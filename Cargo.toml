@@ -1,0 +1,47 @@
+[package]
+name = "smesh-a2a"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "A2A v1 interoperability gateway for SMESH swarms"
+repository = "https://github.com/copyleftdev/smesh-a2a"
+
+[lib]
+name = "smesh_a2a"
+path = "src/lib.rs"
+
+[[bin]]
+name = "smesh-a2a-gateway"
+path = "src/main.rs"
+
+[dependencies]
+a2a = { package = "a2a-lf", version = "0.3.0" }
+a2a-server = { package = "a2a-server-lf", version = "0.4.1" }
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smesh-core = { git = "https://github.com/copyleftdev/smesh-rust", rev = "ff0a88ba75590957e2e108f99e90135cd4b6de80" }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tower-http = { version = "0.6", features = ["limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+a2a-client = { package = "a2a-client-lf", version = "0.2.2" }
+http-body-util = "0.1"
+proptest = "1"
+tower = { version = "0.5", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "warn"
