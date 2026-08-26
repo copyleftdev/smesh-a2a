@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "runtime-trace/1",
+  "captureValid": true,
+  "events": [
+    {
+      "sequence": 0,
+      "monotonicMicros": 16892,
+      "kind": "signalEmitted",
+      "taskId": "trace-task",
+      "contextId": "trace-context",
+      "signalHash": "b5263c4d323b4b3208d9094d722fdd15",
+      "details": {
+        "kind": "none"
+      }
+    }
+  ],
+  "droppedOptional": 0
+}
