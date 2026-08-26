@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'" />
   <title>LIFELINE // A2A × SMESH</title>
   <style>
     :root {
@@ -61,6 +61,7 @@
     body.capture #controls { display: none; }
     body.capture #caption { bottom: 34px; }
     body.capture #protocol-key { bottom: 34px; }
+    #voiceover { display: none; }
     .loading { position: fixed; inset: 0; display: grid; place-items: center; font: 11px ui-monospace, monospace; letter-spacing: .18em; color: var(--muted); background: var(--graphite); z-index: 4; }
     .loading.hidden { display: none; }
     @media (max-width: 900px) { #event-log { display: none; } #chapter { width: 250px; } #protocol-key { display: none; } }
@@ -81,8 +82,9 @@
   <div id="event-log"></div>
   <div id="protocol-key"><span class="key a2a"><i></i>A2A / BETWEEN ORGANIZATIONS</span><span class="key smesh"><i></i>SMESH / WITHIN THE SWARM</span></div>
   <pre id="debug"></pre>
+  <audio id="voiceover" preload="auto" src="./lifeline-voiceover.mp3"></audio>
   <div id="controls">
-    <button id="play" aria-label="Play or pause">PAUSE</button>
+    <button id="play" aria-label="Play or pause">PLAY</button>
     <button id="restart">RESTART</button>
     <input id="scrub" type="range" min="0" max="180000" value="0" step="1" aria-label="Timeline" />
     <button id="speed">1.0×</button>
@@ -138,7 +140,9 @@
     const transientGroup = new THREE.Group();
     world.add(nodeGroup, transientGroup);
     const nodeById = new Map();
-    let events=[], actors=new Map(), playing=true, manualFrameMode=false, speed=1, simTime=0, lastReal=performance.now();
+    const voiceover=document.querySelector('#voiceover');
+    const playButton=document.querySelector('#play');
+    let events=[], actors=new Map(), playing=false, recordingMode=false, tailMode=false, manualFrameMode=false, speed=1, simTime=0, lastReal=performance.now();
 
     const chapters = [
       [0,'CHAPTER 01','THREE POINTS OF NOISE','Three weak clinical signals appear in systems that do not share context.'],
@@ -319,25 +323,42 @@
       requestAnimationFrame(animate);
       const dt=Math.min(100,now-lastReal); lastReal=now;
       if(!manualFrameMode){
-        if(playing){ simTime=(simTime+dt*speed)%DURATION; }
+        if(playing){
+          if(recordingMode)simTime=(simTime+dt*speed)%DURATION;
+          else if(tailMode)simTime=Math.min(DURATION,simTime+dt*speed);
+          else simTime=Math.min(DURATION,voiceover.currentTime*1000);
+          if(tailMode&&simTime>=DURATION){playing=false;tailMode=false;playButton.textContent='PLAY';}
+        }
         renderAt(simTime);
         applyCameraRotation(simTime);
         renderer.render(scene,camera);
       }
     }
 
-    document.querySelector('#play').onclick=()=>{manualFrameMode=false;playing=!playing;document.querySelector('#play').textContent=playing?'PAUSE':'PLAY'};
-    document.querySelector('#restart').onclick=()=>{manualFrameMode=false;simTime=0;playing=true;};
-    document.querySelector('#scrub').oninput=e=>{simTime=Number(e.target.value);playing=false;document.querySelector('#play').textContent='PLAY'};
-    document.querySelector('#speed').onclick=e=>{speed=speed===1?2:speed===2?.5:1;e.target.textContent=`${speed.toFixed(1)}×`};
+    async function setPlaying(next){
+      manualFrameMode=false;recordingMode=false;playing=next;playButton.textContent=playing?'PAUSE':'PLAY';
+      if(!playing){voiceover.pause();return;}
+      const audioEnd=Number.isFinite(voiceover.duration)?voiceover.duration*1000:DURATION;
+      if(simTime>=DURATION-50){simTime=0;voiceover.currentTime=0;tailMode=false;}
+      else if(simTime>=audioEnd-50){voiceover.pause();tailMode=true;lastReal=performance.now();return;}
+      else if(Math.abs(voiceover.currentTime-simTime/1000)>.25)voiceover.currentTime=simTime/1000;
+      tailMode=false;
+      voiceover.playbackRate=speed;
+      try{await voiceover.play();}catch(error){playing=false;playButton.textContent='PLAY';document.querySelector('#caption').textContent=`Audio could not start: ${error.message}`;}
+    }
+    playButton.onclick=()=>{void setPlaying(!playing)};
+    document.querySelector('#restart').onclick=()=>{tailMode=false;simTime=0;voiceover.currentTime=0;void setPlaying(true)};
+    document.querySelector('#scrub').oninput=e=>{recordingMode=false;simTime=Number(e.target.value);playing=false;voiceover.pause();const audioEnd=Number.isFinite(voiceover.duration)?voiceover.duration*1000:DURATION;tailMode=simTime>=audioEnd;voiceover.currentTime=Math.min(simTime/1000,Number.isFinite(voiceover.duration)?voiceover.duration:simTime/1000);playButton.textContent='PLAY'};
+    document.querySelector('#speed').onclick=e=>{speed=speed===1?2:speed===2?.5:1;voiceover.playbackRate=speed;e.target.textContent=`${speed.toFixed(1)}×`};
+    voiceover.addEventListener('ended',()=>{simTime=Math.max(simTime,voiceover.duration*1000);tailMode=true;playing=true;lastReal=performance.now();playButton.textContent='PAUSE'});
     document.querySelector('#debug-toggle').onclick=()=>document.body.classList.toggle('debug');
     addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
     addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();document.querySelector('#play').click()} if(e.key==='d')document.body.classList.toggle('debug');});
     window.LIFELINE_VALIDATE_EVENT=(event)=>validateEvent(structuredClone(event),1);
     window.LIFELINE_CAMERA_ROTATION_AT=(time)=>cameraRotationAt(time);
-    window.LIFELINE_START_CAPTURE=(rate=4)=>{document.body.classList.add('capture');manualFrameMode=false;simTime=0;speed=rate;playing=true;lastReal=performance.now();return {rate,duration:DURATION};};
+    window.LIFELINE_START_CAPTURE=(rate=4)=>{document.body.classList.add('capture');voiceover.pause();tailMode=false;recordingMode=true;manualFrameMode=false;simTime=0;speed=rate;playing=true;lastReal=performance.now();return {rate,duration:DURATION};};
     window.LIFELINE_RENDER_FRAME=(frame,fps=FPS)=>{
-      manualFrameMode=true; playing=false; simTime=frame/fps*1000; renderAt(simTime);
+      voiceover.pause();tailMode=false;recordingMode=true;manualFrameMode=true; playing=false; simTime=frame/fps*1000; renderAt(simTime);
       applyCameraRotation(simTime);
       renderer.render(scene,camera); return simTime;
     };

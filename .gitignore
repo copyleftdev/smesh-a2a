@@ -10,5 +10,6 @@
 /demo/final-*.jpg
 /demo/hardened-*.jpg
 /demo/*.mp3
+!/demo/lifeline-voiceover.mp3
 /demo/*.mp4
 /demo/*.webm

@@ -64,6 +64,7 @@ The repository includes a deterministic cinematic fixture and replay surface:
 - `demo/index.html`: interactive Three.js/WebGL globe, timeline, scrubber, and trace inspector
 - `demo/STORYBOARD.md`: the 16:9 film plan
 - `demo/NARRATION.md`: timed ElevenLabs-ready narration
+- `demo/lifeline-voiceover.mp3`: bundled narration used by the interactive Play control
 - `demo/export-film.mjs`: deterministic frame-by-frame exporter
 - `demo/record-film.mjs`: real-time 1920×1080 recorder and audio muxer
 
