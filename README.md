@@ -54,6 +54,9 @@ See:
 
 ![LIFELINE cinematic replay showing the human-authorization gate](demo/poster.jpg)
 
+- [Open the interactive WebGL replay](https://copyleftdev.github.io/smesh-a2a/)
+- [Download the narrated film and ElevenLabs master](https://github.com/copyleftdev/smesh-a2a/releases/tag/lifeline-demo-v0.1)
+
 The repository includes a deterministic cinematic fixture and replay surface:
 
 - `demo/lifeline.trace.jsonl`: 55 append-only, hash-chained events
