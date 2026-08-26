@@ -29,6 +29,7 @@ test('demo server exposes only the explicit runtime asset allowlist', async () =
     const range = await rawRequest(port, '/lifeline-voiceover.mp3', 'GET', { range: 'bytes=100-199' });
     assert.equal(range.status, 206);
     assert.equal(range.body.length, 100);
+    assert.deepEqual(range.body, audio.body.subarray(100, 200));
     assert.equal(range.headers['content-range'], `bytes 100-199/${audioSize}`);
     const openEnded = await rawRequest(port, '/lifeline-voiceover.mp3', 'GET', { range: 'bytes=100-' });
     assert.equal(openEnded.status, 206);

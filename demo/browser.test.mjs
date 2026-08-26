@@ -107,7 +107,7 @@ test('play starts the bundled voiceover and advances the synchronized timeline',
     });
     await page.click('#play');
     await page.waitForFunction(() => Number(document.querySelector('#scrub').value) > 176000, { timeout: 2_000 });
-    await page.waitForFunction(() => document.querySelector('#play').textContent === 'PLAY' && Number(document.querySelector('#scrub').value) === 180000, { timeout: 4_000 });
+    await page.waitForFunction(() => document.querySelector('#play').textContent === 'PLAY' && Number(document.querySelector('#scrub').value) === 180000 && document.querySelector('#event-count').textContent === '55 / 55 EVENTS', { timeout: 4_000 });
   } finally {
     if (browser) await browser.close();
     await closeServer(server);
