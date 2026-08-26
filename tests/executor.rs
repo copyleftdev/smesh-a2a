@@ -8,9 +8,12 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use smesh_a2a::{
-    DispatchError, ExecutionLimits, InputLimits, MeshDispatcher, MeshEvent, MeshRequest,
-    SmeshExecutor,
+    ArtifactManifest, CompletionEvidence, CompletionPolicySpec, CompletionSnapshot, DispatchError,
+    ExecutionLimits, InputLimits, MeshDispatcher, MeshEvent, MeshRequest, PolicyDecision,
+    RatificationReceipt, RatificationStatement, SmeshExecutor, TrustedAuthority,
+    VersionedCompletionPolicy, artifact_set_digest, content_digest,
 };
+use smesh_core::NodeIdentity;
 
 #[derive(Clone, Default)]
 struct RecordingDispatcher {
@@ -24,8 +27,40 @@ impl MeshDispatcher for RecordingDispatcher {
         request: MeshRequest,
     ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
         self.requests.lock().unwrap().push(request);
+        let subject_digest = artifact_set_digest(&[ArtifactManifest {
+            name: "review.md".into(),
+            media_type: "text/markdown".into(),
+            digest: content_digest(b"all clear"),
+        }])
+        .unwrap();
         Box::pin(stream::iter([
             Ok(MeshEvent::Progress("claimed by reviewer".into())),
+            Ok(MeshEvent::Evidence(CompletionEvidence::Review {
+                id: "review".into(),
+                issuer: "review-authority".into(),
+                subject_digest: subject_digest.clone(),
+                evidence: b"review evidence".to_vec(),
+                evidence_digest: content_digest(b"review evidence"),
+                approved: true,
+                assurance_bps: 9_000,
+            })),
+            Ok(MeshEvent::Evidence(CompletionEvidence::Test {
+                id: "test".into(),
+                issuer: "test-authority".into(),
+                subject_digest: subject_digest.clone(),
+                evidence: b"test evidence".to_vec(),
+                evidence_digest: content_digest(b"test evidence"),
+                passed: true,
+                assurance_bps: 9_000,
+            })),
+            Ok(MeshEvent::Evidence(CompletionEvidence::Contradiction {
+                id: "contradiction-clearance".into(),
+                issuer: "contradiction-monitor".into(),
+                subject_digest,
+                evidence: b"contradiction clearance".to_vec(),
+                evidence_digest: content_digest(b"contradiction clearance"),
+                blocking: false,
+            })),
             Ok(MeshEvent::Artifact {
                 name: "review.md".into(),
                 media_type: "text/markdown".into(),
@@ -74,10 +109,439 @@ async fn executor_streams_work_artifact_and_terminal_completion() {
         StreamResponse::Task(task) if task.status.state == TaskState::Working
     ));
     assert!(matches!(&events[1], StreamResponse::StatusUpdate(_)));
-    assert!(matches!(&events[2], StreamResponse::ArtifactUpdate(_)));
     assert!(matches!(
-        &events[3],
+        &events[2],
         StreamResponse::Task(task) if task.status.state == TaskState::Completed
+    ));
+    let StreamResponse::Task(completed) = &events[2] else {
+        unreachable!();
+    };
+    assert_eq!(completed.artifacts.as_ref().map(Vec::len), Some(1));
+    let metadata = completed.metadata.as_ref().unwrap();
+    let policy = &metadata["smesh.completionPolicy"];
+    assert_eq!(policy["status"], "accepted");
+    assert!(
+        policy["record"]["policyHash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha256:"))
+    );
+    assert!(
+        policy["record"]["evidenceSnapshotHash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha256:"))
+    );
+    assert_eq!(
+        policy["record"]["evidenceHashes"].as_array().map(Vec::len),
+        Some(3)
+    );
+    assert_eq!(policy["record"]["assuranceBps"], 9_000);
+}
+
+#[derive(Clone)]
+struct StaticDispatcher {
+    events: Vec<MeshEvent>,
+}
+
+#[async_trait]
+impl MeshDispatcher for StaticDispatcher {
+    fn dispatch(
+        &self,
+        _request: MeshRequest,
+    ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
+        Box::pin(stream::iter(self.events.clone().into_iter().map(Ok)))
+    }
+
+    async fn cancel(&self, _task_id: &str) -> Result<(), DispatchError> {
+        Ok(())
+    }
+}
+
+fn machine_evidence(name: &str, media_type: &str, content: &str) -> Vec<CompletionEvidence> {
+    let subject_digest = artifact_set_digest(&[ArtifactManifest {
+        name: name.to_owned(),
+        media_type: media_type.to_owned(),
+        digest: content_digest(content.as_bytes()),
+    }])
+    .unwrap();
+    vec![
+        CompletionEvidence::Review {
+            id: "review".into(),
+            issuer: "review-authority".into(),
+            subject_digest: subject_digest.clone(),
+            evidence: b"review evidence".to_vec(),
+            evidence_digest: content_digest(b"review evidence"),
+            approved: true,
+            assurance_bps: 9_000,
+        },
+        CompletionEvidence::Test {
+            id: "test".into(),
+            issuer: "test-authority".into(),
+            subject_digest: subject_digest.clone(),
+            evidence: b"test evidence".to_vec(),
+            evidence_digest: content_digest(b"test evidence"),
+            passed: true,
+            assurance_bps: 9_000,
+        },
+        CompletionEvidence::Contradiction {
+            id: "contradiction-clearance".into(),
+            issuer: "contradiction-monitor".into(),
+            subject_digest,
+            evidence: b"contradiction clearance".to_vec(),
+            evidence_digest: content_digest(b"contradiction clearance"),
+            blocking: false,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn worker_completion_without_policy_evidence_cannot_publish_artifacts_or_complete() {
+    let executor = SmeshExecutor::new(
+        StaticDispatcher {
+            events: vec![
+                MeshEvent::Artifact {
+                    name: "candidate.txt".into(),
+                    media_type: "text/plain".into(),
+                    content: "unreviewed".into(),
+                },
+                MeshEvent::Completed {
+                    summary: "worker claims completion".into(),
+                },
+            ],
+        },
+        InputLimits::default(),
+        "gateway-node",
+    );
+
+    let events = executor
+        .execute(context("untrusted completion"))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        StreamResponse::ArtifactUpdate(_)
+            | StreamResponse::Task(a2a::Task {
+                status: a2a::TaskStatus {
+                    state: TaskState::Completed,
+                    ..
+                },
+                ..
+            })
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(StreamResponse::Task(task)) if task.status.state == TaskState::Failed
+    ));
+}
+
+#[derive(Clone, Default)]
+struct LeakyDispatcher;
+
+#[async_trait]
+impl MeshDispatcher for LeakyDispatcher {
+    fn dispatch(
+        &self,
+        _request: MeshRequest,
+    ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
+        Box::pin(stream::iter([
+            Ok(MeshEvent::Progress("SECRET-CANDIDATE-CONTENT".into())),
+            Err(DispatchError::Message("SECRET-WORKER-ERROR".into())),
+        ]))
+    }
+
+    async fn cancel(&self, _task_id: &str) -> Result<(), DispatchError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn pre_acceptance_progress_and_errors_are_sanitized() {
+    let executor = SmeshExecutor::new(LeakyDispatcher, InputLimits::default(), "gateway-node");
+    let events = executor
+        .execute(context("sanitize"))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let encoded = serde_json::to_string(&events).unwrap();
+    assert!(!encoded.contains("SECRET-CANDIDATE-CONTENT"));
+    assert!(!encoded.contains("SECRET-WORKER-ERROR"));
+    assert!(encoded.contains("SMESH worker reported progress"));
+    assert!(encoded.contains("SMESH worker failed"));
+}
+
+#[tokio::test]
+async fn duplicate_completion_proposals_fail_without_publishing_candidates() {
+    let content = "candidate";
+    let artifact = ArtifactManifest {
+        name: "candidate.txt".into(),
+        media_type: "text/plain".into(),
+        digest: content_digest(content.as_bytes()),
+    };
+    let mut events = machine_evidence(&artifact.name, &artifact.media_type, content)
+        .into_iter()
+        .map(MeshEvent::Evidence)
+        .collect::<Vec<_>>();
+    events.extend([
+        MeshEvent::Artifact {
+            name: artifact.name,
+            media_type: artifact.media_type,
+            content: content.into(),
+        },
+        MeshEvent::Completed {
+            summary: "first proposal".into(),
+        },
+        MeshEvent::Completed {
+            summary: "second proposal".into(),
+        },
+    ]);
+    let executor = SmeshExecutor::new(
+        StaticDispatcher { events },
+        InputLimits::default(),
+        "gateway-node",
+    );
+    let result = executor
+        .execute(context("duplicate completion"))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        !result
+            .iter()
+            .any(|event| matches!(event, StreamResponse::ArtifactUpdate(_)))
+    );
+    assert!(matches!(
+        result.last(),
+        Some(StreamResponse::Task(task)) if task.status.state == TaskState::Failed
+    ));
+}
+
+#[tokio::test]
+async fn contradiction_after_completion_proposal_still_blocks_publication() {
+    let content = "candidate";
+    let artifact = ArtifactManifest {
+        name: "candidate.txt".into(),
+        media_type: "text/plain".into(),
+        digest: content_digest(content.as_bytes()),
+    };
+    let subject = artifact_set_digest(std::slice::from_ref(&artifact)).unwrap();
+    let mut events = machine_evidence(&artifact.name, &artifact.media_type, content)
+        .into_iter()
+        .map(MeshEvent::Evidence)
+        .collect::<Vec<_>>();
+    events.extend([
+        MeshEvent::Artifact {
+            name: artifact.name,
+            media_type: artifact.media_type,
+            content: content.into(),
+        },
+        MeshEvent::Completed {
+            summary: "premature proposal".into(),
+        },
+        MeshEvent::Evidence(CompletionEvidence::Contradiction {
+            id: "late-contradiction".into(),
+            issuer: "contradiction-monitor".into(),
+            subject_digest: subject,
+            evidence: b"late contradiction evidence".to_vec(),
+            evidence_digest: content_digest(b"late contradiction evidence"),
+            blocking: true,
+        }),
+    ]);
+    let executor = SmeshExecutor::new(
+        StaticDispatcher { events },
+        InputLimits::default(),
+        "gateway-node",
+    );
+
+    let result = executor
+        .execute(context("late contradiction"))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        !result
+            .iter()
+            .any(|event| matches!(event, StreamResponse::ArtifactUpdate(_)))
+    );
+    assert!(matches!(
+        result.last(),
+        Some(StreamResponse::Task(task)) if task.status.state == TaskState::Failed
+    ));
+}
+
+#[tokio::test]
+async fn malformed_input_required_checkpoint_fails_closed_before_dispatch() {
+    let executor = SmeshExecutor::new(EmptyDispatcher, InputLimits::default(), "gateway-node");
+    let events = executor
+        .execute(ExecutorContext {
+            message: Some(Message::new(Role::User, vec![Part::text("approve")])),
+            task_id: "task-1".into(),
+            stored_task: Some(a2a::Task {
+                id: "task-1".into(),
+                context_id: "context-1".into(),
+                status: a2a::TaskStatus {
+                    state: TaskState::InputRequired,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            }),
+            context_id: "context-1".into(),
+            metadata: None,
+            user: None,
+            service_params: HashMap::new(),
+            tenant: None,
+        })
+        .collect::<Vec<_>>()
+        .await;
+    assert!(matches!(
+        events.as_slice(),
+        [Err(error)] if error.code == a2a::error_code::INVALID_AGENT_RESPONSE
+    ));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One end-to-end signed-ratification lifecycle.
+async fn human_required_policy_waits_for_and_then_verifies_ratification() {
+    let authority = NodeIdentity::generate_named("human-authority");
+    let mut spec = CompletionPolicySpec::development();
+    spec.require_human_ratification = true;
+    spec.ratification_authorities = vec![TrustedAuthority {
+        node_id: authority.node_id().to_owned(),
+        public_key: authority.public_key_hex(),
+    }];
+    let policy = VersionedCompletionPolicy::new(spec).unwrap();
+    let artifact = ArtifactManifest {
+        name: "result.txt".into(),
+        media_type: "text/plain".into(),
+        digest: content_digest(b"accepted candidate"),
+    };
+    let evidence = machine_evidence(&artifact.name, &artifact.media_type, "accepted candidate");
+    let snapshot = CompletionSnapshot {
+        task_id: "task-1".into(),
+        context_id: "context-1".into(),
+        request_digest: content_digest(
+            &serde_json::to_vec(&MeshRequest {
+                protocol: "a2a-v1".into(),
+                task_id: "task-1".into(),
+                context_id: "context-1".into(),
+                text: "ratify it".into(),
+            })
+            .unwrap(),
+        ),
+        artifacts: vec![artifact.clone()],
+        evidence: evidence.clone(),
+    };
+    let PolicyDecision::AwaitingRatification(checkpoint) = policy.evaluate(&snapshot).unwrap()
+    else {
+        panic!("expected ratification checkpoint");
+    };
+    let statement = RatificationStatement {
+        policy_hash: checkpoint.policy_hash,
+        evidence_snapshot_hash: checkpoint.evidence_snapshot_hash,
+        artifact_set_digest: checkpoint.artifact_set_digest,
+        approved: true,
+    };
+    let receipt = RatificationReceipt {
+        authority: authority.attest(&statement.digest().unwrap()).into(),
+        statement,
+    };
+
+    let without_receipt = SmeshExecutor::new(
+        StaticDispatcher {
+            events: evidence
+                .iter()
+                .cloned()
+                .map(MeshEvent::Evidence)
+                .chain([
+                    MeshEvent::Artifact {
+                        name: artifact.name.clone(),
+                        media_type: artifact.media_type.clone(),
+                        content: "accepted candidate".into(),
+                    },
+                    MeshEvent::Completed {
+                        summary: "candidate complete".into(),
+                    },
+                ])
+                .collect(),
+        },
+        InputLimits::default(),
+        "gateway-node",
+    )
+    .with_completion_policy(policy.clone());
+    let waiting = without_receipt
+        .execute(context("ratify it"))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        !waiting
+            .iter()
+            .any(|event| matches!(event, StreamResponse::ArtifactUpdate(_)))
+    );
+    assert!(matches!(
+        waiting.last(),
+        Some(StreamResponse::Task(task)) if task.status.state == TaskState::InputRequired
+    ));
+    let StreamResponse::Task(waiting_task) = waiting.last().unwrap() else {
+        unreachable!();
+    };
+
+    let mut ratified_evidence = evidence;
+    ratified_evidence.push(CompletionEvidence::Ratification(receipt));
+    let ratified = SmeshExecutor::new(
+        StaticDispatcher {
+            events: ratified_evidence
+                .into_iter()
+                .map(MeshEvent::Evidence)
+                .chain([
+                    MeshEvent::Artifact {
+                        name: artifact.name,
+                        media_type: artifact.media_type,
+                        content: "accepted candidate".into(),
+                    },
+                    MeshEvent::Completed {
+                        summary: "ratified complete".into(),
+                    },
+                ])
+                .collect(),
+        },
+        InputLimits::default(),
+        "gateway-node",
+    )
+    .with_completion_policy(policy);
+    let completed = ratified
+        .execute(ExecutorContext {
+            message: Some(Message::new(Role::User, vec![Part::text("approve")])),
+            task_id: "task-1".into(),
+            stored_task: Some(waiting_task.clone()),
+            context_id: "context-1".into(),
+            metadata: None,
+            user: None,
+            service_params: HashMap::new(),
+            tenant: None,
+        })
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(matches!(
+        completed.last(),
+        Some(StreamResponse::Task(task))
+            if task.status.state == TaskState::Completed
+                && task.artifacts.as_ref().map(Vec::len) == Some(1)
     ));
 }
 
@@ -112,7 +576,9 @@ async fn executor_fails_a_task_if_the_mesh_stream_ends_without_a_terminal_event(
 }
 
 #[derive(Clone, Default)]
-struct HoldingDispatcher;
+struct HoldingDispatcher {
+    canceled: Arc<Mutex<Vec<String>>>,
+}
 
 #[async_trait]
 impl MeshDispatcher for HoldingDispatcher {
@@ -123,14 +589,19 @@ impl MeshDispatcher for HoldingDispatcher {
         Box::pin(stream::pending())
     }
 
-    async fn cancel(&self, _task_id: &str) -> Result<(), DispatchError> {
+    async fn cancel(&self, task_id: &str) -> Result<(), DispatchError> {
+        self.canceled.lock().unwrap().push(task_id.to_owned());
         Ok(())
     }
 }
 
 #[tokio::test]
 async fn cancellation_wakes_and_closes_the_original_execution_stream() {
-    let executor = SmeshExecutor::new(HoldingDispatcher, InputLimits::default(), "gateway-node");
+    let executor = SmeshExecutor::new(
+        HoldingDispatcher::default(),
+        InputLimits::default(),
+        "gateway-node",
+    );
     let mut execution = executor.execute(context("hold"));
     assert!(matches!(
         execution.next().await,
@@ -191,6 +662,30 @@ impl MeshDispatcher for ArtifactBurstDispatcher {
 }
 
 #[tokio::test]
+async fn dropping_execution_stream_requests_dispatcher_cancellation() {
+    let dispatcher = HoldingDispatcher::default();
+    let canceled = Arc::clone(&dispatcher.canceled);
+    let executor = SmeshExecutor::new(dispatcher, InputLimits::default(), "gateway-node");
+    let mut execution = executor.execute(context("drop"));
+    assert!(matches!(
+        execution.next().await,
+        Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Working
+    ));
+    drop(execution);
+    tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            if !canceled.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(canceled.lock().unwrap().as_slice(), ["task-1"]);
+}
+
+#[tokio::test]
 async fn executor_fails_when_worker_exceeds_artifact_budget() {
     let executor = SmeshExecutor::new(
         ArtifactBurstDispatcher,
@@ -213,7 +708,9 @@ async fn executor_fails_when_worker_exceeds_artifact_budget() {
 
 #[tokio::test]
 async fn executor_fails_after_worker_inactivity_timeout() {
-    let executor = SmeshExecutor::new(HoldingDispatcher, InputLimits::default(), "gateway-node")
+    let dispatcher = HoldingDispatcher::default();
+    let canceled = Arc::clone(&dispatcher.canceled);
+    let executor = SmeshExecutor::new(dispatcher, InputLimits::default(), "gateway-node")
         .with_execution_limits(ExecutionLimits {
             worker_idle_timeout: Duration::from_millis(10),
             ..ExecutionLimits::default()
@@ -231,11 +728,14 @@ async fn executor_fails_after_worker_inactivity_timeout() {
         events.last(),
         Some(StreamResponse::Task(task)) if task.status.state == TaskState::Failed
     ));
+    assert_eq!(canceled.lock().unwrap().as_slice(), ["task-1"]);
 }
 
 #[tokio::test]
 async fn executor_fails_after_total_task_deadline() {
-    let executor = SmeshExecutor::new(HoldingDispatcher, InputLimits::default(), "gateway-node")
+    let dispatcher = HoldingDispatcher::default();
+    let canceled = Arc::clone(&dispatcher.canceled);
+    let executor = SmeshExecutor::new(dispatcher, InputLimits::default(), "gateway-node")
         .with_execution_limits(ExecutionLimits {
             worker_idle_timeout: Duration::from_secs(1),
             task_timeout: Duration::from_millis(10),
@@ -253,15 +753,20 @@ async fn executor_fails_after_total_task_deadline() {
         events.last(),
         Some(StreamResponse::Task(task)) if task.status.state == TaskState::Failed
     ));
+    assert_eq!(canceled.lock().unwrap().as_slice(), ["task-1"]);
 }
 
 #[tokio::test]
 async fn executor_rejects_work_above_concurrency_limit() {
-    let executor = SmeshExecutor::new(HoldingDispatcher, InputLimits::default(), "gateway-node")
-        .with_execution_limits(ExecutionLimits {
-            max_concurrent_tasks: 1,
-            ..ExecutionLimits::default()
-        });
+    let executor = SmeshExecutor::new(
+        HoldingDispatcher::default(),
+        InputLimits::default(),
+        "gateway-node",
+    )
+    .with_execution_limits(ExecutionLimits {
+        max_concurrent_tasks: 1,
+        ..ExecutionLimits::default()
+    });
     let mut first = executor.execute(context_with_id("first", "hold"));
     assert!(matches!(
         first.next().await,

@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 
-use crate::{DispatchError, MeshDispatcher, MeshEvent, MeshRequest};
+use crate::{
+    ArtifactManifest, CompletionEvidence, DispatchError, MeshDispatcher, MeshEvent, MeshRequest,
+    artifact_set_digest, content_digest,
+};
 
 /// Deterministic local worker used by tests and the standalone demo.
 #[derive(Debug, Clone, Default)]
@@ -21,11 +24,49 @@ impl MeshDispatcher for LoopbackDispatcher {
             "signalHash": signal.origin_hash,
         })
         .to_string();
+        let subject_digest = match artifact_set_digest(&[ArtifactManifest {
+            name: "smesh-result.json".to_owned(),
+            media_type: "application/json".to_owned(),
+            digest: content_digest(content.as_bytes()),
+        }]) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return Box::pin(stream::iter([Err(DispatchError::Message(format!(
+                    "loopback completion manifest failed: {error}"
+                )))]));
+            }
+        };
 
         Box::pin(stream::iter([
             Ok(MeshEvent::Progress(
                 "task claimed by the loopback SMESH worker".to_owned(),
             )),
+            Ok(MeshEvent::Evidence(CompletionEvidence::Review {
+                id: "loopback-review".to_owned(),
+                issuer: "review-authority".to_owned(),
+                subject_digest: subject_digest.clone(),
+                evidence: b"loopback deterministic review fixture".to_vec(),
+                evidence_digest: content_digest(b"loopback deterministic review fixture"),
+                approved: true,
+                assurance_bps: 10_000,
+            })),
+            Ok(MeshEvent::Evidence(CompletionEvidence::Test {
+                id: "loopback-test".to_owned(),
+                issuer: "test-authority".to_owned(),
+                subject_digest: subject_digest.clone(),
+                evidence: b"loopback deterministic test fixture".to_vec(),
+                evidence_digest: content_digest(b"loopback deterministic test fixture"),
+                passed: true,
+                assurance_bps: 10_000,
+            })),
+            Ok(MeshEvent::Evidence(CompletionEvidence::Contradiction {
+                id: "loopback-contradiction-clearance".to_owned(),
+                issuer: "contradiction-monitor".to_owned(),
+                subject_digest,
+                evidence: b"loopback deterministic contradiction clearance".to_vec(),
+                evidence_digest: content_digest(b"loopback deterministic contradiction clearance"),
+                blocking: false,
+            })),
             Ok(MeshEvent::Artifact {
                 name: "smesh-result.json".to_owned(),
                 media_type: "application/json".to_owned(),

@@ -8,6 +8,7 @@ mod guard;
 mod input;
 mod lifeline;
 mod loopback;
+mod policy;
 mod server;
 mod store;
 
@@ -20,5 +21,11 @@ pub use lifeline::{
     TraceError, TraceEvent, generate_lifeline_trace, verify_trace, write_lifeline_trace,
 };
 pub use loopback::LoopbackDispatcher;
-pub use server::{GatewayConfig, build_router, build_router_with_store};
+pub use policy::{
+    ArtifactManifest, COMPLETION_POLICY_V1, ClosedAttestation, CompletionEvidence,
+    CompletionPolicySpec, CompletionReceipt, CompletionSnapshot, PolicyBlock, PolicyBlockReason,
+    PolicyCheckpoint, PolicyDecision, PolicyError, RatificationReceipt, RatificationStatement,
+    TrustedAuthority, VersionedCompletionPolicy, artifact_set_digest, content_digest,
+};
+pub use server::{GatewayConfig, build_router, build_router_with_policy, build_router_with_store};
 pub use store::BoundedTaskStore;

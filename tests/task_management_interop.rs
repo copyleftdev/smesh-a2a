@@ -16,8 +16,9 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{StreamExt, stream::BoxStream};
 use smesh_a2a::{
-    BoundedTaskStore, DispatchError, GatewayConfig, LoopbackDispatcher, MeshDispatcher, MeshEvent,
-    MeshRequest, build_router_with_store,
+    ArtifactManifest, BoundedTaskStore, CompletionEvidence, CompletionReceipt, DispatchError,
+    GatewayConfig, LoopbackDispatcher, MeshDispatcher, MeshEvent, MeshRequest, artifact_set_digest,
+    build_router_with_store, content_digest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -122,7 +123,7 @@ fn fixture_task(id: &str, context_id: &str, timestamp: &str) -> Task {
         id: id.to_owned(),
         context_id: context_id.to_owned(),
         status: TaskStatus {
-            state: TaskState::Completed,
+            state: TaskState::Working,
             message: None,
             timestamp: Some(
                 chrono::DateTime::parse_from_rfc3339(timestamp)
@@ -130,14 +131,7 @@ fn fixture_task(id: &str, context_id: &str, timestamp: &str) -> Task {
                     .with_timezone(&chrono::Utc),
             ),
         },
-        artifacts: Some(vec![Artifact {
-            artifact_id: format!("artifact-{id}"),
-            name: Some("fixture.json".to_owned()),
-            description: None,
-            parts: vec![Part::text("{}")],
-            metadata: None,
-            extensions: None,
-        }]),
+        artifacts: None,
         history: Some(vec![Message::new(Role::User, vec![Part::text(id)])]),
         metadata: None,
     }
@@ -159,7 +153,7 @@ async fn official_clients_receive_the_most_recent_bounded_history_messages() {
             id: "history-task".to_owned(),
             context_id: "history-context".to_owned(),
             status: TaskStatus {
-                state: TaskState::Completed,
+                state: TaskState::Working,
                 message: None,
                 timestamp: Some(chrono::Utc::now()),
             },
@@ -193,7 +187,7 @@ async fn official_clients_receive_the_most_recent_bounded_history_messages() {
         let listed = client
             .list_tasks(&ListTasksRequest {
                 context_id: Some("history-context".to_owned()),
-                status: Some(TaskState::Completed),
+                status: Some(TaskState::Working),
                 page_size: Some(10),
                 page_token: None,
                 history_length: Some(2),
@@ -215,6 +209,103 @@ async fn official_clients_receive_the_most_recent_bounded_history_messages() {
             expected_ids
         );
     }
+}
+
+#[tokio::test]
+async fn preloaded_tasks_cannot_bypass_policy_receipt_and_artifact_visibility_guards() {
+    let store = BoundedTaskStore::new(8);
+    for (id, state) in [
+        ("unverified-completed", TaskState::Completed),
+        ("unverified-working", TaskState::Working),
+    ] {
+        let mut task = fixture_task(id, "unverified-context", "2026-01-01T00:00:00Z");
+        task.status.state = state;
+        task.artifacts = Some(vec![Artifact {
+            artifact_id: format!("artifact-{id}"),
+            name: Some("unverified.txt".to_owned()),
+            description: None,
+            parts: vec![Part::text("candidate").with_media_type("text/plain")],
+            metadata: None,
+            extensions: None,
+        }]);
+        store.create(task).await.unwrap();
+    }
+    let server = TestServer::start_with_store(LoopbackDispatcher, store.clone()).await;
+    let client = server.client(TRANSPORT_PROTOCOL_JSONRPC).await;
+    let valid = send_completed(&client, "valid receipt", "unverified-context").await;
+    let mut replayed_receipt = valid;
+    replayed_receipt.id = "replayed-receipt".to_owned();
+    replayed_receipt
+        .metadata
+        .as_mut()
+        .unwrap()
+        .get_mut("smesh.completionPolicy")
+        .unwrap()["record"]["taskId"] = serde_json::Value::String("replayed-receipt".to_owned());
+    let record = &mut replayed_receipt
+        .metadata
+        .as_mut()
+        .unwrap()
+        .get_mut("smesh.completionPolicy")
+        .unwrap()["record"];
+    record["policyVersion"] = serde_json::json!(1_u32);
+    record["assuranceBps"] = serde_json::json!(10_000_u16);
+    let receipt: CompletionReceipt = serde_json::from_value(
+        replayed_receipt.metadata.as_ref().unwrap()["smesh.completionPolicy"]["record"].clone(),
+    )
+    .unwrap();
+    assert_eq!(receipt.task_id, replayed_receipt.id);
+    let artifacts = replayed_receipt.artifacts.as_ref().unwrap();
+    let manifests = artifacts
+        .iter()
+        .map(|artifact| {
+            let [part] = artifact.parts.as_slice() else {
+                panic!("fixture artifact must have one part");
+            };
+            let PartContent::Text(content) = &part.content else {
+                panic!("fixture artifact must be text");
+            };
+            ArtifactManifest {
+                name: artifact.name.clone().unwrap(),
+                media_type: part.media_type.clone().unwrap(),
+                digest: content_digest(content.as_bytes()),
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        receipt.artifact_set_digest,
+        artifact_set_digest(&manifests).unwrap()
+    );
+    store.create(replayed_receipt).await.unwrap();
+
+    for id in [
+        "unverified-completed",
+        "unverified-working",
+        "replayed-receipt",
+    ] {
+        let error = client
+            .get_task(&GetTaskRequest {
+                id: id.to_owned(),
+                history_length: None,
+                tenant: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+    }
+    let list_error = client
+        .list_tasks(&ListTasksRequest {
+            context_id: Some("unverified-context".to_owned()),
+            status: None,
+            page_size: Some(10),
+            page_token: None,
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: Some(true),
+            tenant: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(list_error.code, error_code::INVALID_AGENT_RESPONSE);
 }
 
 #[tokio::test]
@@ -266,6 +357,22 @@ async fn official_clients_get_tasks_with_bounded_history_and_not_found_errors() 
             .await
             .unwrap_err();
         assert_eq!(missing.code, error_code::TASK_NOT_FOUND);
+
+        let projected = client
+            .list_tasks(&ListTasksRequest {
+                context_id: Some(created.context_id.clone()),
+                status: Some(TaskState::Completed),
+                page_size: Some(10),
+                page_token: None,
+                history_length: Some(0),
+                status_timestamp_after: None,
+                include_artifacts: Some(false),
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(projected.tasks.len(), 1);
+        assert!(projected.tasks[0].artifacts.is_none());
     }
 }
 
@@ -278,7 +385,7 @@ async fn assert_cursor_survives_concurrent_insert(
 ) -> ListTasksRequest {
     let page_request = ListTasksRequest {
         context_id: None,
-        status: Some(TaskState::Completed),
+        status: Some(TaskState::Working),
         page_size: Some(2),
         page_token: None,
         history_length: Some(0),
@@ -398,7 +505,7 @@ async fn official_clients_list_tasks_with_filters_stable_pagination_and_projecti
         let shared = client
             .list_tasks(&ListTasksRequest {
                 context_id: Some("shared-context".to_owned()),
-                status: Some(TaskState::Completed),
+                status: Some(TaskState::Working),
                 page_size: Some(10),
                 page_token: None,
                 history_length: Some(1),
@@ -415,7 +522,7 @@ async fn official_clients_list_tasks_with_filters_stable_pagination_and_projecti
                 .iter()
                 .all(|task| task.context_id == "shared-context")
         );
-        assert!(shared.tasks.iter().all(|task| task.artifacts.is_some()));
+        assert!(shared.tasks.iter().all(|task| task.artifacts.is_none()));
         assert!(
             shared
                 .tasks
@@ -534,6 +641,42 @@ impl TaskStore for DeepCloneTaskStore {
 }
 
 #[derive(Clone)]
+struct InconsistentListTaskStore {
+    inner: BoundedTaskStore,
+}
+
+#[async_trait]
+impl TaskStore for InconsistentListTaskStore {
+    async fn create(&self, task: Task) -> Result<u64, A2AError> {
+        self.inner.create(task).await
+    }
+
+    async fn update(&self, task: Task) -> Result<u64, A2AError> {
+        self.inner.update(task).await
+    }
+
+    async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
+        self.inner.get(task_id).await
+    }
+
+    async fn list(&self, request: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+        let mut response = self.inner.list(request).await?;
+        if let Some(task) = response.tasks.first_mut() {
+            task.status.state = TaskState::Completed;
+            task.artifacts = Some(vec![Artifact {
+                artifact_id: "forged-list-artifact".to_owned(),
+                name: Some("forged.txt".to_owned()),
+                description: None,
+                parts: vec![Part::text("forged")],
+                metadata: None,
+                extensions: None,
+            }]);
+        }
+        Ok(response)
+    }
+}
+
+#[derive(Clone)]
 struct RacingTaskStore {
     inner: BoundedTaskStore,
     armed_task: Arc<Mutex<Option<String>>>,
@@ -583,6 +726,7 @@ impl TaskStore for RacingTaskStore {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Full official-client evidence-to-terminal stream contract.
 async fn official_clients_subscribe_to_ordered_updates_until_terminal_closure() {
     for binding in [TRANSPORT_PROTOCOL_JSONRPC, TRANSPORT_PROTOCOL_HTTP_JSON] {
         let dispatcher = ControlledDispatcher::default();
@@ -605,8 +749,49 @@ async fn official_clients_subscribe_to_ordered_updates_until_terminal_closure() 
             .await
             .unwrap();
         let sender = dispatcher.sender_for(&task.id).await;
+        let subject_digest = artifact_set_digest(&[ArtifactManifest {
+            name: "result.json".to_owned(),
+            media_type: "application/json".to_owned(),
+            digest: content_digest(b"{\"ok\":true}"),
+        }])
+        .unwrap();
         sender
             .send(Ok(MeshEvent::Progress("runtime claimed task".to_owned())))
+            .await
+            .unwrap();
+        sender
+            .send(Ok(MeshEvent::Evidence(CompletionEvidence::Review {
+                id: "controlled-review".to_owned(),
+                issuer: "review-authority".to_owned(),
+                subject_digest: subject_digest.clone(),
+                evidence: b"controlled review".to_vec(),
+                evidence_digest: content_digest(b"controlled review"),
+                approved: true,
+                assurance_bps: 9_000,
+            })))
+            .await
+            .unwrap();
+        sender
+            .send(Ok(MeshEvent::Evidence(CompletionEvidence::Test {
+                id: "controlled-test".to_owned(),
+                issuer: "test-authority".to_owned(),
+                subject_digest: subject_digest.clone(),
+                evidence: b"controlled test".to_vec(),
+                evidence_digest: content_digest(b"controlled test"),
+                passed: true,
+                assurance_bps: 9_000,
+            })))
+            .await
+            .unwrap();
+        sender
+            .send(Ok(MeshEvent::Evidence(CompletionEvidence::Contradiction {
+                id: "controlled-contradiction-clearance".to_owned(),
+                issuer: "contradiction-monitor".to_owned(),
+                subject_digest,
+                evidence: b"controlled contradiction clearance".to_vec(),
+                evidence_digest: content_digest(b"controlled contradiction clearance"),
+                blocking: false,
+            })))
             .await
             .unwrap();
         sender
@@ -623,6 +808,7 @@ async fn official_clients_subscribe_to_ordered_updates_until_terminal_closure() 
             }))
             .await
             .unwrap();
+        dispatcher.senders.lock().unwrap().remove(&task.id);
         drop(sender);
 
         let events = tokio::time::timeout(
@@ -635,7 +821,6 @@ async fn official_clients_subscribe_to_ordered_updates_until_terminal_closure() 
         let [
             StreamResponse::Task(snapshot),
             StreamResponse::StatusUpdate(progress),
-            StreamResponse::ArtifactUpdate(artifact),
             StreamResponse::Task(completed),
         ] = events.as_slice()
         else {
@@ -645,11 +830,13 @@ async fn official_clients_subscribe_to_ordered_updates_until_terminal_closure() 
         assert_eq!(progress.status.state, TaskState::Working);
         assert!(matches!(
             progress.status.message.as_ref().map(|message| message.parts.as_slice()),
-            Some([Part { content: PartContent::Text(text), .. }]) if text == "runtime claimed task"
+            Some([Part { content: PartContent::Text(text), .. }]) if text == "SMESH worker reported progress"
         ));
-        assert_eq!(artifact.artifact.name.as_deref(), Some("result.json"));
+        let artifacts = completed.artifacts.as_ref().expect("accepted artifact");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name.as_deref(), Some("result.json"));
         assert!(matches!(
-            artifact.artifact.parts.as_slice(),
+            artifacts[0].parts.as_slice(),
             [Part {
                 content: PartContent::Text(content),
                 media_type: Some(media_type),
@@ -658,6 +845,37 @@ async fn official_clients_subscribe_to_ordered_updates_until_terminal_closure() 
         ));
         assert_eq!(completed.status.state, TaskState::Completed);
     }
+}
+
+#[tokio::test]
+async fn inconsistent_list_results_cannot_bypass_authoritative_store_validation() {
+    let store = InconsistentListTaskStore {
+        inner: BoundedTaskStore::new(8),
+    };
+    store
+        .create(fixture_task(
+            "inconsistent-list",
+            "inconsistent-context",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+    let server = TestServer::start_with_store(LoopbackDispatcher, store).await;
+    let client = server.client(TRANSPORT_PROTOCOL_JSONRPC).await;
+    let error = client
+        .list_tasks(&ListTasksRequest {
+            context_id: Some("inconsistent-context".to_owned()),
+            status: Some(TaskState::Working),
+            page_size: Some(10),
+            page_token: None,
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: Some(true),
+            tenant: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
 }
 
 #[tokio::test]

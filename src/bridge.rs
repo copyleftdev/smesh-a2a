@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use smesh_core::{Signal, SignalType};
 use thiserror::Error;
 
-use crate::{InputError, InputLimits, extract_text};
+use crate::{CompletionEvidence, InputError, InputLimits, extract_text};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DispatchError {
@@ -17,6 +17,8 @@ pub enum DispatchError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeshEvent {
     Progress(String),
+    /// Untrusted evidence submitted for gateway-side completion evaluation.
+    Evidence(CompletionEvidence),
     Artifact {
         name: String,
         media_type: String,

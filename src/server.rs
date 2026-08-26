@@ -8,7 +8,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
     BoundedTaskStore, ExecutionLimits, InputLimits, MeshDispatcher, SmeshExecutor,
-    build_agent_card, guard::GuardedRequestHandler,
+    VersionedCompletionPolicy, build_agent_card, guard::GuardedRequestHandler,
 };
 
 struct SharedTaskStore<S>(Arc<S>);
@@ -86,13 +86,34 @@ where
     D: MeshDispatcher,
     S: TaskStore,
 {
+    build_router_with_policy(
+        config,
+        dispatcher,
+        store,
+        VersionedCompletionPolicy::default(),
+    )
+}
+
+/// Compose the A2A router with explicit store and completion-policy boundaries.
+pub fn build_router_with_policy<D, S>(
+    config: GatewayConfig,
+    dispatcher: D,
+    store: S,
+    policy: VersionedCompletionPolicy,
+) -> Router
+where
+    D: MeshDispatcher,
+    S: TaskStore,
+{
     let max_body_bytes = config.max_body_bytes;
     let store = SharedTaskStore(Arc::new(store));
+    let guard_policy = policy.clone();
     let executor = SmeshExecutor::new(dispatcher, config.input_limits, config.gateway_node_id)
-        .with_execution_limits(config.execution_limits);
+        .with_execution_limits(config.execution_limits)
+        .with_completion_policy(policy);
     let inner: Arc<dyn RequestHandler> =
         Arc::new(DefaultRequestHandler::new(executor, store.clone()));
-    let handler = Arc::new(GuardedRequestHandler::new(inner, store));
+    let handler = Arc::new(GuardedRequestHandler::new(inner, store, guard_policy));
     let card = Arc::new(StaticAgentCard::new(build_agent_card(
         &config.public_base_url,
     )));

@@ -22,7 +22,24 @@ Current controls:
 - cancellation tokens that wake active executor streams
 - absorbing terminal states in the task store
 - terminal failure when a worker stream closes without completion
+- worker completion treated as an untrusted proposal; candidate artifacts remain buffered until
+  a versioned, bounded, deterministic policy accepts the sealed evidence snapshot
+- blocking-contradiction veto and signed, allowlisted ratification for human-required profiles
+- process-local HMAC seals on ratification checkpoints and accepted completion receipts, verified
+  with task/context/policy and recomputed artifact bindings before stored tasks are exposed
+- bounded dispatcher cancellation after local deadlines, inactivity, resource-budget failures,
+  policy rejection, and abandoned response streams
 - refusal to bind outside loopback unless an explicit unsafe override is set
+
+Completion-policy review/test payload hashes are recomputed by the gateway and issuer labels must
+appear in the locally configured policy profile, but those labels are not authenticated identities.
+A review/test record proves only that the policy received a structurally valid claim bound to exact
+artifact, request, task, context, and policy hashes. Cryptographic attestations must match a locally
+configured key and prove possession of that key, not real-world authority. Human ratification proves configured-key possession,
+but durable freshness, revocation, and cross-restart replay prevention still require persistent
+identity and ledger work. The loopback worker emits explicitly synthetic evidence fixtures.
+The receipt key is process-local like the current in-memory ledger; durable key management and
+restart replay are not claimed by this release.
 
 ## Known dependency warning
 
