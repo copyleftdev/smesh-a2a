@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ArtifactManifest, CompletionEvidence, CompletionSnapshot, InputLimits, MeshDispatcher,
-    MeshEvent, MeshRequest, PolicyCheckpoint, PolicyDecision, VersionedCompletionPolicy,
-    content_digest,
+    MeshEvent, MeshRequest, PolicyCheckpoint, PolicyDecision, RuntimeEventCapture,
+    RuntimeTerminalState, VersionedCompletionPolicy, content_digest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +159,7 @@ pub struct SmeshExecutor<D> {
     execution_limits: ExecutionLimits,
     permits: Arc<tokio::sync::Semaphore>,
     completion_policy: Arc<VersionedCompletionPolicy>,
+    runtime_trace: Option<Arc<RuntimeEventCapture>>,
 }
 
 impl<D> SmeshExecutor<D>
@@ -177,6 +178,7 @@ where
                 ExecutionLimits::default().max_concurrent_tasks,
             )),
             completion_policy: Arc::new(VersionedCompletionPolicy::default()),
+            runtime_trace: None,
         }
     }
 
@@ -196,6 +198,12 @@ where
     #[must_use]
     pub fn with_completion_policy(mut self, policy: VersionedCompletionPolicy) -> Self {
         self.completion_policy = Arc::new(policy);
+        self
+    }
+
+    #[must_use]
+    pub fn with_runtime_trace(mut self, trace: Arc<RuntimeEventCapture>) -> Self {
+        self.runtime_trace = Some(trace);
         self
     }
 }
@@ -247,7 +255,19 @@ where
             Err(error) => {
                 let task_id = ctx.task_id.clone();
                 let context_id = ctx.context_id.clone();
+                let runtime_trace = self.runtime_trace.clone();
                 return Box::pin(stream::once(async move {
+                    if !record_terminal_trace(
+                        runtime_trace.as_deref(),
+                        &task_id,
+                        &context_id,
+                        TaskState::Rejected,
+                        Vec::new(),
+                    )
+                    .await
+                    {
+                        return Err(A2AError::internal("required runtime trace capture failed"));
+                    }
                     Ok(StreamResponse::Task(Task {
                         id: task_id.clone(),
                         context_id: context_id.clone(),
@@ -287,7 +307,19 @@ where
         let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
             let task_id = ctx.task_id.clone();
             let context_id = ctx.context_id.clone();
+            let runtime_trace = self.runtime_trace.clone();
             return Box::pin(stream::once(async move {
+                if !record_terminal_trace(
+                    runtime_trace.as_deref(),
+                    &task_id,
+                    &context_id,
+                    TaskState::Rejected,
+                    Vec::new(),
+                )
+                .await
+                {
+                    return Err(A2AError::internal("required runtime trace capture failed"));
+                }
                 Ok(StreamResponse::Task(Task {
                     id: task_id.clone(),
                     context_id: context_id.clone(),
@@ -323,6 +355,7 @@ where
         let cancellations = Arc::clone(&self.cancellations);
         let execution_limits = self.execution_limits;
         let completion_policy = Arc::clone(&self.completion_policy);
+        let runtime_trace = self.runtime_trace.clone();
         let dispatcher: Arc<dyn MeshDispatcher> = self.dispatcher.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
@@ -385,6 +418,19 @@ where
                         } else {
                             TaskState::Failed
                         };
+                        if !record_terminal_trace(
+                            runtime_trace.as_deref(),
+                            &task_id,
+                            &context_id,
+                            state.clone(),
+                            Vec::new(),
+                        )
+                        .await
+                        {
+                            control.terminal_published.notify_one();
+                            terminal_emitted = true;
+                            break;
+                        }
                         let text = (state == TaskState::Failed)
                             .then(|| "SMESH cancellation failed".to_owned());
                         let _ = tx.send(Ok(task_response(
@@ -448,6 +494,22 @@ where
                         }
                     }
                     Ok(MeshEvent::Evidence(record)) => {
+                        if let Some(trace) = &runtime_trace
+                            && trace
+                                .record_evidence(&task_id, &context_id, &record)
+                                .await
+                                .is_err()
+                        {
+                            let _ = control.claim_execution();
+                            request_dispatcher_cancel(
+                                &dispatcher,
+                                &task_id,
+                                execution_limits.cancel_timeout,
+                            )
+                            .await;
+                            terminal_emitted = true;
+                            break;
+                        }
                         evidence.push(record);
                     }
                     Ok(MeshEvent::Artifact {
@@ -471,7 +533,16 @@ where
                     }
                     Ok(MeshEvent::Completed { summary: _summary }) => {
                         if completion_proposed {
-                            if control.claim_execution() {
+                            if control.claim_execution()
+                                && record_terminal_trace(
+                                    runtime_trace.as_deref(),
+                                    &task_id,
+                                    &context_id,
+                                    TaskState::Failed,
+                                    Vec::new(),
+                                )
+                                .await
+                            {
                                 let _ = tx
                                     .send(Ok(task_response(
                                         &task_id,
@@ -497,7 +568,16 @@ where
                         completion_proposed = true;
                     }
                     Err(_error) => {
-                        if control.claim_execution() {
+                        if control.claim_execution()
+                            && record_terminal_trace(
+                                runtime_trace.as_deref(),
+                                &task_id,
+                                &context_id,
+                                TaskState::Failed,
+                                Vec::new(),
+                            )
+                            .await
+                        {
                             let _ = tx
                                 .send(Ok(task_response(
                                     &task_id,
@@ -528,6 +608,7 @@ where
                         &tx,
                         completion_policy.as_ref(),
                         control.as_ref(),
+                        runtime_trace.as_deref(),
                         &dispatcher,
                         execution_limits.cancel_timeout,
                         &task_id,
@@ -543,9 +624,55 @@ where
                     tokio::pin!(completion);
                     tokio::select! {
                         biased;
-                        () = cancellation.cancelled() => {}
+                        () = cancellation.cancelled() => {
+                            if control.cancel_outcome.load(Ordering::SeqCst)
+                                == CANCEL_OUTCOME_PENDING
+                            {
+                                control.cancel_done.notified().await;
+                            }
+                            let state = if control.cancel_outcome.load(Ordering::SeqCst)
+                                == CANCEL_OUTCOME_CANCELED
+                            {
+                                TaskState::Canceled
+                            } else {
+                                TaskState::Failed
+                            };
+                            if record_terminal_trace(
+                                runtime_trace.as_deref(),
+                                &task_id,
+                                &context_id,
+                                state.clone(),
+                                Vec::new(),
+                            )
+                            .await
+                            {
+                                let text = if state == TaskState::Failed {
+                                    "SMESH cancellation failed".to_owned()
+                                } else {
+                                    "SMESH task canceled".to_owned()
+                                };
+                                let _ = tx.send(Ok(task_response(
+                                    &task_id,
+                                    &context_id,
+                                    state,
+                                    text,
+                                    None,
+                                    history.clone(),
+                                    None,
+                                ))).await;
+                            }
+                            control.terminal_published.notify_one();
+                        }
                         () = &mut task_deadline => {
-                            if control.claim_execution() {
+                            if control.claim_execution()
+                                && record_terminal_trace(
+                                    runtime_trace.as_deref(),
+                                    &task_id,
+                                    &context_id,
+                                    TaskState::Failed,
+                                    Vec::new(),
+                                ).await
+                            {
                                 let _ = tx.send(Ok(task_response(
                                     &task_id,
                                     &context_id,
@@ -566,7 +693,16 @@ where
                         () = &mut completion => {}
                     }
                 } else {
-                    if control.claim_execution() {
+                    if control.claim_execution()
+                        && record_terminal_trace(
+                            runtime_trace.as_deref(),
+                            &task_id,
+                            &context_id,
+                            TaskState::Failed,
+                            Vec::new(),
+                        )
+                        .await
+                    {
                         let _ = tx
                             .send(Ok(task_response(
                                 &task_id,
@@ -635,6 +771,29 @@ where
     }
 }
 
+async fn record_terminal_trace(
+    trace: Option<&RuntimeEventCapture>,
+    task_id: &str,
+    context_id: &str,
+    state: TaskState,
+    artifact_digests: Vec<String>,
+) -> bool {
+    let Some(trace) = trace else {
+        return true;
+    };
+    let trace_state = match state {
+        TaskState::Completed => RuntimeTerminalState::Completed,
+        TaskState::Canceled => RuntimeTerminalState::Canceled,
+        TaskState::InputRequired => RuntimeTerminalState::InputRequired,
+        TaskState::Rejected => RuntimeTerminalState::Rejected,
+        _ => RuntimeTerminalState::Failed,
+    };
+    trace
+        .record_terminal(task_id, context_id, trace_state, artifact_digests)
+        .await
+        .is_ok()
+}
+
 async fn send_work_event(
     control: &ExecutionControl,
     tx: &tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
@@ -686,6 +845,7 @@ async fn finalize_completion(
     tx: &tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
     policy: &VersionedCompletionPolicy,
     control: &ExecutionControl,
+    runtime_trace: Option<&RuntimeEventCapture>,
     dispatcher: &Arc<dyn MeshDispatcher>,
     cancel_timeout: Duration,
     task_id: &str,
@@ -707,6 +867,18 @@ async fn finalize_completion(
             let metadata = match policy_metadata("accepted", &receipt) {
                 Ok(metadata) => metadata,
                 Err(_error) => {
+                    if !record_terminal_trace(
+                        runtime_trace,
+                        task_id,
+                        context_id,
+                        TaskState::Failed,
+                        Vec::new(),
+                    )
+                    .await
+                    {
+                        request_dispatcher_cancel(dispatcher, task_id, cancel_timeout).await;
+                        return;
+                    }
                     let _ = tx
                         .send(Ok(task_response(
                             task_id,
@@ -722,6 +894,22 @@ async fn finalize_completion(
                     return;
                 }
             };
+            if !record_terminal_trace(
+                runtime_trace,
+                task_id,
+                context_id,
+                TaskState::Completed,
+                snapshot
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.digest.clone())
+                    .collect(),
+            )
+            .await
+            {
+                request_dispatcher_cancel(dispatcher, task_id, cancel_timeout).await;
+                return;
+            }
             for artifact in &mut material.artifacts {
                 artifact.description = Some("Policy-accepted SMESH output".to_owned());
                 artifact.metadata = Some(metadata.clone());
@@ -754,6 +942,9 @@ async fn finalize_completion(
                     status: "awaitingRatification",
                     history: material.history,
                 },
+                runtime_trace,
+                dispatcher,
+                cancel_timeout,
             )
             .await;
         }
@@ -770,11 +961,26 @@ async fn finalize_completion(
                     status: "blocked",
                     history: material.history,
                 },
+                runtime_trace,
+                dispatcher,
+                cancel_timeout,
             )
             .await;
             request_dispatcher_cancel(dispatcher, task_id, cancel_timeout).await;
         }
         Err(_error) => {
+            if !record_terminal_trace(
+                runtime_trace,
+                task_id,
+                context_id,
+                TaskState::Failed,
+                Vec::new(),
+            )
+            .await
+            {
+                request_dispatcher_cancel(dispatcher, task_id, cancel_timeout).await;
+                return;
+            }
             let _ = tx
                 .send(Ok(task_response(
                     task_id,
@@ -798,15 +1004,31 @@ struct PolicyOutcomeMaterial {
     history: Vec<Message>,
 }
 
+#[allow(clippy::too_many_arguments)] // Keep policy metadata, trace, cancellation, and publication explicit.
 async fn send_policy_outcome(
     tx: &tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
     task_id: &str,
     context_id: &str,
     record: &impl serde::Serialize,
     outcome: PolicyOutcomeMaterial,
+    runtime_trace: Option<&RuntimeEventCapture>,
+    dispatcher: &Arc<dyn MeshDispatcher>,
+    cancel_timeout: Duration,
 ) {
     match policy_metadata(outcome.status, record) {
         Ok(metadata) => {
+            if !record_terminal_trace(
+                runtime_trace,
+                task_id,
+                context_id,
+                outcome.state.clone(),
+                Vec::new(),
+            )
+            .await
+            {
+                request_dispatcher_cancel(dispatcher, task_id, cancel_timeout).await;
+                return;
+            }
             let _ = tx
                 .send(Ok(task_response(
                     task_id,
@@ -820,6 +1042,18 @@ async fn send_policy_outcome(
                 .await;
         }
         Err(error) => {
+            if !record_terminal_trace(
+                runtime_trace,
+                task_id,
+                context_id,
+                TaskState::Failed,
+                Vec::new(),
+            )
+            .await
+            {
+                request_dispatcher_cancel(dispatcher, task_id, cancel_timeout).await;
+                return;
+            }
             let _ = tx
                 .send(Ok(task_response(
                     task_id,

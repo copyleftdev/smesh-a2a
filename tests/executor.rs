@@ -10,8 +10,9 @@ use futures::stream::{self, BoxStream};
 use smesh_a2a::{
     ArtifactManifest, CompletionEvidence, CompletionPolicySpec, CompletionSnapshot, DispatchError,
     ExecutionLimits, InputLimits, MeshDispatcher, MeshEvent, MeshRequest, PolicyDecision,
-    RatificationReceipt, RatificationStatement, SmeshExecutor, TrustedAuthority,
-    VersionedCompletionPolicy, artifact_set_digest, content_digest,
+    RatificationReceipt, RatificationStatement, RuntimeEventCapture, RuntimeTerminalState,
+    RuntimeTraceKind, SmeshExecutor, TrustedAuthority, VersionedCompletionPolicy,
+    artifact_set_digest, content_digest,
 };
 use smesh_core::NodeIdentity;
 use tokio::sync::{Notify, mpsc};
@@ -137,6 +138,56 @@ async fn executor_streams_work_artifact_and_terminal_completion() {
         Some(3)
     );
     assert_eq!(policy["record"]["assuranceBps"], 9_000);
+}
+
+#[tokio::test]
+async fn executor_records_claim_contradiction_and_terminal_without_raw_evidence() {
+    let capture = Arc::new(RuntimeEventCapture::new(16, 1));
+    let executor = SmeshExecutor::new(
+        RecordingDispatcher::default(),
+        InputLimits::default(),
+        "gateway-node",
+    )
+    .with_runtime_trace(Arc::clone(&capture));
+    let events = executor
+        .execute(context("trace policy lifecycle"))
+        .collect::<Vec<_>>()
+        .await;
+    assert!(events.iter().all(Result::is_ok));
+
+    let trace = capture.snapshot().await;
+    assert_eq!(
+        trace
+            .events
+            .iter()
+            .filter(|event| event.kind == RuntimeTraceKind::Claim)
+            .count(),
+        2
+    );
+    assert!(
+        trace
+            .events
+            .iter()
+            .any(|event| event.kind == RuntimeTraceKind::Contradiction)
+    );
+    assert!(trace.events.iter().any(|event| {
+        event.kind == RuntimeTraceKind::TerminalOutput
+            && matches!(
+                event.details,
+                smesh_a2a::RuntimeTraceDetails::TerminalOutput {
+                    state: RuntimeTerminalState::Completed,
+                    ..
+                }
+            )
+    }));
+    let encoded = serde_json::to_vec(&trace).unwrap();
+    for secret in [
+        b"review evidence".as_slice(),
+        b"test evidence".as_slice(),
+        b"contradiction clearance".as_slice(),
+    ] {
+        assert!(!encoded.windows(secret.len()).any(|window| window == secret));
+    }
 }
 
 #[derive(Clone)]

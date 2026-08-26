@@ -7,8 +7,8 @@ use axum::Router;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
-    BoundedTaskStore, ExecutionLimits, InputLimits, MeshDispatcher, SmeshExecutor,
-    VersionedCompletionPolicy, build_agent_card, guard::GuardedRequestHandler,
+    BoundedTaskStore, ExecutionLimits, InputLimits, MeshDispatcher, RuntimeEventCapture,
+    SmeshExecutor, VersionedCompletionPolicy, build_agent_card, guard::GuardedRequestHandler,
 };
 
 struct SharedTaskStore<S>(Arc<S>);
@@ -74,6 +74,25 @@ where
     build_router_with_store(config, dispatcher, store)
 }
 
+/// Compose the official A2A routers with canonical runtime/gateway trace capture.
+pub fn build_router_with_trace<D>(
+    config: GatewayConfig,
+    dispatcher: D,
+    trace: Arc<RuntimeEventCapture>,
+) -> Router
+where
+    D: MeshDispatcher,
+{
+    let store = BoundedTaskStore::new(config.max_tasks);
+    build_router_with_policy_and_trace(
+        config,
+        dispatcher,
+        store,
+        VersionedCompletionPolicy::default(),
+        Some(trace),
+    )
+}
+
 /// Compose the official A2A routers around a SMESH executor and injected task store.
 ///
 /// The injected store keeps protocol guards and the SDK request handler on the same
@@ -105,12 +124,29 @@ where
     D: MeshDispatcher,
     S: TaskStore,
 {
+    build_router_with_policy_and_trace(config, dispatcher, store, policy, None)
+}
+
+fn build_router_with_policy_and_trace<D, S>(
+    config: GatewayConfig,
+    dispatcher: D,
+    store: S,
+    policy: VersionedCompletionPolicy,
+    trace: Option<Arc<RuntimeEventCapture>>,
+) -> Router
+where
+    D: MeshDispatcher,
+    S: TaskStore,
+{
     let max_body_bytes = config.max_body_bytes;
     let store = SharedTaskStore(Arc::new(store));
     let guard_policy = policy.clone();
-    let executor = SmeshExecutor::new(dispatcher, config.input_limits, config.gateway_node_id)
+    let mut executor = SmeshExecutor::new(dispatcher, config.input_limits, config.gateway_node_id)
         .with_execution_limits(config.execution_limits)
         .with_completion_policy(policy);
+    if let Some(trace) = trace {
+        executor = executor.with_runtime_trace(trace);
+    }
     let inner: Arc<dyn RequestHandler> =
         Arc::new(DefaultRequestHandler::new(executor, store.clone()));
     let handler = Arc::new(GuardedRequestHandler::new(inner, store, guard_policy));
