@@ -329,9 +329,9 @@ A captured run across live SMESH runtimes would be operational proof. This demo 
 |---|---|
 | A2A v1 Agent Card | authenticated principals |
 | JSON-RPC and HTTP+JSON/REST bindings | tenant-aware authorization |
-| official-client interoperability tests | persistent SQL task ledger |
+| official-client tests for discovery, JSON-RPC/REST send, streaming, and cancellation | persistent SQL task ledger |
 | SSE task streaming | distributed quotas |
-| Get, List, Subscribe, Cancel | TLS termination and deployment policy |
+| Get, List, and Subscribe routes through the SDK handler | TLS termination and deployment policy |
 | real `SignalType::Query` construction | live SMESH runtime adapter behind every organization |
 | bounded process-local execution | push callback validation and SSRF controls |
 | deterministic synthetic replay | captured multi-runtime causal trace |
