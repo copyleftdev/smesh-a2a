@@ -27,7 +27,8 @@ pub use policy::{
     ArtifactManifest, COMPLETION_POLICY_V1, ClosedAttestation, CompletionEvidence,
     CompletionPolicySpec, CompletionReceipt, CompletionSnapshot, PolicyBlock, PolicyBlockReason,
     PolicyCheckpoint, PolicyDecision, PolicyError, RatificationReceipt, RatificationStatement,
-    TrustedAuthority, VersionedCompletionPolicy, artifact_set_digest, content_digest,
+    TrustedAuthority, VersionedCompletionPolicy, artifact_set_digest, completion_evidence_digest,
+    content_digest,
 };
 pub use runtime_config::{GatewayMode, GatewayModeError, RuntimeModeConfig};
 pub use runtime_worker::{

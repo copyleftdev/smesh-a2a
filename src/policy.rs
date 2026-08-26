@@ -1151,9 +1151,18 @@ fn canonical_digest<T: Serialize>(domain: &[u8], value: &T) -> Result<String, Po
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+/// Compute the canonical policy-record digest for one evidence item.
+///
+/// # Errors
+///
+/// Returns an error if the closed evidence record cannot be serialized.
+pub fn completion_evidence_digest(evidence: &CompletionEvidence) -> Result<String, PolicyError> {
+    canonical_digest(b"evidence-record", evidence)
+}
+
 #[must_use]
-pub fn content_digest(content: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(content))
+pub fn content_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 /// Hash a deterministic, sorted artifact manifest.
