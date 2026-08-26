@@ -29,6 +29,8 @@ Current controls:
   with task/context/policy and recomputed artifact bindings before stored tasks are exposed
 - bounded dispatcher cancellation after local deadlines, inactivity, resource-budget failures,
   policy rejection, and abandoned response streams
+- explicit `loopback`/`runtime` mode selection; malformed runtime or bootstrap addresses fail startup
+- bounded runtime command channels and cancellation acknowledgement only after processor shutdown
 - refusal to bind outside loopback unless an explicit unsafe override is set
 
 Completion-policy review/test payload hashes are recomputed by the gateway and issuer labels must
@@ -38,12 +40,19 @@ artifact, request, task, context, and policy hashes. Cryptographic attestations 
 configured key and prove possession of that key, not real-world authority. Human ratification proves configured-key possession,
 but durable freshness, revocation, and cross-restart replay prevention still require persistent
 identity and ledger work. The loopback worker emits explicitly synthetic evidence fixtures.
+The bundled runtime admission processor emits a private candidate receipt and completion proposal but
+no review, test, contradiction, or ratification evidence. Runtime ingress therefore fails closed
+under the default completion policy and cannot masquerade as semantically completed work.
 The receipt key is process-local like the current in-memory ledger; durable key management and
 restart replay are not claimed by this release.
 
 ## Known dependency warning
 
 `cargo audit` reports `RUSTSEC-2025-0141`: `bincode 1.3.3` is unmaintained. It is pulled transitively by the pinned `smesh-core` revision. This is an unmaintained-package warning rather than a reported vulnerability. The gateway does not invoke bincode directly. It should be removed by upgrading SMESH serialization or narrowing the integration dependency when an upstream revision is available.
+
+Adding the pinned runtime initially resolved `time 0.3.45`, affected by
+`RUSTSEC-2026-0009`. The lockfile is upgraded to `time 0.3.47`; that security update raises the
+gateway MSRV to Rust 1.88.
 
 ## Production requirements
 

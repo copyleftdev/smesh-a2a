@@ -37,7 +37,7 @@ SmeshExecutor -- validates and translates
    v
 MeshDispatcher
    |-- LoopbackDispatcher (demo/tests)
-   `-- ChannelDispatcher  (real SMESH worker boundary)
+   `-- ChannelDispatcher -> RuntimeWorker -> SmeshRuntime/QUIC
    |
    v
 SMESH Query signal -> claims/review/tests/consensus -> MeshEvent stream
@@ -91,7 +91,7 @@ The checked-in JSONL is a deterministic synthetic fixture for replay, design, an
 
 ## Run the gateway
 
-Requires Rust 1.85 or newer.
+Requires Rust 1.88 or newer.
 
 ```bash
 cargo run --bin smesh-a2a-gateway
@@ -102,6 +102,7 @@ Defaults:
 - bind: `127.0.0.1:3000`
 - public URL: `http://127.0.0.1:3000`
 - node ID: `smesh-a2a-gateway`
+- mode: `loopback`
 
 Configuration:
 
@@ -111,6 +112,22 @@ SMESH_A2A_PUBLIC_URL=http://127.0.0.1:4000 \
 SMESH_A2A_NODE_ID=gateway-west \
 cargo run --bin smesh-a2a-gateway
 ```
+
+Run the built-in real runtime worker with a live QUIC endpoint:
+
+```bash
+SMESH_A2A_MODE=runtime \
+SMESH_A2A_MESH_BIND=127.0.0.1:4100 \
+SMESH_A2A_BOOTSTRAP=127.0.0.1:4101,127.0.0.1:4102 \
+cargo run --bin smesh-a2a-gateway
+```
+
+`SMESH_A2A_BOOTSTRAP` may be omitted for the first mesh node. Runtime mode creates a genuine
+`SmeshRuntime`, joins its QUIC mesh, emits each validated request as `SignalType::Query`, and uses
+the gateway completion policy as the only authority that can publish artifacts or `Completed`.
+The bundled `RuntimeAdmissionProcessor` deliberately supplies no semantic review/test evidence, so
+an arbitrary request ends `Failed` with no public artifact after proving real ingress. A trusted
+application processor and independent evidence sources are required before semantic completion.
 
 Inspect the Agent Card:
 
@@ -127,34 +144,32 @@ a2acli --base-url http://127.0.0.1:3000 send "review this Rust crate"
 a2acli --base-url http://127.0.0.1:3000 stream "review this Rust crate"
 ```
 
-## Embed a real SMESH worker
+## Embed a custom runtime task processor
 
-Create a `ChannelDispatcher` and consume its commands in the runtime that owns the mesh:
+`RuntimeWorker` owns `ChannelDispatcher` commands and the genuine SMESH ingress path. Inject a
+processor only for application-specific Query→candidate work; its events remain untrusted policy
+inputs:
 
 ```rust,no_run
-use smesh_a2a::{ChannelDispatcher, DispatchCommand};
+use std::sync::Arc;
+use smesh_a2a::{RuntimeAdmissionProcessor, RuntimeWorker};
+use smesh_runtime::SmeshRuntime;
 
-# async fn example() {
-let (commands_tx, mut commands_rx) = tokio::sync::mpsc::channel(32);
-let dispatcher = ChannelDispatcher::new(commands_tx, "gateway-node");
-
-while let Some(command) = commands_rx.recv().await {
-    match command {
-        DispatchCommand::Execute { request, signal, events } => {
-            // Emit `signal` into SMESH. Translate accepted internal output into
-            // MeshEvent values and send them through `events`.
-            let _ = (request, signal, events);
-        }
-        DispatchCommand::Cancel { task_id, ack } => {
-            // Stop internal work for task_id, then acknowledge.
-            let _ = task_id;
-            let _ = ack.send(Ok(()));
-        }
-    }
-}
+# async fn example(runtime: Arc<SmeshRuntime>) -> Result<(), Box<dyn std::error::Error>> {
+let (dispatcher, worker) = RuntimeWorker::spawn(
+    runtime,
+    "gateway-node",
+    RuntimeAdmissionProcessor,
+    64,
+).await?;
 # let _ = dispatcher;
+# let _ = worker;
+# Ok(())
 # }
 ```
+
+The bundled processor proves structural runtime ingress and binding only. It does not claim the
+requested work is semantically correct or independently reviewed.
 
 ## Security posture
 
@@ -183,7 +198,9 @@ cargo test --all-features
 cargo doc --no-deps
 ```
 
-The integration suite starts real Axum listeners and drives them with the official A2A Rust client over both JSON-RPC and REST. It also verifies streaming order and cancellation propagation.
+The integration suite starts real Axum and QUIC listeners and drives the gateway with the official
+A2A Rust client. It verifies real runtime Query ingress, fail-closed admission-only output,
+streaming order, and cancellation acknowledgement after runtime processing stops.
 
 ## License
 

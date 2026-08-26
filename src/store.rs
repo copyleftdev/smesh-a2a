@@ -235,10 +235,10 @@ impl TaskStore for BoundedTaskStore {
             }
             if history_length == Some(0) {
                 task.history = None;
-            } else if let (Some(limit), Some(history)) = (history_length, task.history.as_mut()) {
-                if history.len() > limit {
-                    history.drain(..history.len() - limit);
-                }
+            } else if let (Some(limit), Some(history)) = (history_length, task.history.as_mut())
+                && history.len() > limit
+            {
+                history.drain(..history.len() - limit);
             }
         }
 

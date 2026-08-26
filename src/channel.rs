@@ -56,26 +56,22 @@ impl MeshDispatcher for ChannelDispatcher {
     ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
         let signal = request.to_signal(&self.gateway_node_id);
         let commands = self.commands.clone();
-        let command_timeout = self.command_timeout;
         let (event_tx, event_rx) = mpsc::channel(32);
-
-        tokio::spawn(async move {
-            let send = commands.send(DispatchCommand::Execute {
-                request,
-                signal: Box::new(signal),
-                events: event_tx.clone(),
-            });
-            let error = match tokio::time::timeout(command_timeout, send).await {
-                Ok(Ok(())) => None,
-                Ok(Err(_)) => Some("SMESH worker command channel is closed"),
-                Err(_) => Some("SMESH worker command send timed out"),
-            };
-            if let Some(message) = error {
-                let _ = event_tx
-                    .send(Err(DispatchError::Message(message.to_owned())))
-                    .await;
+        let command = DispatchCommand::Execute {
+            request,
+            signal: Box::new(signal),
+            events: event_tx.clone(),
+        };
+        let error = match commands.try_send(command) {
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(_)) => Some("SMESH worker command channel is full"),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Some("SMESH worker command channel is closed")
             }
-        });
+        };
+        if let Some(message) = error {
+            let _ = event_tx.try_send(Err(DispatchError::Message(message.to_owned())));
+        }
 
         Box::pin(ReceiverStream::new(event_rx))
     }
