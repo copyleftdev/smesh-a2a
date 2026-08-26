@@ -109,13 +109,13 @@ External A2A client
 | validation + MeshDispatcher                        |
 +----------------------------------------------------+
         |
-        +-- current binary: LoopbackDispatcher
+        +-- default binary mode: LoopbackDispatcher
         |      `-> deterministic MeshEvent stream
         |
-        `-- tested seam: ChannelDispatcher
-               `-> real SignalType::Query
-                   `-> SMESH runtime (not wired into the binary yet)
-                       `-> MeshEvent stream
+        `-- explicit runtime mode: ChannelDispatcher
+               `-> RuntimeWorker -> real SignalType::Query
+                   `-> SmeshRuntime + loopback-bound QUIC mesh
+                       `-> admission-only MeshEvent proposals
         |
         v
 Process-lifetime A2A task history in the MVP
@@ -203,7 +203,11 @@ pub fn to_signal(&self, gateway_node_id: &str) -> Signal {
 
 The payload carries the A2A task ID, context ID, protocol marker, and validated text. `ChannelDispatcher` packages that typed signal with the request and hands both to a runtime-owned worker.
 
-That boundary is implemented and tested. The standalone binary still uses `LoopbackDispatcher`, so it does **not** yet inject the Query into a live multi-process SMESH runtime. The real runtime adapter is the next integration step.
+That boundary is implemented and tested. The standalone binary defaults to `LoopbackDispatcher`,
+but `SMESH_A2A_MODE=runtime` now creates a genuine `SmeshRuntime`, joins a loopback-bound QUIC
+mesh, and injects the Query through `SmeshRuntime::emit`. Its bundled admission processor supplies
+no semantic evidence, so arbitrary work fails closed rather than claiming completion. A
+multi-process semantic work/evidence harness remains the next integration step.
 
 Setting `origin` on the gateway Query is deliberate. In my previous article, independently corroborated *claims* omitted their origin from the content hash so identical conclusions could converge on one address. This is a different signal. A gateway Query is an ingress envelope, not a claim waiting for independent corroboration. Its source belongs in the record.
 

@@ -9,6 +9,8 @@ mod input;
 mod lifeline;
 mod loopback;
 mod policy;
+mod runtime_config;
+mod runtime_worker;
 mod server;
 mod store;
 
@@ -26,6 +28,11 @@ pub use policy::{
     CompletionPolicySpec, CompletionReceipt, CompletionSnapshot, PolicyBlock, PolicyBlockReason,
     PolicyCheckpoint, PolicyDecision, PolicyError, RatificationReceipt, RatificationStatement,
     TrustedAuthority, VersionedCompletionPolicy, artifact_set_digest, content_digest,
+};
+pub use runtime_config::{GatewayMode, GatewayModeError, RuntimeModeConfig};
+pub use runtime_worker::{
+    RuntimeAdmissionProcessor, RuntimeEventSink, RuntimeTask, RuntimeTaskProcessor, RuntimeWorker,
+    RuntimeWorkerConfig, RuntimeWorkerHandle,
 };
 pub use server::{GatewayConfig, build_router, build_router_with_policy, build_router_with_store};
 pub use store::BoundedTaskStore;

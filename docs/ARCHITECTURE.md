@@ -18,7 +18,7 @@ BoundedTaskStore + SmeshExecutor
 MeshDispatcher trait
    |
    +-- LoopbackDispatcher (tests/demo)
-   +-- ChannelDispatcher (real SMESH worker boundary)
+   +-- ChannelDispatcher -> RuntimeWorker -> SmeshRuntime/QUIC
    |
    v
 SMESH Query signal -> claims/reinforcement/work -> MeshEvent stream
@@ -44,10 +44,20 @@ Implements the official `a2a_server::AgentExecutor`. It enforces active-task, ev
 
 - dispatch accepted -> `Working`;
 - mesh progress -> `Working` status message;
-- mesh artifact -> A2A artifact update;
-- mesh completion -> terminal A2A task;
+- mesh artifact -> private candidate output;
+- sealed policy acceptance -> candidate artifacts plus terminal A2A task;
+- human-required policy -> `InputRequired`;
 - mesh failure -> `Failed`;
 - cancellation -> `Canceled`.
+
+### `runtime_worker`
+
+Consumes `ChannelDispatcher` commands, emits each genuine `SignalType::Query` through
+`SmeshRuntime`, and invokes a bounded application processor. Processor events remain untrusted:
+runtime ingress, an artifact, or a worker completion proposal cannot directly publish A2A
+`Completed`. The processor sink cannot submit policy evidence; independent authority adapters must do
+that separately. Cancellation acknowledgement is sent only after the processor task exits or is
+aborted after its bounded grace period.
 
 ### `store` and `guard`
 
@@ -67,12 +77,13 @@ Composes the official JSON-RPC, REST, Agent Card, task store, and executor into 
 6. The first accepted cancellation is visible to the dispatcher; later cancellation requests cannot alter the terminal state.
 7. Only validated inline text crosses the public-to-mesh boundary in the MVP.
 8. The gateway emits one final terminal event for every accepted request.
+9. Successful runtime Query ingress is progress, never completion authority.
 
 ## Production extensions
 
 - SQLite/Postgres `TaskStore` with tenant-aware authorization and cursor pagination.
 - Bearer/OAuth/mTLS interceptor.
 - Bounded push notifications with an allowlist and SSRF defenses.
-- Real SMESH runtime adapter and ratification completion policy.
+- Application-specific semantic work processors and authenticated evidence issuers.
 - gRPC listener.
 - OpenTelemetry tracing and per-principal quotas.

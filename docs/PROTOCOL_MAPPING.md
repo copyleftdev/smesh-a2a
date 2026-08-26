@@ -9,6 +9,7 @@
 | Context ID | Stable conversation/workflow grouping |
 | `Submitted` | Durable task created by the A2A handler |
 | `Working` | Mesh dispatch accepted or progress observed |
+| Runtime Query ingress | Genuine `SmeshRuntime::emit`; progress only, never completion authority |
 | Artifact data | Candidate output buffered and embedded only in the accepted terminal Task |
 | `Completed` | Completion policy accepted the output |
 | `Failed` | Dispatcher or worker produced a terminal error |
