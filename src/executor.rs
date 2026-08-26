@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use a2a::{
-    A2AError, Artifact, Message, Part, Role, StreamResponse, Task, TaskArtifactUpdateEvent,
-    TaskState, TaskStatus, TaskStatusUpdateEvent, new_artifact_id, new_message_id,
+    A2AError, Artifact, Message, Part, Role, StreamResponse, Task, TaskState, TaskStatus,
+    TaskStatusUpdateEvent, new_artifact_id, new_message_id,
 };
 use a2a_server::{AgentExecutor, ExecutorContext};
 use futures::StreamExt;
@@ -12,7 +12,11 @@ use futures::stream::{self, BoxStream};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::{InputLimits, MeshDispatcher, MeshEvent, MeshRequest};
+use crate::{
+    ArtifactManifest, CompletionEvidence, CompletionSnapshot, InputLimits, MeshDispatcher,
+    MeshEvent, MeshRequest, PolicyCheckpoint, PolicyDecision, VersionedCompletionPolicy,
+    content_digest,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionLimits {
@@ -61,6 +65,13 @@ impl EventBudget {
 
         let bytes = match event {
             MeshEvent::Progress(text) | MeshEvent::Completed { summary: text } => text.len(),
+            MeshEvent::Evidence(evidence) => serde_json::to_vec(evidence)
+                .map_err(|error| {
+                    crate::DispatchError::Message(format!(
+                        "SMESH evidence serialization failed: {error}"
+                    ))
+                })?
+                .len(),
             MeshEvent::Artifact {
                 name,
                 media_type,
@@ -95,6 +106,7 @@ pub struct SmeshExecutor<D> {
     cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
     execution_limits: ExecutionLimits,
     permits: Arc<tokio::sync::Semaphore>,
+    completion_policy: Arc<VersionedCompletionPolicy>,
 }
 
 impl<D> SmeshExecutor<D>
@@ -112,6 +124,7 @@ where
             permits: Arc::new(tokio::sync::Semaphore::new(
                 ExecutionLimits::default().max_concurrent_tasks,
             )),
+            completion_policy: Arc::new(VersionedCompletionPolicy::default()),
         }
     }
 
@@ -125,6 +138,12 @@ where
             limits.max_concurrent_tasks.max(1),
         ));
         self.execution_limits = limits;
+        self
+    }
+
+    #[must_use]
+    pub fn with_completion_policy(mut self, policy: VersionedCompletionPolicy) -> Self {
+        self.completion_policy = Arc::new(policy);
         self
     }
 }
@@ -192,6 +211,26 @@ where
                 }));
             }
         };
+        let current_request_digest = match serde_json::to_vec(&request) {
+            Ok(bytes) => content_digest(&bytes),
+            Err(error) => {
+                return Box::pin(stream::once(async move {
+                    Err(A2AError::internal(format!(
+                        "failed to encode completion request binding: {error}"
+                    )))
+                }));
+            }
+        };
+        let request_digest = match pending_ratification_request_digest(
+            ctx.stored_task.as_ref(),
+            &ctx.task_id,
+            &ctx.context_id,
+            &self.completion_policy,
+        ) {
+            Ok(Some(digest)) => digest,
+            Ok(None) => current_request_digest,
+            Err(error) => return Box::pin(stream::once(async move { Err(error) })),
+        };
 
         let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
             let task_id = ctx.task_id.clone();
@@ -230,11 +269,16 @@ where
             .insert(task_id.clone(), cancellation.clone());
         let cancellations = Arc::clone(&self.cancellations);
         let execution_limits = self.execution_limits;
+        let completion_policy = Arc::clone(&self.completion_policy);
+        let dispatcher: Arc<dyn MeshDispatcher> = self.dispatcher.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
         tokio::spawn(async move {
             let _permit = permit;
             let mut artifacts = Vec::new();
+            let mut artifact_manifests = Vec::new();
+            let mut evidence = Vec::<CompletionEvidence>::new();
+            let mut completion_proposed = false;
             let mut budget = EventBudget::default();
             let mut terminal_emitted = false;
             let task_deadline = tokio::time::sleep(execution_limits.task_timeout);
@@ -255,6 +299,8 @@ where
                 .await
                 .is_err()
             {
+                request_dispatcher_cancel(&dispatcher, &task_id, execution_limits.cancel_timeout)
+                    .await;
                 cancellations
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -265,6 +311,15 @@ where
             loop {
                 let next = tokio::select! {
                     biased;
+                    () = tx.closed() => {
+                        request_dispatcher_cancel(
+                            &dispatcher,
+                            &task_id,
+                            execution_limits.cancel_timeout,
+                        ).await;
+                        terminal_emitted = true;
+                        break;
+                    }
                     () = cancellation.cancelled() => {
                         terminal_emitted = true;
                         break;
@@ -292,95 +347,157 @@ where
                     },
                     Err(error) => Err(error),
                 };
-                let response = match event {
-                    Ok(MeshEvent::Progress(progress)) => Ok(status_update(
-                        &task_id,
-                        &context_id,
-                        TaskState::Working,
-                        Some(progress),
-                    )),
+                match event {
+                    Ok(MeshEvent::Progress(_progress)) => {
+                        if tx
+                            .send(Ok(status_update(
+                                &task_id,
+                                &context_id,
+                                TaskState::Working,
+                                Some("SMESH worker reported progress".to_owned()),
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            request_dispatcher_cancel(
+                                &dispatcher,
+                                &task_id,
+                                execution_limits.cancel_timeout,
+                            )
+                            .await;
+                            terminal_emitted = true;
+                            break;
+                        }
+                    }
+                    Ok(MeshEvent::Evidence(record)) => {
+                        evidence.push(record);
+                    }
                     Ok(MeshEvent::Artifact {
                         name,
                         media_type,
                         content,
                     }) => {
-                        let artifact = Artifact {
+                        artifact_manifests.push(ArtifactManifest {
+                            name: name.clone(),
+                            media_type: media_type.clone(),
+                            digest: content_digest(content.as_bytes()),
+                        });
+                        artifacts.push(Artifact {
                             artifact_id: new_artifact_id(),
                             name: Some(name),
-                            description: Some("Accepted SMESH output".to_owned()),
+                            description: Some("Unpublished SMESH candidate output".to_owned()),
                             parts: vec![Part::text(content).with_media_type(media_type)],
                             metadata: None,
                             extensions: None,
-                        };
-                        artifacts.push(artifact.clone());
-                        Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
-                            task_id: task_id.clone(),
-                            context_id: context_id.clone(),
-                            artifact,
-                            append: Some(false),
-                            last_chunk: Some(true),
-                            metadata: None,
-                        }))
+                        });
                     }
-                    Ok(MeshEvent::Completed { summary }) => Ok(StreamResponse::Task(Task {
-                        id: task_id.clone(),
-                        context_id: context_id.clone(),
-                        status: TaskStatus {
-                            state: TaskState::Completed,
-                            message: Some(agent_message(&task_id, &context_id, summary)),
-                            timestamp: Some(chrono::Utc::now()),
-                        },
-                        artifacts: (!artifacts.is_empty()).then(|| artifacts.clone()),
-                        history: Some(history.clone()),
-                        metadata: None,
-                    })),
-                    Err(error) => Ok(StreamResponse::Task(Task {
-                        id: task_id.clone(),
-                        context_id: context_id.clone(),
-                        status: TaskStatus {
-                            state: TaskState::Failed,
-                            message: Some(agent_message(&task_id, &context_id, error.to_string())),
-                            timestamp: Some(chrono::Utc::now()),
-                        },
-                        artifacts: None,
-                        history: Some(history.clone()),
-                        metadata: None,
-                    })),
-                };
-
-                let terminal = matches!(
-                    &response,
-                    Ok(StreamResponse::Task(task)) if task.status.state.is_terminal()
-                );
-                if tx.send(response).await.is_err() {
-                    terminal_emitted = true;
-                    break;
-                }
-                if terminal {
-                    terminal_emitted = true;
-                    break;
+                    Ok(MeshEvent::Completed { summary: _summary }) => {
+                        if completion_proposed {
+                            let _ = tx
+                                .send(Ok(task_response(
+                                    &task_id,
+                                    &context_id,
+                                    TaskState::Failed,
+                                    "worker emitted more than one completion proposal".to_owned(),
+                                    None,
+                                    history.clone(),
+                                    None,
+                                )))
+                                .await;
+                            request_dispatcher_cancel(
+                                &dispatcher,
+                                &task_id,
+                                execution_limits.cancel_timeout,
+                            )
+                            .await;
+                            terminal_emitted = true;
+                            break;
+                        }
+                        completion_proposed = true;
+                    }
+                    Err(_error) => {
+                        let _ = tx
+                            .send(Ok(task_response(
+                                &task_id,
+                                &context_id,
+                                TaskState::Failed,
+                                "SMESH worker failed".to_owned(),
+                                None,
+                                history.clone(),
+                                None,
+                            )))
+                            .await;
+                        request_dispatcher_cancel(
+                            &dispatcher,
+                            &task_id,
+                            execution_limits.cancel_timeout,
+                        )
+                        .await;
+                        terminal_emitted = true;
+                        break;
+                    }
                 }
             }
 
             if !terminal_emitted {
-                let _ = tx
-                    .send(Ok(StreamResponse::Task(Task {
-                        id: task_id.clone(),
-                        context_id: context_id.clone(),
-                        status: TaskStatus {
-                            state: TaskState::Failed,
-                            message: Some(agent_message(
+                if completion_proposed {
+                    let completion = finalize_completion(
+                        &tx,
+                        completion_policy.as_ref(),
+                        &dispatcher,
+                        execution_limits.cancel_timeout,
+                        &task_id,
+                        &context_id,
+                        CompletionMaterial {
+                            request_digest,
+                            artifacts,
+                            artifact_manifests,
+                            evidence,
+                            history: history.clone(),
+                        },
+                    );
+                    tokio::pin!(completion);
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => {}
+                        () = &mut task_deadline => {
+                            let _ = tx.send(Ok(task_response(
                                 &task_id,
                                 &context_id,
-                                "SMESH worker stream ended without a terminal event".to_owned(),
-                            )),
-                            timestamp: Some(chrono::Utc::now()),
-                        },
-                        artifacts: (!artifacts.is_empty()).then_some(artifacts),
-                        history: Some(history.clone()),
-                        metadata: None,
-                    })))
+                                TaskState::Failed,
+                                "SMESH task deadline exceeded during completion policy evaluation"
+                                    .to_owned(),
+                                None,
+                                history.clone(),
+                                None,
+                            ))).await;
+                            request_dispatcher_cancel(
+                                &dispatcher,
+                                &task_id,
+                                execution_limits.cancel_timeout,
+                            ).await;
+                        }
+                        () = &mut completion => {}
+                    }
+                } else {
+                    let _ = tx
+                        .send(Ok(task_response(
+                            &task_id,
+                            &context_id,
+                            TaskState::Failed,
+                            "SMESH worker stream ended without a completion proposal".to_owned(),
+                            None,
+                            history.clone(),
+                            None,
+                        )))
+                        .await;
+                    request_dispatcher_cancel(
+                        &dispatcher,
+                        &task_id,
+                        execution_limits.cancel_timeout,
+                    )
                     .await;
+                }
             }
             cancellations
                 .lock()
@@ -421,6 +538,14 @@ where
     }
 }
 
+async fn request_dispatcher_cancel(
+    dispatcher: &Arc<dyn MeshDispatcher>,
+    task_id: &str,
+    timeout: Duration,
+) {
+    let _ = tokio::time::timeout(timeout, dispatcher.cancel(task_id)).await;
+}
+
 fn status_update(
     task_id: &str,
     context_id: &str,
@@ -437,6 +562,230 @@ fn status_update(
         },
         metadata: None,
     })
+}
+
+struct CompletionMaterial {
+    request_digest: String,
+    artifacts: Vec<Artifact>,
+    artifact_manifests: Vec<ArtifactManifest>,
+    evidence: Vec<CompletionEvidence>,
+    history: Vec<Message>,
+}
+
+#[allow(clippy::too_many_lines)] // Keep policy-to-A2A mapping linear and auditable.
+async fn finalize_completion(
+    tx: &tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
+    policy: &VersionedCompletionPolicy,
+    dispatcher: &Arc<dyn MeshDispatcher>,
+    cancel_timeout: Duration,
+    task_id: &str,
+    context_id: &str,
+    mut material: CompletionMaterial,
+) {
+    let snapshot = CompletionSnapshot {
+        task_id: task_id.to_owned(),
+        context_id: context_id.to_owned(),
+        request_digest: material.request_digest,
+        artifacts: material.artifact_manifests,
+        evidence: material.evidence,
+    };
+    match policy.evaluate(&snapshot) {
+        Ok(PolicyDecision::Accepted(receipt)) => {
+            let metadata = match policy_metadata("accepted", &receipt) {
+                Ok(metadata) => metadata,
+                Err(_error) => {
+                    let _ = tx
+                        .send(Ok(task_response(
+                            task_id,
+                            context_id,
+                            TaskState::Failed,
+                            "completion policy metadata encoding failed".to_owned(),
+                            None,
+                            material.history,
+                            None,
+                        )))
+                        .await;
+                    request_dispatcher_cancel(dispatcher, task_id, cancel_timeout).await;
+                    return;
+                }
+            };
+            for artifact in &mut material.artifacts {
+                artifact.description = Some("Policy-accepted SMESH output".to_owned());
+                artifact.metadata = Some(metadata.clone());
+            }
+            if tx
+                .send(Ok(task_response(
+                    task_id,
+                    context_id,
+                    TaskState::Completed,
+                    "SMESH task completed under completion policy".to_owned(),
+                    Some(material.artifacts),
+                    material.history,
+                    Some(metadata),
+                )))
+                .await
+                .is_err()
+            {
+                request_dispatcher_cancel(dispatcher, task_id, cancel_timeout).await;
+            }
+        }
+        Ok(PolicyDecision::AwaitingRatification(checkpoint)) => {
+            send_policy_outcome(
+                tx,
+                task_id,
+                context_id,
+                &checkpoint,
+                PolicyOutcomeMaterial {
+                    state: TaskState::InputRequired,
+                    text: "human ratification is required".to_owned(),
+                    status: "awaitingRatification",
+                    history: material.history,
+                },
+            )
+            .await;
+        }
+        Ok(PolicyDecision::Blocked(block)) => {
+            let text = format!("completion policy blocked the task: {:?}", block.reasons);
+            send_policy_outcome(
+                tx,
+                task_id,
+                context_id,
+                &block,
+                PolicyOutcomeMaterial {
+                    state: TaskState::Failed,
+                    text,
+                    status: "blocked",
+                    history: material.history,
+                },
+            )
+            .await;
+            request_dispatcher_cancel(dispatcher, task_id, cancel_timeout).await;
+        }
+        Err(_error) => {
+            let _ = tx
+                .send(Ok(task_response(
+                    task_id,
+                    context_id,
+                    TaskState::Failed,
+                    "completion policy rejected malformed input".to_owned(),
+                    None,
+                    material.history,
+                    None,
+                )))
+                .await;
+            request_dispatcher_cancel(dispatcher, task_id, cancel_timeout).await;
+        }
+    }
+}
+
+struct PolicyOutcomeMaterial {
+    state: TaskState,
+    text: String,
+    status: &'static str,
+    history: Vec<Message>,
+}
+
+async fn send_policy_outcome(
+    tx: &tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
+    task_id: &str,
+    context_id: &str,
+    record: &impl serde::Serialize,
+    outcome: PolicyOutcomeMaterial,
+) {
+    match policy_metadata(outcome.status, record) {
+        Ok(metadata) => {
+            let _ = tx
+                .send(Ok(task_response(
+                    task_id,
+                    context_id,
+                    outcome.state,
+                    outcome.text,
+                    None,
+                    outcome.history,
+                    Some(metadata),
+                )))
+                .await;
+        }
+        Err(error) => {
+            let _ = tx
+                .send(Ok(task_response(
+                    task_id,
+                    context_id,
+                    TaskState::Failed,
+                    error.to_string(),
+                    None,
+                    outcome.history,
+                    None,
+                )))
+                .await;
+        }
+    }
+}
+
+fn pending_ratification_request_digest(
+    stored_task: Option<&Task>,
+    task_id: &str,
+    context_id: &str,
+    policy: &VersionedCompletionPolicy,
+) -> Result<Option<String>, A2AError> {
+    let Some(task) = stored_task else {
+        return Ok(None);
+    };
+    if task.status.state != TaskState::InputRequired {
+        return Ok(None);
+    }
+    let value = task
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("smesh.completionPolicy"))
+        .filter(|value| {
+            value.get("status").and_then(serde_json::Value::as_str) == Some("awaitingRatification")
+        })
+        .and_then(|value| value.get("record"))
+        .cloned()
+        .ok_or_else(A2AError::invalid_agent_response)?;
+    let checkpoint: PolicyCheckpoint =
+        serde_json::from_value(value).map_err(|_| A2AError::invalid_agent_response())?;
+    if !policy.verify_checkpoint(&checkpoint, task_id, context_id) {
+        return Err(A2AError::invalid_agent_response());
+    }
+    Ok(Some(checkpoint.request_digest))
+}
+
+fn task_response(
+    task_id: &str,
+    context_id: &str,
+    state: TaskState,
+    text: String,
+    artifacts: Option<Vec<Artifact>>,
+    history: Vec<Message>,
+    metadata: Option<HashMap<String, serde_json::Value>>,
+) -> StreamResponse {
+    StreamResponse::Task(Task {
+        id: task_id.to_owned(),
+        context_id: context_id.to_owned(),
+        status: TaskStatus {
+            state,
+            message: Some(agent_message(task_id, context_id, text)),
+            timestamp: Some(chrono::Utc::now()),
+        },
+        artifacts,
+        history: Some(history),
+        metadata,
+    })
+}
+
+fn policy_metadata(
+    status: &str,
+    record: &impl serde::Serialize,
+) -> Result<HashMap<String, serde_json::Value>, crate::DispatchError> {
+    let record = serde_json::to_value(record).map_err(|error| {
+        crate::DispatchError::Message(format!("completion policy record encoding failed: {error}"))
+    })?;
+    Ok(HashMap::from([(
+        "smesh.completionPolicy".to_owned(),
+        serde_json::json!({ "status": status, "record": record }),
+    )]))
 }
 
 fn agent_message(task_id: &str, context_id: &str, text: String) -> Message {

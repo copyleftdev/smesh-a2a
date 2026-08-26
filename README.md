@@ -19,6 +19,9 @@ SMESH remains the internal coordination substrate: signals diffuse, decay, reinf
 - Bounded task retention, execution concurrency, event/artifact counts, and output bytes
 - Worker inactivity, cancellation, and command-channel deadlines
 - Terminal-state and task-ID reuse guards
+- Mandatory versioned completion policy with buffered candidate artifacts, contradiction veto,
+  deterministic receipt claims, and optional signed human ratification
+- Process-local HMAC sealing and read-path validation for accepted completion receipts
 
 ## Architecture
 
@@ -165,6 +168,8 @@ The MVP is intentionally localhost-first and single-tenant.
 - The local store has a hard 1,024-task ceiling; active execution defaults to 64 tasks.
 - Worker output is limited to 16 events, 16 artifacts, and 1 MiB per task.
 - Worker inactivity, total task duration, and cancellation have deadlines; cancellation wakes active streams.
+- Worker `Completed` events are proposals: candidate artifacts remain private until the
+  gateway's locally configured completion policy accepts a sealed evidence snapshot.
 - The binary refuses non-loopback binds unless `SMESH_A2A_UNSAFE_PUBLIC=1` is explicit.
 
 Do not expose the MVP directly to an untrusted network. `SMESH_A2A_UNSAFE_PUBLIC=1` only disables the bind guard; it does not add security. Production deployment still requires authenticated principals, tenant-aware authorization, a persistent task store, TLS, distributed quotas, and observability.

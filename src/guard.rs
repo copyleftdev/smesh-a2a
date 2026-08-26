@@ -4,25 +4,39 @@ use a2a::{
     A2AError, AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest,
     GetExtendedAgentCardRequest, GetTaskPushNotificationConfigRequest, GetTaskRequest,
     ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
-    ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamResponse,
-    SubscribeToTaskRequest, Task, TaskPushNotificationConfig,
+    ListTasksRequest, ListTasksResponse, PartContent, SendMessageRequest, SendMessageResponse,
+    StreamResponse, SubscribeToTaskRequest, Task, TaskPushNotificationConfig, TaskState,
 };
 use a2a_server::{RequestHandler, ServiceParams, TaskStore};
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::{StreamExt, stream::BoxStream};
+
+use crate::{
+    ArtifactManifest, CompletionReceipt, VersionedCompletionPolicy, artifact_set_digest,
+    content_digest,
+};
 
 /// Single-tenant preflight guard around the official request handler.
 pub(crate) struct GuardedRequestHandler<S> {
     inner: Arc<dyn RequestHandler>,
     store: S,
+    completion_policy: VersionedCompletionPolicy,
 }
 
 impl<S> GuardedRequestHandler<S>
 where
     S: TaskStore,
 {
-    pub(crate) fn new(inner: Arc<dyn RequestHandler>, store: S) -> Self {
-        Self { inner, store }
+    pub(crate) fn new(
+        inner: Arc<dyn RequestHandler>,
+        store: S,
+        completion_policy: VersionedCompletionPolicy,
+    ) -> Self {
+        Self {
+            inner,
+            store,
+            completion_policy,
+        }
     }
 
     fn reject_tenant<T>(tenant: Option<&String>) -> Result<(), A2AError> {
@@ -62,6 +76,10 @@ where
         }
     }
 
+    fn validate_visible_task(&self, task: &Task) -> Result<(), A2AError> {
+        validate_task_with_policy(&self.completion_policy, task)
+    }
+
     async fn reject_terminal_subscription(&self, task_id: &str) -> Result<(), A2AError> {
         if self
             .store
@@ -93,6 +111,104 @@ where
     }
 }
 
+fn validate_task_with_policy(
+    policy: &VersionedCompletionPolicy,
+    task: &Task,
+) -> Result<(), A2AError> {
+    if task.status.state != TaskState::Completed {
+        if task
+            .artifacts
+            .as_ref()
+            .is_some_and(|artifacts| !artifacts.is_empty())
+        {
+            return Err(A2AError::invalid_agent_response());
+        }
+        if task.status.state == TaskState::InputRequired {
+            let value = task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("smesh.completionPolicy"))
+                .filter(|value| {
+                    value.get("status").and_then(serde_json::Value::as_str)
+                        == Some("awaitingRatification")
+                })
+                .and_then(|value| value.get("record"))
+                .cloned()
+                .ok_or_else(A2AError::invalid_agent_response)?;
+            let checkpoint: crate::PolicyCheckpoint =
+                serde_json::from_value(value).map_err(|_| A2AError::invalid_agent_response())?;
+            if !policy.verify_checkpoint(&checkpoint, &task.id, &task.context_id) {
+                return Err(A2AError::invalid_agent_response());
+            }
+        }
+        return Ok(());
+    }
+    let value = task
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("smesh.completionPolicy"))
+        .filter(|value| value.get("status").and_then(serde_json::Value::as_str) == Some("accepted"))
+        .and_then(|value| value.get("record"))
+        .cloned()
+        .ok_or_else(A2AError::invalid_agent_response)?;
+    let receipt: CompletionReceipt =
+        serde_json::from_value(value).map_err(|_| A2AError::invalid_agent_response())?;
+    if receipt.task_id != task.id
+        || receipt.context_id != task.context_id
+        || receipt.policy_id != policy.spec().policy_id
+        || receipt.policy_version != policy.spec().version
+        || receipt.policy_hash != policy.policy_hash()
+        || !policy.verify_receipt(&receipt)
+    {
+        return Err(A2AError::invalid_agent_response());
+    }
+    let artifacts = task
+        .artifacts
+        .as_ref()
+        .ok_or_else(A2AError::invalid_agent_response)?;
+    let mut manifests = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let name = artifact
+            .name
+            .clone()
+            .ok_or_else(A2AError::invalid_agent_response)?;
+        let [part] = artifact.parts.as_slice() else {
+            return Err(A2AError::invalid_agent_response());
+        };
+        let PartContent::Text(content) = &part.content else {
+            return Err(A2AError::invalid_agent_response());
+        };
+        let media_type = part
+            .media_type
+            .clone()
+            .ok_or_else(A2AError::invalid_agent_response)?;
+        manifests.push(ArtifactManifest {
+            name,
+            media_type,
+            digest: content_digest(content.as_bytes()),
+        });
+    }
+    let digest = artifact_set_digest(&manifests).map_err(|_| A2AError::invalid_agent_response())?;
+    if receipt.artifact_set_digest != digest {
+        return Err(A2AError::invalid_agent_response());
+    }
+    Ok(())
+}
+
+fn validate_stream(
+    policy: VersionedCompletionPolicy,
+    stream: BoxStream<'static, Result<StreamResponse, A2AError>>,
+) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    Box::pin(stream.map(move |result| match result {
+        Ok(StreamResponse::Task(task)) => {
+            validate_task_with_policy(&policy, &task)?;
+            Ok(StreamResponse::Task(task))
+        }
+        Ok(StreamResponse::ArtifactUpdate(_)) => Err(A2AError::invalid_agent_response()),
+        other => other,
+    }))
+}
+
 #[async_trait]
 impl<S> RequestHandler for GuardedRequestHandler<S>
 where
@@ -104,7 +220,11 @@ where
         request: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
         self.preflight_message(&request).await?;
-        self.inner.send_message(params, request).await
+        let response = self.inner.send_message(params, request).await?;
+        if let SendMessageResponse::Task(task) = &response {
+            self.validate_visible_task(task)?;
+        }
+        Ok(response)
     }
 
     async fn send_streaming_message(
@@ -113,7 +233,8 @@ where
         request: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.preflight_message(&request).await?;
-        self.inner.send_streaming_message(params, request).await
+        let stream = self.inner.send_streaming_message(params, request).await?;
+        Ok(validate_stream(self.completion_policy.clone(), stream))
     }
 
     async fn get_task(
@@ -125,6 +246,7 @@ where
         Self::validate_history_length(request.history_length)?;
         let history_length = request.history_length;
         let mut task = self.inner.get_task(params, request).await?;
+        self.validate_visible_task(&task)?;
         Self::apply_history_length(&mut task, history_length);
         Ok(task)
     }
@@ -136,7 +258,31 @@ where
     ) -> Result<ListTasksResponse, A2AError> {
         Self::reject_tenant::<ListTasksRequest>(request.tenant.as_ref())?;
         Self::validate_history_length(request.history_length)?;
-        self.inner.list_tasks(params, request).await
+        let validation_request = request.clone();
+        let response = self.inner.list_tasks(params, request).await?;
+        for task in &response.tasks {
+            let mut full = self
+                .store
+                .get(&task.id)
+                .await?
+                .ok_or_else(|| A2AError::task_not_found(&task.id))?;
+            self.validate_visible_task(&full)?;
+            Self::apply_history_length(&mut full, validation_request.history_length);
+            let expected_artifacts = if validation_request.include_artifacts.unwrap_or(false) {
+                full.artifacts.as_ref()
+            } else {
+                None
+            };
+            if task.context_id != full.context_id
+                || task.status != full.status
+                || task.metadata != full.metadata
+                || task.history != full.history
+                || task.artifacts.as_ref() != expected_artifacts
+            {
+                return Err(A2AError::invalid_agent_response());
+            }
+        }
+        Ok(response)
     }
 
     async fn cancel_task(
@@ -145,7 +291,9 @@ where
         request: CancelTaskRequest,
     ) -> Result<Task, A2AError> {
         Self::reject_tenant::<CancelTaskRequest>(request.tenant.as_ref())?;
-        self.inner.cancel_task(params, request).await
+        let task = self.inner.cancel_task(params, request).await?;
+        self.validate_visible_task(&task)?;
+        Ok(task)
     }
 
     async fn subscribe_to_task(
@@ -161,7 +309,7 @@ where
                 // yield a terminal snapshot. Do not turn that race into a valid
                 // subscription to a task that is already terminal in the ledger.
                 self.reject_terminal_subscription(&request.id).await?;
-                Ok(stream)
+                Ok(validate_stream(self.completion_policy.clone(), stream))
             }
             Err(error) => {
                 // The task can become terminal after the preflight read but before

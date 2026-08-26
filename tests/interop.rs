@@ -14,8 +14,8 @@ use futures::{
     stream::{self, BoxStream},
 };
 use smesh_a2a::{
-    DispatchError, GatewayConfig, LoopbackDispatcher, MeshDispatcher, MeshEvent, MeshRequest,
-    build_router,
+    ArtifactManifest, CompletionEvidence, DispatchError, GatewayConfig, LoopbackDispatcher,
+    MeshDispatcher, MeshEvent, MeshRequest, artifact_set_digest, build_router, content_digest,
 };
 
 #[tokio::test]
@@ -139,6 +139,7 @@ async fn official_client_receives_ordered_streaming_updates() {
         match event.unwrap() {
             a2a::StreamResponse::Task(task) => {
                 first_was_task.get_or_insert(true);
+                artifacts += task.artifacts.as_ref().map_or(0, Vec::len);
                 states.push(task.status.state);
             }
             a2a::StreamResponse::StatusUpdate(update) => {
@@ -264,9 +265,46 @@ impl MeshDispatcher for SafeBurstDispatcher {
         &self,
         _request: MeshRequest,
     ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
-        let mut events = (0..15)
+        let subject_digest = artifact_set_digest(&[ArtifactManifest {
+            name: "burst.txt".into(),
+            media_type: "text/plain".into(),
+            digest: content_digest(b"burst artifact"),
+        }])
+        .unwrap();
+        let mut events = (0..11)
             .map(|index| Ok(MeshEvent::Progress(format!("progress-{index}"))))
             .collect::<Vec<_>>();
+        events.push(Ok(MeshEvent::Evidence(CompletionEvidence::Review {
+            id: "burst-review".into(),
+            issuer: "review-authority".into(),
+            subject_digest: subject_digest.clone(),
+            evidence: b"burst review".to_vec(),
+            evidence_digest: content_digest(b"burst review"),
+            approved: true,
+            assurance_bps: 9_000,
+        })));
+        events.push(Ok(MeshEvent::Evidence(CompletionEvidence::Test {
+            id: "burst-test".into(),
+            issuer: "test-authority".into(),
+            subject_digest: subject_digest.clone(),
+            evidence: b"burst test".to_vec(),
+            evidence_digest: content_digest(b"burst test"),
+            passed: true,
+            assurance_bps: 9_000,
+        })));
+        events.push(Ok(MeshEvent::Evidence(CompletionEvidence::Contradiction {
+            id: "burst-contradiction-clearance".into(),
+            issuer: "contradiction-monitor".into(),
+            subject_digest,
+            evidence: b"burst contradiction clearance".to_vec(),
+            evidence_digest: content_digest(b"burst contradiction clearance"),
+            blocking: false,
+        })));
+        events.push(Ok(MeshEvent::Artifact {
+            name: "burst.txt".into(),
+            media_type: "text/plain".into(),
+            content: "burst artifact".into(),
+        }));
         events.push(Ok(MeshEvent::Completed {
             summary: "burst complete".into(),
         }));
@@ -311,7 +349,7 @@ async fn maximum_safe_event_burst_does_not_overrun_a2a_subscription_buffer() {
         .collect::<Vec<_>>()
         .await;
 
-    assert_eq!(events.len(), 17);
+    assert_eq!(events.len(), 13);
     assert!(matches!(
         events.last(),
         Some(Ok(a2a::StreamResponse::Task(task))) if task.status.state == TaskState::Completed
@@ -443,19 +481,26 @@ async fn cancellation_terminates_the_active_stream_without_post_cancel_work() {
     )
     .await
     .unwrap();
+    let mut canceled_updates = 0;
     for event in remaining {
         match event.unwrap() {
             a2a::StreamResponse::Task(task) => {
                 assert_ne!(task.status.state, TaskState::Working);
                 assert_ne!(task.status.state, TaskState::Completed);
+                canceled_updates += usize::from(task.status.state == TaskState::Canceled);
             }
             a2a::StreamResponse::StatusUpdate(update) => {
                 assert_ne!(update.status.state, TaskState::Working);
                 assert_ne!(update.status.state, TaskState::Completed);
+                canceled_updates += usize::from(update.status.state == TaskState::Canceled);
             }
             _ => {}
         }
     }
+    assert_eq!(
+        canceled_updates, 1,
+        "stream must contain one terminal cancellation"
+    );
 
     server.abort();
 }
