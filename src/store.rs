@@ -1,10 +1,104 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task, TaskId};
+use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task, TaskId, TaskState};
 use a2a_server::TaskStore;
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tokio::sync::RwLock;
+
+const CURSOR_VERSION: u8 = 1;
+const MAX_PAGE_TOKEN_BYTES: usize = 4096;
+const CURSOR_TAG_BYTES: usize = 32;
+type CursorMac = Hmac<Sha256>;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskCursor {
+    version: u8,
+    status_timestamp: Option<DateTime<Utc>>,
+    task_id: TaskId,
+    scope: CursorScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CursorScope {
+    context_id: Option<String>,
+    status: Option<TaskState>,
+    page_size: i32,
+    history_length: Option<i32>,
+    status_timestamp_after: Option<DateTime<Utc>>,
+    include_artifacts: bool,
+    tenant: Option<String>,
+}
+
+impl CursorScope {
+    fn from_request(request: &ListTasksRequest, page_size: i32) -> Self {
+        Self {
+            context_id: request.context_id.clone(),
+            status: request.status.clone(),
+            page_size,
+            history_length: request.history_length,
+            status_timestamp_after: request.status_timestamp_after,
+            include_artifacts: request.include_artifacts.unwrap_or(false),
+            tenant: request.tenant.clone(),
+        }
+    }
+}
+
+fn encode_cursor(task: &Task, scope: CursorScope, key: &[u8; 32]) -> Result<String, A2AError> {
+    let cursor = TaskCursor {
+        version: CURSOR_VERSION,
+        status_timestamp: task.status.timestamp,
+        task_id: task.id.clone(),
+        scope,
+    };
+    let mut bytes = serde_json::to_vec(&cursor)
+        .map_err(|error| A2AError::internal(format!("failed to encode page cursor: {error}")))?;
+    let mut mac = CursorMac::new_from_slice(key)
+        .map_err(|_| A2AError::internal("failed to initialize page cursor signer"))?;
+    mac.update(&bytes);
+    bytes.extend_from_slice(&mac.finalize().into_bytes());
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_cursor(
+    token: &str,
+    expected_scope: &CursorScope,
+    key: &[u8; 32],
+) -> Result<TaskCursor, A2AError> {
+    if token.len() > MAX_PAGE_TOKEN_BYTES {
+        return Err(A2AError::invalid_params("pageToken is too large"));
+    }
+    let mut bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
+    if bytes.len() <= CURSOR_TAG_BYTES {
+        return Err(A2AError::invalid_params("invalid pageToken"));
+    }
+    let tag = bytes.split_off(bytes.len() - CURSOR_TAG_BYTES);
+    let mut mac = CursorMac::new_from_slice(key)
+        .map_err(|_| A2AError::internal("failed to initialize page cursor verifier"))?;
+    mac.update(&bytes);
+    mac.verify_slice(&tag)
+        .map_err(|_| A2AError::invalid_params("invalid pageToken signature"))?;
+    let cursor: TaskCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
+    if cursor.version != CURSOR_VERSION {
+        return Err(A2AError::invalid_params("unsupported pageToken version"));
+    }
+    if &cursor.scope != expected_scope {
+        return Err(A2AError::invalid_params(
+            "pageToken does not match the list query",
+        ));
+    }
+    Ok(cursor)
+}
 
 #[derive(Default)]
 struct StoreState {
@@ -16,6 +110,7 @@ struct StoreState {
 pub struct BoundedTaskStore {
     state: Arc<RwLock<StoreState>>,
     max_tasks: usize,
+    cursor_key: Arc<[u8; 32]>,
 }
 
 impl BoundedTaskStore {
@@ -24,6 +119,7 @@ impl BoundedTaskStore {
         Self {
             state: Arc::new(RwLock::new(StoreState::default())),
             max_tasks: max_tasks.max(1),
+            cursor_key: Arc::new(rand::random()),
         }
     }
 }
@@ -65,6 +161,11 @@ impl TaskStore for BoundedTaskStore {
     }
 
     async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+        if req.history_length.is_some_and(|length| length < 0) {
+            return Err(A2AError::invalid_params(
+                "historyLength must be a non-negative integer",
+            ));
+        }
         let state = self.state.read().await;
         let mut tasks: Vec<Task> = state
             .tasks
@@ -99,29 +200,42 @@ impl TaskStore for BoundedTaskStore {
                 "pageSize must be between 1 and 100",
             ));
         }
+        let cursor_scope = CursorScope::from_request(req, page_size);
         let start = match req.page_token.as_deref() {
             None | Some("") => 0,
-            Some(token) => token
-                .parse::<usize>()
-                .map_err(|_| A2AError::invalid_params("invalid pageToken"))?,
+            Some(token) => {
+                let cursor = decode_cursor(token, &cursor_scope, &self.cursor_key)?;
+                tasks
+                    .iter()
+                    .position(|task| {
+                        task.id == cursor.task_id
+                            && task.status.timestamp == cursor.status_timestamp
+                    })
+                    .map(|position| position + 1)
+                    .ok_or_else(|| A2AError::invalid_params("pageToken is stale or invalid"))?
+            }
         };
-        if start > tasks.len() {
-            return Err(A2AError::invalid_params("pageToken is out of range"));
-        }
         let page_size_usize = usize::try_from(page_size)
             .map_err(|_| A2AError::invalid_params("pageSize is out of range"))?;
         let end = start.saturating_add(page_size_usize).min(tasks.len());
         let total_size = i32::try_from(tasks.len()).unwrap_or(i32::MAX);
+        let next_page_token = if end < tasks.len() {
+            encode_cursor(&tasks[end - 1], cursor_scope, &self.cursor_key)?
+        } else {
+            String::new()
+        };
         let include_artifacts = req.include_artifacts.unwrap_or(false);
         let history_length = req
             .history_length
-            .and_then(|length| usize::try_from(length.max(0)).ok());
+            .and_then(|length| usize::try_from(length).ok());
         let mut page = tasks[start..end].to_vec();
         for task in &mut page {
             if !include_artifacts {
                 task.artifacts = None;
             }
-            if let (Some(limit), Some(history)) = (history_length, task.history.as_mut()) {
+            if history_length == Some(0) {
+                task.history = None;
+            } else if let (Some(limit), Some(history)) = (history_length, task.history.as_mut()) {
                 if history.len() > limit {
                     history.drain(..history.len() - limit);
                 }
@@ -130,11 +244,7 @@ impl TaskStore for BoundedTaskStore {
 
         Ok(ListTasksResponse {
             tasks: page,
-            next_page_token: if end < tasks.len() {
-                end.to_string()
-            } else {
-                String::new()
-            },
+            next_page_token,
             page_size,
             total_size,
         })

@@ -20,5 +20,5 @@ pub use lifeline::{
     TraceError, TraceEvent, generate_lifeline_trace, verify_trace, write_lifeline_trace,
 };
 pub use loopback::LoopbackDispatcher;
-pub use server::{GatewayConfig, build_router};
+pub use server::{GatewayConfig, build_router, build_router_with_store};
 pub use store::BoundedTaskStore;
