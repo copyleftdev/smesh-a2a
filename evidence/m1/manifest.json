@@ -1,0 +1,67 @@
+{
+  "schema": "smesh-a2a/m1-evidence/v1",
+  "milestone": "M1 — Live SMESH Runtime",
+  "capturedAt": "2026-08-26",
+  "artifacts": [
+    {
+      "path": "evidence/m1/runtime-trace.json",
+      "sha256": "c3669ed476f751a6642730d22b97d83ea1a534a25147f4c33290a0b08b3b64c3",
+      "kind": "genuine-runtime-event-trace"
+    },
+    {
+      "path": "docs/ADR-0001-RUNTIME-PROCESS-OWNERSHIP.md",
+      "sha256": "9a59ef86ca9564b05a22c5bba9d3ac3b18dadc95b83e7d42ce925d291004a7da",
+      "kind": "ownership-decision"
+    }
+  ],
+  "mergedGates": [
+    {
+      "issue": 2,
+      "pullRequest": 44,
+      "mergeCommit": "217309546e319c252706a7bd105e069ecd9528c2",
+      "ciRun": 33007668906
+    },
+    {
+      "issue": 3,
+      "pullRequest": 43,
+      "mergeCommit": "1f1ebc72d2d1de01711404abaf9fc5e4666622ec",
+      "ciRun": 33001898869
+    },
+    {
+      "issue": 4,
+      "pullRequest": 42,
+      "mergeCommit": "da35833b445207100b3df87c78885594e024fc34",
+      "ciRun": null,
+      "exception": "documented exact-tree local-CI merge exception"
+    },
+    {
+      "issue": 5,
+      "pullRequest": 45,
+      "mergeCommit": "e6d0a7744ee2a647b9cc53ec13ffc3d72a7731d2",
+      "ciRun": 33014241721
+    },
+    {
+      "issue": 6,
+      "pullRequest": 46,
+      "mergeCommit": "951df02fecf587e966a21ec529574d44409d933f",
+      "ciRun": 33018200736
+    },
+    {
+      "issue": 7,
+      "pullRequest": 47,
+      "mergeCommit": "51e0190af0ed1c794ee1232dd0ea8b216bb73aac",
+      "ciRun": 33023137707
+    }
+  ],
+  "verification": [
+    "cargo test --test m1_evidence_bundle",
+    "cargo test --all-features --no-fail-fast",
+    "cargo clippy --all-targets --all-features -- -D warnings",
+    "RUSTDOCFLAGS=-D warnings cargo doc --all-features --no-deps"
+  ],
+  "limitations": [
+    "Runtime trace ordering is producer-local, not a distributed total order.",
+    "The checked-in runtime fixture proves genuine runtime emission and replay; the multi-process official-client artifact proof remains executable in tests/runtime_e2e_harness.rs.",
+    "Persistence, restart recovery, durable receipt keys, authentication, and tenant isolation belong to M2."
+  ]
+}

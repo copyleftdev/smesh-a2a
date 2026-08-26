@@ -47,12 +47,14 @@ See:
 
 - [`docs/PLAN.md`](docs/PLAN.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- [`docs/ADR-0001-RUNTIME-PROCESS-OWNERSHIP.md`](docs/ADR-0001-RUNTIME-PROCESS-OWNERSHIP.md)
 - [`docs/PROTOCOL_MAPPING.md`](docs/PROTOCOL_MAPPING.md)
 - [`docs/RUNTIME_E2E_HARNESS.md`](docs/RUNTIME_E2E_HARNESS.md)
 - [`docs/RUNTIME_EVENT_CAPTURE.md`](docs/RUNTIME_EVENT_CAPTURE.md)
 - [`docs/RUNTIME_TERMINAL_RACES.md`](docs/RUNTIME_TERMINAL_RACES.md)
 - [`docs/ULTIMATE_DEMO.md`](docs/ULTIMATE_DEMO.md)
 - [`docs/TRACE_CAPTURE.md`](docs/TRACE_CAPTURE.md)
+- [`evidence/m1/README.md`](evidence/m1/README.md)
 
 ## LIFELINE cinematic demo
 
