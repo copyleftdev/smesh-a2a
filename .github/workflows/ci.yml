@@ -25,3 +25,22 @@ jobs:
         run: cargo test --all-features
       - name: Documentation
         run: cargo doc --no-deps
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: demo/package-lock.json
+      - name: Install demo tooling
+        run: npm ci --prefix demo
+      - name: Audit demo tooling
+        run: npm audit --audit-level=high --prefix demo
+      - name: Test demo tooling
+        run: |
+          node --check demo/export-film.mjs
+          node --check demo/record-film.mjs
+          node --check demo/serve-demo.mjs
+          npm test --prefix demo
+      - name: Verify deterministic cinematic trace
+        run: |
+          cargo run --quiet --bin lifeline-trace -- /tmp/lifeline.trace.jsonl
+          cmp /tmp/lifeline.trace.jsonl demo/lifeline.trace.jsonl

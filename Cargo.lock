@@ -2200,6 +2200,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "smesh-core",
  "thiserror 2.0.20",
  "tokio",

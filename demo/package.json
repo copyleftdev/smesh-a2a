@@ -1,0 +1,16 @@
+{
+  "name": "smesh-a2a-lifeline-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "serve": "node serve-demo.mjs",
+    "test": "node --test *.test.mjs && node validate-trace.mjs",
+    "export": "node export-film.mjs",
+    "record": "node record-film.mjs"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "puppeteer-core": "25.9.0"
+  }
+}

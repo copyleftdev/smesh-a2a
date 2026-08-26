@@ -45,6 +45,42 @@ See:
 - [`docs/PLAN.md`](docs/PLAN.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - [`docs/PROTOCOL_MAPPING.md`](docs/PROTOCOL_MAPPING.md)
+- [`docs/ULTIMATE_DEMO.md`](docs/ULTIMATE_DEMO.md)
+- [`docs/TRACE_CAPTURE.md`](docs/TRACE_CAPTURE.md)
+
+## LIFELINE cinematic demo
+
+`LIFELINE // 47 MINUTES` is the proposed ultimate use case: six fictional organizations coordinate a medication-safety response without pooling private memory or granting an AI authority to act. The 47-minute fictional response is compressed into a three-minute replay. A2A carries accountable work between organizations; SMESH coordinates uncertain work inside each organization; a human ratifies the final response package.
+
+![LIFELINE cinematic replay showing the human-authorization gate](demo/poster.jpg)
+
+The repository includes a deterministic cinematic fixture and replay surface:
+
+- `demo/lifeline.trace.jsonl`: 55 append-only, hash-chained events
+- `demo/trace.schema.json`: the replay schema
+- `demo/index.html`: interactive Three.js/WebGL globe, timeline, scrubber, and trace inspector
+- `demo/STORYBOARD.md`: the 16:9 film plan
+- `demo/NARRATION.md`: timed ElevenLabs-ready narration
+- `demo/export-film.mjs`: deterministic frame-by-frame exporter
+- `demo/record-film.mjs`: real-time 1920×1080 recorder and audio muxer
+
+Generate and validate the trace:
+
+```bash
+cargo run --bin lifeline-trace -- demo/lifeline.trace.jsonl
+cargo test --test lifeline_trace
+```
+
+Preview the WebGL film:
+
+```bash
+cd demo
+npm ci
+npm run serve
+# open http://127.0.0.1:43130/
+```
+
+The checked-in JSONL is a deterministic synthetic fixture for replay, design, and conformance work. The nominal visual timeline is three minutes; the current narrated master is approximately 2:55 because export stops at the end of the narration track. It does not claim that six production organizations or six live SMESH runtimes executed the incident. The operational version must replace fixture emission with captured A2A requests, real `SignalType::Query` diffusion, dispatcher acknowledgements, task-ledger transitions, and human approval events. The film is permanently labeled `SIMULATION · NOT MEDICAL ADVICE · NO ACTIONS EXECUTED`.
 
 ## Run the gateway
 

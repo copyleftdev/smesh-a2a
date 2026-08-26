@@ -24,6 +24,7 @@ chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 smesh-core = { git = "https://github.com/copyleftdev/smesh-rust", rev = "ff0a88ba75590957e2e108f99e90135cd4b6de80" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
