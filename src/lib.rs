@@ -10,6 +10,7 @@ mod lifeline;
 mod loopback;
 mod policy;
 mod runtime_config;
+mod runtime_trace;
 mod runtime_worker;
 mod server;
 mod store;
@@ -31,9 +32,16 @@ pub use policy::{
     content_digest,
 };
 pub use runtime_config::{GatewayMode, GatewayModeError, RuntimeModeConfig};
+pub use runtime_trace::{
+    CorrelatingRuntimeProcessor, RuntimeClaimKind, RuntimeEventCapture, RuntimeTerminalState,
+    RuntimeTrace, RuntimeTraceDetails, RuntimeTraceError, RuntimeTraceEvent, RuntimeTraceKind,
+};
 pub use runtime_worker::{
     RuntimeAdmissionProcessor, RuntimeEventSink, RuntimeTask, RuntimeTaskProcessor, RuntimeWorker,
     RuntimeWorkerConfig, RuntimeWorkerHandle,
 };
-pub use server::{GatewayConfig, build_router, build_router_with_policy, build_router_with_store};
+pub use server::{
+    GatewayConfig, build_router, build_router_with_policy, build_router_with_store,
+    build_router_with_trace,
+};
 pub use store::BoundedTaskStore;
