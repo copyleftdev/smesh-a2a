@@ -48,6 +48,7 @@ See:
 - [`docs/PLAN.md`](docs/PLAN.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - [`docs/PROTOCOL_MAPPING.md`](docs/PROTOCOL_MAPPING.md)
+- [`docs/RUNTIME_E2E_HARNESS.md`](docs/RUNTIME_E2E_HARNESS.md)
 - [`docs/ULTIMATE_DEMO.md`](docs/ULTIMATE_DEMO.md)
 - [`docs/TRACE_CAPTURE.md`](docs/TRACE_CAPTURE.md)
 
