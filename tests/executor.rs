@@ -14,6 +14,8 @@ use smesh_a2a::{
     VersionedCompletionPolicy, artifact_set_digest, content_digest,
 };
 use smesh_core::NodeIdentity;
+use tokio::sync::{Notify, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Clone, Default)]
 struct RecordingDispatcher {
@@ -621,11 +623,12 @@ async fn cancellation_wakes_and_closes_the_original_execution_stream() {
         })
         .collect()
         .await;
-    assert!(matches!(
-        cancel_events.as_slice(),
-        [Ok(StreamResponse::StatusUpdate(update))] if update.status.state == TaskState::Canceled
-    ));
+    assert!(cancel_events.is_empty());
 
+    assert!(matches!(
+        execution.next().await,
+        Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Canceled
+    ));
     let closed = tokio::time::timeout(Duration::from_millis(100), execution.next()).await;
     assert!(closed.unwrap().is_none());
 }
@@ -842,5 +845,226 @@ async fn caller_supplied_event_budget_is_clamped_below_a2a_broadcast_capacity() 
     assert!(matches!(
         events.last(),
         Some(StreamResponse::Task(task)) if task.status.state == TaskState::Failed
+    ));
+}
+
+#[derive(Clone, Default)]
+struct CompletionCancelRaceDispatcher {
+    completion_release: Arc<Notify>,
+    cancel_started: Arc<Notify>,
+    cancel_ack_release: Arc<Notify>,
+}
+
+#[async_trait]
+impl MeshDispatcher for CompletionCancelRaceDispatcher {
+    fn dispatch(
+        &self,
+        _request: MeshRequest,
+    ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
+        let completion_release = Arc::clone(&self.completion_release);
+        let (tx, rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            completion_release.notified().await;
+            let content = "race candidate";
+            for evidence in machine_evidence("race.txt", "text/plain", content) {
+                let _ = tx.send(Ok(MeshEvent::Evidence(evidence))).await;
+            }
+            let _ = tx
+                .send(Ok(MeshEvent::Artifact {
+                    name: "race.txt".to_owned(),
+                    media_type: "text/plain".to_owned(),
+                    content: content.to_owned(),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(MeshEvent::Completed {
+                    summary: "completion raced cancellation".to_owned(),
+                }))
+                .await;
+        });
+        Box::pin(ReceiverStream::new(rx))
+    }
+
+    async fn cancel(&self, _task_id: &str) -> Result<(), DispatchError> {
+        self.cancel_started.notify_one();
+        self.cancel_ack_release.notified().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn accepted_cancel_request_suppresses_completion_while_ack_is_pending() {
+    let dispatcher = CompletionCancelRaceDispatcher::default();
+    let completion_release = Arc::clone(&dispatcher.completion_release);
+    let cancel_started = Arc::clone(&dispatcher.cancel_started);
+    let cancel_ack_release = Arc::clone(&dispatcher.cancel_ack_release);
+    let executor = SmeshExecutor::new(dispatcher, InputLimits::default(), "gateway-node");
+    let mut execution = executor.execute(context("race completion and cancellation"));
+    assert!(matches!(
+        execution.next().await,
+        Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Working
+    ));
+    let cancel = tokio::spawn(async move {
+        executor
+            .cancel(ExecutorContext {
+                message: None,
+                task_id: "task-1".to_owned(),
+                stored_task: None,
+                context_id: "context-1".to_owned(),
+                metadata: None,
+                user: None,
+                service_params: HashMap::new(),
+                tenant: None,
+            })
+            .collect::<Vec<_>>()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), cancel_started.notified())
+        .await
+        .unwrap();
+    completion_release.notify_one();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), execution.next())
+            .await
+            .is_err()
+    );
+    assert!(!cancel.is_finished());
+    cancel_ack_release.notify_one();
+    let cancel_events = cancel.await.unwrap();
+    assert!(cancel_events.is_empty());
+    assert!(matches!(
+        execution.next().await,
+        Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Canceled
+    ));
+}
+
+#[tokio::test]
+async fn dropping_cancel_response_stream_does_not_abandon_terminal_publication() {
+    let dispatcher = CompletionCancelRaceDispatcher::default();
+    let cancel_started = Arc::clone(&dispatcher.cancel_started);
+    let cancel_ack_release = Arc::clone(&dispatcher.cancel_ack_release);
+    let executor = SmeshExecutor::new(dispatcher, InputLimits::default(), "gateway-node");
+    let mut execution = executor.execute(context("drop cancel response"));
+    assert!(matches!(
+        execution.next().await,
+        Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Working
+    ));
+    let cancel = executor.cancel(ExecutorContext {
+        message: None,
+        task_id: "task-1".to_owned(),
+        stored_task: None,
+        context_id: "context-1".to_owned(),
+        metadata: None,
+        user: None,
+        service_params: HashMap::new(),
+        tenant: None,
+    });
+    drop(cancel);
+    tokio::time::timeout(Duration::from_secs(1), cancel_started.notified())
+        .await
+        .unwrap();
+    cancel_ack_release.notify_one();
+    assert!(matches!(
+        execution.next().await,
+        Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Canceled
+    ));
+}
+
+#[derive(Clone, Default)]
+struct CancelFailureDispatcher;
+
+#[async_trait]
+impl MeshDispatcher for CancelFailureDispatcher {
+    fn dispatch(
+        &self,
+        _request: MeshRequest,
+    ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
+        Box::pin(stream::pending())
+    }
+
+    async fn cancel(&self, _task_id: &str) -> Result<(), DispatchError> {
+        Err(DispatchError::Message(
+            "dropped cancellation acknowledgement".to_owned(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn failed_cancellation_acknowledgement_fails_task_and_closes_execution() {
+    let executor = SmeshExecutor::new(
+        CancelFailureDispatcher,
+        InputLimits::default(),
+        "gateway-node",
+    );
+    let mut execution = executor.execute(context("cancel failure"));
+    assert!(matches!(
+        execution.next().await,
+        Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Working
+    ));
+    let cancel_events = executor
+        .cancel(ExecutorContext {
+            message: None,
+            task_id: "task-1".to_owned(),
+            stored_task: None,
+            context_id: "context-1".to_owned(),
+            metadata: None,
+            user: None,
+            service_params: HashMap::new(),
+            tenant: None,
+        })
+        .collect::<Vec<_>>()
+        .await;
+    assert!(cancel_events.is_empty());
+    assert!(matches!(
+        execution.next().await,
+        Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Failed
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), execution.next())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn committed_completion_rejects_late_cancellation_without_second_terminal() {
+    let dispatcher = CompletionCancelRaceDispatcher::default();
+    let completion_release = Arc::clone(&dispatcher.completion_release);
+    let executor = SmeshExecutor::new(dispatcher, InputLimits::default(), "gateway-node");
+    let mut execution = executor.execute(context("completion wins"));
+    assert!(matches!(
+        execution.next().await,
+        Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Working
+    ));
+    completion_release.notify_one();
+    let remaining = execution
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(matches!(
+        remaining.last(),
+        Some(StreamResponse::Task(task)) if task.status.state == TaskState::Completed
+    ));
+
+    let cancel = executor
+        .cancel(ExecutorContext {
+            message: None,
+            task_id: "task-1".to_owned(),
+            stored_task: None,
+            context_id: "context-1".to_owned(),
+            metadata: None,
+            user: None,
+            service_params: HashMap::new(),
+            tenant: None,
+        })
+        .collect::<Vec<_>>()
+        .await;
+    assert!(matches!(
+        cancel.as_slice(),
+        [Err(error)] if error.code == a2a::error_code::TASK_NOT_CANCELABLE
     ));
 }
