@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -98,12 +99,63 @@ impl EventBudget {
     }
 }
 
+const TERMINAL_OPEN: u8 = 0;
+const TERMINAL_CANCEL: u8 = 1;
+const TERMINAL_EXECUTION: u8 = 2;
+const CANCEL_OUTCOME_PENDING: u8 = 0;
+const CANCEL_OUTCOME_CANCELED: u8 = 1;
+const CANCEL_OUTCOME_FAILED: u8 = 2;
+
+struct ExecutionControl {
+    cancellation: CancellationToken,
+    terminal: AtomicU8,
+    cancel_outcome: AtomicU8,
+    cancel_done: tokio::sync::Notify,
+    terminal_published: tokio::sync::Notify,
+    emission: tokio::sync::Mutex<()>,
+}
+
+impl ExecutionControl {
+    fn new() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            terminal: AtomicU8::new(TERMINAL_OPEN),
+            cancel_outcome: AtomicU8::new(CANCEL_OUTCOME_PENDING),
+            cancel_done: tokio::sync::Notify::new(),
+            terminal_published: tokio::sync::Notify::new(),
+            emission: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    fn claim_execution(&self) -> bool {
+        self.terminal
+            .compare_exchange(
+                TERMINAL_OPEN,
+                TERMINAL_EXECUTION,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn claim_cancel(&self) -> bool {
+        self.terminal
+            .compare_exchange(
+                TERMINAL_OPEN,
+                TERMINAL_CANCEL,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+}
+
 /// A2A executor that delegates accepted work to a SMESH dispatcher.
 pub struct SmeshExecutor<D> {
     dispatcher: Arc<D>,
     limits: InputLimits,
     gateway_node_id: String,
-    cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    cancellations: Arc<Mutex<HashMap<String, Arc<ExecutionControl>>>>,
     execution_limits: ExecutionLimits,
     permits: Arc<tokio::sync::Semaphore>,
     completion_policy: Arc<VersionedCompletionPolicy>,
@@ -259,14 +311,15 @@ where
         // before the request crosses the dispatcher boundary. Dispatchers may
         // reconstruct or forward it according to their transport policy.
         let _signal = request.to_signal(&self.gateway_node_id);
-        let mut mesh_stream = self.dispatcher.dispatch(request);
         let task_id = ctx.task_id;
         let context_id = ctx.context_id;
-        let cancellation = CancellationToken::new();
+        let control = Arc::new(ExecutionControl::new());
+        let cancellation = control.cancellation.clone();
         self.cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(task_id.clone(), cancellation.clone());
+            .insert(task_id.clone(), Arc::clone(&control));
+        let mut mesh_stream = self.dispatcher.dispatch(request);
         let cancellations = Arc::clone(&self.cancellations);
         let execution_limits = self.execution_limits;
         let completion_policy = Arc::clone(&self.completion_policy);
@@ -283,8 +336,10 @@ where
             let mut terminal_emitted = false;
             let task_deadline = tokio::time::sleep(execution_limits.task_timeout);
             tokio::pin!(task_deadline);
-            if tx
-                .send(Ok(StreamResponse::Task(Task {
+            if !send_work_event(
+                &control,
+                &tx,
+                StreamResponse::Task(Task {
                     id: task_id.clone(),
                     context_id: context_id.clone(),
                     status: TaskStatus {
@@ -295,9 +350,9 @@ where
                     artifacts: None,
                     history: Some(history.clone()),
                     metadata: None,
-                })))
-                .await
-                .is_err()
+                }),
+            )
+            .await
             {
                 request_dispatcher_cancel(&dispatcher, &task_id, execution_limits.cancel_timeout)
                     .await;
@@ -321,6 +376,27 @@ where
                         break;
                     }
                     () = cancellation.cancelled() => {
+                        if control.cancel_outcome.load(Ordering::SeqCst) == CANCEL_OUTCOME_PENDING {
+                            control.cancel_done.notified().await;
+                        }
+                        let outcome = control.cancel_outcome.load(Ordering::SeqCst);
+                        let state = if outcome == CANCEL_OUTCOME_CANCELED {
+                            TaskState::Canceled
+                        } else {
+                            TaskState::Failed
+                        };
+                        let text = (state == TaskState::Failed)
+                            .then(|| "SMESH cancellation failed".to_owned());
+                        let _ = tx.send(Ok(task_response(
+                            &task_id,
+                            &context_id,
+                            state,
+                            text.unwrap_or_else(|| "SMESH task canceled".to_owned()),
+                            None,
+                            history.clone(),
+                            None,
+                        ))).await;
+                        control.terminal_published.notify_one();
                         terminal_emitted = true;
                         break;
                     }
@@ -349,15 +425,17 @@ where
                 };
                 match event {
                     Ok(MeshEvent::Progress(_progress)) => {
-                        if tx
-                            .send(Ok(status_update(
+                        if !send_work_event(
+                            &control,
+                            &tx,
+                            status_update(
                                 &task_id,
                                 &context_id,
                                 TaskState::Working,
                                 Some("SMESH worker reported progress".to_owned()),
-                            )))
-                            .await
-                            .is_err()
+                            ),
+                        )
+                        .await
                         {
                             request_dispatcher_cancel(
                                 &dispatcher,
@@ -393,17 +471,20 @@ where
                     }
                     Ok(MeshEvent::Completed { summary: _summary }) => {
                         if completion_proposed {
-                            let _ = tx
-                                .send(Ok(task_response(
-                                    &task_id,
-                                    &context_id,
-                                    TaskState::Failed,
-                                    "worker emitted more than one completion proposal".to_owned(),
-                                    None,
-                                    history.clone(),
-                                    None,
-                                )))
-                                .await;
+                            if control.claim_execution() {
+                                let _ = tx
+                                    .send(Ok(task_response(
+                                        &task_id,
+                                        &context_id,
+                                        TaskState::Failed,
+                                        "worker emitted more than one completion proposal"
+                                            .to_owned(),
+                                        None,
+                                        history.clone(),
+                                        None,
+                                    )))
+                                    .await;
+                            }
                             request_dispatcher_cancel(
                                 &dispatcher,
                                 &task_id,
@@ -416,17 +497,19 @@ where
                         completion_proposed = true;
                     }
                     Err(_error) => {
-                        let _ = tx
-                            .send(Ok(task_response(
-                                &task_id,
-                                &context_id,
-                                TaskState::Failed,
-                                "SMESH worker failed".to_owned(),
-                                None,
-                                history.clone(),
-                                None,
-                            )))
-                            .await;
+                        if control.claim_execution() {
+                            let _ = tx
+                                .send(Ok(task_response(
+                                    &task_id,
+                                    &context_id,
+                                    TaskState::Failed,
+                                    "SMESH worker failed".to_owned(),
+                                    None,
+                                    history.clone(),
+                                    None,
+                                )))
+                                .await;
+                        }
                         request_dispatcher_cancel(
                             &dispatcher,
                             &task_id,
@@ -444,6 +527,7 @@ where
                     let completion = finalize_completion(
                         &tx,
                         completion_policy.as_ref(),
+                        control.as_ref(),
                         &dispatcher,
                         execution_limits.cancel_timeout,
                         &task_id,
@@ -461,16 +545,18 @@ where
                         biased;
                         () = cancellation.cancelled() => {}
                         () = &mut task_deadline => {
-                            let _ = tx.send(Ok(task_response(
-                                &task_id,
-                                &context_id,
-                                TaskState::Failed,
-                                "SMESH task deadline exceeded during completion policy evaluation"
-                                    .to_owned(),
-                                None,
-                                history.clone(),
-                                None,
-                            ))).await;
+                            if control.claim_execution() {
+                                let _ = tx.send(Ok(task_response(
+                                    &task_id,
+                                    &context_id,
+                                    TaskState::Failed,
+                                    "SMESH task deadline exceeded during completion policy evaluation"
+                                        .to_owned(),
+                                    None,
+                                    history.clone(),
+                                    None,
+                                ))).await;
+                            }
                             request_dispatcher_cancel(
                                 &dispatcher,
                                 &task_id,
@@ -480,17 +566,20 @@ where
                         () = &mut completion => {}
                     }
                 } else {
-                    let _ = tx
-                        .send(Ok(task_response(
-                            &task_id,
-                            &context_id,
-                            TaskState::Failed,
-                            "SMESH worker stream ended without a completion proposal".to_owned(),
-                            None,
-                            history.clone(),
-                            None,
-                        )))
-                        .await;
+                    if control.claim_execution() {
+                        let _ = tx
+                            .send(Ok(task_response(
+                                &task_id,
+                                &context_id,
+                                TaskState::Failed,
+                                "SMESH worker stream ended without a completion proposal"
+                                    .to_owned(),
+                                None,
+                                history.clone(),
+                                None,
+                            )))
+                            .await;
+                    }
                     request_dispatcher_cancel(
                         &dispatcher,
                         &task_id,
@@ -513,29 +602,49 @@ where
         let cancellations = Arc::clone(&self.cancellations);
         let cancel_timeout = self.execution_limits.cancel_timeout;
         let task_id = ctx.task_id;
-        let context_id = ctx.context_id;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
 
-        Box::pin(stream::once(async move {
-            let token = cancellations
+        tokio::spawn(async move {
+            let control = cancellations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&task_id)
                 .cloned();
-            tokio::time::timeout(cancel_timeout, dispatcher.cancel(&task_id))
-                .await
-                .map_err(|_| A2AError::internal("SMESH cancellation timed out"))?
-                .map_err(|error| A2AError::internal(error.to_string()))?;
-            if let Some(token) = token {
-                token.cancel();
+            let Some(control) = control else {
+                let _ = tx.send(Err(A2AError::task_not_cancelable(&task_id))).await;
+                return;
+            };
+            let emission = control.emission.lock().await;
+            if !control.claim_cancel() {
+                let _ = tx.send(Err(A2AError::task_not_cancelable(&task_id))).await;
+                return;
             }
-            Ok(status_update(
-                &task_id,
-                &context_id,
-                TaskState::Canceled,
-                None,
-            ))
-        }))
+            control.cancellation.cancel();
+            drop(emission);
+            let outcome =
+                match tokio::time::timeout(cancel_timeout, dispatcher.cancel(&task_id)).await {
+                    Ok(Ok(())) => CANCEL_OUTCOME_CANCELED,
+                    Ok(Err(_)) | Err(_) => CANCEL_OUTCOME_FAILED,
+                };
+            control.cancel_outcome.store(outcome, Ordering::SeqCst);
+            control.cancel_done.notify_one();
+            let _ =
+                tokio::time::timeout(cancel_timeout, control.terminal_published.notified()).await;
+        });
+        Box::pin(ReceiverStream::new(rx))
     }
+}
+
+async fn send_work_event(
+    control: &ExecutionControl,
+    tx: &tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
+    event: StreamResponse,
+) -> bool {
+    let _guard = control.emission.lock().await;
+    if control.terminal.load(Ordering::SeqCst) != TERMINAL_OPEN {
+        return false;
+    }
+    tx.send(Ok(event)).await.is_ok()
 }
 
 async fn request_dispatcher_cancel(
@@ -572,16 +681,20 @@ struct CompletionMaterial {
     history: Vec<Message>,
 }
 
-#[allow(clippy::too_many_lines)] // Keep policy-to-A2A mapping linear and auditable.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep policy-to-A2A mapping linear and auditable.
 async fn finalize_completion(
     tx: &tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
     policy: &VersionedCompletionPolicy,
+    control: &ExecutionControl,
     dispatcher: &Arc<dyn MeshDispatcher>,
     cancel_timeout: Duration,
     task_id: &str,
     context_id: &str,
     mut material: CompletionMaterial,
 ) {
+    if !control.claim_execution() {
+        return;
+    }
     let snapshot = CompletionSnapshot {
         task_id: task_id.to_owned(),
         context_id: context_id.to_owned(),
