@@ -113,10 +113,12 @@ Defaults:
 Configuration:
 
 ```bash
+mkdir -p "$HOME/.local/state/smesh-a2a"
+chmod 700 "$HOME/.local/state/smesh-a2a"
 SMESH_A2A_BIND=127.0.0.1:4000 \
 SMESH_A2A_PUBLIC_URL=http://127.0.0.1:4000 \
 SMESH_A2A_NODE_ID=gateway-west \
-SMESH_A2A_SQLITE_PATH=/var/lib/smesh-a2a/tasks.sqlite3 \
+SMESH_A2A_SQLITE_PATH="$HOME/.local/state/smesh-a2a/tasks.sqlite3" \
 cargo run --bin smesh-a2a-gateway
 ```
 

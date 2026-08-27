@@ -16,9 +16,10 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{StreamExt, stream::BoxStream};
 use smesh_a2a::{
-    ArtifactManifest, BoundedTaskStore, CompletionEvidence, CompletionReceipt, DispatchError,
-    GatewayConfig, LoopbackDispatcher, MeshDispatcher, MeshEvent, MeshRequest,
-    VersionedCompletionPolicy, artifact_set_digest, build_router_with_policy, content_digest,
+    ArtifactManifest, BoundedTaskStore, CompletionEvidence, CompletionPolicyStore,
+    CompletionReceipt, DispatchError, GatewayConfig, LoopbackDispatcher, MeshDispatcher, MeshEvent,
+    MeshRequest, VersionedCompletionPolicy, artifact_set_digest, build_router_with_policy,
+    content_digest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -36,7 +37,7 @@ impl TestServer {
     async fn start_with_store<D, S>(dispatcher: D, store: S) -> Self
     where
         D: MeshDispatcher,
-        S: TaskStore + Clone + 'static,
+        S: CompletionPolicyStore + Clone + 'static,
     {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -605,6 +606,12 @@ impl Clone for DeepCloneTaskStore {
     }
 }
 
+impl CompletionPolicyStore for DeepCloneTaskStore {
+    fn durable_receipt_key(&self) -> Option<[u8; 32]> {
+        None
+    }
+}
+
 #[async_trait]
 impl TaskStore for DeepCloneTaskStore {
     async fn create(&self, task: Task) -> Result<u64, A2AError> {
@@ -645,6 +652,12 @@ impl TaskStore for DeepCloneTaskStore {
 #[derive(Clone)]
 struct InconsistentListTaskStore {
     inner: BoundedTaskStore,
+}
+
+impl CompletionPolicyStore for InconsistentListTaskStore {
+    fn durable_receipt_key(&self) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 #[async_trait]
@@ -697,6 +710,12 @@ impl RacingTaskStore {
     fn arm_completion_race(&self, task_id: &str) {
         *self.armed_task.lock().unwrap() = Some(task_id.to_owned());
         self.armed_reads.store(0, Ordering::SeqCst);
+    }
+}
+
+impl CompletionPolicyStore for RacingTaskStore {
+    fn durable_receipt_key(&self) -> Option<[u8; 32]> {
+        None
     }
 }
 

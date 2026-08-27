@@ -1,16 +1,21 @@
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use a2a::{
-    GetTaskRequest, Message, Part, PartContent, Role, SendMessageRequest, SendMessageResponse,
-    TRANSPORT_PROTOCOL_JSONRPC, Task, TaskState, TaskStatus,
+    GetTaskRequest, ListTasksRequest, ListTasksResponse, Message, Part, PartContent, Role,
+    SendMessageRequest, SendMessageResponse, TRANSPORT_PROTOCOL_JSONRPC, Task, TaskState,
+    TaskStatus,
 };
 use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::{A2AClient, A2AClientFactory, Transport};
 use a2a_server::TaskStore;
+use async_trait::async_trait;
 use smesh_a2a::{
-    CompletionPolicySpec, CompletionReceipt, GatewayConfig, LoopbackDispatcher, SqliteTaskStore,
-    VersionedCompletionPolicy, build_router_with_policy, build_router_with_sqlite,
+    CompletionPolicySpec, CompletionPolicyStore, CompletionReceipt, GatewayConfig,
+    LoopbackDispatcher, SqliteTaskStore, VersionedCompletionPolicy, build_router_with_policy,
+    build_router_with_sqlite,
 };
 
 fn database_path() -> PathBuf {
@@ -36,6 +41,34 @@ fn cleanup(path: &Path) {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
     let _ = std::fs::remove_dir(path.parent().unwrap());
+}
+
+#[derive(Clone)]
+struct DelegatingSqliteStore(SqliteTaskStore);
+
+impl CompletionPolicyStore for DelegatingSqliteStore {
+    fn durable_receipt_key(&self) -> Option<[u8; 32]> {
+        Some(self.0.completion_receipt_key())
+    }
+}
+
+#[async_trait]
+impl TaskStore for DelegatingSqliteStore {
+    async fn create(&self, task: Task) -> Result<u64, a2a::A2AError> {
+        self.0.create(task).await
+    }
+
+    async fn update(&self, task: Task) -> Result<u64, a2a::A2AError> {
+        self.0.update(task).await
+    }
+
+    async fn get(&self, task_id: &str) -> Result<Option<Task>, a2a::A2AError> {
+        self.0.get(task_id).await
+    }
+
+    async fn list(&self, request: &ListTasksRequest) -> Result<ListTasksResponse, a2a::A2AError> {
+        self.0.list(request).await
+    }
 }
 
 async fn start_gateway(
@@ -78,13 +111,13 @@ async fn client(base_url: &str) -> A2AClient<Box<dyn Transport>> {
 }
 
 #[tokio::test]
-async fn generic_router_rejects_a_fresh_policy_for_a_persistent_store() {
+async fn generic_router_rejects_a_fresh_policy_through_a_persistent_store_decorator() {
     let path = database_path();
     let store = SqliteTaskStore::open(&path, 4).await.unwrap();
     let result = build_router_with_policy(
         GatewayConfig::new("http://127.0.0.1:3000", "persistent-gateway"),
         LoopbackDispatcher,
-        store,
+        DelegatingSqliteStore(store),
         VersionedCompletionPolicy::default(),
     );
     assert!(result.is_err());
@@ -117,21 +150,28 @@ async fn completed_task_receipt_and_artifact_remain_visible_after_gateway_restar
     let recovered = client(&base_url)
         .await
         .get_task(&GetTaskRequest {
-            id: task_id,
+            id: task_id.clone(),
             history_length: None,
             tenant: None,
         })
         .await
         .unwrap();
     assert_eq!(recovered, task);
-    let mut record =
+    let wire_record =
         recovered.metadata.as_ref().unwrap()["smesh.completionPolicy"]["record"].clone();
-    record["policyVersion"] = serde_json::json!(1_u32);
-    record["assuranceBps"] = serde_json::json!(10_000_u16);
-    let receipt: CompletionReceipt = serde_json::from_value(record).unwrap();
-    assert!(verifier.verify_receipt(&receipt));
+    assert_eq!(wire_record["policyVersion"].as_f64(), Some(1.0));
+    assert_eq!(wire_record["assuranceBps"].as_f64(), Some(10_000.0));
     restarted.abort();
     let _ = restarted.await;
+
+    let store = SqliteTaskStore::open(&path, 32).await.unwrap();
+    let persisted = store.get(&task_id).await.unwrap().unwrap();
+    let record = persisted.metadata.as_ref().unwrap()["smesh.completionPolicy"]["record"].clone();
+    assert_eq!(record["policyVersion"].as_u64(), Some(1));
+    assert_eq!(record["assuranceBps"].as_u64(), Some(10_000));
+    let receipt: CompletionReceipt = serde_json::from_value(record).unwrap();
+    assert!(verifier.verify_receipt(&receipt));
+    drop(store);
     cleanup(&path);
 }
 

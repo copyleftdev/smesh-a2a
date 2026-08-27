@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -191,7 +193,6 @@ async fn terminal_and_nonterminal_tasks_survive_restart_without_terminal_regress
     cleanup(&path);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn second_open_is_rejected_without_recovering_live_work() {
     let path = database_path();
@@ -350,7 +351,6 @@ async fn unexpected_schema_trigger_fails_closed() {
     cleanup(&path);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn database_and_sidecars_are_owner_only_and_untrusted_parent_is_rejected() {
     use std::os::unix::fs::PermissionsExt;

@@ -73,6 +73,12 @@ async fn run_runtime_gateway(
     runtime_config: RuntimeModeConfig,
     sqlite_path: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let config = GatewayConfig::new(&public_base_url, &gateway_node_id);
+    let sqlite_store = if let Some(path) = sqlite_path {
+        Some(SqliteTaskStore::open(path, config.max_tasks).await?)
+    } else {
+        None
+    };
     let mut network = Network::new();
     network.add_node(Node::named(&gateway_node_id));
     let mut runtime_value = SmeshRuntime::with_network(network, RuntimeConfig::default());
@@ -136,9 +142,7 @@ async fn run_runtime_gateway(
         64,
     )
     .await?;
-    let config = GatewayConfig::new(&public_base_url, &gateway_node_id);
-    let app = if let Some(path) = sqlite_path {
-        let store = SqliteTaskStore::open(path, config.max_tasks).await?;
+    let app = if let Some(store) = sqlite_store {
         build_router_with_sqlite_and_trace(config, dispatcher, store, Arc::clone(&capture))?
     } else {
         build_router_with_trace(config, dispatcher, Arc::clone(&capture))

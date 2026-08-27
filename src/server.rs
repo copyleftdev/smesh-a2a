@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task};
@@ -14,6 +13,24 @@ use crate::{
 };
 
 struct SharedTaskStore<S>(Arc<S>);
+
+/// A task store that declares whether completion receipts must use durable key material.
+pub trait CompletionPolicyStore: TaskStore {
+    /// Return the durable receipt key for persistent stores, or `None` for ephemeral stores.
+    fn durable_receipt_key(&self) -> Option<[u8; 32]>;
+}
+
+impl CompletionPolicyStore for BoundedTaskStore {
+    fn durable_receipt_key(&self) -> Option<[u8; 32]> {
+        None
+    }
+}
+
+impl CompletionPolicyStore for SqliteTaskStore {
+    fn durable_receipt_key(&self) -> Option<[u8; 32]> {
+        Some(self.completion_receipt_key())
+    }
+}
 
 impl<S> Clone for SharedTaskStore<S> {
     fn clone(&self) -> Self {
@@ -163,7 +180,7 @@ pub fn build_router_with_policy<D, S>(
 ) -> Result<Router, PolicyError>
 where
     D: MeshDispatcher,
-    S: TaskStore + Any,
+    S: CompletionPolicyStore + 'static,
 {
     build_router_with_policy_and_trace(config, dispatcher, store, policy, None)
 }
@@ -182,10 +199,10 @@ pub fn build_router_with_policy_and_trace<D, S>(
 ) -> Result<Router, PolicyError>
 where
     D: MeshDispatcher,
-    S: TaskStore + Any,
+    S: CompletionPolicyStore + 'static,
 {
-    if let Some(sqlite) = (&store as &dyn Any).downcast_ref::<SqliteTaskStore>()
-        && sqlite.completion_receipt_key() != policy.receipt_key()
+    if let Some(receipt_key) = store.durable_receipt_key()
+        && receipt_key != policy.receipt_key()
     {
         return Err(PolicyError::InvalidPolicy(
             "persistent task store and completion policy use different receipt keys".to_owned(),

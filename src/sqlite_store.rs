@@ -444,6 +444,9 @@ fn recover_orphaned_tasks(connection: &mut Connection) -> Result<(), SqliteStore
 #[cfg(unix)]
 fn prepare_secure_path(path: &Path) -> Result<(), SqliteStoreError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    if !path.is_absolute() {
+        return Err(SqliteStoreError::Initialization);
+    }
     let parent = path.parent().ok_or(SqliteStoreError::Initialization)?;
     let canonical_parent = parent
         .canonicalize()
