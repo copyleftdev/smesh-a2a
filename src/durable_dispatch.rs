@@ -97,6 +97,13 @@ pub struct SystemClockTicker {
     join: tokio::task::JoinHandle<Result<(), a2a::A2AError>>,
 }
 
+impl Drop for SystemClockTicker {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.join.abort();
+    }
+}
+
 impl SystemClockTicker {
     /// Start a ticker that advances `clock` from the system Unix clock and wakes subscribers.
     #[must_use]
@@ -128,7 +135,7 @@ impl SystemClockTicker {
             joined.map_err(|_| a2a::A2AError::internal("system clock ticker panicked"))?
         } else {
             self.join.abort();
-            let _ = self.join.await;
+            let _ = (&mut self.join).await;
             Err(a2a::A2AError::internal(
                 "system clock ticker shutdown timed out",
             ))

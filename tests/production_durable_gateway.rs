@@ -185,18 +185,26 @@ async fn wait_for_official_client(
     }
 }
 
-async fn stop_with_sigint(mut child: Child) {
+async fn stop_with_signal(mut child: Child, signal_arg: &str, label: &str) {
     let process_id = child.id().expect("running gateway process");
     let signal = bounded_child_status(
-        "SIGINT delivery",
+        label,
         Command::new("/usr/bin/kill")
-            .arg("-INT")
+            .arg(signal_arg)
             .arg(process_id.to_string()),
     )
     .await;
     assert!(signal.success());
     let status = bounded_child_wait("gateway process join", &mut child).await;
     assert!(status.success(), "gateway did not stop cleanly: {status}");
+}
+
+async fn stop_with_sigint(child: Child) {
+    stop_with_signal(child, "-INT", "SIGINT delivery").await;
+}
+
+async fn stop_with_sigterm(child: Child) {
+    stop_with_signal(child, "-TERM", "SIGTERM delivery").await;
 }
 
 fn send_request(message_id: &str, text: &str) -> SendMessageRequest {
@@ -255,7 +263,7 @@ async fn production_loopback_sqlite_replays_unary_and_stream_after_sigint_restar
         StreamResponse::StatusUpdate(update) => update.status.state == TaskState::Completed,
         StreamResponse::ArtifactUpdate(_) | StreamResponse::Message(_) => false,
     }));
-    stop_with_sigint(first_process).await;
+    stop_with_sigterm(first_process).await;
 
     let first_reopen = bounded("first store reopen", SqliteTaskStore::open(&database, 1024))
         .await

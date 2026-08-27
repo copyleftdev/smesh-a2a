@@ -38,6 +38,17 @@ struct DurableStreamState {
     emit_stream_errors: bool,
 }
 
+struct DurableTaskEventStreamState {
+    store: SqliteTaskStore,
+    driver_state: tokio::sync::watch::Receiver<crate::outbox_driver::DriverState>,
+    _waiter: WaiterGuard,
+    task_id: String,
+    last_revision: u64,
+    pending: VecDeque<StreamResponse>,
+    closed: bool,
+    emit_stream_errors: bool,
+}
+
 pub(crate) struct DurableRequestHandler {
     store: SqliteTaskStore,
     driver: Arc<DurableDriverControl>,
@@ -310,52 +321,56 @@ impl DurableRequestHandler {
         task_id: String,
         last_revision: u64,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-        let state = (
-            self.store.clone(),
-            self.driver.subscribe(),
-            self.driver.waiter(),
+        let state = DurableTaskEventStreamState {
+            store: self.store.clone(),
+            driver_state: self.driver.subscribe(),
+            _waiter: self.driver.waiter(),
             task_id,
             last_revision,
-            VecDeque::new(),
-            false,
-            !self.errors_before_stream,
-        );
+            pending: VecDeque::new(),
+            closed: false,
+            emit_stream_errors: !self.errors_before_stream,
+        };
         Box::pin(stream::unfold(state, |mut state| async move {
             loop {
-                if let Some(frame) = state.5.pop_front() {
+                if let Some(frame) = state.pending.pop_front() {
                     return Some((Ok(frame), state));
                 }
-                if state.6 {
+                if state.closed {
                     return None;
                 }
-                match state.0.task_events_after(&state.3, state.4).await {
+                match state
+                    .store
+                    .task_events_after(&state.task_id, state.last_revision)
+                    .await
+                {
                     Ok(batch) => {
-                        state.4 = batch.last_revision;
-                        state.6 = batch.closed;
-                        state.5.extend(batch.frames);
-                        if !state.5.is_empty() || state.6 {
+                        state.last_revision = batch.last_revision;
+                        state.closed = batch.closed;
+                        state.pending.extend(batch.frames);
+                        if !state.pending.is_empty() || state.closed {
                             continue;
                         }
                     }
                     Err(error) => {
-                        state.6 = true;
-                        if !state.7 {
+                        state.closed = true;
+                        if !state.emit_stream_errors {
                             return None;
                         }
                         return Some((Err(error), state));
                     }
                 }
-                let failure = state.1.borrow().failure.clone();
+                let failure = state.driver_state.borrow().failure.clone();
                 if let Some(failure) = failure {
-                    state.6 = true;
-                    if !state.7 {
+                    state.closed = true;
+                    if !state.emit_stream_errors {
                         return None;
                     }
                     return Some((Err(A2AError::internal(failure)), state));
                 }
-                if state.1.changed().await.is_err() {
-                    state.6 = true;
-                    if !state.7 {
+                if state.driver_state.changed().await.is_err() {
+                    state.closed = true;
+                    if !state.emit_stream_errors {
                         return None;
                     }
                     return Some((
@@ -552,23 +567,12 @@ impl RequestHandler for DurableRequestHandler {
                 "historyLength must be a non-negative integer",
             ));
         }
-        let history_length = request.history_length;
-        let mut task = self
+        let task = self
             .store
             .get(&request.id)
             .await?
             .ok_or_else(|| A2AError::task_not_found(&request.id))?;
-        if let Some(length) = history_length {
-            if length == 0 {
-                task.history = None;
-            } else if let (Ok(limit), Some(history)) =
-                (usize::try_from(length), task.history.as_mut())
-                && history.len() > limit
-            {
-                history.drain(..history.len() - limit);
-            }
-        }
-        Ok(task)
+        Ok(project_task(task, request.history_length))
     }
 
     async fn list_tasks(

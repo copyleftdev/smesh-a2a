@@ -183,10 +183,13 @@ impl Drop for DurableGateway {
     }
 }
 
-/// Build the repository-owned durable loopback unary gateway.
+/// Build the repository-owned durable loopback gateway.
 ///
 /// Unlike the source-compatible generic builders, this accepts no arbitrary
 /// `MeshDispatcher` and never routes send methods through `DefaultRequestHandler`.
+/// It applies `public_base_url`, `input_limits`, and `max_body_bytes` from
+/// [`GatewayConfig`]. `gateway_node_id` and `execution_limits` do not affect this
+/// owned loopback adapter, and `max_tasks` is enforced when opening [`SqliteTaskStore`].
 ///
 /// # Errors
 ///

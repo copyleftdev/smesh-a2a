@@ -60,6 +60,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<(), std::io::Error> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        signal = terminate.recv() => signal
+            .ok_or_else(|| std::io::Error::other("SIGTERM signal stream closed")),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<(), std::io::Error> {
+    tokio::signal::ctrl_c().await
+}
+
 async fn run_durable_loopback_gateway(
     bind: SocketAddr,
     public_base_url: String,
@@ -84,7 +99,7 @@ async fn run_durable_loopback_gateway(
     ));
     let serve_result = tokio::select! {
         result = &mut server => result,
-        signal = tokio::signal::ctrl_c() => {
+        signal = shutdown_signal() => {
             shutdown.cancel();
             let graceful_result = match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -192,7 +207,7 @@ async fn run_runtime_gateway(
     let mut event_drain_finished = false;
     let serve_result = tokio::select! {
         result = axum::serve(listener, app) => result,
-        signal = tokio::signal::ctrl_c() => signal.map_err(std::io::Error::other),
+        signal = shutdown_signal() => signal.map_err(std::io::Error::other),
         () = trace_failure.cancelled() => Err(std::io::Error::other(
             "required SMESH runtime trace capture failed",
         )),
