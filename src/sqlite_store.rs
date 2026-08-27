@@ -92,6 +92,7 @@ const ATOMIC_SCHEMA_SQL: &str = "CREATE TABLE task_events (
      updated_at INTEGER NOT NULL,
      PRIMARY KEY(tenant_scope, message_id)
  );
+ CREATE INDEX idempotency_records_task ON idempotency_records(tenant_scope, task_id);
  CREATE TABLE outbox (
      outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
      dispatch_id TEXT NOT NULL UNIQUE,
@@ -112,6 +113,7 @@ const ATOMIC_SCHEMA_SQL: &str = "CREATE TABLE task_events (
      updated_at INTEGER NOT NULL
  );
  CREATE INDEX outbox_due ON outbox(state, available_at, lease_until, outbox_id);
+ CREATE INDEX outbox_task_state ON outbox(task_id, state);
  CREATE TABLE outbox_attempts (
      outbox_id INTEGER NOT NULL REFERENCES outbox(outbox_id) ON DELETE RESTRICT,
      attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
@@ -168,6 +170,7 @@ const SCHEMA_SQL: &str = "CREATE TABLE store_metadata (
      updated_at INTEGER NOT NULL,
      PRIMARY KEY(tenant_scope, message_id)
  );
+ CREATE INDEX idempotency_records_task ON idempotency_records(tenant_scope, task_id);
  CREATE TABLE outbox (
      outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
      dispatch_id TEXT NOT NULL UNIQUE,
@@ -188,6 +191,7 @@ const SCHEMA_SQL: &str = "CREATE TABLE store_metadata (
      updated_at INTEGER NOT NULL
  );
  CREATE INDEX outbox_due ON outbox(state, available_at, lease_until, outbox_id);
+ CREATE INDEX outbox_task_state ON outbox(task_id, state);
  CREATE TABLE outbox_attempts (
      outbox_id INTEGER NOT NULL REFERENCES outbox(outbox_id) ON DELETE RESTRICT,
      attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
@@ -1250,7 +1254,12 @@ fn legal_transition(from: &a2a::TaskState, to: &a2a::TaskState) -> bool {
         return true;
     }
     match from {
-        TaskState::Unspecified => matches!(to, TaskState::Submitted | TaskState::Rejected),
+        TaskState::Unspecified => {
+            matches!(
+                to,
+                TaskState::Submitted | TaskState::Failed | TaskState::Rejected
+            )
+        }
         TaskState::Submitted => matches!(
             to,
             TaskState::Working
@@ -1300,6 +1309,11 @@ fn dead_letter_task(
     let mut task = decode_task(&encoded)?;
     if task.status.state.is_terminal() {
         return Ok(());
+    }
+    if !legal_transition(&task.status.state, &a2a::TaskState::Failed) {
+        return Err(A2AError::unsupported_operation(
+            "task state cannot transition to dead-letter failure",
+        ));
     }
     task.status.state = a2a::TaskState::Failed;
     task.status.timestamp = chrono::DateTime::from_timestamp_millis(now);
@@ -1794,7 +1808,7 @@ fn expected_schema_sql(schema: &str, object_name: &str) -> Option<String> {
     schema.split(';').find_map(|statement| {
         let normalized = normalize_schema_sql(statement);
         let table_prefix = format!("createtable{object_name}(");
-        let index_prefix = format!("createindex{object_name}");
+        let index_prefix = format!("createindex{object_name}on");
         (normalized.starts_with(&table_prefix) || normalized.starts_with(&index_prefix))
             .then_some(normalized)
     })
@@ -1808,8 +1822,10 @@ const V2_OBJECTS: &[&str] = &[
     "task_events",
     "task_events_task_revision",
     "idempotency_records",
+    "idempotency_records_task",
     "outbox",
     "outbox_due",
+    "outbox_task_state",
     "outbox_attempts",
 ];
 
@@ -2075,6 +2091,9 @@ fn recover_orphaned_tasks(connection: &mut Connection) -> Result<(), SqliteStore
         };
         let mut task: Task =
             serde_json::from_str(&encoded).map_err(|_| SqliteStoreError::InvalidSchema)?;
+        if !legal_transition(&task.status.state, &a2a::TaskState::Failed) {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
         task.status.state = a2a::TaskState::Failed;
         task.status.timestamp = Some(chrono::Utc::now());
         let mut recovery_message = Message::new(
@@ -2372,6 +2391,11 @@ impl TaskStore for SqliteTaskStore {
                     "terminal task state cannot be changed",
                 ));
             }
+            if !legal_transition(&current_task.status.state, &task.status.state) {
+                return Err(A2AError::unsupported_operation(
+                    "task lifecycle transition is not allowed",
+                ));
+            }
             let previous_state = state_key(&current_task)?;
             let next_revision = revision
                 .checked_add(1)
@@ -2508,6 +2532,20 @@ impl TaskStore for SqliteTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expected_schema_lookup_does_not_confuse_table_with_prefixed_index() {
+        let reordered =
+            "CREATE INDEX outbox_due ON outbox(state); CREATE TABLE outbox (state TEXT);";
+        assert_eq!(
+            expected_schema_sql(reordered, "outbox"),
+            Some("createtableoutbox(statetext)".to_owned())
+        );
+        assert_eq!(
+            expected_schema_sql(reordered, "outbox_due"),
+            Some("createindexoutbox_dueonoutbox(state)".to_owned())
+        );
+    }
 
     fn task(id: &str, state: a2a::TaskState) -> Task {
         Task {

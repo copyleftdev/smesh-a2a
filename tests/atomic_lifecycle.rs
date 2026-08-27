@@ -915,6 +915,68 @@ async fn delivered_nonterminal_intent_fails_closed_during_restart_recovery() {
 }
 
 #[tokio::test]
+async fn sdk_update_rejects_illegal_transition_without_poisoning_reopen() {
+    let path = path();
+    let store = SqliteTaskStore::open(&path, 8).await.unwrap();
+    let submitted = task("sdk-illegal", TaskState::Submitted);
+    a2a_server::TaskStore::create(&store, submitted.clone())
+        .await
+        .unwrap();
+    let unspecified = task("sdk-illegal", TaskState::Unspecified);
+    assert!(
+        a2a_server::TaskStore::update(&store, unspecified)
+            .await
+            .unwrap_err()
+            .message
+            .contains("not allowed")
+    );
+    drop(store);
+    let reopened = SqliteTaskStore::open(&path, 8).await.unwrap();
+    assert_eq!(
+        a2a_server::TaskStore::get(&reopened, "sdk-illegal")
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .state,
+        TaskState::Failed
+    );
+    drop(reopened);
+    SqliteTaskStore::open(&path, 8).await.unwrap();
+}
+
+#[tokio::test]
+async fn unspecified_orphan_recovery_remains_valid_on_second_reopen() {
+    let path = path();
+    let store = SqliteTaskStore::open(&path, 8).await.unwrap();
+    a2a_server::TaskStore::create(&store, task("unspecified-orphan", TaskState::Unspecified))
+        .await
+        .unwrap();
+    drop(store);
+    let recovered = SqliteTaskStore::open(&path, 8).await.unwrap();
+    assert_eq!(
+        a2a_server::TaskStore::get(&recovered, "unspecified-orphan")
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .state,
+        TaskState::Failed
+    );
+    drop(recovered);
+    let reopened = SqliteTaskStore::open(&path, 8).await.unwrap();
+    assert_eq!(
+        a2a_server::TaskStore::get(&reopened, "unspecified-orphan")
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .state,
+        TaskState::Failed
+    );
+}
+
+#[tokio::test]
 async fn lifecycle_rejects_regression_and_admission_rejects_reopen_poisoning_bounds() {
     let path = path();
     let store = SqliteTaskStore::open(&path, 8).await.unwrap();

@@ -34,6 +34,7 @@ CREATE TABLE idempotency_records (
     updated_at BIGINT NOT NULL,
     PRIMARY KEY (tenant_scope, message_id)
 );
+CREATE INDEX idempotency_records_task ON idempotency_records(tenant_scope, task_id);
 
 CREATE TABLE outbox (
     outbox_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -55,6 +56,7 @@ CREATE TABLE outbox (
     updated_at BIGINT NOT NULL
 );
 CREATE INDEX outbox_due ON outbox(state, available_at, lease_until, outbox_id);
+CREATE INDEX outbox_task_state ON outbox(task_id, state);
 
 CREATE TABLE outbox_attempts (
     outbox_id BIGINT NOT NULL REFERENCES outbox(outbox_id) ON DELETE RESTRICT,

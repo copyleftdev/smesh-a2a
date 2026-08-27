@@ -20,7 +20,7 @@
 - Focused GREEN additions
   - `cargo test --test atomic_lifecycle retry_and_dead_letter_faults_roll_back_then_persist_exact_attempt_sequence -- --exact` — passed.
   - `cargo test --test atomic_lifecycle every_atomic_table_reopen_aggregate_counts_multibyte_bytes_without_mutation -- --exact` — passed (events, idempotency, outbox, attempts).
-  - `cargo test --test atomic_lifecycle` — final exact-tree run passed 27 atomic lifecycle tests.
+  - `cargo test --test atomic_lifecycle` — final exact-tree run passed 29 atomic lifecycle tests.
 
 ## Final gates
 
@@ -45,3 +45,5 @@ The final implementation now requires exact canonical request/task/result bindin
 A subsequent exact-tree review found that replay identity also needed to bind the complete admission snapshot, continuation seed, and typed result, and that acknowledged-but-nonterminal delivery could be stranded at restart. Replay now rejects changed admission or continuation snapshots even when the canonical request digest is unchanged. Restart recovery fails acknowledged nonterminal work closed with explicit unknown-downstream-effect evidence, completes idempotency replay, and supersedes the delivered outbox intent. The test admission helper now verifies its expected derived dispatch instead of silently discarding inputs.
 
 The final recovery probe covered multiple delivered intents for one interrupted/continued task. Recovery now supersedes every delivered intent for that task while completing only unresolved idempotency records; an earlier completed message retains its exact typed replay result and the unresolved continuation replays the recovery failure.
+
+Public review then identified a transition-policy asymmetry. SDK updates now reject illegal lifecycle edges before writing events, dead-letter/recovery paths validate their transition, and intentional `Unspecified -> Failed` restart recovery is part of the legal matrix and remains valid on a second reopen. Exact schema lookup now distinguishes table names from prefixed index names, and task-based idempotency/outbox indexes bound the new lifecycle queries.
