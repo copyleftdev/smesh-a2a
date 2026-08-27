@@ -749,6 +749,44 @@ mod tests {
     use rustls::pki_types::pem::PemObject as _;
     use tower::ServiceExt as _;
 
+    struct TestTlsMaterial(std::path::PathBuf);
+
+    impl TestTlsMaterial {
+        fn copy_from_fixtures() -> Self {
+            let source =
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
+            let path = std::env::temp_dir().join(format!(
+                "smesh-transport-unit-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock after epoch")
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&path).expect("create isolated TLS material directory");
+            std::fs::copy(source.join("server.pem"), path.join("server.pem"))
+                .expect("copy server certificate");
+            std::fs::copy(source.join("server.key"), path.join("server.key"))
+                .expect("copy server key");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(
+                    path.join("server.key"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .expect("secure copied server key");
+            }
+            Self(path)
+        }
+    }
+
+    impl Drop for TestTlsMaterial {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[derive(Debug)]
     struct TestServerVerifier;
 
@@ -793,7 +831,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn queued_connection_uses_reloaded_generation_and_capacity_recovers() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
+        let material = TestTlsMaterial::copy_from_fixtures();
+        let root = &material.0;
         let paths = TlsMaterialPaths {
             cert: root.join("server.pem"),
             key: root.join("server.key"),
