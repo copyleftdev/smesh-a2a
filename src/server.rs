@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task};
 use a2a_server::{DefaultRequestHandler, RequestHandler, StaticAgentCard, TaskStore};
@@ -7,9 +8,12 @@ use axum::Router;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
-    BoundedTaskStore, CompletionPolicySpec, ExecutionLimits, InputLimits, MeshDispatcher,
-    PolicyError, RuntimeEventCapture, SmeshExecutor, SqliteTaskStore, VersionedCompletionPolicy,
-    build_agent_card, guard::GuardedRequestHandler,
+    BoundedTaskStore, CompletionPolicySpec, DurableLoopbackEndpoint, ExecutionLimits,
+    InjectedClock, InputLimits, MeshDispatcher, PolicyError, RuntimeEventCapture, SmeshExecutor,
+    SqliteTaskStore, VersionedCompletionPolicy, build_agent_card,
+    durable_handler::DurableRequestHandler,
+    guard::GuardedRequestHandler,
+    outbox_driver::{DurableDriverHandle, spawn_durable_driver},
 };
 
 struct SharedTaskStore<S>(Arc<S>);
@@ -84,6 +88,157 @@ impl GatewayConfig {
     }
 }
 
+/// Structured owner for the durable unary router and its joinable outbox driver.
+pub struct DurableGateway {
+    router: Option<Router>,
+    driver: Option<DurableDriverHandle>,
+    store: Option<SqliteTaskStore>,
+}
+
+impl DurableGateway {
+    /// Clone the protocol router owned by this live gateway.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if called from internal code after the consuming shutdown path
+    /// has already taken the router; safe Rust callers cannot retain `self` then.
+    pub fn router(&self) -> Router {
+        self.router
+            .as_ref()
+            .expect("durable gateway router is unavailable after shutdown")
+            .clone()
+    }
+
+    #[doc(hidden)]
+    pub async fn wait_for_waiter_count(&self, expected: usize) -> Result<(), A2AError> {
+        let driver = self
+            .driver
+            .as_ref()
+            .ok_or_else(|| A2AError::internal("durable gateway is shut down"))?;
+        let mut state = driver.control().subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            loop {
+                if state.borrow().waiters >= expected {
+                    return Ok(());
+                }
+                state
+                    .changed()
+                    .await
+                    .map_err(|_| A2AError::internal("durable outbox driver stopped"))?;
+            }
+        })
+        .await
+        .map_err(|_| A2AError::internal("durable waiter-count wait timed out"))?
+    }
+
+    #[doc(hidden)]
+    pub async fn durable_effect_count(&self) -> Result<u64, A2AError> {
+        self.store
+            .as_ref()
+            .ok_or_else(|| A2AError::internal("durable gateway is shut down"))?
+            .durable_effect_count()
+            .await
+    }
+
+    /// Stop claiming work, join the driver, and release the final durable owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal protocol error if the owned driver fails or panics.
+    pub async fn shutdown(mut self) -> Result<(), A2AError> {
+        let driver = self
+            .driver
+            .take()
+            .ok_or_else(|| A2AError::internal("durable gateway is already shut down"))?;
+        let store = self
+            .store
+            .take()
+            .ok_or_else(|| A2AError::internal("durable gateway is already shut down"))?;
+        let driver_result = driver.shutdown().await;
+        // Closing shared state invalidates handler/router clones and drops both
+        // SQLite and the process ownership lock before shutdown returns.
+        let store_result = store.shutdown_shared().await;
+        self.router.take();
+        driver_result?;
+        store_result?;
+        Ok(())
+    }
+}
+
+impl Drop for DurableGateway {
+    fn drop(&mut self) {
+        // Drop cannot async-join. It cancels and aborts the owned worker, closes
+        // admission for every router clone, then synchronously drops SQLite and
+        // the process ownership lock. Explicit shutdown remains authoritative and
+        // performs the bounded async join.
+        if let Some(driver) = self.driver.as_mut() {
+            driver.abort_owned();
+        }
+        self.driver.take();
+        if let Some(store) = self.store.as_ref() {
+            store.close_shared_sync();
+        }
+        self.store.take();
+        self.router.take();
+    }
+}
+
+/// Build the repository-owned durable loopback gateway.
+///
+/// Unlike the source-compatible generic builders, this accepts no arbitrary
+/// `MeshDispatcher` and never routes send methods through `DefaultRequestHandler`.
+/// It applies `public_base_url`, `input_limits`, and `max_body_bytes` from
+/// [`GatewayConfig`]. `gateway_node_id` and `execution_limits` do not affect this
+/// owned loopback adapter, and `max_tasks` is enforced when opening [`SqliteTaskStore`].
+///
+/// # Errors
+///
+/// Returns an error if durable gateway policy construction fails.
+pub fn build_durable_loopback_gateway(
+    config: GatewayConfig,
+    store: SqliteTaskStore,
+    endpoint: DurableLoopbackEndpoint,
+    clock: InjectedClock,
+) -> Result<DurableGateway, PolicyError> {
+    let GatewayConfig {
+        public_base_url,
+        input_limits,
+        max_body_bytes,
+        ..
+    } = config;
+    let driver = spawn_durable_driver(store.clone(), endpoint, clock.clone());
+    let jsonrpc_handler = Arc::new(DurableRequestHandler::new(
+        store.clone(),
+        driver.control(),
+        clock.clone(),
+        input_limits,
+    ));
+    let rest_handler = Arc::new(
+        DurableRequestHandler::new(store.clone(), driver.control(), clock, input_limits)
+            .with_errors_before_stream(),
+    );
+    let mut durable_card = build_agent_card(&public_base_url);
+    durable_card.capabilities.streaming = Some(true);
+    durable_card.default_output_modes = vec!["application/json".to_owned()];
+    for skill in &mut durable_card.skills {
+        skill.output_modes = Some(vec!["application/json".to_owned()]);
+    }
+    let card = Arc::new(StaticAgentCard::new(durable_card));
+    let router = Router::new()
+        .nest(
+            "/jsonrpc",
+            a2a_server::jsonrpc::jsonrpc_router(jsonrpc_handler),
+        )
+        .nest("/rest", a2a_server::rest::rest_router(rest_handler))
+        .merge(a2a_server::agent_card::agent_card_router(card))
+        .layer(RequestBodyLimitLayer::new(max_body_bytes));
+    Ok(DurableGateway {
+        router: Some(router),
+        driver: Some(driver),
+        store: Some(store),
+    })
+}
+
 /// Compose the official A2A routers around a SMESH executor.
 pub fn build_router<D>(config: GatewayConfig, dispatcher: D) -> Router
 where
@@ -126,7 +281,11 @@ where
     )
 }
 
-/// Compose the A2A router with a persistent store and its durable receipt key.
+/// Compose the compatibility/task-snapshot A2A router with SQLite-backed task state.
+///
+/// This builder still routes through the upstream `DefaultRequestHandler`; it does
+/// not provide repository-owned durable dispatch or receiver effect replay. Use
+/// `build_durable_loopback_gateway` for that production loopback boundary.
 ///
 /// # Errors
 ///
@@ -146,7 +305,10 @@ where
     build_router_with_policy(config, dispatcher, store, policy)
 }
 
-/// Compose the traced A2A router with a persistent store and its durable receipt key.
+/// Compose the traced compatibility/task-snapshot router with SQLite-backed task state.
+///
+/// Like `build_router_with_sqlite`, this is not durable dispatch and does not
+/// provide receiver effect idempotency or replay.
 ///
 /// # Errors
 ///

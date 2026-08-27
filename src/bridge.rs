@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{CompletionEvidence, InputError, InputLimits, extract_text};
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum DispatchError {
     #[error("mesh dispatch failed: {0}")]
@@ -26,7 +26,7 @@ impl DispatchError {
 }
 
 /// Progress emitted by the internal mesh and translated to A2A events.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MeshEvent {
     Progress(String),
     /// Untrusted evidence submitted for gateway-side completion evaluation.

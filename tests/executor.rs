@@ -631,6 +631,7 @@ async fn executor_fails_a_task_if_the_mesh_stream_ends_without_a_terminal_event(
 #[derive(Clone, Default)]
 struct HoldingDispatcher {
     canceled: Arc<Mutex<Vec<String>>>,
+    canceled_notify: Arc<Notify>,
 }
 
 #[async_trait]
@@ -644,6 +645,7 @@ impl MeshDispatcher for HoldingDispatcher {
 
     async fn cancel(&self, task_id: &str) -> Result<(), DispatchError> {
         self.canceled.lock().unwrap().push(task_id.to_owned());
+        self.canceled_notify.notify_waiters();
         Ok(())
     }
 }
@@ -719,6 +721,7 @@ impl MeshDispatcher for ArtifactBurstDispatcher {
 async fn dropping_execution_stream_requests_dispatcher_cancellation() {
     let dispatcher = HoldingDispatcher::default();
     let canceled = Arc::clone(&dispatcher.canceled);
+    let canceled_notify = Arc::clone(&dispatcher.canceled_notify);
     let executor = SmeshExecutor::new(dispatcher, InputLimits::default(), "gateway-node");
     let mut execution = executor.execute(context("drop"));
     assert!(matches!(
@@ -728,10 +731,11 @@ async fn dropping_execution_stream_requests_dispatcher_cancellation() {
     drop(execution);
     tokio::time::timeout(Duration::from_millis(100), async {
         loop {
+            let notified = canceled_notify.notified();
             if !canceled.lock().unwrap().is_empty() {
                 break;
             }
-            tokio::task::yield_now().await;
+            notified.await;
         }
     })
     .await

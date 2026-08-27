@@ -2,10 +2,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use smesh_a2a::{
-    CorrelatingRuntimeProcessor, GatewayConfig, GatewayMode, LoopbackDispatcher,
-    RuntimeAdmissionProcessor, RuntimeEventCapture, RuntimeModeConfig, RuntimeWorker,
-    SqliteTaskStore, build_router, build_router_with_sqlite, build_router_with_sqlite_and_trace,
-    build_router_with_trace,
+    CorrelatingRuntimeProcessor, DurableLoopbackEndpoint, GatewayConfig, GatewayMode,
+    InjectedClock, LoopbackDispatcher, RuntimeAdmissionProcessor, RuntimeEventCapture,
+    RuntimeModeConfig, RuntimeWorker, SqliteTaskStore, SystemClockTicker,
+    build_durable_loopback_gateway, build_router, build_router_with_trace,
 };
 use smesh_core::{Network, Node};
 use smesh_runtime::{MeshConfig, RuntimeConfig, SmeshRuntime};
@@ -37,31 +37,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap = std::env::var("SMESH_A2A_BOOTSTRAP").ok();
     let mode = GatewayMode::parse(mode.as_deref(), mesh_bind.as_deref(), bootstrap.as_deref())?;
     let sqlite_path = std::env::var_os("SMESH_A2A_SQLITE_PATH").map(std::path::PathBuf::from);
+    if matches!(mode, GatewayMode::Runtime(_)) && sqlite_path.is_some() {
+        return Err("durable runtime receiver/effect replay is unsupported; SQLite durable routing is supported only in loopback mode".into());
+    }
 
     match mode {
         GatewayMode::Loopback => {
             let config = GatewayConfig::new(&public_base_url, &gateway_node_id);
-            let app = if let Some(path) = sqlite_path {
-                let store = SqliteTaskStore::open(path, config.max_tasks).await?;
-                build_router_with_sqlite(config, LoopbackDispatcher, store)?
+            if let Some(path) = sqlite_path {
+                run_durable_loopback_gateway(bind, public_base_url, config, path).await?;
             } else {
-                build_router(config, LoopbackDispatcher)
-            };
-            let listener = tokio::net::TcpListener::bind(bind).await?;
-            tracing::info!(%bind, %public_base_url, mode = "loopback", "SMESH A2A gateway listening");
-            axum::serve(listener, app).await?;
+                let app = build_router(config, LoopbackDispatcher);
+                let listener = tokio::net::TcpListener::bind(bind).await?;
+                tracing::info!(%bind, %public_base_url, mode = "loopback", "SMESH A2A gateway listening");
+                axum::serve(listener, app).await?;
+            }
         }
         GatewayMode::Runtime(runtime_config) => {
-            run_runtime_gateway(
-                bind,
-                public_base_url,
-                gateway_node_id,
-                runtime_config,
-                sqlite_path,
-            )
-            .await?;
+            run_runtime_gateway(bind, public_base_url, gateway_node_id, runtime_config).await?;
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<(), std::io::Error> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        signal = terminate.recv() => signal
+            .ok_or_else(|| std::io::Error::other("SIGTERM signal stream closed")),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<(), std::io::Error> {
+    tokio::signal::ctrl_c().await
+}
+
+async fn run_durable_loopback_gateway(
+    bind: SocketAddr,
+    public_base_url: String,
+    config: GatewayConfig,
+    sqlite_path: std::path::PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let store = SqliteTaskStore::open(sqlite_path, config.max_tasks).await?;
+    let clock = InjectedClock::new(chrono::Utc::now().timestamp_millis());
+    let gateway = build_durable_loopback_gateway(
+        config,
+        store,
+        DurableLoopbackEndpoint::new(),
+        clock.clone(),
+    )?;
+    let ticker = SystemClockTicker::spawn(clock);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let app = gateway.router();
+    tracing::info!(%bind, %public_base_url, mode = "loopback", durable = true, "SMESH A2A gateway listening");
+    let mut server = std::pin::pin!(std::future::IntoFuture::into_future(
+        axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned()),
+    ));
+    let serve_result = tokio::select! {
+        result = &mut server => result,
+        signal = shutdown_signal() => {
+            shutdown.cancel();
+            let graceful_result = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                &mut server,
+            ).await {
+                Ok(result) => result,
+                Err(_) => Err(std::io::Error::other(
+                    "durable HTTP graceful shutdown timed out",
+                )),
+            };
+            match signal {
+                Ok(()) => graceful_result,
+                Err(error) => Err(std::io::Error::other(error)),
+            }
+        }
+    };
+    let ticker_result = ticker.shutdown().await;
+    let gateway_result = gateway.shutdown().await;
+    serve_result?;
+    ticker_result?;
+    gateway_result?;
     Ok(())
 }
 
@@ -71,14 +130,8 @@ async fn run_runtime_gateway(
     public_base_url: String,
     gateway_node_id: String,
     runtime_config: RuntimeModeConfig,
-    sqlite_path: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayConfig::new(&public_base_url, &gateway_node_id);
-    let sqlite_store = if let Some(path) = sqlite_path {
-        Some(SqliteTaskStore::open(path, config.max_tasks).await?)
-    } else {
-        None
-    };
     let mut network = Network::new();
     network.add_node(Node::named(&gateway_node_id));
     let mut runtime_value = SmeshRuntime::with_network(network, RuntimeConfig::default());
@@ -142,11 +195,7 @@ async fn run_runtime_gateway(
         64,
     )
     .await?;
-    let app = if let Some(store) = sqlite_store {
-        build_router_with_sqlite_and_trace(config, dispatcher, store, Arc::clone(&capture))?
-    } else {
-        build_router_with_trace(config, dispatcher, Arc::clone(&capture))
-    };
+    let app = build_router_with_trace(config, dispatcher, Arc::clone(&capture));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(
         %bind,
@@ -158,7 +207,7 @@ async fn run_runtime_gateway(
     let mut event_drain_finished = false;
     let serve_result = tokio::select! {
         result = axum::serve(listener, app) => result,
-        signal = tokio::signal::ctrl_c() => signal.map_err(std::io::Error::other),
+        signal = shutdown_signal() => signal.map_err(std::io::Error::other),
         () = trace_failure.cancelled() => Err(std::io::Error::other(
             "required SMESH runtime trace capture failed",
         )),

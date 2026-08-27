@@ -10,6 +10,14 @@ fn agent_card_advertises_supported_bindings_and_streaming() {
     assert_eq!(card.capabilities.push_notifications, Some(false));
     assert_eq!(card.skills.len(), 1);
     assert_eq!(card.skills[0].id, "smesh.collaborative-task");
+    assert_eq!(
+        card.default_output_modes,
+        ["text/plain", "application/json"]
+    );
+    assert_eq!(
+        card.skills[0].output_modes.as_deref(),
+        Some(["text/plain".to_owned(), "application/json".to_owned()].as_slice())
+    );
 
     let bindings: Vec<_> = card
         .supported_interfaces

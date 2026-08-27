@@ -3,11 +3,16 @@
 mod bridge;
 mod card;
 mod channel;
+mod durable_dispatch;
+mod durable_handler;
+#[cfg(test)]
+mod durable_handler_tests;
 mod executor;
 mod guard;
 mod input;
 mod lifeline;
 mod loopback;
+mod outbox_driver;
 mod policy;
 mod runtime_config;
 mod runtime_trace;
@@ -19,6 +24,10 @@ mod store;
 pub use bridge::{DispatchError, MeshDispatcher, MeshEvent, MeshRequest};
 pub use card::build_agent_card;
 pub use channel::{ChannelDispatcher, DispatchCommand};
+pub use durable_dispatch::{
+    DurableDispatchEnvelope, DurableInterruptionKind, DurableLoopbackEndpoint,
+    DurableReceiverResult, DurableReceiverTermination, InjectedClock, SystemClockTicker,
+};
 pub use executor::{ExecutionLimits, SmeshExecutor};
 pub use input::{InputError, InputLimits, extract_text};
 pub use lifeline::{
@@ -43,13 +52,13 @@ pub use runtime_worker::{
     RuntimeWorkerConfig, RuntimeWorkerHandle,
 };
 pub use server::{
-    CompletionPolicyStore, GatewayConfig, build_router, build_router_with_policy,
-    build_router_with_policy_and_trace, build_router_with_sqlite,
-    build_router_with_sqlite_and_trace, build_router_with_trace,
+    CompletionPolicyStore, DurableGateway, GatewayConfig, build_durable_loopback_gateway,
+    build_router, build_router_with_policy, build_router_with_policy_and_trace,
+    build_router_with_sqlite, build_router_with_sqlite_and_trace, build_router_with_trace,
 };
 pub use sqlite_store::{
-    AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition, OutboxLease,
-    SendMessageAdmission, SqliteStoreError, SqliteTaskStore, TRUSTED_SINGLE_TENANT_SCOPE,
-    TransitionOutcome, canonical_send_message_digest,
+    AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition, CancellationOutcome,
+    OutboxLease, ReceiverAdmission, ReceiverLease, SendMessageAdmission, SqliteStoreError,
+    SqliteTaskStore, TRUSTED_SINGLE_TENANT_SCOPE, TransitionOutcome, canonical_send_message_digest,
 };
 pub use store::BoundedTaskStore;
