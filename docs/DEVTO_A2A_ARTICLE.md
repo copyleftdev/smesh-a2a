@@ -94,7 +94,7 @@ For SMESH, that produced a hard architectural rule:
 
 > **A2A is the external task contract. SMESH is the ephemeral internal coordination field.**
 
-The design requires the A2A ledger to outlive internal signal decay. In this MVP, that retention lasts only for the life of the process; restart durability still requires SQLite or Postgres.
+The design requires the A2A ledger to outlive internal signal decay. The production loopback path now uses SQLite-backed durable admission, replay, subscriptions, cancellation, and restart recovery; an in-memory compatibility path remains available for local tests.
 
 The boundary is split between a path that runs now and a path that is only an integration seam:
 
@@ -104,13 +104,13 @@ External A2A client
         | Agent Card / Send / Stream / Get / List / Cancel
         v
 +-------------------- smesh-a2a ---------------------+
-| A2A SDK routers + guarded request handler          |
-| bounded process-local task ledger + executor       |
+| A2A SDK routers + guarded/durable request handler  |
+| bounded task ledger + executor/outbox driver       |
 | validation + MeshDispatcher                        |
 +----------------------------------------------------+
         |
-        +-- default binary mode: LoopbackDispatcher
-        |      `-> deterministic MeshEvent stream
+        +-- default binary mode: loopback
+        |      `-> ephemeral compatibility or durable SQLite receiver
         |
         `-- explicit runtime mode: ChannelDispatcher
                `-> RuntimeWorker -> real SignalType::Query
@@ -118,10 +118,10 @@ External A2A client
                        `-> admission-only MeshEvent proposals
         |
         v
-Process-lifetime A2A task history in the MVP
+SQLite-backed A2A task history in durable loopback mode
 ```
 
-The desired live path is present as a typed, tested boundary. The checked-in standalone executable still takes the loopback path.
+The checked-in executable supports both loopback and explicit runtime modes. Setting `SMESH_A2A_SQLITE_PATH` in loopback mode selects the repository-owned durable receiver/outbox path; runtime mode remains fail-closed with SQLite until durable runtime effect replay exists.
 
 I kept the adapter in a separate repository. `smesh-rust` remains the coordination substrate. `smesh-a2a` can follow A2A's release cycle, server dependencies, and security boundary without pushing HTTP and SDK churn into the core mesh.[6][7]
 
@@ -228,7 +228,7 @@ An external client may reconnect five minutes later and call `GetTask`. An audit
 So the gateway cannot reconstruct its public state by looking at the mesh.
 
 ```text
-A2A task ledger = retained external task state (process-local today)
+A2A task ledger = retained external task state (SQLite-backed in durable mode)
 SMESH signal     = temporary coordination pressure
 ```
 
@@ -290,7 +290,7 @@ The current localhost-first gateway now bounds:
 |---|---:|
 | HTTP request body | 128 KiB |
 | accepted inline text | 64 KiB |
-| retained process-local tasks | 1,024 |
+| retained tasks | 1,024 |
 | active executions | 64 |
 | worker events | 16 |
 | artifacts per task | 16 |
@@ -299,9 +299,11 @@ The current localhost-first gateway now bounds:
 | total task execution | 5 minutes |
 | channel/cancel acknowledgement | 5 seconds |
 
-It also refuses non-loopback binds unless an explicit unsafe override is present.
-
-That override does not add authentication, TLS, tenant isolation, or authorization. It only disables the refusal. The current binary is for localhost and trusted integration work, not direct exposure to the internet.[7]
+It refuses non-loopback binds unless the gateway terminates TLS directly, advertises an HTTPS URL
+covered by its serving certificate, and enables OIDC and/or required mTLS. The old
+`SMESH_A2A_UNSAFE_PUBLIC` override is ignored; it cannot bypass transport or authentication policy.
+Loopback development may explicitly disable authentication, while internet-facing deployment still
+requires tenant authorization and operational hardening beyond transport identity.[7]
 
 I am spelling that out because "supports enterprise authentication" in a protocol specification does not mean every prototype using the protocol is enterprise-secure.
 
@@ -331,13 +333,15 @@ A captured run across live SMESH runtimes would be operational proof. This demo 
 
 | implemented now | still required for an internet-facing system |
 |---|---|
-| A2A v1 Agent Card | authenticated principals |
+| A2A v1 Agent Card advertising OIDC bearer requirements | tenant authorization from the authenticated principal |
 | JSON-RPC and HTTP+JSON/REST bindings | tenant-aware authorization |
-| official-client tests for discovery, JSON-RPC/REST send, streaming, and cancellation | persistent SQL task ledger |
+| official-client tests for discovery, JSON-RPC/REST send, streaming, and cancellation | PostgreSQL production adapter |
+| SQLite durable task ledger, transactional outbox, receiver deduplication, and exact replay | multi-node SQL deployment and operations |
 | SSE task streaming | distributed quotas |
-| Get, List, and Subscribe routes through the SDK handler | TLS termination and deployment policy |
+| direct rustls TLS, optional/required mTLS, OIDC, and atomic SIGHUP material reload | tenant authorization and deployment policy |
+| Get, List, and Subscribe routes through the SDK handler | managed certificate issuance and revocation operations |
 | real `SignalType::Query` construction | live SMESH runtime adapter behind every organization |
-| bounded process-local execution | push callback validation and SSRF controls |
+| bounded execution with durable loopback recovery | push callback validation and SSRF controls |
 | deterministic synthetic replay | captured multi-runtime causal trace |
 
 There are two easy ways to lie with a demo like this.

@@ -1,6 +1,7 @@
 use a2a::{
     AgentCapabilities, AgentCard, AgentInterface, AgentProvider, AgentSkill,
-    TRANSPORT_PROTOCOL_HTTP_JSON, TRANSPORT_PROTOCOL_JSONRPC,
+    HttpAuthSecurityScheme, MutualTlsSecurityScheme, SecurityScheme, TRANSPORT_PROTOCOL_HTTP_JSON,
+    TRANSPORT_PROTOCOL_JSONRPC,
 };
 
 /// Build the public A2A v1 card for a SMESH swarm gateway.
@@ -55,4 +56,58 @@ pub fn build_agent_card(base_url: &str) -> AgentCard {
         security_requirements: None,
         signatures: None,
     }
+}
+
+/// Build a public discovery card whose advertised interfaces require OIDC bearer JWTs.
+#[must_use]
+pub fn build_authenticated_agent_card(base_url: &str) -> AgentCard {
+    build_secured_agent_card(base_url, true, false)
+}
+
+/// Advertise exactly the credential alternatives accepted at the HTTP boundary.
+#[must_use]
+pub fn build_secured_agent_card(base_url: &str, oidc: bool, mutual_tls: bool) -> AgentCard {
+    build_secured_agent_card_with_policy(base_url, oidc, mutual_tls, false)
+}
+
+/// Advertise exact credential alternatives, including handshake-required mTLS.
+#[must_use]
+pub fn build_secured_agent_card_with_policy(
+    base_url: &str,
+    oidc: bool,
+    mutual_tls: bool,
+    mutual_tls_required: bool,
+) -> AgentCard {
+    let mut card = build_agent_card(base_url);
+    let mut schemes = std::collections::HashMap::new();
+    let mut requirements = Vec::new();
+    if oidc {
+        let name = "oidc_bearer".to_owned();
+        schemes.insert(
+            name.clone(),
+            SecurityScheme::HttpAuth(HttpAuthSecurityScheme {
+                scheme: "bearer".to_owned(),
+                description: Some("OIDC RFC 9068 JWT access token".to_owned()),
+                bearer_format: Some("JWT".to_owned()),
+            }),
+        );
+        if !mutual_tls_required {
+            requirements.push(std::collections::HashMap::from([(name, Vec::new())]));
+        }
+    }
+    if mutual_tls {
+        let name = "mutual_tls".to_owned();
+        schemes.insert(
+            name.clone(),
+            SecurityScheme::MutualTls(MutualTlsSecurityScheme {
+                description: Some(
+                    "Verified client certificate mapped by SHA-256 leaf fingerprint".to_owned(),
+                ),
+            }),
+        );
+        requirements.push(std::collections::HashMap::from([(name, Vec::new())]));
+    }
+    card.security_schemes = Some(schemes);
+    card.security_requirements = Some(requirements);
+    card
 }

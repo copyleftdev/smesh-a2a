@@ -128,6 +128,7 @@ fn gateway_address() -> std::net::SocketAddr {
 fn spawn_durable_gateway(address: std::net::SocketAddr, database: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_smesh-a2a-gateway"))
         .env_clear()
+        .env("SMESH_A2A_AUTH_MODE", "disabled")
         .env("SMESH_A2A_MODE", "loopback")
         .env("SMESH_A2A_BIND", address.to_string())
         .env("SMESH_A2A_PUBLIC_URL", format!("http://{address}"))
@@ -584,6 +585,7 @@ async fn runtime_with_sqlite_fails_before_acquiring_any_resource() {
         "runtime plus SQLite rejection process",
         Command::new(env!("CARGO_BIN_EXE_smesh-a2a-gateway"))
             .env_clear()
+            .env("SMESH_A2A_AUTH_MODE", "disabled")
             .env("SMESH_A2A_MODE", "runtime")
             .env("SMESH_A2A_MESH_BIND", mesh_addr.to_string())
             .env("SMESH_A2A_SQLITE_PATH", &database)
