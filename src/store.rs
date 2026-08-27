@@ -100,6 +100,101 @@ fn decode_cursor(
     Ok(cursor)
 }
 
+fn build_list_response(
+    mut tasks: Vec<Task>,
+    req: &ListTasksRequest,
+    cursor_key: &[u8; 32],
+) -> Result<ListTasksResponse, A2AError> {
+    if req.history_length.is_some_and(|length| length < 0) {
+        return Err(A2AError::invalid_params(
+            "historyLength must be a non-negative integer",
+        ));
+    }
+    tasks.retain(|task| {
+        req.context_id
+            .as_ref()
+            .is_none_or(|context| task.context_id == *context)
+            && req
+                .status
+                .as_ref()
+                .is_none_or(|status| task.status.state == *status)
+            && req.status_timestamp_after.is_none_or(|after| {
+                task.status
+                    .timestamp
+                    .is_some_and(|timestamp| timestamp >= after)
+            })
+    });
+    tasks.sort_by(|left, right| {
+        right
+            .status
+            .timestamp
+            .cmp(&left.status.timestamp)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let page_size = req.page_size.unwrap_or(50);
+    if !(1..=100).contains(&page_size) {
+        return Err(A2AError::invalid_params(
+            "pageSize must be between 1 and 100",
+        ));
+    }
+    let cursor_scope = CursorScope::from_request(req, page_size);
+    let start = match req.page_token.as_deref() {
+        None | Some("") => 0,
+        Some(token) => {
+            let cursor = decode_cursor(token, &cursor_scope, cursor_key)?;
+            tasks
+                .iter()
+                .position(|task| {
+                    task.id == cursor.task_id && task.status.timestamp == cursor.status_timestamp
+                })
+                .map(|position| position + 1)
+                .ok_or_else(|| A2AError::invalid_params("pageToken is stale or invalid"))?
+        }
+    };
+    let page_size_usize = usize::try_from(page_size)
+        .map_err(|_| A2AError::invalid_params("pageSize is out of range"))?;
+    let end = start.saturating_add(page_size_usize).min(tasks.len());
+    let total_size = i32::try_from(tasks.len()).unwrap_or(i32::MAX);
+    let next_page_token = if end < tasks.len() {
+        encode_cursor(&tasks[end - 1], cursor_scope, cursor_key)?
+    } else {
+        String::new()
+    };
+    let include_artifacts = req.include_artifacts.unwrap_or(false);
+    let history_length = req
+        .history_length
+        .and_then(|length| usize::try_from(length).ok());
+    let mut page = tasks[start..end].to_vec();
+    for task in &mut page {
+        if !include_artifacts {
+            task.artifacts = None;
+        }
+        if history_length == Some(0) {
+            task.history = None;
+        } else if let (Some(limit), Some(history)) = (history_length, task.history.as_mut())
+            && history.len() > limit
+        {
+            history.drain(..history.len() - limit);
+        }
+    }
+
+    Ok(ListTasksResponse {
+        tasks: page,
+        next_page_token,
+        page_size,
+        total_size,
+    })
+}
+
+pub(crate) fn list_tasks_response(
+    tasks: Vec<Task>,
+    req: &ListTasksRequest,
+    cursor_key: &[u8; 32],
+) -> Result<ListTasksResponse, A2AError> {
+    build_list_response(tasks, req, cursor_key)
+}
+
 #[derive(Default)]
 struct StoreState {
     tasks: HashMap<TaskId, Task>,
@@ -145,7 +240,7 @@ impl TaskStore for BoundedTaskStore {
             .get_mut(&task.id)
             .ok_or_else(|| A2AError::task_not_found(&task.id))?;
         if stored.status.state.is_terminal() {
-            if stored.status.state == task.status.state {
+            if *stored == task {
                 return Ok(1);
             }
             return Err(A2AError::unsupported_operation(
@@ -161,92 +256,7 @@ impl TaskStore for BoundedTaskStore {
     }
 
     async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
-        if req.history_length.is_some_and(|length| length < 0) {
-            return Err(A2AError::invalid_params(
-                "historyLength must be a non-negative integer",
-            ));
-        }
-        let state = self.state.read().await;
-        let mut tasks: Vec<Task> = state
-            .tasks
-            .values()
-            .filter(|task| {
-                req.context_id
-                    .as_ref()
-                    .is_none_or(|context| task.context_id == *context)
-                    && req
-                        .status
-                        .as_ref()
-                        .is_none_or(|status| task.status.state == *status)
-                    && req.status_timestamp_after.is_none_or(|after| {
-                        task.status
-                            .timestamp
-                            .is_some_and(|timestamp| timestamp >= after)
-                    })
-            })
-            .cloned()
-            .collect();
-        tasks.sort_by(|left, right| {
-            right
-                .status
-                .timestamp
-                .cmp(&left.status.timestamp)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-
-        let page_size = req.page_size.unwrap_or(50);
-        if !(1..=100).contains(&page_size) {
-            return Err(A2AError::invalid_params(
-                "pageSize must be between 1 and 100",
-            ));
-        }
-        let cursor_scope = CursorScope::from_request(req, page_size);
-        let start = match req.page_token.as_deref() {
-            None | Some("") => 0,
-            Some(token) => {
-                let cursor = decode_cursor(token, &cursor_scope, &self.cursor_key)?;
-                tasks
-                    .iter()
-                    .position(|task| {
-                        task.id == cursor.task_id
-                            && task.status.timestamp == cursor.status_timestamp
-                    })
-                    .map(|position| position + 1)
-                    .ok_or_else(|| A2AError::invalid_params("pageToken is stale or invalid"))?
-            }
-        };
-        let page_size_usize = usize::try_from(page_size)
-            .map_err(|_| A2AError::invalid_params("pageSize is out of range"))?;
-        let end = start.saturating_add(page_size_usize).min(tasks.len());
-        let total_size = i32::try_from(tasks.len()).unwrap_or(i32::MAX);
-        let next_page_token = if end < tasks.len() {
-            encode_cursor(&tasks[end - 1], cursor_scope, &self.cursor_key)?
-        } else {
-            String::new()
-        };
-        let include_artifacts = req.include_artifacts.unwrap_or(false);
-        let history_length = req
-            .history_length
-            .and_then(|length| usize::try_from(length).ok());
-        let mut page = tasks[start..end].to_vec();
-        for task in &mut page {
-            if !include_artifacts {
-                task.artifacts = None;
-            }
-            if history_length == Some(0) {
-                task.history = None;
-            } else if let (Some(limit), Some(history)) = (history_length, task.history.as_mut())
-                && history.len() > limit
-            {
-                history.drain(..history.len() - limit);
-            }
-        }
-
-        Ok(ListTasksResponse {
-            tasks: page,
-            next_page_token,
-            page_size,
-            total_size,
-        })
+        let tasks = self.state.read().await.tasks.values().cloned().collect();
+        list_tasks_response(tasks, req, &self.cursor_key)
     }
 }

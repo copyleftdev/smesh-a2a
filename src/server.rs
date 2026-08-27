@@ -7,11 +7,30 @@ use axum::Router;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
-    BoundedTaskStore, ExecutionLimits, InputLimits, MeshDispatcher, RuntimeEventCapture,
-    SmeshExecutor, VersionedCompletionPolicy, build_agent_card, guard::GuardedRequestHandler,
+    BoundedTaskStore, CompletionPolicySpec, ExecutionLimits, InputLimits, MeshDispatcher,
+    PolicyError, RuntimeEventCapture, SmeshExecutor, SqliteTaskStore, VersionedCompletionPolicy,
+    build_agent_card, guard::GuardedRequestHandler,
 };
 
 struct SharedTaskStore<S>(Arc<S>);
+
+/// A task store that declares whether completion receipts must use durable key material.
+pub trait CompletionPolicyStore: TaskStore {
+    /// Return the durable receipt key for persistent stores, or `None` for ephemeral stores.
+    fn durable_receipt_key(&self) -> Option<[u8; 32]>;
+}
+
+impl CompletionPolicyStore for BoundedTaskStore {
+    fn durable_receipt_key(&self) -> Option<[u8; 32]> {
+        None
+    }
+}
+
+impl CompletionPolicyStore for SqliteTaskStore {
+    fn durable_receipt_key(&self) -> Option<[u8; 32]> {
+        Some(self.completion_receipt_key())
+    }
+}
 
 impl<S> Clone for SharedTaskStore<S> {
     fn clone(&self) -> Self {
@@ -84,7 +103,7 @@ where
     D: MeshDispatcher,
 {
     let store = BoundedTaskStore::new(config.max_tasks);
-    build_router_with_policy_and_trace(
+    compose_router_with_policy_and_trace(
         config,
         dispatcher,
         store,
@@ -93,41 +112,108 @@ where
     )
 }
 
-/// Compose the official A2A routers around a SMESH executor and injected task store.
-///
-/// The injected store keeps protocol guards and the SDK request handler on the same
-/// authoritative task view. The router wraps the supplied store in an internal
-/// reference-counted adapter before cloning it, so even a store with deep-copy
-/// [`Clone`] semantics cannot split the guard and SDK views. Production persistence
-/// adapters can implement [`TaskStore`] without changing the public A2A routing layer.
-pub fn build_router_with_store<D, S>(config: GatewayConfig, dispatcher: D, store: S) -> Router
+fn build_router_with_store<D, S>(config: GatewayConfig, dispatcher: D, store: S) -> Router
 where
     D: MeshDispatcher,
     S: TaskStore,
 {
-    build_router_with_policy(
+    compose_router_with_policy_and_trace(
         config,
         dispatcher,
         store,
         VersionedCompletionPolicy::default(),
+        None,
     )
 }
 
+/// Compose the A2A router with a persistent store and its durable receipt key.
+///
+/// # Errors
+///
+/// Returns an error if the built-in completion-policy profile is invalid.
+pub fn build_router_with_sqlite<D>(
+    config: GatewayConfig,
+    dispatcher: D,
+    store: SqliteTaskStore,
+) -> Result<Router, PolicyError>
+where
+    D: MeshDispatcher,
+{
+    let policy = VersionedCompletionPolicy::new_with_receipt_key(
+        CompletionPolicySpec::development(),
+        store.completion_receipt_key(),
+    )?;
+    build_router_with_policy(config, dispatcher, store, policy)
+}
+
+/// Compose the traced A2A router with a persistent store and its durable receipt key.
+///
+/// # Errors
+///
+/// Returns an error if the built-in completion-policy profile is invalid.
+pub fn build_router_with_sqlite_and_trace<D>(
+    config: GatewayConfig,
+    dispatcher: D,
+    store: SqliteTaskStore,
+    trace: Arc<RuntimeEventCapture>,
+) -> Result<Router, PolicyError>
+where
+    D: MeshDispatcher,
+{
+    let policy = VersionedCompletionPolicy::new_with_receipt_key(
+        CompletionPolicySpec::development(),
+        store.completion_receipt_key(),
+    )?;
+    build_router_with_policy_and_trace(config, dispatcher, store, policy, Some(trace))
+}
+
 /// Compose the A2A router with explicit store and completion-policy boundaries.
+///
+/// # Errors
+///
+/// Returns an error when a persistent SQLite store and policy use different receipt keys.
 pub fn build_router_with_policy<D, S>(
     config: GatewayConfig,
     dispatcher: D,
     store: S,
     policy: VersionedCompletionPolicy,
-) -> Router
+) -> Result<Router, PolicyError>
 where
     D: MeshDispatcher,
-    S: TaskStore,
+    S: CompletionPolicyStore + 'static,
 {
     build_router_with_policy_and_trace(config, dispatcher, store, policy, None)
 }
 
-fn build_router_with_policy_and_trace<D, S>(
+/// Compose the traced A2A router with explicit store and completion-policy boundaries.
+///
+/// # Errors
+///
+/// Returns an error when a persistent SQLite store and policy use different receipt keys.
+pub fn build_router_with_policy_and_trace<D, S>(
+    config: GatewayConfig,
+    dispatcher: D,
+    store: S,
+    policy: VersionedCompletionPolicy,
+    trace: Option<Arc<RuntimeEventCapture>>,
+) -> Result<Router, PolicyError>
+where
+    D: MeshDispatcher,
+    S: CompletionPolicyStore + 'static,
+{
+    if let Some(receipt_key) = store.durable_receipt_key()
+        && receipt_key != policy.receipt_key()
+    {
+        return Err(PolicyError::InvalidPolicy(
+            "persistent task store and completion policy use different receipt keys".to_owned(),
+        ));
+    }
+    Ok(compose_router_with_policy_and_trace(
+        config, dispatcher, store, policy, trace,
+    ))
+}
+
+fn compose_router_with_policy_and_trace<D, S>(
     config: GatewayConfig,
     dispatcher: D,
     store: S,

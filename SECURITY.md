@@ -6,7 +6,7 @@ The `0.1.x` line is an MVP intended for local development and integration testin
 
 ## Deployment boundary
 
-The bundled binary binds to loopback by default. Do not expose it directly to an untrusted network. It does not yet implement authentication, tenant authorization, persistent task storage, request quotas, or TLS termination.
+The bundled binary binds to loopback by default. Do not expose it directly to an untrusted network. It does not yet implement authentication, tenant authorization, tenant-aware persistence, request quotas, or TLS termination.
 
 Current controls:
 
@@ -25,8 +25,9 @@ Current controls:
 - worker completion treated as an untrusted proposal; candidate artifacts remain buffered until
   a versioned, bounded, deterministic policy accepts the sealed evidence snapshot
 - blocking-contradiction veto and signed, allowlisted ratification for human-required profiles
-- process-local HMAC seals on ratification checkpoints and accepted completion receipts, verified
-  with task/context/policy and recomputed artifact bindings before stored tasks are exposed
+- HMAC seals on ratification checkpoints and accepted completion receipts, verified with
+  task/context/policy and recomputed artifact bindings before stored tasks are exposed; SQLite mode
+  stores the receipt key in the owner-only ledger so pre-restart receipts remain verifiable
 - bounded dispatcher cancellation after local deadlines, inactivity, resource-budget failures,
   policy rejection, and abandoned response streams
 - explicit `loopback`/`runtime` mode selection; malformed runtime or bootstrap addresses fail startup
@@ -43,8 +44,11 @@ identity and ledger work. The loopback worker emits explicitly synthetic evidenc
 The bundled runtime admission processor emits a private candidate receipt and completion proposal but
 no review, test, contradiction, or ratification evidence. Runtime ingress therefore fails closed
 under the default completion policy and cannot masquerade as semantically completed work.
-The receipt key is process-local like the current in-memory ledger; durable key management and
-restart replay are not claimed by this release.
+The SQLite task ledger is Unix-only, owner-only, single-writer, crash-durable after transaction
+commit, and persists its cursor and completion-receipt keys. It is not a tenant boundary or a general
+key-management system: key rotation, revocation, identity binding, rollback-resistant freshness, and
+cross-host coordination remain production work. In-memory mode retains process-local keys and ledger
+state.
 
 ## Known dependency warning
 
@@ -59,7 +63,7 @@ gateway MSRV to Rust 1.88.
 Before internet or multi-tenant deployment, add:
 
 - authenticated principals and tenant-scoped authorization on every task operation;
-- persistent, tenant-aware `TaskStore` implementation;
+- tenant-aware persistence and key management;
 - TLS or a trusted reverse proxy;
 - per-principal rate, concurrency, task-duration, history, and artifact quotas;
 - structured audit logs and distributed tracing;
