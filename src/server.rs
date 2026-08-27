@@ -4,13 +4,15 @@ use std::time::Duration;
 use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task};
 use a2a_server::{DefaultRequestHandler, RequestHandler, StaticAgentCard, TaskStore};
 use async_trait::async_trait;
-use axum::Router;
+use axum::{Router, middleware};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
     BoundedTaskStore, CompletionPolicySpec, DurableLoopbackEndpoint, ExecutionLimits,
     InjectedClock, InputLimits, MeshDispatcher, PolicyError, RuntimeEventCapture, SmeshExecutor,
-    SqliteTaskStore, VersionedCompletionPolicy, build_agent_card,
+    SqliteTaskStore, VersionedCompletionPolicy,
+    auth::{AuthState, authenticate_request},
+    build_agent_card, build_secured_agent_card_with_policy,
     durable_handler::DurableRequestHandler,
     guard::GuardedRequestHandler,
     outbox_driver::{DurableDriverHandle, spawn_durable_driver},
@@ -200,6 +202,39 @@ pub fn build_durable_loopback_gateway(
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
 ) -> Result<DurableGateway, PolicyError> {
+    Ok(build_durable_gateway_inner(
+        config, store, endpoint, clock, None,
+    ))
+}
+
+/// Build the durable loopback gateway with bearer authentication protecting
+/// every JSON-RPC and REST operation while leaving the well-known card public.
+///
+/// # Errors
+/// Returns an error if durable gateway policy construction fails.
+pub fn build_authenticated_durable_loopback_gateway(
+    config: GatewayConfig,
+    store: SqliteTaskStore,
+    endpoint: DurableLoopbackEndpoint,
+    clock: InjectedClock,
+    auth: AuthState,
+) -> Result<DurableGateway, PolicyError> {
+    Ok(build_durable_gateway_inner(
+        config,
+        store,
+        endpoint,
+        clock,
+        Some(auth),
+    ))
+}
+
+fn build_durable_gateway_inner(
+    config: GatewayConfig,
+    store: SqliteTaskStore,
+    endpoint: DurableLoopbackEndpoint,
+    clock: InjectedClock,
+    auth: Option<AuthState>,
+) -> DurableGateway {
     let GatewayConfig {
         public_base_url,
         input_limits,
@@ -217,26 +252,45 @@ pub fn build_durable_loopback_gateway(
         DurableRequestHandler::new(store.clone(), driver.control(), clock, input_limits)
             .with_errors_before_stream(),
     );
-    let mut durable_card = build_agent_card(&public_base_url);
+    let mut durable_card = if let Some(auth) = auth.as_ref() {
+        build_secured_agent_card_with_policy(
+            &public_base_url,
+            auth.bearer_enabled(),
+            auth.mutual_tls_enabled(),
+            auth.mutual_tls_required(),
+        )
+    } else {
+        build_agent_card(&public_base_url)
+    };
     durable_card.capabilities.streaming = Some(true);
     durable_card.default_output_modes = vec!["application/json".to_owned()];
     for skill in &mut durable_card.skills {
         skill.output_modes = Some(vec!["application/json".to_owned()]);
     }
     let card = Arc::new(StaticAgentCard::new(durable_card));
-    let router = Router::new()
-        .nest(
-            "/jsonrpc",
-            a2a_server::jsonrpc::jsonrpc_router(jsonrpc_handler),
-        )
-        .nest("/rest", a2a_server::rest::rest_router(rest_handler))
-        .merge(a2a_server::agent_card::agent_card_router(card))
-        .layer(RequestBodyLimitLayer::new(max_body_bytes));
-    Ok(DurableGateway {
+    let protocol = if let Some(auth) = auth {
+        let jsonrpc = auth.wrap_handler(jsonrpc_handler);
+        let rest = auth.wrap_handler(rest_handler);
+        Router::new()
+            .nest("/jsonrpc", a2a_server::jsonrpc::jsonrpc_router(jsonrpc))
+            .nest("/rest", a2a_server::rest::rest_router(rest))
+            .layer(RequestBodyLimitLayer::new(max_body_bytes))
+            .layer(middleware::from_fn_with_state(auth, authenticate_request))
+    } else {
+        Router::new()
+            .nest(
+                "/jsonrpc",
+                a2a_server::jsonrpc::jsonrpc_router(jsonrpc_handler),
+            )
+            .nest("/rest", a2a_server::rest::rest_router(rest_handler))
+            .layer(RequestBodyLimitLayer::new(max_body_bytes))
+    };
+    let router = protocol.merge(a2a_server::agent_card::agent_card_router(card));
+    DurableGateway {
         router: Some(router),
         driver: Some(driver),
         store: Some(store),
-    })
+    }
 }
 
 /// Compose the official A2A routers around a SMESH executor.
@@ -246,6 +300,74 @@ where
 {
     let store = BoundedTaskStore::new(config.max_tasks);
     build_router_with_store(config, dispatcher, store)
+}
+
+/// Compose opt-in bearer-authenticated official JSON-RPC and REST routers.
+/// The well-known agent card remains public. Existing loopback builders stay
+/// intentionally unauthenticated for source-compatible local tests.
+pub fn build_authenticated_router<D>(
+    config: GatewayConfig,
+    dispatcher: D,
+    auth: AuthState,
+) -> Router
+where
+    D: MeshDispatcher,
+{
+    build_authenticated_router_inner(config, dispatcher, auth, None)
+}
+
+/// Compose authenticated protocol routers while preserving canonical runtime trace capture.
+pub fn build_authenticated_router_with_trace<D>(
+    config: GatewayConfig,
+    dispatcher: D,
+    auth: AuthState,
+    trace: Arc<RuntimeEventCapture>,
+) -> Router
+where
+    D: MeshDispatcher,
+{
+    build_authenticated_router_inner(config, dispatcher, auth, Some(trace))
+}
+
+fn build_authenticated_router_inner<D>(
+    config: GatewayConfig,
+    dispatcher: D,
+    auth: AuthState,
+    trace: Option<Arc<RuntimeEventCapture>>,
+) -> Router
+where
+    D: MeshDispatcher,
+{
+    let max_body_bytes = config.max_body_bytes;
+    let store = SharedTaskStore(Arc::new(BoundedTaskStore::new(config.max_tasks)));
+    let policy = VersionedCompletionPolicy::default();
+    let mut executor = SmeshExecutor::new(dispatcher, config.input_limits, config.gateway_node_id)
+        .with_execution_limits(config.execution_limits)
+        .with_completion_policy(policy.clone());
+    if let Some(trace) = trace {
+        executor = executor.with_runtime_trace(trace);
+    }
+    let executor = auth.wrap_executor(executor);
+    let inner: Arc<dyn RequestHandler> =
+        Arc::new(DefaultRequestHandler::new(executor, store.clone()));
+    let guarded: Arc<dyn RequestHandler> =
+        Arc::new(GuardedRequestHandler::new(inner, store, policy));
+    let handler = auth.wrap_handler(guarded);
+    let card = Arc::new(StaticAgentCard::new(build_secured_agent_card_with_policy(
+        &config.public_base_url,
+        auth.bearer_enabled(),
+        auth.mutual_tls_enabled(),
+        auth.mutual_tls_required(),
+    )));
+    let protected = Router::new()
+        .nest(
+            "/jsonrpc",
+            a2a_server::jsonrpc::jsonrpc_router(handler.clone()),
+        )
+        .nest("/rest", a2a_server::rest::rest_router(handler))
+        .layer(RequestBodyLimitLayer::new(max_body_bytes))
+        .layer(middleware::from_fn_with_state(auth, authenticate_request));
+    protected.merge(a2a_server::agent_card::agent_card_router(card))
 }
 
 /// Compose the official A2A routers with canonical runtime/gateway trace capture.

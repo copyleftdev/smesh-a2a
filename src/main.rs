@@ -1,18 +1,325 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use smesh_a2a::auth::{
+    AuthState, HttpJwksProvider, JwtBearerVerifier, JwtVerifierConfig, SystemAuthClock,
+};
+use smesh_a2a::transport::{
+    ClientAuthMode, ProductionTransportConfig, TlsIdentityAcceptor, TlsMaterialPaths,
+    TlsSnapshotManager, TransportMode, load_tls_snapshot,
+};
 use smesh_a2a::{
     CorrelatingRuntimeProcessor, DurableLoopbackEndpoint, GatewayConfig, GatewayMode,
     InjectedClock, LoopbackDispatcher, RuntimeAdmissionProcessor, RuntimeEventCapture,
     RuntimeModeConfig, RuntimeWorker, SqliteTaskStore, SystemClockTicker,
-    build_durable_loopback_gateway, build_router, build_router_with_trace,
+    build_authenticated_durable_loopback_gateway, build_authenticated_router,
+    build_authenticated_router_with_trace, build_durable_loopback_gateway, build_router,
+    build_router_with_trace,
 };
 use smesh_core::{Network, Node};
 use smesh_runtime::{MeshConfig, RuntimeConfig, SmeshRuntime};
 
+async fn auth_state_from_environment() -> Result<Option<AuthState>, Box<dyn std::error::Error>> {
+    let mode = std::env::var("SMESH_A2A_AUTH_MODE").unwrap_or_else(|_| "oidc".to_owned());
+    if mode == "disabled" {
+        return Ok(None);
+    }
+    if mode != "oidc" {
+        return Err(
+            "SMESH_A2A_AUTH_MODE must be oidc or explicitly disabled for loopback development"
+                .into(),
+        );
+    }
+    let issuer = std::env::var("SMESH_A2A_OIDC_ISSUER")
+        .map_err(|_| "SMESH_A2A_OIDC_ISSUER is required when OIDC authentication is enabled")?;
+    let audience = std::env::var("SMESH_A2A_OIDC_AUDIENCE")
+        .map_err(|_| "SMESH_A2A_OIDC_AUDIENCE is required when OIDC authentication is enabled")?;
+    let jwks_uri = std::env::var("SMESH_A2A_OIDC_JWKS_URI")
+        .map_err(|_| "SMESH_A2A_OIDC_JWKS_URI is required when OIDC authentication is enabled")?;
+    if issuer.is_empty()
+        || issuer.len() > 2_048
+        || audience.is_empty()
+        || audience.len() > 512
+        || jwks_uri.is_empty()
+        || jwks_uri.len() > 4_096
+    {
+        return Err("OIDC issuer, audience, or JWKS URI violates configured bounds".into());
+    }
+    let issuer_url = url::Url::parse(&issuer)?;
+    let parsed_jwks = url::Url::parse(&jwks_uri)?;
+    for parsed in [&issuer_url, &parsed_jwks] {
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err("OIDC issuer and JWKS URI must be bounded HTTPS URLs without credentials or fragments".into());
+        }
+    }
+    if issuer_url.query().is_some() {
+        return Err("OIDC issuer URL must not contain a query".into());
+    }
+    let allow_cross_origin = match std::env::var("SMESH_A2A_OIDC_ALLOW_CROSS_ORIGIN_JWKS") {
+        Ok(value) if value == "1" => true,
+        Ok(value) if value == "0" => false,
+        Ok(_) => return Err("SMESH_A2A_OIDC_ALLOW_CROSS_ORIGIN_JWKS must be 0 or 1".into()),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !allow_cross_origin
+        && (
+            issuer_url.scheme(),
+            issuer_url.host_str(),
+            issuer_url.port_or_known_default(),
+        ) != (
+            parsed_jwks.scheme(),
+            parsed_jwks.host_str(),
+            parsed_jwks.port_or_known_default(),
+        )
+    {
+        return Err(
+            "cross-origin OIDC JWKS URI requires SMESH_A2A_OIDC_ALLOW_CROSS_ORIGIN_JWKS=1".into(),
+        );
+    }
+    let max_jwks_bytes = std::env::var("SMESH_A2A_OIDC_MAX_JWKS_BYTES")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(256 * 1024);
+    let clock_skew_seconds = std::env::var("SMESH_A2A_OIDC_CLOCK_SKEW_SECONDS")
+        .ok()
+        .map(|value| value.parse::<i64>())
+        .transpose()?
+        .unwrap_or(30);
+    if !(1..=1024 * 1024).contains(&max_jwks_bytes) || !(0..=300).contains(&clock_skew_seconds) {
+        return Err("OIDC JWKS limit must be 1..=1048576 and clock skew 0..=300 seconds".into());
+    }
+    let provider = Arc::new(HttpJwksProvider::new(
+        &jwks_uri,
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(300),
+        std::time::Duration::from_secs(6 * 60 * 60),
+    )?);
+    let mut config = JwtVerifierConfig::strict(issuer, audience);
+    config.max_jwks_bytes = max_jwks_bytes;
+    config.clock_skew_seconds = clock_skew_seconds;
+    let verifier =
+        Arc::new(JwtBearerVerifier::new(config, provider, Arc::new(SystemAuthClock::new())).await?);
+    Ok(Some(AuthState::new(verifier, rand::random())))
+}
+
+#[derive(Clone)]
+enum HttpTransport {
+    Plain,
+    Direct {
+        snapshots: Arc<TlsSnapshotManager>,
+        handshake_timeout: std::time::Duration,
+        max_connections: usize,
+    },
+}
+
+fn transport_from_environment(
+    bind: SocketAddr,
+    public_url: &str,
+    oidc_enabled: bool,
+) -> Result<(ProductionTransportConfig, HttpTransport), Box<dyn std::error::Error>> {
+    let mode: TransportMode = std::env::var("SMESH_A2A_TRANSPORT_MODE")
+        .unwrap_or_else(|_| "loopback-plain".to_owned())
+        .parse()?;
+    let client_auth: ClientAuthMode = std::env::var("SMESH_A2A_CLIENT_AUTH_MODE")
+        .unwrap_or_else(|_| "disabled".to_owned())
+        .parse()?;
+    let cert_path = std::env::var_os("SMESH_A2A_TLS_CERT_PATH").map(std::path::PathBuf::from);
+    let key_path = std::env::var_os("SMESH_A2A_TLS_KEY_PATH").map(std::path::PathBuf::from);
+    let client_ca_path =
+        std::env::var_os("SMESH_A2A_TLS_CLIENT_CA_PATH").map(std::path::PathBuf::from);
+    let principal_map_path =
+        std::env::var_os("SMESH_A2A_TLS_PRINCIPAL_MAP_PATH").map(std::path::PathBuf::from);
+    let handshake_timeout = std::time::Duration::from_secs(
+        std::env::var("SMESH_A2A_TLS_HANDSHAKE_TIMEOUT_SECONDS")
+            .ok()
+            .map(|value| value.parse())
+            .transpose()?
+            .unwrap_or(10),
+    );
+    let max_connections = std::env::var("SMESH_A2A_MAX_CONNECTIONS")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(1024);
+    let config = ProductionTransportConfig {
+        mode,
+        client_auth,
+        bind,
+        public_url: public_url.to_owned(),
+        oidc_enabled,
+        cert_path: cert_path.clone(),
+        key_path: key_path.clone(),
+        client_ca_path: client_ca_path.clone(),
+        principal_map_path: principal_map_path.clone(),
+        handshake_timeout,
+        max_connections,
+    };
+    config.validate_paths_and_policy()?;
+    let runtime = if mode == TransportMode::DirectTls {
+        let paths = TlsMaterialPaths {
+            cert: cert_path.ok_or("TLS certificate path is required")?,
+            key: key_path.ok_or("TLS private key path is required")?,
+            client_ca: client_ca_path,
+            principal_map: principal_map_path,
+        };
+        let snapshot = load_tls_snapshot(&paths, client_auth, 1)?;
+        if !snapshot.covers_public_url(public_url) {
+            return Err(
+                "direct TLS public URL host is not covered by the serving certificate".into(),
+            );
+        }
+        HttpTransport::Direct {
+            snapshots: Arc::new(TlsSnapshotManager::new(
+                snapshot,
+                paths,
+                client_auth,
+                public_url.to_owned(),
+            )),
+            handshake_timeout,
+            max_connections,
+        }
+    } else {
+        HttpTransport::Plain
+    };
+    Ok((config, runtime))
+}
+
+#[derive(Clone, Copy)]
+enum ServerControl {
+    Shutdown,
+    Reload,
+}
+
+#[cfg(unix)]
+struct ServerControlSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ServerControlSignals {
+    fn new() -> Result<Self, std::io::Error> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            hangup: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?,
+        })
+    }
+
+    async fn next(&mut self) -> Result<ServerControl, std::io::Error> {
+        tokio::select! {
+            signal = self.interrupt.recv() => signal.map(|()| ServerControl::Shutdown).ok_or_else(|| std::io::Error::other("SIGINT stream closed")),
+            signal = self.terminate.recv() => signal.map(|()| ServerControl::Shutdown).ok_or_else(|| std::io::Error::other("SIGTERM stream closed")),
+            signal = self.hangup.recv() => signal.map(|()| ServerControl::Reload).ok_or_else(|| std::io::Error::other("SIGHUP stream closed")),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ServerControlSignals;
+
+#[cfg(not(unix))]
+impl ServerControlSignals {
+    fn new() -> Result<Self, std::io::Error> {
+        Ok(Self)
+    }
+
+    async fn next(&mut self) -> Result<ServerControl, std::io::Error> {
+        tokio::signal::ctrl_c()
+            .await
+            .map(|()| ServerControl::Shutdown)
+    }
+}
+
+struct AbortServerTask(tokio::task::JoinHandle<Result<(), std::io::Error>>);
+impl Drop for AbortServerTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn serve_router(
+    listener: std::net::TcpListener,
+    app: axum::Router,
+    transport: HttpTransport,
+) -> Result<(), std::io::Error> {
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let direct_handle = a2a_server::tls::axum_server::Handle::new();
+    let snapshots = match &transport {
+        HttpTransport::Direct { snapshots, .. } => Some(Arc::clone(snapshots)),
+        HttpTransport::Plain => None,
+    };
+    let mut server = AbortServerTask(match transport {
+        HttpTransport::Plain => {
+            listener.set_nonblocking(true)?;
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            let stop = cancellation.clone();
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(stop.cancelled_owned())
+                    .await
+            })
+        }
+        HttpTransport::Direct {
+            snapshots,
+            handshake_timeout,
+            max_connections,
+        } => {
+            listener.set_nonblocking(true)?;
+            let acceptor = TlsIdentityAcceptor::new(snapshots, handshake_timeout, max_connections);
+            let handle = direct_handle.clone();
+            let server = a2a_server::tls::axum_server::from_tcp(listener)?
+                .acceptor(acceptor)
+                .handle(handle);
+            tokio::spawn(async move { server.serve(app.into_make_service()).await })
+        }
+    });
+    let mut signals = ServerControlSignals::new()?;
+    tracing::info!("server control signals armed");
+    loop {
+        tokio::select! {
+            result = &mut server.0 => return result.map_err(std::io::Error::other)?,
+            control = signals.next() => match control? {
+                ServerControl::Reload => {
+                    if let Some(snapshots) = snapshots.as_ref() {
+                        if let Ok(generation) = snapshots.reload() {
+                            tracing::info!(generation, "TLS snapshot reloaded");
+                        } else {
+                            tracing::error!("TLS snapshot reload rejected; retaining prior generation");
+                        }
+                    }
+                }
+                ServerControl::Shutdown => {
+                    cancellation.cancel();
+                    direct_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+                    if let Ok(result) = tokio::time::timeout(
+                        std::time::Duration::from_secs(6),
+                        &mut server.0,
+                    ).await {
+                        return result.map_err(std::io::Error::other)?;
+                    }
+                    server.0.abort();
+                    let _ = (&mut server.0).await;
+                    return Err(std::io::Error::other("HTTP server shutdown deadline exceeded"));
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -23,11 +330,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()?;
     let public_base_url =
         std::env::var("SMESH_A2A_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
-    let allow_public = std::env::var("SMESH_A2A_UNSAFE_PUBLIC").as_deref() == Ok("1");
-    if !bind.ip().is_loopback() && !allow_public {
-        return Err(
-            "refusing non-loopback bind; set SMESH_A2A_UNSAFE_PUBLIC=1 after adding authentication and TLS"
-                .into(),
+    let oidc_enabled = std::env::var("SMESH_A2A_AUTH_MODE").as_deref() != Ok("disabled");
+    let (transport_config, http_transport) =
+        transport_from_environment(bind, &public_base_url, oidc_enabled)?;
+    let legacy_unsafe_public = std::env::var("SMESH_A2A_UNSAFE_PUBLIC").as_deref() == Ok("1");
+    if legacy_unsafe_public {
+        tracing::warn!(
+            "SMESH_A2A_UNSAFE_PUBLIC is ignored; transport/auth policy remains fail-closed"
         );
     }
     let gateway_node_id =
@@ -40,82 +349,92 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(mode, GatewayMode::Runtime(_)) && sqlite_path.is_some() {
         return Err("durable runtime receiver/effect replay is unsupported; SQLite durable routing is supported only in loopback mode".into());
     }
+    let mut auth = auth_state_from_environment().await?;
+    if transport_config.client_auth != ClientAuthMode::Disabled {
+        auth = Some(match auth {
+            Some(state) if transport_config.client_auth == ClientAuthMode::Required => {
+                state.with_required_mutual_tls()
+            }
+            Some(state) => state.with_mutual_tls(),
+            None => AuthState::mutual_tls_only(rand::random()),
+        });
+    }
+    // Reserve the public endpoint before SQLite, runtime, mesh, ticker, or
+    // worker resources can be acquired or mutate durable state.
+    let listener = std::net::TcpListener::bind(bind)?;
 
     match mode {
         GatewayMode::Loopback => {
             let config = GatewayConfig::new(&public_base_url, &gateway_node_id);
             if let Some(path) = sqlite_path {
-                run_durable_loopback_gateway(bind, public_base_url, config, path).await?;
+                run_durable_loopback_gateway(
+                    listener,
+                    bind,
+                    public_base_url,
+                    config,
+                    path,
+                    auth,
+                    http_transport.clone(),
+                )
+                .await?;
             } else {
-                let app = build_router(config, LoopbackDispatcher);
-                let listener = tokio::net::TcpListener::bind(bind).await?;
-                tracing::info!(%bind, %public_base_url, mode = "loopback", "SMESH A2A gateway listening");
-                axum::serve(listener, app).await?;
+                let app = if let Some(auth) = auth {
+                    build_authenticated_router(config, LoopbackDispatcher, auth)
+                } else {
+                    build_router(config, LoopbackDispatcher)
+                };
+                tracing::info!(%bind, %public_base_url, mode = "loopback", transport = %transport_config.mode, "SMESH A2A gateway listening");
+                serve_router(listener, app, http_transport.clone()).await?;
             }
         }
         GatewayMode::Runtime(runtime_config) => {
-            run_runtime_gateway(bind, public_base_url, gateway_node_id, runtime_config).await?;
+            run_runtime_gateway(
+                listener,
+                bind,
+                public_base_url,
+                gateway_node_id,
+                runtime_config,
+                auth,
+                http_transport,
+            )
+            .await?;
         }
     }
     Ok(())
 }
 
-#[cfg(unix)]
-async fn shutdown_signal() -> Result<(), std::io::Error> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result,
-        signal = terminate.recv() => signal
-            .ok_or_else(|| std::io::Error::other("SIGTERM signal stream closed")),
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() -> Result<(), std::io::Error> {
-    tokio::signal::ctrl_c().await
-}
-
 async fn run_durable_loopback_gateway(
+    listener: std::net::TcpListener,
     bind: SocketAddr,
     public_base_url: String,
     config: GatewayConfig,
     sqlite_path: std::path::PathBuf,
+    auth: Option<AuthState>,
+    transport: HttpTransport,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(bind).await?;
     let store = SqliteTaskStore::open(sqlite_path, config.max_tasks).await?;
     let clock = InjectedClock::new(chrono::Utc::now().timestamp_millis());
-    let gateway = build_durable_loopback_gateway(
-        config,
-        store,
-        DurableLoopbackEndpoint::new(),
-        clock.clone(),
-    )?;
+    let gateway = if let Some(auth) = auth {
+        build_authenticated_durable_loopback_gateway(
+            config,
+            store,
+            DurableLoopbackEndpoint::new(),
+            clock.clone(),
+            auth,
+        )?
+    } else {
+        build_durable_loopback_gateway(
+            config,
+            store,
+            DurableLoopbackEndpoint::new(),
+            clock.clone(),
+        )?
+    };
     let ticker = SystemClockTicker::spawn(clock);
-    let shutdown = tokio_util::sync::CancellationToken::new();
     let app = gateway.router();
     tracing::info!(%bind, %public_base_url, mode = "loopback", durable = true, "SMESH A2A gateway listening");
-    let mut server = std::pin::pin!(std::future::IntoFuture::into_future(
-        axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned()),
-    ));
-    let serve_result = tokio::select! {
-        result = &mut server => result,
-        signal = shutdown_signal() => {
-            shutdown.cancel();
-            let graceful_result = match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                &mut server,
-            ).await {
-                Ok(result) => result,
-                Err(_) => Err(std::io::Error::other(
-                    "durable HTTP graceful shutdown timed out",
-                )),
-            };
-            match signal {
-                Ok(()) => graceful_result,
-                Err(error) => Err(std::io::Error::other(error)),
-            }
-        }
-    };
+    let serve_result = serve_router(listener, app, transport).await;
+
     let ticker_result = ticker.shutdown().await;
     let gateway_result = gateway.shutdown().await;
     serve_result?;
@@ -126,10 +445,13 @@ async fn run_durable_loopback_gateway(
 
 #[allow(clippy::too_many_lines)] // Keep runtime startup, trace supervision, and shutdown ownership linear.
 async fn run_runtime_gateway(
+    listener: std::net::TcpListener,
     bind: SocketAddr,
     public_base_url: String,
     gateway_node_id: String,
     runtime_config: RuntimeModeConfig,
+    auth: Option<AuthState>,
+    transport: HttpTransport,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayConfig::new(&public_base_url, &gateway_node_id);
     let mut network = Network::new();
@@ -195,8 +517,11 @@ async fn run_runtime_gateway(
         64,
     )
     .await?;
-    let app = build_router_with_trace(config, dispatcher, Arc::clone(&capture));
-    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let app = if let Some(auth) = auth {
+        build_authenticated_router_with_trace(config, dispatcher, auth, Arc::clone(&capture))
+    } else {
+        build_router_with_trace(config, dispatcher, Arc::clone(&capture))
+    };
     tracing::info!(
         %bind,
         %public_base_url,
@@ -205,9 +530,9 @@ async fn run_runtime_gateway(
         "SMESH A2A gateway listening"
     );
     let mut event_drain_finished = false;
+    let mut http_server = std::pin::pin!(serve_router(listener, app, transport));
     let serve_result = tokio::select! {
-        result = axum::serve(listener, app) => result,
-        signal = shutdown_signal() => signal.map_err(std::io::Error::other),
+        result = &mut http_server => result,
         () = trace_failure.cancelled() => Err(std::io::Error::other(
             "required SMESH runtime trace capture failed",
         )),

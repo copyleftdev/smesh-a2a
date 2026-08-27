@@ -6,7 +6,12 @@ The `0.1.x` line is an MVP intended for local development and integration testin
 
 ## Deployment boundary
 
-The bundled binary binds to loopback by default. Do not expose it directly to an untrusted network. It does not yet implement authentication, tenant authorization, tenant-aware persistence, request quotas, or TLS termination.
+The bundled binary defaults to loopback and OIDC bearer authentication. It also supports direct
+rustls termination and optional/required mTLS with exact verified-leaf fingerprint mapping.
+Non-loopback exposure fails closed unless direct TLS, an HTTPS public URL, and OIDC and/or required
+mTLS are configured and all material validates before listener, SQLite, runtime, or mesh startup.
+Explicit authentication disablement is reserved for loopback development or direct TLS with required
+mTLS. `SMESH_A2A_UNSAFE_PUBLIC` is ignored.
 
 Current controls:
 
@@ -35,7 +40,12 @@ Current controls:
   processor stop or bounded local reap, and the trace distinguishes cooperative stop from forced abort
 - forced local abort fails the public task and does not claim containment of model, tool, network, or
   storage effects that were already issued outside the canceled future
-- refusal to bind outside loopback unless an explicit unsafe override is set
+- typed `loopback-plain`, `reverse-proxy-loopback`, and `direct-tls` transport policy;
+  non-loopback binds require direct TLS and reviewed authentication
+- rustls ALPN (`h2`, `http/1.1`), zero early data, no key logging, bounded handshakes and connections
+- required/optional WebPKI client verification and exact SHA-256 leaf-fingerprint principal mapping;
+  CN, SAN, metadata, and forwarding headers do not establish identity
+- atomic SIGHUP reload of the complete certificate/key/client-roots/principal-map generation
 
 Completion-policy review/test payload hashes are recomputed by the gateway and issuer labels must
 appear in the locally configured policy profile, but those labels are not authenticated identities.
@@ -65,9 +75,9 @@ gateway MSRV to Rust 1.88.
 
 Before internet or multi-tenant deployment, add:
 
-- authenticated principals and tenant-scoped authorization on every task operation;
+- tenant-scoped authorization using the authenticated principal on every task operation;
 - tenant-aware persistence and key management;
-- TLS or a trusted reverse proxy;
+- managed certificate issuance/revocation and external key custody for direct TLS deployments;
 - per-principal rate, concurrency, task-duration, history, and artifact quotas;
 - structured audit logs and distributed tracing;
 - cancellation on client disconnect and execution deadlines;

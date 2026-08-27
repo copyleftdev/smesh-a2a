@@ -21,6 +21,7 @@ async fn sigint_gracefully_persists_a_replayable_runtime_trace() {
     drop(probe);
     let mut child = Command::new(env!("CARGO_BIN_EXE_smesh-a2a-gateway"))
         .env_clear()
+        .env("SMESH_A2A_AUTH_MODE", "disabled")
         .env("SMESH_A2A_MODE", "runtime")
         .env("SMESH_A2A_BIND", gateway_addr.to_string())
         .env("SMESH_A2A_MESH_BIND", "127.0.0.1:0")

@@ -1,5 +1,7 @@
 //! A2A v1 interoperability gateway for SMESH swarms.
 
+/// Bearer and mTLS principal verification and request-scoping boundaries.
+pub mod auth;
 mod bridge;
 mod card;
 mod channel;
@@ -20,9 +22,14 @@ mod runtime_worker;
 mod server;
 mod sqlite_store;
 mod store;
+/// Production exposure policy, TLS material loading, reload, and bounded acceptor.
+pub mod transport;
 
 pub use bridge::{DispatchError, MeshDispatcher, MeshEvent, MeshRequest};
-pub use card::build_agent_card;
+pub use card::{
+    build_agent_card, build_authenticated_agent_card, build_secured_agent_card,
+    build_secured_agent_card_with_policy,
+};
 pub use channel::{ChannelDispatcher, DispatchCommand};
 pub use durable_dispatch::{
     DurableDispatchEnvelope, DurableInterruptionKind, DurableLoopbackEndpoint,
@@ -52,9 +59,11 @@ pub use runtime_worker::{
     RuntimeWorkerConfig, RuntimeWorkerHandle,
 };
 pub use server::{
-    CompletionPolicyStore, DurableGateway, GatewayConfig, build_durable_loopback_gateway,
-    build_router, build_router_with_policy, build_router_with_policy_and_trace,
-    build_router_with_sqlite, build_router_with_sqlite_and_trace, build_router_with_trace,
+    CompletionPolicyStore, DurableGateway, GatewayConfig,
+    build_authenticated_durable_loopback_gateway, build_authenticated_router,
+    build_authenticated_router_with_trace, build_durable_loopback_gateway, build_router,
+    build_router_with_policy, build_router_with_policy_and_trace, build_router_with_sqlite,
+    build_router_with_sqlite_and_trace, build_router_with_trace,
 };
 pub use sqlite_store::{
     AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition, CancellationOutcome,

@@ -100,7 +100,7 @@ The checked-in JSONL is a deterministic synthetic fixture for replay, design, an
 Requires Rust 1.88 or newer.
 
 ```bash
-cargo run --bin smesh-a2a-gateway
+SMESH_A2A_AUTH_MODE=disabled cargo run --bin smesh-a2a-gateway
 ```
 
 Defaults:
@@ -118,6 +118,7 @@ chmod 700 "$HOME/.local/state/smesh-a2a"
 SMESH_A2A_BIND=127.0.0.1:4000 \
 SMESH_A2A_PUBLIC_URL=http://127.0.0.1:4000 \
 SMESH_A2A_NODE_ID=gateway-west \
+SMESH_A2A_AUTH_MODE=disabled \
 SMESH_A2A_SQLITE_PATH="$HOME/.local/state/smesh-a2a/tasks.sqlite3" \
 cargo run --bin smesh-a2a-gateway
 ```
@@ -143,6 +144,7 @@ Run the built-in real runtime worker with a live QUIC endpoint:
 
 ```bash
 SMESH_A2A_MODE=runtime \
+SMESH_A2A_AUTH_MODE=disabled \
 SMESH_A2A_MESH_BIND=127.0.0.1:4100 \
 SMESH_A2A_BOOTSTRAP=127.0.0.1:4101,127.0.0.1:4102 \
 cargo run --bin smesh-a2a-gateway
@@ -211,9 +213,25 @@ The MVP is intentionally localhost-first and single-tenant.
 - Worker inactivity, total task duration, and cancellation have deadlines; cancellation wakes active streams.
 - Worker `Completed` events are proposals: candidate artifacts remain private until the
   gateway's locally configured completion policy accepts a sealed evidence snapshot.
-- The binary refuses non-loopback binds unless `SMESH_A2A_UNSAFE_PUBLIC=1` is explicit.
+- Non-loopback binds require `direct-tls`, an HTTPS public URL, and OIDC and/or required mTLS.
+  `SMESH_A2A_UNSAFE_PUBLIC` is ignored and cannot bypass transport or authentication policy.
 
-Do not expose the MVP directly to an untrusted network. `SMESH_A2A_UNSAFE_PUBLIC=1` only disables the bind guard; it does not add security. Production deployment still requires authenticated principals, tenant-aware authorization, TLS, tenant-aware persistence, distributed quotas, and observability.
+OIDC bearer authentication is required by default; an absent `SMESH_A2A_AUTH_MODE` behaves as
+`oidc`. Startup fails before listener, SQLite, runtime, or JWKS resources are initialized when the
+required OIDC settings are missing. Explicit `SMESH_A2A_AUTH_MODE=disabled` is permitted for
+loopback local development or for direct TLS when required mTLS is the sole authentication method.
+OIDC mode validates RFC 9068 RS256 access tokens against an eagerly
+fetched, bounded HTTPS JWKS and supplies an immutable, request-scoped principal to all handler
+methods and deferred stream polls. The public Agent Card advertises the bearer requirement. See
+[`docs/OIDC_KEY_ROTATION_RUNBOOK.md`](docs/OIDC_KEY_ROTATION_RUNBOOK.md).
+
+Direct rustls termination supports disabled, optional, or required client authentication. Verified
+leaf-certificate DER is SHA-256 fingerprinted and exact-matched against a bounded principal map;
+CN, SAN, forwarding headers, and protocol metadata never establish identity. Optional mTLS permits a
+valid bearer when no certificate is presented, but a verified unmapped certificate never falls back
+to bearer. Bearer and mTLS identities presented together must have identical issuer and subject.
+SIGHUP atomically reloads the complete certificate, key, client roots, and map generation. See
+[`docs/TLS_MTLS_ROTATION_RUNBOOK.md`](docs/TLS_MTLS_ROTATION_RUNBOOK.md).
 
 ## Test and verify
 
@@ -227,6 +245,10 @@ cargo doc --no-deps
 The integration suite starts real Axum and QUIC listeners and drives the gateway with the official
 A2A Rust client. It verifies real runtime Query ingress, fail-closed admission-only output,
 streaming order, and cancellation acknowledgement after runtime processing stops.
+
+## A2A client SDK TLS limitation (a2a-client-lf 0.2.2)
+
+The official SDK's `A2AClientFactory::builder()` does not expose a custom `reqwest::Client` or a direct custom-root option for its default transports. Custom private roots require low-level composition: build the SDK HTTP client with `a2a_client::default_reqwest_client(Some(root_pem))`, pass it to `AgentCardResolver::new(Some(client))`, disable factory defaults, and register explicit JSON-RPC/REST transport factories with that client. The SDK helper does not provide client-identity (mTLS) configuration, so the checked real mTLS socket evidence in this repository uses a separately configured `reqwest` client and is intentionally **not** described as official-client interoperability evidence.
 
 ## License
 
