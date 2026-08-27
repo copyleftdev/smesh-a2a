@@ -18,6 +18,13 @@ pub enum DispatchError {
     CancellationForcedAbort,
 }
 
+impl DispatchError {
+    /// Construct a general dispatch failure without requiring exhaustive enum construction.
+    pub fn message(message: impl Into<String>) -> Self {
+        Self::Message(message.into())
+    }
+}
+
 /// Progress emitted by the internal mesh and translated to A2A events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeshEvent {

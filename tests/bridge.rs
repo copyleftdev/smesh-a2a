@@ -1,5 +1,5 @@
 use a2a::{Message, Part, Role};
-use smesh_a2a::{InputLimits, MeshRequest};
+use smesh_a2a::{DispatchError, InputLimits, MeshRequest};
 use smesh_core::SignalType;
 
 #[test]
@@ -26,4 +26,10 @@ fn a2a_message_becomes_a_smesh_query_signal() {
     assert_eq!(payload["text"], "review the crate");
     assert!(payload.get("trust").is_none());
     assert!(payload.get("confidence").is_none());
+}
+
+#[test]
+fn external_dispatchers_can_construct_message_errors() {
+    let error = DispatchError::message("external dispatcher failure");
+    assert!(error.to_string().contains("external dispatcher failure"));
 }
