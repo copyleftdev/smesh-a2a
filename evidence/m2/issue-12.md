@@ -60,7 +60,7 @@ cargo audit
 git diff --check
 ```
 
-All gates pass. `cargo audit` reports no vulnerability failure. It retains the accepted transitive warnings for unmaintained `bincode 1.3.3` and yanked `chacha20 0.10.1` through pinned upstream SMESH/QUIC dependencies.
+All gates pass at the PR head. CI directly enforces formatting, Clippy, the all-target/all-feature test command, warning-denied Rustdoc, MSRV, audit, and diff hygiene. `cargo audit` reports no vulnerability failure. It retains the accepted transitive warnings for unmaintained `bincode 1.3.3` and yanked `chacha20 0.10.1` through pinned upstream SMESH/QUIC dependencies.
 
 ## Operations
 

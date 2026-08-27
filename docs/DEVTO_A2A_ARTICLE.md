@@ -94,7 +94,7 @@ For SMESH, that produced a hard architectural rule:
 
 > **A2A is the external task contract. SMESH is the ephemeral internal coordination field.**
 
-The design requires the A2A ledger to outlive internal signal decay. The production loopback path now uses SQLite-backed durable admission, replay, subscriptions, cancellation, and restart recovery; an in-memory compatibility path remains available for local tests.
+The design requires the A2A ledger to outlive internal signal decay. When `SMESH_A2A_SQLITE_PATH` is set, the production loopback path uses SQLite-backed durable admission, replay, subscriptions, cancellation, and restart recovery; otherwise loopback uses the ephemeral compatibility receiver.
 
 The boundary is split between a path that runs now and a path that is only an integration seam:
 

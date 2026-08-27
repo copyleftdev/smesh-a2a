@@ -44,7 +44,8 @@ The map is a bounded JSON object. Keys are exactly `sha256:` followed by 64 lowe
 Compute a key:
 
 ```bash
-openssl x509 -in client.pem -outform DER | sha256sum
+openssl x509 -in client.pem -outform DER |
+  sha256sum | awk '{printf "sha256:%s\n", $1}'
 ```
 
 CN, DN, SAN, `Forwarded`, `X-Client-Cert`, `X-Forwarded-Client-Cert`, A2A metadata, and caller principal fields are never identity inputs.
