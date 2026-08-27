@@ -54,6 +54,12 @@ accepted. Public artifacts retain only their policy-bound digests.
 input/event bounds, contiguous sequence, non-regressing monotonic time, bounded identifiers, and
 event/detail shape. It never reads live runtime state.
 
+`runtime-trace/2` adds a typed `cancellationOutcome` to cancellation terminal events. `Canceled`
+requires `cooperativeStop`; `Failed` may record `forcedAbort` or `failed`. Ordinary terminal events
+omit the field. Replay remains compatible with legacy `runtime-trace/1` captures that lack the field,
+but rejects v1 traces that try to carry v2 cancellation claims and rejects contradictory v2
+state/outcome pairs.
+
 ## Persistence and shutdown
 
 Set `SMESH_RUNTIME_TRACE_PATH` to persist the final trace. Persistence uses create-new semantics,

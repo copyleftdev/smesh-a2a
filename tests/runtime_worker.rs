@@ -393,6 +393,100 @@ async fn cancellation_acknowledges_only_after_runtime_processing_stops() {
 }
 
 #[derive(Clone, Default)]
+struct FailingOnCancelProcessor {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl RuntimeTaskProcessor for FailingOnCancelProcessor {
+    async fn process(
+        &self,
+        _task: RuntimeTask,
+        cancellation: CancellationToken,
+        _events: RuntimeEventSink,
+    ) -> Result<(), DispatchError> {
+        self.started.notify_one();
+        cancellation.cancelled().await;
+        Err(DispatchError::Message(
+            "processor reported cancellation failure".to_owned(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn processor_error_during_cancellation_is_preserved_in_acknowledgement() {
+    let processor = FailingOnCancelProcessor::default();
+    let started = Arc::clone(&processor.started);
+    let (dispatcher, worker) = RuntimeWorker::spawn(runtime(), "runtime-node", processor, 8)
+        .await
+        .unwrap();
+    let mut events = dispatcher.dispatch(MeshRequest {
+        protocol: "a2a-v1".to_owned(),
+        task_id: "task-cancel-error".to_owned(),
+        context_id: "context-cancel-error".to_owned(),
+        text: "return an error after cancellation".to_owned(),
+    });
+    assert!(matches!(
+        events.next().await,
+        Some(Ok(MeshEvent::Progress(_)))
+    ));
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .unwrap();
+
+    let error = dispatcher.cancel("task-cancel-error").await.unwrap_err();
+    assert!(error.to_string().contains("reported cancellation failure"));
+    assert!(events.collect::<Vec<_>>().await.is_empty());
+    worker.shutdown().await.unwrap();
+}
+
+#[derive(Clone, Default)]
+struct PanickingOnCancelProcessor {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl RuntimeTaskProcessor for PanickingOnCancelProcessor {
+    async fn process(
+        &self,
+        _task: RuntimeTask,
+        cancellation: CancellationToken,
+        _events: RuntimeEventSink,
+    ) -> Result<(), DispatchError> {
+        self.started.notify_one();
+        cancellation.cancelled().await;
+        panic!("injected processor cancellation panic");
+    }
+}
+
+#[tokio::test]
+async fn processor_panic_during_cancellation_is_not_acknowledged_as_clean() {
+    let processor = PanickingOnCancelProcessor::default();
+    let started = Arc::clone(&processor.started);
+    let (dispatcher, worker) = RuntimeWorker::spawn(runtime(), "runtime-node", processor, 8)
+        .await
+        .unwrap();
+    let mut events = dispatcher.dispatch(MeshRequest {
+        protocol: "a2a-v1".to_owned(),
+        task_id: "task-cancel-panic".to_owned(),
+        context_id: "context-cancel-panic".to_owned(),
+        text: "panic after cancellation".to_owned(),
+    });
+    assert!(matches!(
+        events.next().await,
+        Some(Ok(MeshEvent::Progress(_)))
+    ));
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .unwrap();
+
+    let error = dispatcher.cancel("task-cancel-panic").await.unwrap_err();
+    assert!(error.to_string().contains("processor task failed"));
+    assert!(events.collect::<Vec<_>>().await.is_empty());
+    worker.shutdown().await.unwrap();
+}
+
+#[derive(Clone, Default)]
 struct IgnoringProcessor {
     started: Arc<Notify>,
 }
@@ -440,10 +534,11 @@ async fn noncooperative_processor_is_aborted_before_cancel_acknowledgement() {
         .await
         .unwrap();
 
-    tokio::time::timeout(Duration::from_secs(1), dispatcher.cancel("task-abort"))
+    let error = tokio::time::timeout(Duration::from_secs(1), dispatcher.cancel("task-abort"))
         .await
         .unwrap()
-        .unwrap();
+        .unwrap_err();
+    assert!(error.to_string().contains("forced abort"));
     assert!(events.collect::<Vec<_>>().await.is_empty());
     worker.shutdown().await.unwrap();
 }
@@ -469,13 +564,14 @@ async fn immediate_cancel_cannot_overtake_an_accepted_execute_command() {
         text: "cancel immediately".to_owned(),
     });
 
-    tokio::time::timeout(
+    let error = tokio::time::timeout(
         Duration::from_secs(1),
         dispatcher.cancel("task-immediate-cancel"),
     )
     .await
     .unwrap()
-    .unwrap();
+    .unwrap_err();
+    assert!(error.to_string().contains("forced abort"));
     assert!(
         !events
             .collect::<Vec<_>>()
@@ -523,7 +619,10 @@ async fn runtime_worker_capacity_and_unknown_cancellation_fail_closed() {
         matches!(second.as_slice(), [Err(DispatchError::Message(message))] if message.contains("capacity"))
     );
     assert!(dispatcher.cancel("unknown-task").await.is_err());
-    dispatcher.cancel("task-capacity-first").await.unwrap();
+    assert!(matches!(
+        dispatcher.cancel("task-capacity-first").await,
+        Err(DispatchError::CancellationForcedAbort)
+    ));
     worker.shutdown().await.unwrap();
 }
 

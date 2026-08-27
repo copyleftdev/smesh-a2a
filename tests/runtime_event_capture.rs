@@ -5,8 +5,8 @@ use futures::StreamExt;
 use smesh_a2a::{
     ClosedAttestation, CompletionEvidence, CorrelatingRuntimeProcessor, MeshDispatcher,
     MeshRequest, RatificationReceipt, RatificationStatement, RuntimeAdmissionProcessor,
-    RuntimeClaimKind, RuntimeEventCapture, RuntimeTerminalState, RuntimeTraceDetails,
-    RuntimeTraceKind, RuntimeWorker, content_digest,
+    RuntimeCancellationOutcome, RuntimeClaimKind, RuntimeEventCapture, RuntimeTerminalState,
+    RuntimeTraceDetails, RuntimeTraceError, RuntimeTraceKind, RuntimeWorker, content_digest,
 };
 use smesh_core::{Network, Node};
 use smesh_runtime::{RuntimeConfig, RuntimeEvent, SmeshRuntime};
@@ -370,12 +370,82 @@ async fn adapter_covers_runtime_lifecycle_and_untrusted_claim_semantics() {
 }
 
 #[tokio::test]
+async fn cancellation_trace_outcomes_are_typed_state_bound_and_round_trip() {
+    let capture = RuntimeEventCapture::new(2, 1);
+    capture
+        .record_cancellation_terminal(
+            "canceled-task",
+            "canceled-context",
+            RuntimeTerminalState::Canceled,
+            RuntimeCancellationOutcome::CooperativeStop,
+        )
+        .await
+        .unwrap();
+    capture
+        .record_cancellation_terminal(
+            "forced-task",
+            "forced-context",
+            RuntimeTerminalState::Failed,
+            RuntimeCancellationOutcome::ForcedAbort,
+        )
+        .await
+        .unwrap();
+    let trace = capture.snapshot().await;
+    let encoded = serde_json::to_vec(&trace).unwrap();
+    let decoded: smesh_a2a::RuntimeTrace = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, trace);
+    assert!(trace.events.iter().any(|event| {
+        matches!(
+            event.details,
+            RuntimeTraceDetails::TerminalOutput {
+                state: RuntimeTerminalState::Failed,
+                cancellation_outcome: Some(RuntimeCancellationOutcome::ForcedAbort),
+                ..
+            }
+        )
+    }));
+
+    let mut contradictory: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    contradictory["events"][1]["details"]["state"] = serde_json::json!("canceled");
+    assert!(RuntimeEventCapture::replay(&serde_json::to_vec(&contradictory).unwrap()).is_err());
+    contradictory["events"][1]["details"]["state"] = serde_json::json!("failed");
+    contradictory["schemaVersion"] = serde_json::json!("runtime-trace/1");
+    assert!(RuntimeEventCapture::replay(&serde_json::to_vec(&contradictory).unwrap()).is_err());
+
+    let ordinary = RuntimeEventCapture::new(1, 1);
+    ordinary
+        .record_terminal(
+            "completed-task",
+            "completed-context",
+            RuntimeTerminalState::Completed,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let ordinary_json = serde_json::to_string(&ordinary.snapshot().await).unwrap();
+    assert!(!ordinary_json.contains("cancellationOutcome"));
+
+    let invalid = RuntimeEventCapture::new(1, 1);
+    assert_eq!(
+        invalid
+            .record_cancellation_terminal(
+                "invalid-task",
+                "invalid-context",
+                RuntimeTerminalState::Canceled,
+                RuntimeCancellationOutcome::ForcedAbort,
+            )
+            .await
+            .unwrap_err(),
+        RuntimeTraceError::InvalidCorrelation
+    );
+}
+
+#[tokio::test]
 async fn canonical_trace_represents_every_gateway_terminal_state() {
     let capture = RuntimeEventCapture::new(5, 1);
     for state in [
         RuntimeTerminalState::Completed,
         RuntimeTerminalState::Failed,
-        RuntimeTerminalState::Canceled,
         RuntimeTerminalState::InputRequired,
         RuntimeTerminalState::Rejected,
     ] {
@@ -384,7 +454,17 @@ async fn canonical_trace_represents_every_gateway_terminal_state() {
             .await
             .unwrap();
     }
+    capture
+        .record_cancellation_terminal(
+            "terminal-task",
+            "terminal-context",
+            RuntimeTerminalState::Canceled,
+            RuntimeCancellationOutcome::CooperativeStop,
+        )
+        .await
+        .unwrap();
     let trace = capture.snapshot().await;
+    assert_eq!(trace.schema_version, "runtime-trace/2");
     assert_eq!(trace.events.len(), 5);
     assert!(trace.events.iter().all(|event| {
         event.kind == RuntimeTraceKind::TerminalOutput

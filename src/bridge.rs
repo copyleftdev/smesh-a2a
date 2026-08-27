@@ -8,9 +8,14 @@ use thiserror::Error;
 use crate::{CompletionEvidence, InputError, InputLimits, extract_text};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DispatchError {
     #[error("mesh dispatch failed: {0}")]
     Message(String),
+    /// The local processor was reaped only by aborting its future after the cancellation grace.
+    /// This confirms local polling stopped, not containment of effects already issued externally.
+    #[error("mesh cancellation required a forced abort; external effect containment is unknown")]
+    CancellationForcedAbort,
 }
 
 /// Progress emitted by the internal mesh and translated to A2A events.
