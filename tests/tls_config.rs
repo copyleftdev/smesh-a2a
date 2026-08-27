@@ -9,6 +9,35 @@ use smesh_a2a::{
     },
 };
 
+struct SecureTestKey(PathBuf);
+
+impl SecureTestKey {
+    fn copy(source: &std::path::Path, label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "smesh-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::copy(source, &path).expect("copy test private key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("secure copied test private key");
+        }
+        Self(path)
+    }
+}
+
+impl Drop for SecureTestKey {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[test]
 fn required_mtls_card_does_not_advertise_bearer_as_a_standalone_alternative() {
     let card = build_secured_agent_card_with_policy("https://gateway.example", true, true, true);
@@ -83,9 +112,10 @@ fn public_bind_requires_direct_tls_https_and_authentication() {
 #[test]
 fn tls_loader_builds_hardened_rustls_snapshot_and_rejects_insecure_key_mode() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
+    let secure_key = SecureTestKey::copy(&root.join("server.key"), "secure-key");
     let paths = TlsMaterialPaths {
         cert: root.join("server.pem"),
-        key: root.join("server.key"),
+        key: secure_key.0.clone(),
         client_ca: Some(root.join("client-ca.pem")),
         principal_map: Some(root.join("principals.json")),
     };
