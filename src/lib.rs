@@ -47,5 +47,9 @@ pub use server::{
     build_router_with_policy_and_trace, build_router_with_sqlite,
     build_router_with_sqlite_and_trace, build_router_with_trace,
 };
-pub use sqlite_store::{SqliteStoreError, SqliteTaskStore};
+pub use sqlite_store::{
+    AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition, OutboxLease,
+    SendMessageAdmission, SqliteStoreError, SqliteTaskStore, TRUSTED_SINGLE_TENANT_SCOPE,
+    TransitionOutcome, canonical_send_message_digest,
+};
 pub use store::BoundedTaskStore;

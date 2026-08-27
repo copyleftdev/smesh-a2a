@@ -239,10 +239,10 @@ impl TaskStore for BoundedTaskStore {
             .tasks
             .get_mut(&task.id)
             .ok_or_else(|| A2AError::task_not_found(&task.id))?;
+        if *stored == task {
+            return Ok(1);
+        }
         if stored.status.state.is_terminal() {
-            if *stored == task {
-                return Ok(1);
-            }
             return Err(A2AError::unsupported_operation(
                 "terminal task state cannot be changed",
             ));
