@@ -34,8 +34,9 @@ pub use policy::{
 };
 pub use runtime_config::{GatewayMode, GatewayModeError, RuntimeModeConfig};
 pub use runtime_trace::{
-    CorrelatingRuntimeProcessor, RuntimeClaimKind, RuntimeEventCapture, RuntimeTerminalState,
-    RuntimeTrace, RuntimeTraceDetails, RuntimeTraceError, RuntimeTraceEvent, RuntimeTraceKind,
+    CorrelatingRuntimeProcessor, RuntimeCancellationOutcome, RuntimeClaimKind, RuntimeEventCapture,
+    RuntimeTerminalState, RuntimeTrace, RuntimeTraceDetails, RuntimeTraceError, RuntimeTraceEvent,
+    RuntimeTraceKind,
 };
 pub use runtime_worker::{
     RuntimeAdmissionProcessor, RuntimeEventSink, RuntimeTask, RuntimeTaskProcessor, RuntimeWorker,

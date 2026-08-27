@@ -31,7 +31,10 @@ Current controls:
 - bounded dispatcher cancellation after local deadlines, inactivity, resource-budget failures,
   policy rejection, and abandoned response streams
 - explicit `loopback`/`runtime` mode selection; malformed runtime or bootstrap addresses fail startup
-- bounded runtime command channels and cancellation acknowledgement only after processor shutdown
+- bounded runtime command channels; cancellation acknowledgement is emitted only after cooperative
+  processor stop or bounded local reap, and the trace distinguishes cooperative stop from forced abort
+- forced local abort fails the public task and does not claim containment of model, tool, network, or
+  storage effects that were already issued outside the canceled future
 - refusal to bind outside loopback unless an explicit unsafe override is set
 
 Completion-policy review/test payload hashes are recomputed by the gateway and issuer labels must

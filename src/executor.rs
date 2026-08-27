@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ArtifactManifest, CompletionEvidence, CompletionSnapshot, InputLimits, MeshDispatcher,
-    MeshEvent, MeshRequest, PolicyCheckpoint, PolicyDecision, RuntimeEventCapture,
-    RuntimeTerminalState, VersionedCompletionPolicy, content_digest,
+    MeshEvent, MeshRequest, PolicyCheckpoint, PolicyDecision, RuntimeCancellationOutcome,
+    RuntimeEventCapture, RuntimeTerminalState, VersionedCompletionPolicy, content_digest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +105,7 @@ const TERMINAL_EXECUTION: u8 = 2;
 const CANCEL_OUTCOME_PENDING: u8 = 0;
 const CANCEL_OUTCOME_CANCELED: u8 = 1;
 const CANCEL_OUTCOME_FAILED: u8 = 2;
+const CANCEL_OUTCOME_FORCED_ABORT: u8 = 3;
 
 struct ExecutionControl {
     cancellation: CancellationToken,
@@ -147,6 +148,26 @@ impl ExecutionControl {
                 Ordering::SeqCst,
             )
             .is_ok()
+    }
+}
+
+fn cancellation_terminal(outcome: u8) -> (TaskState, RuntimeCancellationOutcome, &'static str) {
+    match outcome {
+        CANCEL_OUTCOME_CANCELED => (
+            TaskState::Canceled,
+            RuntimeCancellationOutcome::CooperativeStop,
+            "SMESH task canceled",
+        ),
+        CANCEL_OUTCOME_FORCED_ABORT => (
+            TaskState::Failed,
+            RuntimeCancellationOutcome::ForcedAbort,
+            "SMESH dispatcher reported a forced abort; external effect containment is unknown",
+        ),
+        _ => (
+            TaskState::Failed,
+            RuntimeCancellationOutcome::Failed,
+            "SMESH cancellation failed",
+        ),
     }
 }
 
@@ -409,40 +430,15 @@ where
                         break;
                     }
                     () = cancellation.cancelled() => {
-                        if control.cancel_outcome.load(Ordering::SeqCst) == CANCEL_OUTCOME_PENDING {
-                            control.cancel_done.notified().await;
-                        }
-                        let outcome = control.cancel_outcome.load(Ordering::SeqCst);
-                        let state = if outcome == CANCEL_OUTCOME_CANCELED {
-                            TaskState::Canceled
-                        } else {
-                            TaskState::Failed
-                        };
-                        if !record_terminal_trace(
+                        publish_cancellation_terminal(
+                            control.as_ref(),
+                            &tx,
                             runtime_trace.as_deref(),
                             &task_id,
                             &context_id,
-                            state.clone(),
-                            Vec::new(),
+                            &history,
                         )
-                        .await
-                        {
-                            control.terminal_published.notify_one();
-                            terminal_emitted = true;
-                            break;
-                        }
-                        let text = (state == TaskState::Failed)
-                            .then(|| "SMESH cancellation failed".to_owned());
-                        let _ = tx.send(Ok(task_response(
-                            &task_id,
-                            &context_id,
-                            state,
-                            text.unwrap_or_else(|| "SMESH task canceled".to_owned()),
-                            None,
-                            history.clone(),
-                            None,
-                        ))).await;
-                        control.terminal_published.notify_one();
+                        .await;
                         terminal_emitted = true;
                         break;
                     }
@@ -625,43 +621,15 @@ where
                     tokio::select! {
                         biased;
                         () = cancellation.cancelled() => {
-                            if control.cancel_outcome.load(Ordering::SeqCst)
-                                == CANCEL_OUTCOME_PENDING
-                            {
-                                control.cancel_done.notified().await;
-                            }
-                            let state = if control.cancel_outcome.load(Ordering::SeqCst)
-                                == CANCEL_OUTCOME_CANCELED
-                            {
-                                TaskState::Canceled
-                            } else {
-                                TaskState::Failed
-                            };
-                            if record_terminal_trace(
+                            publish_cancellation_terminal(
+                                control.as_ref(),
+                                &tx,
                                 runtime_trace.as_deref(),
                                 &task_id,
                                 &context_id,
-                                state.clone(),
-                                Vec::new(),
+                                &history,
                             )
-                            .await
-                            {
-                                let text = if state == TaskState::Failed {
-                                    "SMESH cancellation failed".to_owned()
-                                } else {
-                                    "SMESH task canceled".to_owned()
-                                };
-                                let _ = tx.send(Ok(task_response(
-                                    &task_id,
-                                    &context_id,
-                                    state,
-                                    text,
-                                    None,
-                                    history.clone(),
-                                    None,
-                                ))).await;
-                            }
-                            control.terminal_published.notify_one();
+                            .await;
                         }
                         () = &mut task_deadline => {
                             if control.claim_execution()
@@ -760,6 +728,9 @@ where
             let outcome =
                 match tokio::time::timeout(cancel_timeout, dispatcher.cancel(&task_id)).await {
                     Ok(Ok(())) => CANCEL_OUTCOME_CANCELED,
+                    Ok(Err(crate::DispatchError::CancellationForcedAbort)) => {
+                        CANCEL_OUTCOME_FORCED_ABORT
+                    }
                     Ok(Err(_)) | Err(_) => CANCEL_OUTCOME_FAILED,
                 };
             control.cancel_outcome.store(outcome, Ordering::SeqCst);
@@ -790,6 +761,64 @@ async fn record_terminal_trace(
     };
     trace
         .record_terminal(task_id, context_id, trace_state, artifact_digests)
+        .await
+        .is_ok()
+}
+
+async fn publish_cancellation_terminal(
+    control: &ExecutionControl,
+    tx: &tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
+    trace: Option<&RuntimeEventCapture>,
+    task_id: &str,
+    context_id: &str,
+    history: &[Message],
+) {
+    if control.cancel_outcome.load(Ordering::SeqCst) == CANCEL_OUTCOME_PENDING {
+        control.cancel_done.notified().await;
+    }
+    let (state, cancellation_outcome, text) =
+        cancellation_terminal(control.cancel_outcome.load(Ordering::SeqCst));
+    if record_cancellation_terminal_trace(
+        trace,
+        task_id,
+        context_id,
+        state.clone(),
+        cancellation_outcome,
+    )
+    .await
+    {
+        let _ = tx
+            .send(Ok(task_response(
+                task_id,
+                context_id,
+                state,
+                text.to_owned(),
+                None,
+                history.to_vec(),
+                None,
+            )))
+            .await;
+    }
+    control.terminal_published.notify_one();
+}
+
+async fn record_cancellation_terminal_trace(
+    trace: Option<&RuntimeEventCapture>,
+    task_id: &str,
+    context_id: &str,
+    state: TaskState,
+    outcome: RuntimeCancellationOutcome,
+) -> bool {
+    let Some(trace) = trace else {
+        return true;
+    };
+    let trace_state = if state == TaskState::Canceled {
+        RuntimeTerminalState::Canceled
+    } else {
+        RuntimeTerminalState::Failed
+    };
+    trace
+        .record_cancellation_terminal(task_id, context_id, trace_state, outcome)
         .await
         .is_ok()
 }

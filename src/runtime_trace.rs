@@ -15,7 +15,8 @@ use crate::{
     content_digest,
 };
 
-const RUNTIME_TRACE_SCHEMA: &str = "runtime-trace/1";
+const RUNTIME_TRACE_SCHEMA_V1: &str = "runtime-trace/1";
+const RUNTIME_TRACE_SCHEMA: &str = "runtime-trace/2";
 const MAX_REPLAY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REPLAY_EVENTS: usize = 100_000;
 
@@ -53,6 +54,16 @@ pub enum RuntimeTerminalState {
     Rejected,
 }
 
+/// How a requested cancellation reached its public terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum RuntimeCancellationOutcome {
+    CooperativeStop,
+    ForcedAbort,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum RuntimeTraceDetails {
@@ -82,6 +93,8 @@ pub enum RuntimeTraceDetails {
     TerminalOutput {
         state: RuntimeTerminalState,
         artifact_digests: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancellation_outcome: Option<RuntimeCancellationOutcome>,
     },
 }
 
@@ -405,7 +418,8 @@ impl RuntimeEventCapture {
         state: RuntimeTerminalState,
         artifact_digests: Vec<String>,
     ) -> Result<(), RuntimeTraceError> {
-        if artifact_digests.len() > 16
+        if state == RuntimeTerminalState::Canceled
+            || artifact_digests.len() > 16
             || artifact_digests
                 .iter()
                 .any(|digest| !bounded_public_value(digest))
@@ -419,6 +433,46 @@ impl RuntimeEventCapture {
             RuntimeTraceDetails::TerminalOutput {
                 state,
                 artifact_digests,
+                cancellation_outcome: None,
+            },
+        )
+        .await
+    }
+
+    /// Record a terminal cancellation and how local processor containment ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for inconsistent state/outcome pairs, invalid identifiers, or exhausted
+    /// required capacity.
+    pub async fn record_cancellation_terminal(
+        &self,
+        task_id: &str,
+        context_id: &str,
+        state: RuntimeTerminalState,
+        outcome: RuntimeCancellationOutcome,
+    ) -> Result<(), RuntimeTraceError> {
+        let valid = matches!(
+            (state, outcome),
+            (
+                RuntimeTerminalState::Canceled,
+                RuntimeCancellationOutcome::CooperativeStop
+            ) | (
+                RuntimeTerminalState::Failed,
+                RuntimeCancellationOutcome::ForcedAbort | RuntimeCancellationOutcome::Failed
+            )
+        );
+        if !valid {
+            return self.fail(RuntimeTraceError::InvalidCorrelation);
+        }
+        self.record_required_gateway(
+            task_id,
+            context_id,
+            RuntimeTraceKind::TerminalOutput,
+            RuntimeTraceDetails::TerminalOutput {
+                state,
+                artifact_digests: Vec::new(),
+                cancellation_outcome: Some(outcome),
             },
         )
         .await
@@ -433,7 +487,7 @@ impl RuntimeEventCapture {
     ) -> Result<(), RuntimeTraceError> {
         if !bounded_public_value(task_id)
             || !bounded_public_value(context_id)
-            || !details_are_bounded(&details)
+            || !details_are_bounded(&details, false)
         {
             return self.fail(RuntimeTraceError::InvalidCorrelation);
         }
@@ -517,7 +571,8 @@ impl RuntimeEventCapture {
         }
         let trace: RuntimeTrace = serde_json::from_slice(bytes)
             .map_err(|error| RuntimeTraceError::MalformedReplay(error.to_string()))?;
-        if trace.schema_version != RUNTIME_TRACE_SCHEMA {
+        let legacy_v1 = trace.schema_version == RUNTIME_TRACE_SCHEMA_V1;
+        if !legacy_v1 && trace.schema_version != RUNTIME_TRACE_SCHEMA {
             return Err(RuntimeTraceError::UnsupportedSchema);
         }
         if !trace.capture_valid {
@@ -531,7 +586,7 @@ impl RuntimeEventCapture {
         for (index, event) in trace.events.iter().enumerate() {
             if event.sequence != u64::try_from(index).unwrap_or(u64::MAX)
                 || index > 0 && trace.events[index - 1].monotonic_micros > event.monotonic_micros
-                || !trace_event_is_valid(event)
+                || !trace_event_is_valid(event, legacy_v1)
             {
                 return Err(RuntimeTraceError::MalformedReplay(
                     "trace ordering regressed".to_owned(),
@@ -552,7 +607,7 @@ fn canonical_sha256(value: &str) -> bool {
         && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn trace_event_is_valid(event: &RuntimeTraceEvent) -> bool {
+fn trace_event_is_valid(event: &RuntimeTraceEvent, legacy_v1: bool) -> bool {
     let identifiers_valid = event.task_id.as_deref().is_none_or(bounded_public_value)
         && event.context_id.as_deref().is_none_or(bounded_public_value)
         && event
@@ -583,10 +638,10 @@ fn trace_event_is_valid(event: &RuntimeTraceEvent) -> bool {
         }
         _ => false,
     };
-    identifiers_valid && shape_valid && details_are_bounded(&event.details)
+    identifiers_valid && shape_valid && details_are_bounded(&event.details, legacy_v1)
 }
 
-fn details_are_bounded(details: &RuntimeTraceDetails) -> bool {
+fn details_are_bounded(details: &RuntimeTraceDetails, legacy_v1: bool) -> bool {
     match details {
         RuntimeTraceDetails::Claim {
             claim_kind,
@@ -616,9 +671,21 @@ fn details_are_bounded(details: &RuntimeTraceDetails) -> bool {
             ..
         } => canonical_sha256(evidence_id) && canonical_sha256(subject_digest),
         RuntimeTraceDetails::TerminalOutput {
-            artifact_digests, ..
+            state,
+            artifact_digests,
+            cancellation_outcome,
         } => {
-            artifact_digests.len() <= 16
+            let cancellation_valid = match cancellation_outcome {
+                None => legacy_v1 || *state != RuntimeTerminalState::Canceled,
+                Some(RuntimeCancellationOutcome::CooperativeStop) => {
+                    !legacy_v1 && *state == RuntimeTerminalState::Canceled
+                }
+                Some(
+                    RuntimeCancellationOutcome::ForcedAbort | RuntimeCancellationOutcome::Failed,
+                ) => !legacy_v1 && *state == RuntimeTerminalState::Failed,
+            };
+            cancellation_valid
+                && artifact_digests.len() <= 16
                 && artifact_digests.iter().all(|value| canonical_sha256(value))
         }
         RuntimeTraceDetails::None

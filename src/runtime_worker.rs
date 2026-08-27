@@ -300,7 +300,7 @@ impl RuntimeWorkerHandle {
     }
 }
 
-type ActiveTask = (CancellationToken, JoinHandle<()>);
+type ActiveTask = (CancellationToken, JoinHandle<Result<(), DispatchError>>);
 
 async fn run_worker(
     runtime: Arc<SmeshRuntime>,
@@ -396,7 +396,7 @@ async fn run_worker(
 
 async fn stop_tracked_task(
     cancellation: CancellationToken,
-    mut join: JoinHandle<()>,
+    mut join: JoinHandle<Result<(), DispatchError>>,
     cancel_grace: Duration,
 ) {
     cancellation.cancel();
@@ -406,26 +406,44 @@ async fn stop_tracked_task(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CancellationReapOutcome {
+    CooperativeStop,
+    ProcessorFailed(DispatchError),
+    ForcedAbort,
+}
+
+impl CancellationReapOutcome {
+    fn into_dispatch_result(self) -> Result<(), DispatchError> {
+        match self {
+            Self::CooperativeStop => Ok(()),
+            Self::ProcessorFailed(error) => Err(error),
+            Self::ForcedAbort => Err(DispatchError::CancellationForcedAbort),
+        }
+    }
+}
+
 async fn reap_canceled_task(
     task_id: String,
     cancellation: CancellationToken,
-    mut join: JoinHandle<()>,
+    mut join: JoinHandle<Result<(), DispatchError>>,
     ack: oneshot::Sender<Result<(), DispatchError>>,
     cancel_grace: Duration,
 ) -> String {
     cancellation.cancel();
-    let result = match tokio::time::timeout(cancel_grace, &mut join).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(DispatchError::Message(
+    let outcome = match tokio::time::timeout(cancel_grace, &mut join).await {
+        Ok(Ok(Ok(()))) => CancellationReapOutcome::CooperativeStop,
+        Ok(Ok(Err(error))) => CancellationReapOutcome::ProcessorFailed(error),
+        Ok(Err(_)) => CancellationReapOutcome::ProcessorFailed(DispatchError::Message(
             "runtime processor task failed during cancellation".to_owned(),
         )),
         Err(_) => {
             join.abort();
             let _ = join.await;
-            Ok(())
+            CancellationReapOutcome::ForcedAbort
         }
     };
-    let _ = ack.send(result);
+    let _ = ack.send(outcome.into_dispatch_result());
     task_id
 }
 
@@ -437,16 +455,16 @@ async fn run_task(
     signal: smesh_core::Signal,
     cancellation: CancellationToken,
     events: mpsc::Sender<Result<MeshEvent, DispatchError>>,
-) {
+) -> Result<(), DispatchError> {
     let emitted = tokio::select! {
-        () = cancellation.cancelled() => return,
+        () = cancellation.cancelled() => return Ok(()),
         emitted = runtime.emit(signal, &node_id) => emitted,
     };
     let Some(signal_hash) = emitted else {
         let _ = events.try_send(Err(DispatchError::Message(
             "runtime rejected query ingress".to_owned(),
         )));
-        return;
+        return Ok(());
     };
     if send_event(
         &events,
@@ -456,7 +474,7 @@ async fn run_task(
     .await
     .is_err()
     {
-        return;
+        return Ok(());
     }
     let task = RuntimeTask {
         request,
@@ -467,9 +485,12 @@ async fn run_task(
         events: events.clone(),
         cancellation: cancellation.clone(),
     };
-    if let Err(error) = processor.process(task, cancellation.clone(), sink).await
-        && !cancellation.is_cancelled()
-    {
-        let _ = send_dispatch_error(&events, &cancellation, error).await;
+    match processor.process(task, cancellation.clone(), sink).await {
+        Ok(()) => Ok(()),
+        Err(error) if cancellation.is_cancelled() => Err(error),
+        Err(error) => {
+            let _ = send_dispatch_error(&events, &cancellation, error).await;
+            Ok(())
+        }
     }
 }

@@ -10,9 +10,9 @@ use futures::stream::{self, BoxStream};
 use smesh_a2a::{
     ArtifactManifest, CompletionEvidence, CompletionPolicySpec, CompletionSnapshot, DispatchError,
     ExecutionLimits, InputLimits, MeshDispatcher, MeshEvent, MeshRequest, PolicyDecision,
-    RatificationReceipt, RatificationStatement, RuntimeEventCapture, RuntimeTerminalState,
-    RuntimeTraceKind, SmeshExecutor, TrustedAuthority, VersionedCompletionPolicy,
-    artifact_set_digest, content_digest,
+    RatificationReceipt, RatificationStatement, RuntimeCancellationOutcome, RuntimeEventCapture,
+    RuntimeTerminalState, RuntimeTraceKind, SmeshExecutor, TrustedAuthority,
+    VersionedCompletionPolicy, artifact_set_digest, content_digest,
 };
 use smesh_core::NodeIdentity;
 use tokio::sync::{Notify, mpsc};
@@ -949,7 +949,9 @@ async fn accepted_cancel_request_suppresses_completion_while_ack_is_pending() {
     let completion_release = Arc::clone(&dispatcher.completion_release);
     let cancel_started = Arc::clone(&dispatcher.cancel_started);
     let cancel_ack_release = Arc::clone(&dispatcher.cancel_ack_release);
-    let executor = SmeshExecutor::new(dispatcher, InputLimits::default(), "gateway-node");
+    let capture = Arc::new(RuntimeEventCapture::new(4, 1));
+    let executor = SmeshExecutor::new(dispatcher, InputLimits::default(), "gateway-node")
+        .with_runtime_trace(Arc::clone(&capture));
     let mut execution = executor.execute(context("race completion and cancellation"));
     assert!(matches!(
         execution.next().await,
@@ -988,6 +990,17 @@ async fn accepted_cancel_request_suppresses_completion_while_ack_is_pending() {
         execution.next().await,
         Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Canceled
     ));
+    let trace = capture.snapshot().await;
+    assert!(trace.events.iter().any(|event| {
+        matches!(
+            event.details,
+            smesh_a2a::RuntimeTraceDetails::TerminalOutput {
+                state: RuntimeTerminalState::Canceled,
+                cancellation_outcome: Some(RuntimeCancellationOutcome::CooperativeStop),
+                ..
+            }
+        )
+    }));
 }
 
 #[tokio::test]
@@ -1043,11 +1056,13 @@ impl MeshDispatcher for CancelFailureDispatcher {
 
 #[tokio::test]
 async fn failed_cancellation_acknowledgement_fails_task_and_closes_execution() {
+    let capture = Arc::new(RuntimeEventCapture::new(4, 1));
     let executor = SmeshExecutor::new(
         CancelFailureDispatcher,
         InputLimits::default(),
         "gateway-node",
-    );
+    )
+    .with_runtime_trace(Arc::clone(&capture));
     let mut execution = executor.execute(context("cancel failure"));
     assert!(matches!(
         execution.next().await,
@@ -1071,12 +1086,94 @@ async fn failed_cancellation_acknowledgement_fails_task_and_closes_execution() {
         execution.next().await,
         Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Failed
     ));
+    let trace = capture.snapshot().await;
+    assert!(trace.events.iter().any(|event| {
+        matches!(
+            event.details,
+            smesh_a2a::RuntimeTraceDetails::TerminalOutput {
+                state: RuntimeTerminalState::Failed,
+                cancellation_outcome: Some(RuntimeCancellationOutcome::Failed),
+                ..
+            }
+        )
+    }));
     assert!(
         tokio::time::timeout(Duration::from_secs(1), execution.next())
             .await
             .unwrap()
             .is_none()
     );
+}
+
+#[derive(Clone, Default)]
+struct ForcedAbortCancellationDispatcher;
+
+#[async_trait]
+impl MeshDispatcher for ForcedAbortCancellationDispatcher {
+    fn dispatch(
+        &self,
+        _request: MeshRequest,
+    ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
+        Box::pin(stream::pending())
+    }
+
+    async fn cancel(&self, _task_id: &str) -> Result<(), DispatchError> {
+        Err(DispatchError::CancellationForcedAbort)
+    }
+}
+
+#[tokio::test]
+async fn forced_abort_cancellation_fails_closed_and_records_containment_outcome() {
+    let capture = Arc::new(RuntimeEventCapture::new(4, 1));
+    let executor = SmeshExecutor::new(
+        ForcedAbortCancellationDispatcher,
+        InputLimits::default(),
+        "gateway-node",
+    )
+    .with_runtime_trace(Arc::clone(&capture));
+    let mut execution = executor.execute(context("forced abort cancellation"));
+    assert!(matches!(
+        execution.next().await,
+        Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Working
+    ));
+
+    let cancel_events = executor
+        .cancel(ExecutorContext {
+            message: None,
+            task_id: "task-1".to_owned(),
+            stored_task: None,
+            context_id: "context-1".to_owned(),
+            metadata: None,
+            user: None,
+            service_params: HashMap::new(),
+            tenant: None,
+        })
+        .collect::<Vec<_>>()
+        .await;
+    assert!(cancel_events.is_empty());
+    let terminal = execution.next().await.unwrap().unwrap();
+    let StreamResponse::Task(task) = terminal else {
+        panic!("forced abort must publish a terminal task");
+    };
+    assert_eq!(task.status.state, TaskState::Failed);
+    let message = task.status.message.unwrap();
+    assert!(matches!(
+        message.parts.as_slice(),
+        [Part { content: a2a::PartContent::Text(text), .. }]
+            if text.contains("forced") && text.contains("containment")
+    ));
+
+    let trace = capture.snapshot().await;
+    assert!(trace.events.iter().any(|event| {
+        matches!(
+            event.details,
+            smesh_a2a::RuntimeTraceDetails::TerminalOutput {
+                state: RuntimeTerminalState::Failed,
+                cancellation_outcome: Some(RuntimeCancellationOutcome::ForcedAbort),
+                ..
+            }
+        )
+    }));
 }
 
 #[tokio::test]
