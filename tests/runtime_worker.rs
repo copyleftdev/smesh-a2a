@@ -144,13 +144,15 @@ async fn runtime_worker_query_crosses_a_real_quic_socket_to_a_peer() {
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
+        let mut changed = tokio::time::interval(Duration::from_millis(10));
+        changed.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            changed.tick().await;
             if runtime_a.peers().connected_count().await == 1
                 && runtime_b.peers().connected_count().await == 1
             {
                 break;
             }
-            tokio::task::yield_now().await;
         }
     })
     .await
@@ -186,7 +188,10 @@ async fn runtime_worker_query_crosses_a_real_quic_socket_to_a_peer() {
             .clone()
     };
     tokio::time::timeout(Duration::from_secs(5), async {
+        let mut changed = tokio::time::interval(Duration::from_millis(10));
+        changed.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            changed.tick().await;
             let network = runtime_b.network();
             if network
                 .read()
@@ -197,7 +202,6 @@ async fn runtime_worker_query_crosses_a_real_quic_socket_to_a_peer() {
             {
                 break;
             }
-            tokio::task::yield_now().await;
         }
     })
     .await

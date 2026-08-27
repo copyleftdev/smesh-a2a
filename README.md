@@ -122,16 +122,22 @@ SMESH_A2A_SQLITE_PATH="$HOME/.local/state/smesh-a2a/tasks.sqlite3" \
 cargo run --bin smesh-a2a-gateway
 ```
 
-`SMESH_A2A_SQLITE_PATH` enables the persistent SQLite task store in either gateway mode. Persistent
+`SMESH_A2A_SQLITE_PATH` enables repository-owned durable admission, dispatch, receiver deduplication,
+and exact unary/stream replay **only when `SMESH_A2A_MODE=loopback`** (the default). Persistent
 SQLite mode is supported on Unix platforms only and enforces exactly one open writer per database
 with a nonblocking lifetime file lock; a second gateway/store open fails before restart recovery and
 cannot terminalize live work. On non-Unix platforms persistent open fails explicitly. The path must
 be absolute and its existing parent directory must be owned by the gateway user with no group or
 world permissions (normally mode `0700`). The database and SQLite sidecars are held at `0600`.
-After restart, terminal tasks remain unchanged; nonterminal tasks that no longer have a live
-execution are recovered fail-closed as `Failed` with a fresh timestamp and restart diagnostic rather
-than being exposed as orphaned work. The SQLite metadata persists the completion-receipt key, so
-receipts accepted before restart can be verified afterward.
+On SIGINT, durable loopback stops HTTP admission gracefully, joins its outbox driver and real-time
+retry ticker within bounded deadlines, then closes shared SQLite state and releases the lock.
+
+`SMESH_A2A_MODE=runtime` combined with `SMESH_A2A_SQLITE_PATH` fails closed before opening SQLite,
+starting the runtime/event drain or worker, or binding/joining the mesh. Durable runtime routing is not
+supported until a repository-owned runtime effect-idempotency adapter can durably deduplicate stable
+dispatch IDs and replay receiver effects. The generic library function `build_router_with_sqlite`
+(and its traced variant) remains a compatibility/task-snapshot API around the upstream
+`DefaultRequestHandler`; it is not durable dispatch and must not be used to claim effect replay.
 
 Run the built-in real runtime worker with a live QUIC endpoint:
 

@@ -7,22 +7,30 @@ use std::time::Duration;
 
 use a2a::{
     A2AError, ListTasksRequest, ListTasksResponse, Message, Part, Role, SendMessageRequest,
-    SendMessageResponse, Task,
+    SendMessageResponse, StreamResponse, Task, TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
 };
 use a2a_server::TaskStore;
 use async_trait::async_trait;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 
-use crate::{InputLimits, MeshRequest, content_digest, store::list_tasks_response};
+use crate::{
+    DurableDispatchEnvelope, DurableReceiverResult, DurableReceiverTermination, InputLimits,
+    MeshEvent, MeshRequest, content_digest, store::list_tasks_response,
+};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
+const V2_SCHEMA_VERSION: i64 = 2;
+const V3_SCHEMA_VERSION: i64 = 3;
 const APPLICATION_ID: i64 = 0x534D_4132;
 const MAX_TASK_JSON_BYTES: usize = 1024 * 1024;
 const MAX_STORE_JSON_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATOMIC_JSON_BYTES: usize = 1024 * 1024;
 const MAX_ATOMIC_TEXT_BYTES: usize = 4096;
 const MAX_OUTBOX_ATTEMPTS: u32 = 1_000;
+const STREAM_TRANSCRIPT_VERSION: i64 = 1;
+const MAX_STREAM_FRAMES: usize = 1_024;
+const STREAM_INTERRUPTION_PREFIX: &str = "durable stream interrupted: ";
 /// Authority is deliberately not caller controlled. Authenticated multi-tenant scoping is #13.
 pub const TRUSTED_SINGLE_TENANT_SCOPE: &str = "smesh:trusted-single-tenant:v1";
 
@@ -37,7 +45,11 @@ pub fn canonical_send_message_digest(
     streaming: bool,
 ) -> Result<String, A2AError> {
     let semantic = serde_json::json!({
-        "configuration": request.configuration,
+        // The durable gateway accepts only application/json. Client spelling of
+        // omitted defaults, accepted-mode ordering/duplicates, and unary
+        // response controls (historyLength/returnImmediately) affect only the
+        // current response projection/wait, never business execution identity.
+        "executionConfiguration": { "outputMode": "application/json" },
         "invocation": if streaming { "streaming" } else { "unary" },
         "message": request.message,
         "metadata": request.metadata,
@@ -126,7 +138,7 @@ const ATOMIC_SCHEMA_SQL: &str = "CREATE TABLE task_events (
      PRIMARY KEY(outbox_id, attempt_no)
  );
 ";
-const SCHEMA_SQL: &str = "CREATE TABLE store_metadata (
+const V2_SCHEMA_SQL: &str = "CREATE TABLE store_metadata (
      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
      schema_version INTEGER NOT NULL,
      migration_hash TEXT NOT NULL,
@@ -204,6 +216,138 @@ const SCHEMA_SQL: &str = "CREATE TABLE store_metadata (
      PRIMARY KEY(outbox_id, attempt_no)
  );
 ";
+const RECEIVER_SCHEMA_SQL: &str = "CREATE TABLE receiver_inbox (
+     tenant_scope TEXT NOT NULL,
+     dispatch_id TEXT NOT NULL,
+     payload_digest TEXT NOT NULL,
+     payload_json TEXT NOT NULL,
+     task_id TEXT NOT NULL,
+     context_id TEXT NOT NULL,
+     state TEXT NOT NULL CHECK (state IN ('processing', 'completed')),
+     lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+     lease_owner TEXT,
+     lease_token TEXT,
+     lease_until INTEGER,
+     completion_kind TEXT CHECK (completion_kind IS NULL OR completion_kind IN
+         ('success', 'input_required', 'auth_required')),
+     termination_json TEXT,
+     frame_count INTEGER CHECK (frame_count IS NULL OR frame_count >= 0),
+     transcript_digest TEXT,
+     accepted_at INTEGER NOT NULL,
+     completed_at INTEGER,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY(tenant_scope, dispatch_id),
+     CHECK ((state = 'processing' AND completion_kind IS NULL AND termination_json IS NULL AND frame_count IS NULL
+             AND transcript_digest IS NULL AND completed_at IS NULL
+             AND lease_owner IS NOT NULL AND lease_token IS NOT NULL AND lease_until IS NOT NULL)
+         OR (state = 'completed' AND completion_kind IS NOT NULL
+             AND ((completion_kind = 'success' AND termination_json IS NULL)
+                  OR (completion_kind IN ('input_required', 'auth_required') AND termination_json IS NOT NULL))
+             AND frame_count IS NOT NULL
+             AND transcript_digest IS NOT NULL AND completed_at IS NOT NULL
+             AND lease_owner IS NULL AND lease_token IS NULL AND lease_until IS NULL))
+ );
+ CREATE INDEX receiver_inbox_reclaim
+     ON receiver_inbox(state, lease_until, accepted_at, dispatch_id);
+ CREATE TABLE receiver_frames (
+     tenant_scope TEXT NOT NULL,
+     dispatch_id TEXT NOT NULL,
+     frame_seq INTEGER NOT NULL CHECK (frame_seq > 0),
+     frame_version INTEGER NOT NULL CHECK (frame_version = 1),
+     frame_kind TEXT NOT NULL CHECK (frame_kind IN ('mesh_event', 'dispatch_error')),
+     frame_json TEXT NOT NULL,
+     frame_digest TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     PRIMARY KEY(tenant_scope, dispatch_id, frame_seq),
+     FOREIGN KEY(tenant_scope, dispatch_id)
+       REFERENCES receiver_inbox(tenant_scope, dispatch_id) ON DELETE RESTRICT
+ );
+ CREATE TABLE loopback_effects (
+     tenant_scope TEXT NOT NULL,
+     dispatch_id TEXT NOT NULL,
+     effect_kind TEXT NOT NULL CHECK (effect_kind = 'accepted'),
+     committed_at INTEGER NOT NULL,
+     PRIMARY KEY(tenant_scope, dispatch_id),
+     FOREIGN KEY(tenant_scope, dispatch_id)
+       REFERENCES receiver_inbox(tenant_scope, dispatch_id) ON DELETE RESTRICT
+ );
+ CREATE TABLE stream_transcripts (
+     tenant_scope TEXT NOT NULL,
+     message_id TEXT NOT NULL,
+     dispatch_id TEXT NOT NULL UNIQUE REFERENCES outbox(dispatch_id) ON DELETE RESTRICT,
+     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+     transcript_version INTEGER NOT NULL CHECK (transcript_version = 1),
+     state TEXT NOT NULL CHECK (state IN ('open', 'terminal', 'interrupted')),
+     frame_count INTEGER NOT NULL CHECK (frame_count >= 0 AND frame_count <= 1024),
+     transcript_digest TEXT,
+     terminal_seq INTEGER,
+     interruption_error TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY(tenant_scope, message_id),
+     CHECK ((state = 'open' AND frame_count > 0 AND transcript_digest IS NOT NULL
+             AND terminal_seq IS NULL AND interruption_error IS NULL)
+         OR (state = 'terminal' AND frame_count > 0 AND transcript_digest IS NOT NULL
+             AND terminal_seq = frame_count AND interruption_error IS NULL)
+         OR (state = 'interrupted' AND transcript_digest IS NOT NULL
+             AND terminal_seq IS NULL AND interruption_error IS NOT NULL))
+ );
+ CREATE INDEX stream_transcripts_task
+     ON stream_transcripts(tenant_scope, task_id, state);
+ CREATE TABLE stream_frames (
+     tenant_scope TEXT NOT NULL,
+     message_id TEXT NOT NULL,
+     frame_seq INTEGER NOT NULL CHECK (frame_seq > 0 AND frame_seq <= 1024),
+     frame_version INTEGER NOT NULL CHECK (frame_version = 1),
+     frame_kind TEXT NOT NULL CHECK (frame_kind IN
+         ('task', 'message', 'status_update', 'artifact_update')),
+     frame_json TEXT NOT NULL,
+     frame_digest TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     PRIMARY KEY(tenant_scope, message_id, frame_seq),
+     FOREIGN KEY(tenant_scope, message_id)
+       REFERENCES stream_transcripts(tenant_scope, message_id) ON DELETE RESTRICT
+ );
+";
+const CANCELLATION_SCHEMA_SQL: &str = "CREATE TABLE cancellation_intents (
+     tenant_scope TEXT NOT NULL,
+     dispatch_id TEXT NOT NULL REFERENCES outbox(dispatch_id) ON DELETE RESTRICT,
+     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+     state TEXT NOT NULL CHECK (state IN ('requested', 'receiver_canceled')),
+     requested_at INTEGER NOT NULL,
+     completed_at INTEGER,
+     PRIMARY KEY(tenant_scope, dispatch_id),
+     CHECK ((state = 'requested' AND completed_at IS NULL)
+         OR (state = 'receiver_canceled' AND completed_at IS NOT NULL))
+ );
+ CREATE INDEX cancellation_intents_task
+     ON cancellation_intents(tenant_scope, task_id, state);";
+const V4_OUTBOX_TABLE_SQL: &str = "CREATE TABLE outbox_v4 (
+     outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+     dispatch_id TEXT NOT NULL UNIQUE,
+     tenant_scope TEXT NOT NULL,
+     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+     message_id TEXT NOT NULL,
+     causative_revision INTEGER NOT NULL CHECK (causative_revision > 0),
+     payload_json TEXT NOT NULL,
+     payload_digest TEXT NOT NULL,
+     state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'delivered', 'dead', 'superseded')),
+     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+     max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+     available_at INTEGER NOT NULL,
+     lease_owner TEXT,
+     lease_token TEXT,
+     lease_until INTEGER,
+     last_error TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+ );";
+const OUTBOX_MESSAGE_BINDING_SQL: &str =
+    "CREATE UNIQUE INDEX outbox_message_identity ON outbox(tenant_scope, message_id);";
+const OUTBOX_MESSAGE_IMMUTABILITY_SQL: &str = "CREATE TRIGGER outbox_message_immutable
+ BEFORE UPDATE OF message_id ON outbox
+ WHEN NEW.message_id IS NOT OLD.message_id
+ BEGIN SELECT RAISE(ABORT, 'outbox message identity is immutable'); END;";
 
 #[derive(Debug, Error)]
 pub enum SqliteStoreError {
@@ -267,6 +411,53 @@ pub enum AttemptDisposition {
     Permanent { error: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiverLease {
+    pub dispatch_id: String,
+    pub payload_digest: String,
+    pub lease_owner: String,
+    pub lease_token: String,
+    pub lease_epoch: u64,
+    pub lease_until: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiverAdmission {
+    Execute(ReceiverLease),
+    Replay(Vec<MeshEvent>),
+    ReplayOutcome(DurableReceiverResult),
+    Busy,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum CancellationOutcome {
+    Canceled(Task),
+    AwaitReceiver {
+        dispatch_id: String,
+        message_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StreamTranscriptBatch {
+    pub frames: Vec<StreamResponse>,
+    pub closed: bool,
+    pub interruption: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubscriptionCursor {
+    Transcript { message_id: String, cursor: usize },
+    TaskRevision(u64),
+}
+
+pub(crate) struct TaskEventBatch {
+    pub frames: Vec<StreamResponse>,
+    pub closed: bool,
+    pub last_revision: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionOutcome {
     Applied,
@@ -285,8 +476,8 @@ pub struct AtomicRecordCounts {
 
 #[derive(Clone)]
 pub struct SqliteTaskStore {
-    connection: Arc<Mutex<Connection>>,
-    _ownership_lock: Arc<File>,
+    connection: Arc<Mutex<Option<Connection>>>,
+    ownership_lock: Arc<Mutex<Option<File>>>,
     admission: Arc<tokio::sync::Semaphore>,
     cursor_key: Arc<[u8; 32]>,
     receipt_key: Arc<[u8; 32]>,
@@ -318,8 +509,8 @@ impl SqliteTaskStore {
                     .map_err(|_| SqliteStoreError::Initialization)??;
             secure_permissions(&connection)?;
             Ok(Self {
-                connection: Arc::new(Mutex::new(connection)),
-                _ownership_lock: Arc::new(ownership_lock),
+                connection: Arc::new(Mutex::new(Some(connection))),
+                ownership_lock: Arc::new(Mutex::new(Some(ownership_lock))),
                 admission: Arc::new(tokio::sync::Semaphore::new(1)),
                 cursor_key: Arc::new(cursor_key),
                 receipt_key: Arc::new(receipt_key),
@@ -331,6 +522,47 @@ impl SqliteTaskStore {
     #[must_use]
     pub fn completion_receipt_key(&self) -> [u8; 32] {
         *self.receipt_key
+    }
+
+    /// Check canonical message replay/conflict without consulting mutable task state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an A2A conflict for a bound message with different semantics, or an
+    /// internal error when the durable replay record is corrupt or unavailable.
+    pub async fn replay_send_message(
+        &self,
+        request: &SendMessageRequest,
+        streaming: bool,
+    ) -> Result<Option<SendMessageResponse>, A2AError> {
+        let message_id = request.message.message_id.clone();
+        if message_id.is_empty() {
+            return Ok(None);
+        }
+        let digest = canonical_send_message_digest(request, streaming)?;
+        self.run(move |connection| {
+            let row: Option<(String, String, Option<String>)> = connection
+                .query_row(
+                    "SELECT request_digest, admission_result_json, final_result_json
+                     FROM idempotency_records WHERE tenant_scope = ?1 AND message_id = ?2",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, message_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|_| A2AError::internal("idempotency replay lookup failed"))?;
+            let Some((stored_digest, admission, final_result)) = row else {
+                return Ok(None);
+            };
+            if stored_digest != digest {
+                return Err(A2AError::invalid_request(
+                    "idempotency key is already bound to different request semantics",
+                ));
+            }
+            serde_json::from_str(final_result.as_deref().unwrap_or(&admission))
+                .map(Some)
+                .map_err(|_| A2AError::internal("stored idempotency result is corrupt"))
+        })
+        .await
     }
 
     /// Admit a complete semantic `SendMessage` command using the canonical request digest.
@@ -382,6 +614,7 @@ impl SqliteTaskStore {
             dispatch,
             command.now,
             command.max_attempts,
+            command.streaming,
         )
         .await
     }
@@ -392,7 +625,7 @@ impl SqliteTaskStore {
     ///
     /// Returns an A2A error for invalid identity/payload bounds, conflicts, capacity,
     /// serialization failures, or any transactional storage failure.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn admit_message(
         &self,
         task: Task,
@@ -401,6 +634,7 @@ impl SqliteTaskStore {
         request: MeshRequest,
         now: i64,
         max_attempts: u32,
+        streaming: bool,
     ) -> Result<AdmissionOutcome, A2AError> {
         let request_digest = request_digest.into();
         let message_id = task
@@ -443,6 +677,13 @@ impl SqliteTaskStore {
             ));
         }
         let payload_digest = content_digest(payload_json.as_bytes());
+        let initial_stream_frame = StreamResponse::Task(task.clone());
+        let initial_stream_json = serde_json::to_string(&initial_stream_frame)
+            .map_err(|_| A2AError::internal("failed to encode initial stream frame"))?;
+        let initial_stream_digest = content_digest(
+            &serde_json::to_vec(&vec![initial_stream_frame])
+                .map_err(|_| A2AError::internal("failed to digest initial stream frame"))?,
+        );
         let max_tasks = self.max_tasks;
         self.run(move |connection| {
             let transaction = connection
@@ -539,14 +780,15 @@ impl SqliteTaskStore {
             transaction
                 .execute(
                     "INSERT INTO outbox(
-                         dispatch_id, tenant_scope, task_id, causative_revision,
+                         dispatch_id, tenant_scope, task_id, message_id, causative_revision,
                          payload_json, payload_digest, state, attempt_count,
                          max_attempts, available_at, created_at, updated_at
-                     ) VALUES (?1, ?2, ?3, 1, ?4, ?5, 'pending', 0, ?6, ?7, ?7, ?7)",
+                     ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, 'pending', 0, ?7, ?8, ?8, ?8)",
                     params![
                         dispatch_id,
                         TRUSTED_SINGLE_TENANT_SCOPE,
                         task.id,
+                        message_id,
                         payload_json,
                         payload_digest,
                         max_attempts,
@@ -554,7 +796,40 @@ impl SqliteTaskStore {
                     ],
                 )
                 .map_err(|_| A2AError::internal("atomic outbox enqueue failed"))?;
+            if streaming {
+                transaction
+                    .execute(
+                        "INSERT INTO stream_transcripts(
+                             tenant_scope, message_id, dispatch_id, task_id, transcript_version,
+                             state, frame_count, transcript_digest, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, 1, 'open', 1, ?5, ?6, ?6)",
+                        params![
+                            TRUSTED_SINGLE_TENANT_SCOPE,
+                            message_id,
+                            dispatch_id,
+                            task.id,
+                            initial_stream_digest,
+                            now
+                        ],
+                    )
+                    .map_err(|_| A2AError::internal("stream transcript admission failed"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO stream_frames(tenant_scope, message_id, frame_seq,
+                             frame_version, frame_kind, frame_json, frame_digest, created_at)
+                         VALUES (?1, ?2, 1, 1, 'task', ?3, ?4, ?5)",
+                        params![
+                            TRUSTED_SINGLE_TENANT_SCOPE,
+                            message_id,
+                            initial_stream_json,
+                            content_digest(initial_stream_json.as_bytes()),
+                            now
+                        ],
+                    )
+                    .map_err(|_| A2AError::internal("initial stream frame append failed"))?;
+            }
             ensure_atomic_capacity(&transaction)?;
+            ensure_stream_capacity(&transaction)?;
             transaction
                 .commit()
                 .map_err(|_| A2AError::internal("atomic admission commit failed"))?;
@@ -599,21 +874,12 @@ impl SqliteTaskStore {
             return Err(A2AError::invalid_params("invalid durable continuation"));
         }
         let digest = canonical_send_message_digest(&command.request, command.streaming)?;
-        if !matches!(
-            command.task.status.state,
-            a2a::TaskState::InputRequired | a2a::TaskState::AuthRequired
-        ) {
-            return Err(A2AError::unsupported_operation(
-                "only interrupted tasks accept durable continuation",
-            ));
-        }
-        let result_json = serde_json::to_string(&command.original_result)
-            .map_err(|_| A2AError::internal("failed to encode continuation result"))?;
         let dispatch_id = content_digest(
             format!("{TRUSTED_SINGLE_TENANT_SCOPE}\0send-message\0{message_id}").as_bytes(),
         );
         let now = command.now;
         let max_attempts = command.max_attempts;
+        let streaming = command.streaming;
         let expected_task = command.task;
         let request = command.request;
         let input_limits = command.input_limits;
@@ -631,7 +897,7 @@ impl SqliteTaskStore {
                 .optional()
                 .map_err(|_| A2AError::internal("continuation idempotency lookup failed"))?;
             if let Some((stored_digest, admission, final_result)) = existing {
-                if stored_digest != digest || admission != result_json {
+                if stored_digest != digest {
                     return Err(A2AError::invalid_request(
                         "idempotency key is already bound to different request or continuation semantics",
                     ));
@@ -664,8 +930,12 @@ impl SqliteTaskStore {
                 .get_or_insert_with(Vec::new)
                 .push(request.message.clone());
             task.status.state = a2a::TaskState::Working;
+            task.status.message = None;
             task.status.timestamp = chrono::DateTime::from_timestamp_millis(now);
             let task_json = encode_task(&task)?;
+            let admission_result = SendMessageResponse::Task(task.clone());
+            let result_json = serde_json::to_string(&admission_result)
+                .map_err(|_| A2AError::internal("failed to encode continuation admission"))?;
             let dispatch = MeshRequest::from_a2a(
                 task.id.clone(),
                 task.context_id.clone(),
@@ -705,13 +975,37 @@ impl SqliteTaskStore {
                 params![TRUSTED_SINGLE_TENANT_SCOPE, message_id, digest, task.id, result_json, now],
             ).map_err(|_| A2AError::internal("continuation idempotency reservation failed"))?;
             tx.execute(
-                "INSERT INTO outbox(dispatch_id, tenant_scope, task_id, causative_revision,
+                "INSERT INTO outbox(dispatch_id, tenant_scope, task_id, message_id, causative_revision,
                      payload_json, payload_digest, state, max_attempts, available_at, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?8, ?8)",
-                params![dispatch_id, TRUSTED_SINGLE_TENANT_SCOPE, task.id, next_revision,
-                    payload_json, payload_digest, max_attempts, now],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9, ?9)",
+                params![dispatch_id, TRUSTED_SINGLE_TENANT_SCOPE, task.id, message_id,
+                    next_revision, payload_json, payload_digest, max_attempts, now],
             ).map_err(|_| A2AError::internal("continuation outbox enqueue failed"))?;
+            if streaming {
+                let initial = StreamResponse::Task(task.clone());
+                let initial_json = serde_json::to_string(&initial)
+                    .map_err(|_| A2AError::internal("failed to encode continuation stream"))?;
+                let initial_digest = content_digest(
+                    &serde_json::to_vec(&vec![initial.clone()])
+                        .map_err(|_| A2AError::internal("failed to digest continuation stream"))?,
+                );
+                tx.execute(
+                    "INSERT INTO stream_transcripts(tenant_scope, message_id, dispatch_id, task_id,
+                         transcript_version, state, frame_count, transcript_digest, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 1, 'open', 1, ?5, ?6, ?6)",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, message_id, dispatch_id, task.id,
+                        initial_digest, now],
+                ).map_err(|_| A2AError::internal("continuation stream admission failed"))?;
+                tx.execute(
+                    "INSERT INTO stream_frames(tenant_scope, message_id, frame_seq, frame_version,
+                         frame_kind, frame_json, frame_digest, created_at)
+                     VALUES (?1, ?2, 1, 1, 'task', ?3, ?4, ?5)",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, message_id, initial_json,
+                        content_digest(initial_json.as_bytes()), now],
+                ).map_err(|_| A2AError::internal("continuation initial stream append failed"))?;
+            }
             ensure_atomic_capacity(&tx)?;
+            ensure_stream_capacity(&tx)?;
             tx.commit().map_err(|_| A2AError::internal("continuation commit failed"))?;
             Ok(AdmissionOutcome::Admitted(AdmissionRecord {
                 task_id: task.id,
@@ -744,19 +1038,108 @@ impl SqliteTaskStore {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("outbox claim transaction failed"))?;
-            let expired_final: Option<(i64, String)> = transaction
+            validate_atomic_records(&transaction)
+                .map_err(|_| A2AError::internal("durable outbox binding is corrupt"))?;
+            let expired_final: Option<(i64, String, String, i64, i64, String, String)> = transaction
                 .query_row(
-                    "SELECT outbox_id, task_id FROM outbox
+                    "SELECT outbox_id, dispatch_id, task_id, attempt_count, max_attempts,
+                            payload_json, payload_digest
+                     FROM outbox
                      WHERE state = 'leased' AND lease_until <= ?1
-                       AND attempt_count >= max_attempts
+                       AND (attempt_count >= max_attempts OR EXISTS (
+                           SELECT 1 FROM receiver_inbox receiver
+                           WHERE receiver.tenant_scope = outbox.tenant_scope
+                             AND receiver.dispatch_id = outbox.dispatch_id
+                             AND receiver.payload_digest = outbox.payload_digest
+                             AND receiver.state IN ('processing', 'completed')
+                       ))
                      ORDER BY lease_until, outbox_id LIMIT 1",
                     [now],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|_| A2AError::internal("expired final attempt lookup failed"))?;
-            if let Some((outbox_id, task_id)) = expired_final {
-                let error = "final outbox attempt lease expired before acknowledgement";
+            if let Some((outbox_id, dispatch_id, task_id, attempt_no, max_attempts, payload, payload_digest)) = expired_final {
+                let receiver: Option<(String, String, Option<i64>)> = transaction
+                    .query_row(
+                        "SELECT payload_digest, state, lease_until FROM receiver_inbox
+                         WHERE tenant_scope = ?1 AND dispatch_id = ?2",
+                        params![TRUSTED_SINGLE_TENANT_SCOPE, dispatch_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|_| A2AError::internal("final attempt receiver lookup failed"))?;
+                if let Some((receiver_digest, receiver_state, receiver_lease_until)) = receiver {
+                    if receiver_digest != payload_digest {
+                        return Err(A2AError::internal(
+                            "receiver dispatch identity is bound to a conflicting payload",
+                        ));
+                    }
+                    if receiver_state == "processing"
+                        && receiver_lease_until.is_some_and(|lease_until| lease_until > now)
+                    {
+                        transaction.commit().map_err(|_| {
+                            A2AError::internal("final attempt receiver wait commit failed")
+                        })?;
+                        return Ok(None);
+                    }
+                    let lease_until = now
+                        .checked_add(lease_duration)
+                        .ok_or_else(|| A2AError::invalid_params("outbox lease time overflow"))?;
+                    let entropy: [u8; 32] = rand::random();
+                    let lease_token = content_digest(
+                        [dispatch_id.as_bytes(), lease_owner.as_bytes(), &now.to_le_bytes(), &entropy]
+                            .concat()
+                            .as_slice(),
+                    );
+                    transaction
+                        .execute(
+                            "UPDATE outbox SET lease_owner = ?2, lease_token = ?3,
+                                 lease_until = ?4, updated_at = ?5
+                             WHERE outbox_id = ?1 AND state = 'leased'
+                               AND attempt_count = ?6 AND lease_until <= ?5",
+                            params![outbox_id, lease_owner, lease_token, lease_until, now, attempt_no],
+                        )
+                        .map_err(|_| A2AError::internal("final attempt reconciliation claim failed"))?;
+                    transaction
+                        .execute(
+                            "UPDATE outbox_attempts SET lease_token = ?3, started_at = ?4,
+                                 finished_at = NULL, outcome = NULL, error = NULL, next_attempt_at = NULL
+                             WHERE outbox_id = ?1 AND attempt_no = ?2 AND finished_at IS NULL",
+                            params![outbox_id, attempt_no, lease_token, now],
+                        )
+                        .map_err(|_| A2AError::internal("final attempt reconciliation fence failed"))?;
+                    ensure_atomic_capacity(&transaction)?;
+                    transaction.commit().map_err(|_| {
+                        A2AError::internal("final attempt reconciliation claim commit failed")
+                    })?;
+                    let request: MeshRequest = serde_json::from_str(&payload)
+                        .map_err(|_| A2AError::internal("outbox payload is corrupt"))?;
+                    return Ok(Some(OutboxLease {
+                        outbox_id,
+                        dispatch_id,
+                        task_id,
+                        attempt_no: u32::try_from(attempt_no)
+                            .map_err(|_| A2AError::internal("outbox attempt is corrupt"))?,
+                        max_attempts: u32::try_from(max_attempts)
+                            .map_err(|_| A2AError::internal("outbox bound is corrupt"))?,
+                        lease_owner,
+                        lease_token,
+                        lease_until,
+                        request,
+                    }));
+                }
+                let error = "final outbox attempt lease expired before receiver acceptance";
                 transaction
                     .execute(
                         "UPDATE outbox_attempts SET finished_at = ?2, outcome = 'dead', error = ?3
@@ -773,7 +1156,7 @@ impl SqliteTaskStore {
                         |row| row.get(0),
                     )
                     .map_err(|_| A2AError::internal("expired final task arbitration failed"))?;
-                dead_letter_task(&transaction, &task_id, error, now)?;
+                dead_letter_task(&transaction, &task_id, &dispatch_id, error, now)?;
                 transaction
                     .execute(
                         "UPDATE outbox SET state = ?2, lease_owner = NULL, lease_token = NULL,
@@ -918,6 +1301,7 @@ impl SqliteTaskStore {
     /// # Errors
     ///
     /// Returns an A2A error for oversized diagnostics or transactional storage failure.
+    #[allow(clippy::too_many_lines)] // Fence, cancellation arbitration, and attempt outcome share one transaction.
     pub async fn finish_outbox_attempt(
         &self,
         lease: &OutboxLease,
@@ -929,9 +1313,10 @@ impl SqliteTaskStore {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("outbox finish transaction failed"))?;
-            let durable: Option<(i64, i64, String, i64, String)> = transaction
+            let durable: Option<(i64, i64, String, i64, String, String)> = transaction
                 .query_row(
-                    "SELECT attempt_count, max_attempts, lease_owner, lease_until, task_id FROM outbox
+                    "SELECT attempt_count, max_attempts, lease_owner, lease_until, task_id,
+                            payload_digest FROM outbox
                      WHERE outbox_id = ?1 AND state = 'leased' AND lease_token = ?2",
                     params![lease.outbox_id, lease.lease_token],
                     |row| {
@@ -941,12 +1326,15 @@ impl SqliteTaskStore {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            row.get(5)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(|_| A2AError::internal("outbox fence lookup failed"))?;
-            let Some((attempt_no, max_attempts, owner, lease_until, task_id)) = durable else {
+            let Some((attempt_no, max_attempts, owner, lease_until, task_id, payload_digest)) =
+                durable
+            else {
                 return Ok(TransitionOutcome::Stale);
             };
             if attempt_no != i64::from(lease.attempt_no)
@@ -958,7 +1346,98 @@ impl SqliteTaskStore {
             {
                 return Ok(TransitionOutcome::Stale);
             }
+            let cancellation_won: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cancellation_intents
+                     WHERE tenant_scope = ?1 AND dispatch_id = ?2 AND task_id = ?3
+                       AND state = 'requested')",
+                    params![
+                        TRUSTED_SINGLE_TENANT_SCOPE,
+                        lease.dispatch_id,
+                        lease.task_id
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|_| A2AError::internal("outbox cancellation arbitration failed"))?;
+            if cancellation_won {
+                return Ok(TransitionOutcome::Stale);
+            }
             let exhausted = attempt_no >= max_attempts;
+            let would_dead_letter = match &disposition {
+                AttemptDisposition::Retry { .. } => exhausted,
+                AttemptDisposition::Permanent { .. } => true,
+            };
+            if would_dead_letter {
+                let receiver: Option<(String, String)> = transaction
+                    .query_row(
+                        "SELECT payload_digest, state FROM receiver_inbox
+                         WHERE tenant_scope = ?1 AND dispatch_id = ?2",
+                        params![TRUSTED_SINGLE_TENANT_SCOPE, lease.dispatch_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|_| A2AError::internal("outbox finish receiver lookup failed"))?;
+                if let Some((receiver_digest, receiver_state)) = receiver {
+                    if receiver_digest != payload_digest {
+                        return Err(A2AError::internal(
+                            "receiver dispatch identity is bound to a conflicting payload",
+                        ));
+                    }
+                    if matches!(receiver_state.as_str(), "processing" | "completed") {
+                        // Never dead-letter an effect that the receiver has accepted. Fence
+                        // this caller immediately and leave the final attempt reclaimable;
+                        // claim/recovery will reconcile the durable receiver transcript.
+                        let entropy: [u8; 32] = rand::random();
+                        let reconciliation_token = content_digest(
+                            [
+                                lease.dispatch_id.as_bytes(),
+                                b"finish-reconciliation",
+                                &now.to_le_bytes(),
+                                &entropy,
+                            ]
+                            .concat()
+                            .as_slice(),
+                        );
+                        transaction
+                            .execute(
+                                "UPDATE outbox SET lease_owner = 'receiver-reconciliation',
+                                     lease_token = ?3, lease_until = ?4, updated_at = ?4
+                                 WHERE outbox_id = ?1 AND lease_token = ?2",
+                                params![
+                                    lease.outbox_id,
+                                    lease.lease_token,
+                                    reconciliation_token,
+                                    now
+                                ],
+                            )
+                            .map_err(|_| {
+                                A2AError::internal("outbox finish reconciliation fence failed")
+                            })?;
+                        transaction
+                            .execute(
+                                "UPDATE outbox_attempts SET lease_token = ?3, started_at = ?4,
+                                     finished_at = NULL, outcome = NULL, error = NULL,
+                                     next_attempt_at = NULL
+                                 WHERE outbox_id = ?1 AND attempt_no = ?2
+                                   AND finished_at IS NULL",
+                                params![
+                                    lease.outbox_id,
+                                    lease.attempt_no,
+                                    reconciliation_token,
+                                    now
+                                ],
+                            )
+                            .map_err(|_| {
+                                A2AError::internal("outbox finish reconciliation attempt failed")
+                            })?;
+                        ensure_atomic_capacity(&transaction)?;
+                        transaction.commit().map_err(|_| {
+                            A2AError::internal("outbox finish reconciliation commit failed")
+                        })?;
+                        return Ok(TransitionOutcome::Applied);
+                    }
+                }
+            }
             let (dead, error, available_at) = match disposition {
                 AttemptDisposition::Retry {
                     available_at,
@@ -1013,7 +1492,13 @@ impl SqliteTaskStore {
                     params![lease.outbox_id, lease.lease_token, error, now],
                 )
                 .map_err(|_| A2AError::internal("outbox dead-letter failed"))?;
-            dead_letter_task(&transaction, &lease.task_id, &error, now)?;
+            dead_letter_task(
+                &transaction,
+                &lease.task_id,
+                &lease.dispatch_id,
+                &error,
+                now,
+            )?;
             ensure_atomic_capacity(&transaction)?;
             transaction
                 .commit()
@@ -1170,6 +1655,1085 @@ impl SqliteTaskStore {
         .await
     }
 
+    /// Return the immutable completed replay bound to a semantic message identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error if the replay record cannot be read or decoded.
+    pub async fn final_result_for_message(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<SendMessageResponse>, A2AError> {
+        let message_id = message_id.to_owned();
+        self.run(move |connection| {
+            let encoded: Option<String> = connection
+                .query_row(
+                    "SELECT final_result_json FROM idempotency_records
+                     WHERE tenant_scope = ?1 AND message_id = ?2 AND state = 'completed'",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, message_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| A2AError::internal("idempotency replay lookup failed"))?;
+            encoded
+                .map(|value| {
+                    serde_json::from_str(&value)
+                        .map_err(|_| A2AError::internal("stored idempotency result is corrupt"))
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    /// Persist cancellation authority or atomically cancel an unclaimed intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns protocol errors for missing/terminal tasks and internal errors when the
+    /// revision-fenced cancellation transaction cannot be committed.
+    #[allow(clippy::too_many_lines)]
+    pub async fn request_cancellation(
+        &self,
+        task_id: &str,
+        now: i64,
+    ) -> Result<CancellationOutcome, A2AError> {
+        let task_id = task_id.to_owned();
+        self.run(move |connection| {
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| A2AError::internal("cancellation transaction failed"))?;
+            let row: Option<(String, i64, String, String, String)> = tx.query_row(
+                "SELECT task.task_json, task.revision, identity.message_id,
+                        outbox.dispatch_id, outbox.state
+                 FROM tasks task
+                 JOIN outbox ON outbox.tenant_scope = ?1 AND outbox.task_id = task.task_id
+                 JOIN idempotency_records identity ON identity.tenant_scope = outbox.tenant_scope
+                   AND identity.message_id = outbox.message_id
+                   AND identity.task_id = outbox.task_id
+                 WHERE task.task_id = ?2
+                 ORDER BY outbox.state IN ('pending', 'leased', 'delivered') DESC,
+                          outbox.outbox_id DESC LIMIT 1",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            ).optional().map_err(|_| A2AError::internal("cancellation lookup failed"))?;
+            let Some((task_json, revision, message_id, dispatch_id, _outbox_state)) = row else {
+                return Err(A2AError::task_not_found(&task_id));
+            };
+            let mut task = decode_task(&task_json)?;
+            if task.status.state.is_terminal() {
+                return Err(A2AError::task_not_cancelable(&task_id));
+            }
+            let receiver_state: Option<String> = tx.query_row(
+                "SELECT state FROM receiver_inbox WHERE tenant_scope = ?1 AND dispatch_id = ?2",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, dispatch_id], |row| row.get(0),
+            ).optional().map_err(|_| A2AError::internal("cancellation receiver lookup failed"))?;
+            let active_state = matches!(task.status.state,
+                a2a::TaskState::Submitted | a2a::TaskState::Working);
+            if active_state && receiver_state.is_some() {
+                if receiver_state.as_deref() == Some("processing") {
+                    tx.execute(
+                        "INSERT INTO cancellation_intents(
+                             tenant_scope, dispatch_id, task_id, state, requested_at)
+                         VALUES (?1, ?2, ?3, 'requested', ?4)
+                         ON CONFLICT(tenant_scope, dispatch_id) DO NOTHING",
+                        params![TRUSTED_SINGLE_TENANT_SCOPE, dispatch_id, task_id, now],
+                    ).map_err(|_| A2AError::internal("cancellation intent commit failed"))?;
+                }
+                tx.commit().map_err(|_| A2AError::internal("cancellation intent transaction failed"))?;
+                return Ok(CancellationOutcome::AwaitReceiver { dispatch_id, message_id });
+            }
+
+            let previous_state = state_key(&task)?;
+            let mut message = Message::new(Role::Agent, vec![Part::text("SMESH task canceled")]);
+            message.message_id = format!("cancel-{}", &content_digest(dispatch_id.as_bytes())[..32]);
+            message.task_id = Some(task.id.clone());
+            message.context_id = Some(task.context_id.clone());
+            task.status = a2a::TaskStatus {
+                state: a2a::TaskState::Canceled,
+                message: Some(message),
+                timestamp: chrono::DateTime::from_timestamp_millis(now),
+            };
+            let canceled_json = encode_task(&task)?;
+            let canceled_state = state_key(&task)?;
+            let next_revision = revision.checked_add(1)
+                .ok_or_else(|| A2AError::internal("persistent task revision exhausted"))?;
+            let changed = tx.execute(
+                "UPDATE tasks SET state = ?2, status_timestamp = ?3, revision = ?4, task_json = ?5
+                 WHERE task_id = ?1 AND revision = ?6
+                   AND state NOT IN ('\"TASK_STATE_COMPLETED\"', '\"TASK_STATE_FAILED\"',
+                                     '\"TASK_STATE_CANCELED\"', '\"TASK_STATE_REJECTED\"')",
+                params![task_id, canceled_state, task.status.timestamp.map(|value| value.to_rfc3339()),
+                    next_revision, canceled_json, revision],
+            ).map_err(|_| A2AError::internal("cancellation task commit failed"))?;
+            if changed != 1 { return Err(A2AError::task_not_cancelable(&task_id)); }
+            let event_seq: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(event_seq), 0) + 1 FROM task_events
+                 WHERE tenant_scope = ?1 AND task_id = ?2",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, task_id], |row| row.get(0),
+            ).map_err(|_| A2AError::internal("cancellation event sequence failed"))?;
+            tx.execute(
+                "INSERT INTO task_events(tenant_scope, task_id, event_seq, task_revision,
+                     event_kind, from_state, to_state, event_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'durable_canceled', ?5, ?6, ?7, ?8)",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, task_id, event_seq, next_revision,
+                    previous_state, canceled_state, canceled_json, now],
+            ).map_err(|_| A2AError::internal("cancellation event append failed"))?;
+            append_canceled_public_terminal(&tx, &dispatch_id, &task, now)?;
+            let final_json = serde_json::to_string(&SendMessageResponse::Task(task.clone()))
+                .map_err(|_| A2AError::internal("failed to encode cancellation result"))?;
+            tx.execute(
+                "UPDATE idempotency_records SET state = 'completed', final_result_json = ?2,
+                     updated_at = ?3 WHERE tenant_scope = ?1 AND message_id = ?4
+                     AND task_id = ?5 AND state = 'in_progress' AND final_result_json IS NULL",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, final_json, now, message_id, task_id],
+            ).map_err(|_| A2AError::internal("cancellation replay commit failed"))?;
+            tx.execute(
+                "UPDATE outbox_attempts SET finished_at = ?2, outcome = 'superseded'
+                 WHERE finished_at IS NULL AND outbox_id =
+                     (SELECT outbox_id FROM outbox WHERE dispatch_id = ?1)",
+                params![dispatch_id, now],
+            ).map_err(|_| A2AError::internal("cancellation attempt close failed"))?;
+            tx.execute(
+                "UPDATE outbox SET state = 'superseded', lease_owner = NULL, lease_token = NULL,
+                     lease_until = NULL, updated_at = ?2 WHERE dispatch_id = ?1 AND state != 'dead'",
+                params![dispatch_id, now],
+            ).map_err(|_| A2AError::internal("cancellation outbox supersede failed"))?;
+            ensure_atomic_capacity(&tx)?;
+            ensure_stream_capacity(&tx)?;
+            tx.commit().map_err(|_| A2AError::internal("cancellation commit failed"))?;
+            Ok(CancellationOutcome::Canceled(task))
+        }).await
+    }
+
+    pub(crate) async fn cancellation_requested(&self, dispatch_id: &str) -> Result<bool, A2AError> {
+        let dispatch_id = dispatch_id.to_owned();
+        self.run(move |connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cancellation_intents
+                 WHERE tenant_scope = ?1 AND dispatch_id = ?2 AND state = 'requested')",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, dispatch_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| A2AError::internal("cancellation intent lookup failed"))
+        })
+        .await
+    }
+
+    /// Read committed public stream frames strictly after `last_sequence`.
+    pub(crate) async fn stream_frames_after(
+        &self,
+        message_id: &str,
+        last_sequence: usize,
+    ) -> Result<StreamTranscriptBatch, A2AError> {
+        let message_id = message_id.to_owned();
+        self.run(move |connection| {
+            let metadata: Option<(String, i64, Option<String>, Option<String>)> = connection
+                .query_row(
+                    "SELECT state, frame_count, transcript_digest, interruption_error
+                     FROM stream_transcripts WHERE tenant_scope = ?1 AND message_id = ?2",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, message_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|_| A2AError::internal("stream transcript lookup failed"))?;
+            let Some((state, frame_count, transcript_digest, interruption)) = metadata else {
+                return Err(A2AError::invalid_request(
+                    "message identity is not bound to a streaming request",
+                ));
+            };
+            let all = load_public_stream_frames(
+                connection,
+                &message_id,
+                frame_count,
+                transcript_digest.as_deref(),
+                &state,
+                interruption.as_deref(),
+            )?;
+            if last_sequence > all.len() {
+                return Err(A2AError::internal("stream replay cursor is corrupt"));
+            }
+            Ok(StreamTranscriptBatch {
+                frames: all.into_iter().skip(last_sequence).collect(),
+                closed: state != "open",
+                interruption,
+            })
+        })
+        .await
+    }
+
+    /// Append the committed working/progress frame for an active streaming dispatch.
+    pub(crate) async fn append_stream_progress(
+        &self,
+        dispatch_id: &str,
+        frame: StreamResponse,
+        now: i64,
+    ) -> Result<bool, A2AError> {
+        if !matches!(&frame, StreamResponse::StatusUpdate(update)
+            if update.status.state == a2a::TaskState::Working)
+        {
+            return Err(A2AError::invalid_params(
+                "invalid durable stream progress frame",
+            ));
+        }
+        let dispatch_id = dispatch_id.to_owned();
+        let encoded = serde_json::to_string(&frame)
+            .map_err(|_| A2AError::internal("failed to encode stream progress frame"))?;
+        self.run(move |connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| A2AError::internal("stream progress transaction failed"))?;
+            let metadata: Option<(String, i64, String)> = tx.query_row(
+                "SELECT message_id, frame_count, transcript_digest FROM stream_transcripts
+                 WHERE tenant_scope = ?1 AND dispatch_id = ?2 AND state = 'open'",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, dispatch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional().map_err(|_| A2AError::internal("stream progress lookup failed"))?;
+            let Some((message_id, count, digest)) = metadata else { return Ok(false); };
+            let mut frames = load_public_stream_frames(&tx, &message_id, count, Some(&digest), "open", None)?;
+            if frames.iter().any(|existing| matches!(existing,
+                StreamResponse::StatusUpdate(update) if update.status.state == a2a::TaskState::Working))
+            {
+                return Ok(false);
+            }
+            frames.push(frame.clone());
+            let sequence = i64::try_from(frames.len())
+                .map_err(|_| A2AError::internal("stream progress sequence exhausted"))?;
+            tx.execute(
+                "INSERT INTO stream_frames(tenant_scope, message_id, frame_seq, frame_version,
+                     frame_kind, frame_json, frame_digest, created_at)
+                 VALUES (?1, ?2, ?3, 1, 'status_update', ?4, ?5, ?6)",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, message_id, sequence, encoded,
+                    content_digest(encoded.as_bytes()), now],
+            ).map_err(|_| A2AError::internal("stream progress append failed"))?;
+            let transcript = serde_json::to_vec(&frames)
+                .map_err(|_| A2AError::internal("stream progress digest failed"))?;
+            tx.execute(
+                "UPDATE stream_transcripts SET frame_count = ?3, transcript_digest = ?4,
+                     updated_at = ?5 WHERE tenant_scope = ?1 AND message_id = ?2 AND state = 'open'",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, message_id, sequence,
+                    content_digest(&transcript), now],
+            ).map_err(|_| A2AError::internal("stream progress metadata failed"))?;
+            ensure_stream_capacity(&tx)?;
+            tx.commit().map_err(|_| A2AError::internal("stream progress commit failed"))?;
+            Ok(true)
+        }).await
+    }
+
+    /// Atomically capture the authoritative task and a tail cursor.
+    pub(crate) async fn subscription_snapshot(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(Task, SubscriptionCursor)>, A2AError> {
+        let task_id = task_id.to_owned();
+        self.run(move |connection| {
+            #[allow(clippy::type_complexity)]
+            let row: Option<(
+                String,
+                i64,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+            )> = connection
+                .query_row(
+                    "SELECT task.task_json, task.revision, stream.message_id, stream.frame_count,
+                            stream.transcript_digest
+                     FROM tasks task LEFT JOIN stream_transcripts stream
+                       ON stream.tenant_scope = ?1 AND stream.task_id = task.task_id
+                      AND stream.state = 'open'
+                     WHERE task.task_id = ?2",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, task_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|_| A2AError::internal("subscription snapshot lookup failed"))?;
+            row.map(|(encoded, revision, message_id, cursor, digest)| {
+                let mut task: Task = serde_json::from_str(&encoded)
+                    .map_err(|_| A2AError::internal("subscription task is corrupt"))?;
+                let cursor = match (message_id, cursor, digest) {
+                    (Some(message_id), Some(cursor), Some(digest)) => {
+                        let frames = load_public_stream_frames(
+                            connection,
+                            &message_id,
+                            cursor,
+                            Some(&digest),
+                            "open",
+                            None,
+                        )?;
+                        for frame in frames.into_iter().skip(1) {
+                            match frame {
+                                StreamResponse::StatusUpdate(update) => task.status = update.status,
+                                StreamResponse::ArtifactUpdate(update) => task
+                                    .artifacts
+                                    .get_or_insert_with(Vec::new)
+                                    .push(update.artifact),
+                                StreamResponse::Task(_) | StreamResponse::Message(_) => {}
+                            }
+                        }
+                        SubscriptionCursor::Transcript {
+                            message_id,
+                            cursor: usize::try_from(cursor).map_err(|_| {
+                                A2AError::internal("subscription cursor is corrupt")
+                            })?,
+                        }
+                    }
+                    (None, None, None) => SubscriptionCursor::TaskRevision(
+                        u64::try_from(revision)
+                            .map_err(|_| A2AError::internal("subscription revision is corrupt"))?,
+                    ),
+                    _ => return Err(A2AError::internal("subscription cursor is corrupt")),
+                };
+                Ok((task, cursor))
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    pub(crate) async fn task_events_after(
+        &self,
+        task_id: &str,
+        last_revision: u64,
+    ) -> Result<TaskEventBatch, A2AError> {
+        let task_id = task_id.to_owned();
+        self.run(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT event_json, task_revision FROM task_events
+                     WHERE tenant_scope = ?1 AND task_id = ?2 AND task_revision > ?3
+                     ORDER BY task_revision",
+                )
+                .map_err(|_| A2AError::internal("subscription event lookup failed"))?;
+            let rows = statement
+                .query_map(
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, task_id, last_revision],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(|_| A2AError::internal("subscription event lookup failed"))?;
+            let baseline: Option<String> = connection
+                .query_row(
+                    "SELECT event_json FROM task_events
+                     WHERE tenant_scope = ?1 AND task_id = ?2 AND task_revision <= ?3
+                     ORDER BY task_revision DESC LIMIT 1",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, task_id, last_revision],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| A2AError::internal("subscription baseline lookup failed"))?;
+            let mut previous = baseline
+                .map(|encoded| {
+                    serde_json::from_str::<Task>(&encoded)
+                        .map_err(|_| A2AError::internal("subscription baseline task is corrupt"))
+                })
+                .transpose()?;
+            let mut frames = Vec::new();
+            let mut cursor = last_revision;
+            let mut terminal = false;
+            for row in rows {
+                let (encoded, revision) =
+                    row.map_err(|_| A2AError::internal("subscription event row is corrupt"))?;
+                let task: Task = serde_json::from_str(&encoded)
+                    .map_err(|_| A2AError::internal("subscription event task is corrupt"))?;
+                cursor = u64::try_from(revision)
+                    .map_err(|_| A2AError::internal("subscription event revision is corrupt"))?;
+                let previous_artifacts = previous
+                    .as_ref()
+                    .and_then(|task| task.artifacts.as_deref())
+                    .unwrap_or_default();
+                for artifact in task.artifacts.as_deref().unwrap_or_default() {
+                    if !previous_artifacts
+                        .iter()
+                        .any(|existing| existing.artifact_id == artifact.artifact_id)
+                    {
+                        frames.push(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                            task_id: task.id.clone(),
+                            context_id: task.context_id.clone(),
+                            artifact: artifact.clone(),
+                            append: Some(false),
+                            last_chunk: Some(true),
+                            metadata: None,
+                        }));
+                    }
+                }
+                if previous
+                    .as_ref()
+                    .is_none_or(|previous| previous.status != task.status)
+                {
+                    frames.push(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                        task_id: task.id.clone(),
+                        context_id: task.context_id.clone(),
+                        status: task.status.clone(),
+                        metadata: None,
+                    }));
+                }
+                terminal = task.status.state.is_terminal();
+                previous = Some(task);
+            }
+            Ok(TaskEventBatch {
+                frames,
+                closed: terminal,
+                last_revision: cursor,
+            })
+        })
+        .await
+    }
+
+    /// Accept, replay, or reclaim a stable receiver dispatch identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid/conflicting envelopes or transactional failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn begin_receive(
+        &self,
+        envelope: DurableDispatchEnvelope,
+        lease_owner: &str,
+        now: i64,
+        lease_duration: i64,
+    ) -> Result<ReceiverAdmission, A2AError> {
+        let lease_owner = lease_owner.to_owned();
+        let payload_json = serde_json::to_string(&envelope.request)
+            .map_err(|_| A2AError::internal("failed to encode receiver payload"))?;
+        if envelope.tenant_scope != TRUSTED_SINGLE_TENANT_SCOPE
+            || envelope.dispatch_id.is_empty()
+            || envelope.dispatch_id.len() > 256
+            || envelope.payload_digest != content_digest(payload_json.as_bytes())
+            || !receiver_request_is_valid(&envelope.request, payload_json.len())
+            || lease_owner.is_empty()
+            || lease_owner.len() > MAX_ATOMIC_TEXT_BYTES
+            || lease_duration <= 0
+            || envelope.request.task_id.is_empty()
+            || envelope.request.context_id.is_empty()
+        {
+            return Err(A2AError::invalid_params(
+                "invalid durable receiver envelope",
+            ));
+        }
+        self.run(move |connection| {
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| A2AError::internal("receiver admission transaction failed"))?;
+            #[allow(clippy::type_complexity)]
+            let existing: Option<(
+                String,
+                String,
+                i64,
+                i64,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )> = tx
+                .query_row(
+                    "SELECT payload_digest, state, lease_epoch, COALESCE(lease_until, 0),
+                            frame_count, transcript_digest, completion_kind, termination_json
+                 FROM receiver_inbox WHERE tenant_scope = ?1 AND dispatch_id = ?2",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, envelope.dispatch_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|_| A2AError::internal("receiver inbox lookup failed"))?;
+            if let Some((
+                digest,
+                state,
+                epoch,
+                lease_until,
+                frame_count,
+                transcript_digest,
+                completion_kind,
+                termination_json,
+            )) = existing
+            {
+                if digest != envelope.payload_digest {
+                    return Err(A2AError::invalid_request(
+                        "dispatch identity is already bound to a different payload",
+                    ));
+                }
+                if state == "completed" {
+                    let frame_count = frame_count
+                        .ok_or_else(|| A2AError::internal("receiver replay metadata is corrupt"))?;
+                    let transcript_digest = transcript_digest
+                        .ok_or_else(|| A2AError::internal("receiver replay metadata is corrupt"))?;
+                    let events = load_receiver_frames(
+                        &tx,
+                        &envelope.dispatch_id,
+                        frame_count,
+                        &transcript_digest,
+                    )?;
+                    let termination = decode_receiver_termination(
+                        completion_kind.as_deref(),
+                        termination_json.as_deref(),
+                    )?;
+                    validate_receiver_outcome(&events, &termination)?;
+                    return Ok(match termination {
+                        DurableReceiverTermination::Success => ReceiverAdmission::Replay(events),
+                        termination => ReceiverAdmission::ReplayOutcome(DurableReceiverResult {
+                            events,
+                            termination,
+                        }),
+                    });
+                }
+                if lease_until > now {
+                    return Ok(ReceiverAdmission::Busy);
+                }
+                let next_epoch = epoch
+                    .checked_add(1)
+                    .ok_or_else(|| A2AError::internal("receiver lease epoch exhausted"))?;
+                let lease_until = now
+                    .checked_add(lease_duration)
+                    .ok_or_else(|| A2AError::invalid_params("receiver lease time overflow"))?;
+                let entropy: [u8; 32] = rand::random();
+                let token = content_digest(
+                    [
+                        envelope.dispatch_id.as_bytes(),
+                        lease_owner.as_bytes(),
+                        &next_epoch.to_le_bytes(),
+                        &entropy,
+                    ]
+                    .concat()
+                    .as_slice(),
+                );
+                let changed = tx
+                    .execute(
+                        "UPDATE receiver_inbox SET lease_epoch = ?3, lease_owner = ?4,
+                         lease_token = ?5, lease_until = ?6, updated_at = ?7
+                     WHERE tenant_scope = ?1 AND dispatch_id = ?2 AND state = 'processing'
+                       AND lease_epoch = ?8 AND lease_until <= ?7",
+                        params![
+                            TRUSTED_SINGLE_TENANT_SCOPE,
+                            envelope.dispatch_id,
+                            next_epoch,
+                            lease_owner,
+                            token,
+                            lease_until,
+                            now,
+                            epoch
+                        ],
+                    )
+                    .map_err(|_| A2AError::internal("receiver reclaim failed"))?;
+                if changed != 1 {
+                    return Ok(ReceiverAdmission::Busy);
+                }
+                tx.commit()
+                    .map_err(|_| A2AError::internal("receiver reclaim commit failed"))?;
+                return Ok(ReceiverAdmission::Execute(ReceiverLease {
+                    dispatch_id: envelope.dispatch_id,
+                    payload_digest: envelope.payload_digest,
+                    lease_owner,
+                    lease_token: token,
+                    lease_epoch: u64::try_from(next_epoch)
+                        .map_err(|_| A2AError::internal("receiver lease epoch is corrupt"))?,
+                    lease_until,
+                }));
+            }
+            let lease_until = now
+                .checked_add(lease_duration)
+                .ok_or_else(|| A2AError::invalid_params("receiver lease time overflow"))?;
+            let entropy: [u8; 32] = rand::random();
+            let token = content_digest(
+                [
+                    envelope.dispatch_id.as_bytes(),
+                    lease_owner.as_bytes(),
+                    &now.to_le_bytes(),
+                    &entropy,
+                ]
+                .concat()
+                .as_slice(),
+            );
+            tx.execute(
+                "INSERT INTO receiver_inbox(tenant_scope, dispatch_id, payload_digest,
+                     payload_json, task_id, context_id, state, lease_epoch, lease_owner,
+                     lease_token, lease_until, accepted_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'processing', 1, ?7, ?8, ?9, ?10, ?10)",
+                params![
+                    TRUSTED_SINGLE_TENANT_SCOPE,
+                    envelope.dispatch_id,
+                    envelope.payload_digest,
+                    payload_json,
+                    envelope.request.task_id,
+                    envelope.request.context_id,
+                    lease_owner,
+                    token,
+                    lease_until,
+                    now
+                ],
+            )
+            .map_err(|_| A2AError::internal("receiver acceptance failed"))?;
+            ensure_receiver_capacity(&tx)?;
+            tx.commit()
+                .map_err(|_| A2AError::internal("receiver acceptance commit failed"))?;
+            Ok(ReceiverAdmission::Execute(ReceiverLease {
+                dispatch_id: envelope.dispatch_id,
+                payload_digest: envelope.payload_digest,
+                lease_owner,
+                lease_token: token,
+                lease_epoch: 1,
+                lease_until,
+            }))
+        })
+        .await
+    }
+
+    /// Atomically persist an exact receiver transcript and fence completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale leases, oversized frames, or transactional failure.
+    pub async fn complete_receive(
+        &self,
+        lease: &ReceiverLease,
+        events: &[MeshEvent],
+        now: i64,
+    ) -> Result<(), A2AError> {
+        self.complete_receive_inner(
+            lease,
+            events,
+            DurableReceiverTermination::Success,
+            now,
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// Commit the owned loopback effect and transcript in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale lease, invalid transcript, capacity, or commit failure.
+    pub async fn complete_loopback_receive(
+        &self,
+        lease: &ReceiverLease,
+        events: &[MeshEvent],
+        now: i64,
+    ) -> Result<(), A2AError> {
+        self.complete_receive_inner(
+            lease,
+            events,
+            DurableReceiverTermination::Success,
+            now,
+            true,
+            false,
+        )
+        .await
+    }
+
+    /// Commit an immutable loopback interruption or success outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid outcome, stale receiver fence, capacity,
+    /// or transactional persistence failure.
+    pub async fn complete_loopback_outcome(
+        &self,
+        lease: &ReceiverLease,
+        outcome: &DurableReceiverResult,
+        now: i64,
+    ) -> Result<(), A2AError> {
+        self.complete_receive_inner(
+            lease,
+            &outcome.events,
+            outcome.termination.clone(),
+            now,
+            true,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_canceled_receive(
+        &self,
+        lease: &ReceiverLease,
+        events: &[MeshEvent],
+        now: i64,
+    ) -> Result<(), A2AError> {
+        self.complete_receive_inner(
+            lease,
+            events,
+            DurableReceiverTermination::Success,
+            now,
+            false,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)] // Validation, frames, effect, and fence must stay visibly atomic.
+    async fn complete_receive_inner(
+        &self,
+        lease: &ReceiverLease,
+        events: &[MeshEvent],
+        termination: DurableReceiverTermination,
+        now: i64,
+        loopback_effect: bool,
+        completion_canceled: bool,
+    ) -> Result<(), A2AError> {
+        validate_receiver_outcome(events, &termination)?;
+        let (completion_kind, termination_json) = encode_receiver_termination(&termination)?;
+        let lease = lease.clone();
+        let events = events.to_vec();
+        let encoded = events
+            .iter()
+            .map(|event| {
+                serde_json::to_string(event)
+                    .map_err(|_| A2AError::internal("failed to encode receiver frame"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if encoded.len() > 1024
+            || encoded
+                .iter()
+                .any(|frame| frame.len() > MAX_ATOMIC_JSON_BYTES)
+        {
+            return Err(A2AError::invalid_params(
+                "receiver transcript exceeds limit",
+            ));
+        }
+        let transcript = serde_json::to_vec(&events)
+            .map_err(|_| A2AError::internal("failed to digest receiver transcript"))?;
+        if transcript.len() > MAX_STORE_JSON_BYTES {
+            return Err(A2AError::invalid_params(
+                "receiver transcript exceeds byte limit",
+            ));
+        }
+        let transcript_digest = content_digest(&transcript);
+        self.run(move |connection| {
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| A2AError::internal("receiver completion transaction failed"))?;
+            let valid: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM receiver_inbox WHERE tenant_scope = ?1
+                     AND dispatch_id = ?2 AND payload_digest = ?3 AND state = 'processing'
+                     AND lease_owner = ?4 AND lease_token = ?5 AND lease_epoch = ?6
+                     AND lease_until = ?7 AND lease_until > ?8
+                     AND (EXISTS(SELECT 1 FROM cancellation_intents cancel
+                          WHERE cancel.tenant_scope = ?1 AND cancel.dispatch_id = ?2
+                            AND cancel.state = 'requested')) = ?9)",
+                    params![
+                        TRUSTED_SINGLE_TENANT_SCOPE,
+                        lease.dispatch_id,
+                        lease.payload_digest,
+                        lease.lease_owner,
+                        lease.lease_token,
+                        lease.lease_epoch,
+                        lease.lease_until,
+                        now,
+                        completion_canceled
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|_| A2AError::internal("receiver completion fence lookup failed"))?;
+            if !valid {
+                return Err(A2AError::internal("stale receiver completion lease"));
+            }
+            if completion_canceled {
+                let changed = tx.execute(
+                    "UPDATE cancellation_intents SET state = 'receiver_canceled', completed_at = ?3
+                     WHERE tenant_scope = ?1 AND dispatch_id = ?2 AND state = 'requested'",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, lease.dispatch_id, now],
+                ).map_err(|_| A2AError::internal("receiver cancellation transcript arbitration failed"))?;
+                if changed != 1 {
+                    return Err(A2AError::internal("stale receiver cancellation intent"));
+                }
+            }
+            if loopback_effect {
+                tx.execute(
+                    "INSERT INTO loopback_effects(tenant_scope, dispatch_id, effect_kind, committed_at)
+                     VALUES (?1, ?2, 'accepted', ?3)",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, lease.dispatch_id, now],
+                )
+                .map_err(|_| A2AError::internal("loopback effect commit failed"))?;
+            }
+            for (index, frame) in encoded.iter().enumerate() {
+                let sequence = i64::try_from(index + 1)
+                    .map_err(|_| A2AError::internal("receiver frame sequence exhausted"))?;
+                tx.execute(
+                    "INSERT INTO receiver_frames(tenant_scope, dispatch_id, frame_seq,
+                         frame_version, frame_kind, frame_json, frame_digest, created_at)
+                     VALUES (?1, ?2, ?3, 1, 'mesh_event', ?4, ?5, ?6)",
+                    params![
+                        TRUSTED_SINGLE_TENANT_SCOPE,
+                        lease.dispatch_id,
+                        sequence,
+                        frame,
+                        content_digest(frame.as_bytes()),
+                        now
+                    ],
+                )
+                .map_err(|_| A2AError::internal("receiver frame append failed"))?;
+            }
+            let changed = tx
+                .execute(
+                    "UPDATE receiver_inbox SET state = 'completed', completion_kind = ?3,
+                     termination_json = ?4, frame_count = ?5, transcript_digest = ?6,
+                     completed_at = ?7, updated_at = ?7,
+                     lease_owner = NULL, lease_token = NULL, lease_until = NULL
+                 WHERE tenant_scope = ?1 AND dispatch_id = ?2 AND state = 'processing'
+                   AND lease_token = ?8 AND lease_epoch = ?9",
+                    params![
+                        TRUSTED_SINGLE_TENANT_SCOPE,
+                        lease.dispatch_id,
+                        completion_kind,
+                        termination_json,
+                        encoded.len(),
+                        transcript_digest,
+                        now,
+                        lease.lease_token,
+                        lease.lease_epoch
+                    ],
+                )
+                .map_err(|_| A2AError::internal("receiver completion failed"))?;
+            if changed != 1 {
+                return Err(A2AError::internal("stale receiver completion lease"));
+            }
+            ensure_receiver_capacity(&tx)?;
+            tx.commit()
+                .map_err(|_| A2AError::internal("receiver completion commit failed"))
+        })
+        .await
+    }
+
+    /// Atomically commit sender terminal state, exact replay result, and fenced outbox ack.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid results, stale/corrupt state, or transactional failure.
+    #[allow(clippy::too_many_lines)] // One transaction intentionally exposes every sender write.
+    pub async fn commit_delivery(
+        &self,
+        lease: &OutboxLease,
+        task: Task,
+        final_result: SendMessageResponse,
+        public_transcript: &[StreamResponse],
+        now: i64,
+    ) -> Result<TransitionOutcome, A2AError> {
+        if task.id != lease.task_id
+            || !is_dispatch_closed(&task.status.state)
+            || !final_result_matches_task(&final_result, &task)
+        {
+            return Err(A2AError::invalid_params("invalid durable delivery result"));
+        }
+        let lease = lease.clone();
+        let task_json = encode_task(&task)?;
+        let state = state_key(&task)?;
+        let timestamp = task.status.timestamp.map(|value| value.to_rfc3339());
+        let final_json = serde_json::to_string(&final_result)
+            .map_err(|_| A2AError::internal("failed to encode durable delivery result"))?;
+        validate_terminal_public_transcript(public_transcript, &task)?;
+        let public_transcript = public_transcript.to_vec();
+        let transcript_frames = public_transcript
+            .iter()
+            .map(|frame| {
+                serde_json::to_string(frame)
+                    .map_err(|_| A2AError::internal("failed to encode public stream frame"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let transcript_json = serde_json::to_vec(&public_transcript)
+            .map_err(|_| A2AError::internal("failed to encode public stream transcript"))?;
+        if transcript_frames.len() > MAX_STREAM_FRAMES
+            || transcript_json.len() > MAX_STORE_JSON_BYTES
+            || transcript_frames
+                .iter()
+                .any(|frame| frame.len() > MAX_ATOMIC_JSON_BYTES)
+        {
+            return Err(A2AError::invalid_params(
+                "public stream transcript exceeds limit",
+            ));
+        }
+        let transcript_digest = content_digest(&transcript_json);
+        self.run(move |connection| {
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| A2AError::internal("durable delivery transaction failed"))?;
+            let causative: Option<i64> = tx.query_row(
+                "SELECT causative_revision FROM outbox WHERE outbox_id = ?1 AND dispatch_id = ?2
+                     AND task_id = ?3 AND state = 'leased' AND lease_owner = ?4
+                     AND lease_token = ?5 AND attempt_count = ?6 AND lease_until = ?7
+                     AND lease_until > ?8",
+                params![lease.outbox_id, lease.dispatch_id, lease.task_id, lease.lease_owner,
+                    lease.lease_token, lease.attempt_no, lease.lease_until, now],
+                |row| row.get(0),
+            ).optional().map_err(|_| A2AError::internal("durable delivery fence lookup failed"))?;
+            let Some(revision) = causative else {
+                return Ok(TransitionOutcome::Stale);
+            };
+            let (current, previous_state): (i64, String) = tx
+                .query_row(
+                    "SELECT revision, state FROM tasks WHERE task_id = ?1",
+                    [&lease.task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| A2AError::internal("durable delivery task lookup failed"))?;
+            if current != revision {
+                return Ok(TransitionOutcome::Stale);
+            }
+            let stream_message_id: Option<(String, i64, String)> = tx
+                .query_row(
+                    "SELECT message_id, frame_count, transcript_digest FROM stream_transcripts
+                 WHERE tenant_scope = ?1 AND dispatch_id = ?2 AND task_id = ?3 AND state = 'open'",
+                    params![
+                        TRUSTED_SINGLE_TENANT_SCOPE,
+                        lease.dispatch_id,
+                        lease.task_id
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|_| A2AError::internal("public stream fence lookup failed"))?;
+            let stream_message_id = stream_message_id
+                .map(|(message_id, persisted_count, persisted_digest)| {
+                    let persisted = load_public_stream_frames(
+                        &tx,
+                        &message_id,
+                        persisted_count,
+                        Some(&persisted_digest),
+                        "open",
+                        None,
+                    )?;
+                    let persisted_count = usize::try_from(persisted_count)
+                        .map_err(|_| A2AError::internal("public stream cursor is corrupt"))?;
+                    if persisted_count > public_transcript.len()
+                        || persisted != public_transcript[..persisted_count]
+                    {
+                        return Err(A2AError::internal(
+                            "persisted public stream prefix diverges from delivery transcript",
+                        ));
+                    }
+                    Ok((message_id, persisted_count))
+                })
+                .transpose()?;
+            let next_revision = revision
+                .checked_add(1)
+                .ok_or_else(|| A2AError::internal("persistent task revision exhausted"))?;
+            tx.execute(
+                "UPDATE tasks SET context_id = ?2, state = ?3, status_timestamp = ?4,
+                     revision = ?5, task_json = ?6 WHERE task_id = ?1 AND revision = ?7",
+                params![
+                    lease.task_id,
+                    task.context_id,
+                    state,
+                    timestamp,
+                    next_revision,
+                    task_json,
+                    revision
+                ],
+            )
+            .map_err(|_| A2AError::internal("durable delivery task commit failed"))?;
+            let event_seq: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(event_seq), 0) + 1 FROM task_events
+                 WHERE tenant_scope = ?1 AND task_id = ?2",
+                    params![TRUSTED_SINGLE_TENANT_SCOPE, lease.task_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| A2AError::internal("durable delivery event sequence failed"))?;
+            tx.execute(
+                "INSERT INTO task_events(tenant_scope, task_id, event_seq, task_revision,
+                     event_kind, from_state, to_state, event_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'durable_completed', ?5, ?6, ?7, ?8)",
+                params![
+                    TRUSTED_SINGLE_TENANT_SCOPE,
+                    lease.task_id,
+                    event_seq,
+                    next_revision,
+                    previous_state,
+                    state,
+                    task_json,
+                    now
+                ],
+            )
+            .map_err(|_| A2AError::internal("durable delivery event append failed"))?;
+            if let Some((message_id, persisted_count)) = stream_message_id {
+                for (index, frame) in transcript_frames.iter().enumerate().skip(persisted_count) {
+                    let sequence = i64::try_from(index + 1)
+                        .map_err(|_| A2AError::internal("public stream sequence exhausted"))?;
+                    tx.execute(
+                        "INSERT INTO stream_frames(tenant_scope, message_id, frame_seq,
+                             frame_version, frame_kind, frame_json, frame_digest, created_at)
+                         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)",
+                        params![
+                            TRUSTED_SINGLE_TENANT_SCOPE,
+                            message_id,
+                            sequence,
+                            public_stream_kind(&public_transcript[index]),
+                            frame,
+                            content_digest(frame.as_bytes()),
+                            now
+                        ],
+                    )
+                    .map_err(|_| A2AError::internal("public stream frame append failed"))?;
+                }
+                let changed = tx
+                    .execute(
+                        "UPDATE stream_transcripts SET state = 'terminal', frame_count = ?3,
+                         transcript_digest = ?4, terminal_seq = ?3, updated_at = ?5
+                     WHERE tenant_scope = ?1 AND message_id = ?2 AND state = 'open'",
+                        params![
+                            TRUSTED_SINGLE_TENANT_SCOPE,
+                            message_id,
+                            transcript_frames.len(),
+                            transcript_digest,
+                            now
+                        ],
+                    )
+                    .map_err(|_| A2AError::internal("public stream completion failed"))?;
+                if changed != 1 {
+                    return Err(A2AError::internal("stale public stream completion"));
+                }
+            }
+            tx.execute(
+                "UPDATE idempotency_records SET state = 'completed', final_result_json = ?2,
+                     updated_at = ?3 WHERE tenant_scope = ?1 AND task_id = ?4
+                     AND message_id = (SELECT message_id FROM outbox WHERE outbox_id = ?5)
+                     AND state = 'in_progress'",
+                params![
+                    TRUSTED_SINGLE_TENANT_SCOPE,
+                    final_json,
+                    now,
+                    lease.task_id,
+                    lease.outbox_id
+                ],
+            )
+            .map_err(|_| A2AError::internal("durable delivery replay commit failed"))?;
+            tx.execute(
+                "UPDATE outbox SET state = 'delivered', lease_owner = NULL, lease_token = NULL,
+                     lease_until = NULL, updated_at = ?3 WHERE outbox_id = ?1 AND lease_token = ?2",
+                params![lease.outbox_id, lease.lease_token, now],
+            )
+            .map_err(|_| A2AError::internal("durable delivery ack failed"))?;
+            tx.execute(
+                "UPDATE outbox_attempts SET finished_at = ?3, outcome = 'delivered'
+                 WHERE outbox_id = ?1 AND attempt_no = ?2 AND finished_at IS NULL",
+                params![lease.outbox_id, lease.attempt_no, now],
+            )
+            .map_err(|_| A2AError::internal("durable delivery attempt close failed"))?;
+            ensure_atomic_capacity(&tx)?;
+            ensure_stream_capacity(&tx)?;
+            tx.commit()
+                .map_err(|_| A2AError::internal("durable delivery commit failed"))?;
+            Ok(TransitionOutcome::Applied)
+        })
+        .await
+    }
+
     #[doc(hidden)]
     pub async fn atomic_record_counts(&self) -> Result<AtomicRecordCounts, A2AError> {
         self.run(move |connection| {
@@ -1191,6 +2755,86 @@ impl SqliteTaskStore {
         .await
     }
 
+    /// Count effects durably committed by the owned loopback adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shared store is closed or the query is corrupt.
+    pub async fn durable_effect_count(&self) -> Result<u64, A2AError> {
+        self.run(move |connection| {
+            let value: i64 = connection
+                .query_row("SELECT COUNT(*) FROM loopback_effects", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|_| A2AError::internal("loopback effect count failed"))?;
+            u64::try_from(value).map_err(|_| A2AError::internal("loopback effect count is corrupt"))
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_test_batch(&self, sql: &'static str) -> Result<(), A2AError> {
+        self.run(move |connection| {
+            connection
+                .execute_batch(sql)
+                .map_err(|error| A2AError::internal(format!("test fault install failed: {error}")))
+        })
+        .await
+    }
+
+    /// Synchronously close shared admission, SQLite, and ownership state.
+    ///
+    /// Used only by fail-safe owner drop after its worker has been aborted. Closing
+    /// the semaphore rejects router-clone work; taking the mutexes waits for any
+    /// already-running bounded SQLite operation before releasing the process lock.
+    pub(crate) fn close_shared_sync(&self) {
+        self.admission.close();
+        if let Ok(mut connection) = self.connection.lock() {
+            connection.take();
+        }
+        if let Ok(mut ownership_lock) = self.ownership_lock.lock() {
+            ownership_lock.take();
+        }
+    }
+
+    /// Relinquish the shared SQLite connection and process ownership lock for all clones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shared state cannot be locked or the close worker fails.
+    pub async fn shutdown_shared(&self) -> Result<(), A2AError> {
+        let permit = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&self.admission).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            A2AError::internal("persistent task store shutdown timed out acquiring admission")
+        })?
+        .map_err(|_| A2AError::internal("persistent task store is closed"))?;
+        let connection = Arc::clone(&self.connection);
+        let ownership_lock = Arc::clone(&self.ownership_lock);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let connection = connection
+                    .lock()
+                    .map_err(|_| A2AError::internal("persistent task store lock failed"))?
+                    .take();
+                drop(connection);
+                ownership_lock
+                    .lock()
+                    .map_err(|_| A2AError::internal("persistent ownership lock failed"))?
+                    .take();
+                Ok(())
+            }),
+        )
+        .await
+        .map_err(|_| A2AError::internal("persistent task store shutdown timed out"))?
+        .map_err(|_| A2AError::internal("persistent task store shutdown failed"))?
+    }
+
     async fn run<R, F>(&self, operation: F) -> Result<R, A2AError>
     where
         R: Send + 'static,
@@ -1203,14 +2847,405 @@ impl SqliteTaskStore {
         let connection = Arc::clone(&self.connection);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let mut connection = connection
+            let mut guard = connection
                 .lock()
                 .map_err(|_| A2AError::internal("persistent task store lock failed"))?;
-            operation(&mut connection)
+            let connection = guard
+                .as_mut()
+                .ok_or_else(|| A2AError::internal("persistent task store is closed"))?;
+            operation(connection)
         })
         .await
         .map_err(|_| A2AError::internal("persistent task store worker failed"))?
     }
+}
+
+fn append_canceled_public_terminal(
+    tx: &rusqlite::Transaction<'_>,
+    dispatch_id: &str,
+    task: &Task,
+    now: i64,
+) -> Result<(), A2AError> {
+    let metadata: Option<(String, i64, String)> = tx
+        .query_row(
+            "SELECT message_id, frame_count, transcript_digest FROM stream_transcripts
+         WHERE tenant_scope = ?1 AND dispatch_id = ?2 AND state = 'open'",
+            params![TRUSTED_SINGLE_TENANT_SCOPE, dispatch_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|_| A2AError::internal("cancellation stream lookup failed"))?;
+    let Some((message_id, frame_count, digest)) = metadata else {
+        return Ok(());
+    };
+    let mut frames =
+        load_public_stream_frames(tx, &message_id, frame_count, Some(&digest), "open", None)?;
+    let terminal = StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+        task_id: task.id.clone(),
+        context_id: task.context_id.clone(),
+        status: task.status.clone(),
+        metadata: None,
+    });
+    frames.push(terminal.clone());
+    validate_terminal_public_transcript(&frames, task)?;
+    let encoded = serde_json::to_string(&terminal)
+        .map_err(|_| A2AError::internal("failed to encode cancellation stream frame"))?;
+    let sequence = i64::try_from(frames.len())
+        .map_err(|_| A2AError::internal("cancellation stream sequence exhausted"))?;
+    tx.execute(
+        "INSERT INTO stream_frames(tenant_scope, message_id, frame_seq, frame_version,
+             frame_kind, frame_json, frame_digest, created_at)
+         VALUES (?1, ?2, ?3, 1, 'status_update', ?4, ?5, ?6)",
+        params![
+            TRUSTED_SINGLE_TENANT_SCOPE,
+            message_id,
+            sequence,
+            encoded,
+            content_digest(encoded.as_bytes()),
+            now
+        ],
+    )
+    .map_err(|_| A2AError::internal("cancellation stream append failed"))?;
+    let transcript = serde_json::to_vec(&frames)
+        .map_err(|_| A2AError::internal("cancellation stream digest failed"))?;
+    tx.execute(
+        "UPDATE stream_transcripts SET state = 'terminal', frame_count = ?3,
+             transcript_digest = ?4, terminal_seq = ?3, updated_at = ?5
+         WHERE tenant_scope = ?1 AND message_id = ?2 AND state = 'open'",
+        params![
+            TRUSTED_SINGLE_TENANT_SCOPE,
+            message_id,
+            sequence,
+            content_digest(&transcript),
+            now
+        ],
+    )
+    .map_err(|_| A2AError::internal("cancellation stream completion failed"))?;
+    Ok(())
+}
+
+fn load_receiver_frames(
+    connection: &Connection,
+    dispatch_id: &str,
+    expected_count: i64,
+    expected_transcript_digest: &str,
+) -> Result<Vec<MeshEvent>, A2AError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT frame_seq, frame_version, frame_kind, frame_json, frame_digest
+         FROM receiver_frames
+         WHERE tenant_scope = ?1 AND dispatch_id = ?2 ORDER BY frame_seq",
+        )
+        .map_err(|_| A2AError::internal("receiver replay query failed"))?;
+    let rows = statement
+        .query_map(params![TRUSTED_SINGLE_TENANT_SCOPE, dispatch_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|_| A2AError::internal("receiver replay query failed"))?;
+    let mut events = Vec::new();
+    for (index, row) in rows.enumerate() {
+        let (sequence, version, kind, encoded, digest) =
+            row.map_err(|_| A2AError::internal("receiver replay record is corrupt"))?;
+        if sequence != i64::try_from(index + 1).unwrap_or(i64::MAX)
+            || version != 1
+            || kind != "mesh_event"
+            || digest != content_digest(encoded.as_bytes())
+            || encoded.len() > MAX_ATOMIC_JSON_BYTES
+        {
+            return Err(A2AError::internal("receiver replay transcript is corrupt"));
+        }
+        events.push(
+            serde_json::from_str(&encoded)
+                .map_err(|_| A2AError::internal("receiver replay frame is corrupt"))?,
+        );
+    }
+    let transcript = serde_json::to_vec(&events)
+        .map_err(|_| A2AError::internal("receiver replay transcript is corrupt"))?;
+    if i64::try_from(events.len()).ok() != Some(expected_count)
+        || content_digest(&transcript) != expected_transcript_digest
+    {
+        return Err(A2AError::internal("receiver replay transcript is corrupt"));
+    }
+    Ok(events)
+}
+
+fn encode_receiver_termination(
+    termination: &DurableReceiverTermination,
+) -> Result<(&'static str, Option<String>), A2AError> {
+    let (kind, payload) = match termination {
+        DurableReceiverTermination::Success => ("success", None),
+        DurableReceiverTermination::InputRequired { .. } => (
+            "input_required",
+            Some(
+                serde_json::to_string(termination)
+                    .map_err(|_| A2AError::internal("failed to encode receiver termination"))?,
+            ),
+        ),
+        DurableReceiverTermination::AuthRequired { .. } => (
+            "auth_required",
+            Some(
+                serde_json::to_string(termination)
+                    .map_err(|_| A2AError::internal("failed to encode receiver termination"))?,
+            ),
+        ),
+    };
+    if payload
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_ATOMIC_JSON_BYTES)
+    {
+        return Err(A2AError::invalid_params(
+            "receiver termination exceeds limit",
+        ));
+    }
+    Ok((kind, payload))
+}
+
+fn decode_receiver_termination(
+    kind: Option<&str>,
+    payload: Option<&str>,
+) -> Result<DurableReceiverTermination, A2AError> {
+    match (kind, payload) {
+        (Some("success"), None) => Ok(DurableReceiverTermination::Success),
+        (Some(expected @ ("input_required" | "auth_required")), Some(encoded))
+            if encoded.len() <= MAX_ATOMIC_JSON_BYTES =>
+        {
+            let termination: DurableReceiverTermination = serde_json::from_str(encoded)
+                .map_err(|_| A2AError::internal("receiver termination is corrupt"))?;
+            let actual = match termination {
+                DurableReceiverTermination::InputRequired { ref message }
+                    if !message.is_empty() =>
+                {
+                    "input_required"
+                }
+                DurableReceiverTermination::AuthRequired { ref message } if !message.is_empty() => {
+                    "auth_required"
+                }
+                _ => return Err(A2AError::internal("receiver termination is corrupt")),
+            };
+            if actual != expected {
+                return Err(A2AError::internal("receiver termination is corrupt"));
+            }
+            Ok(termination)
+        }
+        _ => Err(A2AError::internal("receiver termination is corrupt")),
+    }
+}
+
+fn validate_receiver_outcome(
+    events: &[MeshEvent],
+    termination: &DurableReceiverTermination,
+) -> Result<(), A2AError> {
+    match termination {
+        DurableReceiverTermination::Success => validate_completed_receiver_transcript(events),
+        DurableReceiverTermination::InputRequired { message }
+        | DurableReceiverTermination::AuthRequired { message } => {
+            if message.is_empty()
+                || message.len() > MAX_ATOMIC_TEXT_BYTES
+                || events
+                    .iter()
+                    .any(|event| matches!(event, MeshEvent::Completed { .. }))
+            {
+                return Err(A2AError::invalid_agent_response());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_completed_receiver_transcript(events: &[MeshEvent]) -> Result<(), A2AError> {
+    let completed = events
+        .iter()
+        .filter(|event| matches!(event, MeshEvent::Completed { .. }))
+        .count();
+    if completed != 1 || !matches!(events.last(), Some(MeshEvent::Completed { .. })) {
+        return Err(A2AError::invalid_agent_response());
+    }
+    Ok(())
+}
+
+fn public_stream_kind(frame: &StreamResponse) -> &'static str {
+    match frame {
+        StreamResponse::Task(_) => "task",
+        StreamResponse::Message(_) => "message",
+        StreamResponse::StatusUpdate(_) => "status_update",
+        StreamResponse::ArtifactUpdate(_) => "artifact_update",
+    }
+}
+
+fn is_dispatch_closed(state: &a2a::TaskState) -> bool {
+    state.is_terminal()
+        || matches!(
+            state,
+            a2a::TaskState::InputRequired | a2a::TaskState::AuthRequired
+        )
+}
+
+fn validate_terminal_public_transcript(
+    frames: &[StreamResponse],
+    final_task: &Task,
+) -> Result<(), A2AError> {
+    if frames.is_empty() || frames.len() > MAX_STREAM_FRAMES {
+        return Err(A2AError::invalid_agent_response());
+    }
+    let Some(StreamResponse::Task(initial)) = frames.first() else {
+        return Err(A2AError::invalid_agent_response());
+    };
+    if is_dispatch_closed(&initial.status.state)
+        || frames
+            .iter()
+            .filter(|frame| matches!(frame, StreamResponse::Task(_)))
+            .count()
+            != 1
+    {
+        return Err(A2AError::invalid_agent_response());
+    }
+    let mut reconstructed = initial.clone();
+    let mut terminal_count = 0;
+    for (index, frame) in frames.iter().enumerate().skip(1) {
+        match frame {
+            StreamResponse::Task(_) | StreamResponse::Message(_) => {
+                return Err(A2AError::invalid_agent_response());
+            }
+            StreamResponse::StatusUpdate(update) => {
+                if update.task_id != final_task.id || update.context_id != final_task.context_id {
+                    return Err(A2AError::invalid_agent_response());
+                }
+                reconstructed.status = update.status.clone();
+                if is_dispatch_closed(&update.status.state) {
+                    terminal_count += 1;
+                    if index + 1 != frames.len() {
+                        return Err(A2AError::invalid_agent_response());
+                    }
+                }
+            }
+            StreamResponse::ArtifactUpdate(update) => {
+                if update.task_id != final_task.id || update.context_id != final_task.context_id {
+                    return Err(A2AError::invalid_agent_response());
+                }
+                reconstructed
+                    .artifacts
+                    .get_or_insert_with(Vec::new)
+                    .push(update.artifact.clone());
+            }
+        }
+    }
+    if terminal_count != 1 || reconstructed != *final_task {
+        return Err(A2AError::invalid_agent_response());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn load_public_stream_frames(
+    connection: &Connection,
+    message_id: &str,
+    expected_count: i64,
+    expected_digest: Option<&str>,
+    state: &str,
+    interruption: Option<&str>,
+) -> Result<Vec<StreamResponse>, A2AError> {
+    if interruption.is_some_and(|value| value.len() > MAX_ATOMIC_TEXT_BYTES)
+        || expected_count < 0
+        || usize::try_from(expected_count).unwrap_or(usize::MAX) > MAX_STREAM_FRAMES
+        || !matches!(state, "open" | "terminal" | "interrupted")
+        || (state == "open"
+            && (expected_count <= 0 || expected_digest.is_none() || interruption.is_some()))
+        || (state == "terminal"
+            && (expected_count == 0 || expected_digest.is_none() || interruption.is_some()))
+        || (state == "interrupted" && (expected_digest.is_none() || interruption.is_none()))
+    {
+        return Err(A2AError::internal("public stream transcript is corrupt"));
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT frame_seq, frame_version, frame_kind, frame_json, frame_digest
+             FROM stream_frames WHERE tenant_scope = ?1 AND message_id = ?2 ORDER BY frame_seq",
+        )
+        .map_err(|_| A2AError::internal("public stream replay query failed"))?;
+    let rows = statement
+        .query_map(params![TRUSTED_SINGLE_TENANT_SCOPE, message_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|_| A2AError::internal("public stream replay query failed"))?;
+    let mut frames = Vec::new();
+    for (index, row) in rows.enumerate() {
+        let (sequence, version, kind, encoded, digest) =
+            row.map_err(|_| A2AError::internal("public stream frame is corrupt"))?;
+        let frame: StreamResponse = serde_json::from_str(&encoded)
+            .map_err(|_| A2AError::internal("public stream frame is corrupt"))?;
+        if sequence != i64::try_from(index + 1).unwrap_or(i64::MAX)
+            || version != STREAM_TRANSCRIPT_VERSION
+            || kind != public_stream_kind(&frame)
+            || digest != content_digest(encoded.as_bytes())
+            || encoded.len() > MAX_ATOMIC_JSON_BYTES
+        {
+            return Err(A2AError::internal("public stream frame is corrupt"));
+        }
+        frames.push(frame);
+    }
+    if i64::try_from(frames.len()).ok() != Some(expected_count) {
+        return Err(A2AError::internal("public stream transcript is corrupt"));
+    }
+    if let Some(expected_digest) = expected_digest {
+        let encoded = serde_json::to_vec(&frames)
+            .map_err(|_| A2AError::internal("public stream transcript is corrupt"))?;
+        if encoded.len() > MAX_STORE_JSON_BYTES || content_digest(&encoded) != expected_digest {
+            return Err(A2AError::internal("public stream transcript is corrupt"));
+        }
+    }
+    if state == "terminal" {
+        let encoded_result: String = connection
+            .query_row(
+                "SELECT identity.final_result_json
+                 FROM stream_transcripts stream
+                 JOIN idempotency_records identity
+                   ON identity.tenant_scope = stream.tenant_scope
+                  AND identity.message_id = stream.message_id
+                 WHERE stream.tenant_scope = ?1 AND stream.message_id = ?2",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, message_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| A2AError::internal("canonical stream result is corrupt"))?;
+        let final_result: SendMessageResponse = serde_json::from_str(&encoded_result)
+            .map_err(|_| A2AError::internal("canonical stream result is corrupt"))?;
+        let SendMessageResponse::Task(final_task) = final_result else {
+            return Err(A2AError::internal("canonical stream result is corrupt"));
+        };
+        validate_terminal_public_transcript(&frames, &final_task)
+            .map_err(|_| A2AError::internal("public stream terminal transcript is corrupt"))?;
+    } else if frames.iter().any(|frame| match frame {
+        StreamResponse::Task(task) => is_dispatch_closed(&task.status.state),
+        StreamResponse::StatusUpdate(update) => is_dispatch_closed(&update.status.state),
+        StreamResponse::Message(_) | StreamResponse::ArtifactUpdate(_) => false,
+    }) {
+        return Err(A2AError::internal(
+            "public stream interrupted transcript contains terminal frame",
+        ));
+    }
+    Ok(frames)
+}
+
+fn receiver_request_is_valid(request: &MeshRequest, payload_bytes: usize) -> bool {
+    payload_bytes <= MAX_ATOMIC_JSON_BYTES
+        && !request.protocol.is_empty()
+        && request.protocol.len() <= MAX_ATOMIC_TEXT_BYTES
+        && !request.task_id.is_empty()
+        && request.task_id.len() <= MAX_ATOMIC_TEXT_BYTES
+        && !request.context_id.is_empty()
+        && request.context_id.len() <= MAX_ATOMIC_TEXT_BYTES
+        && request.text.len() <= MAX_ATOMIC_JSON_BYTES
 }
 
 fn response_matches_task(response: &SendMessageResponse, task_id: &str) -> bool {
@@ -1228,6 +3263,84 @@ fn final_result_matches_task(response: &SendMessageResponse, task: &Task) -> boo
                 && task.status.message.as_ref() == Some(message)
         }
     }
+}
+
+fn final_result_matches_persisted_event(
+    connection: &Connection,
+    task_id: &str,
+    encoded_result: &str,
+) -> Result<bool, SqliteStoreError> {
+    let result: SendMessageResponse =
+        serde_json::from_str(encoded_result).map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT event_json FROM task_events
+             WHERE tenant_scope = ?1 AND task_id = ?2 ORDER BY event_seq",
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let rows = statement
+        .query_map(params![TRUSTED_SINGLE_TENANT_SCOPE, task_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    for row in rows {
+        let task: Task = serde_json::from_str(&row.map_err(|_| SqliteStoreError::InvalidSchema)?)
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        if final_result_matches_task(&result, &task) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_receiver_capacity(connection: &Connection) -> Result<(), A2AError> {
+    let bytes: i64 = connection
+        .query_row(
+            "SELECT (SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB)) +
+             length(CAST(dispatch_id AS BLOB)) + length(CAST(payload_digest AS BLOB)) +
+             length(CAST(payload_json AS BLOB)) + length(CAST(task_id AS BLOB)) +
+             length(CAST(context_id AS BLOB)) + COALESCE(length(CAST(lease_owner AS BLOB)), 0) +
+             COALESCE(length(CAST(lease_token AS BLOB)), 0) +
+             COALESCE(length(CAST(transcript_digest AS BLOB)), 0) +
+             COALESCE(length(CAST(termination_json AS BLOB)), 0)), 0) FROM receiver_inbox) +
+         (SELECT COALESCE(SUM(length(CAST(frame_json AS BLOB)) +
+             length(CAST(frame_digest AS BLOB))), 0) FROM receiver_frames) +
+         (SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB)) +
+             length(CAST(dispatch_id AS BLOB)) + length(CAST(effect_kind AS BLOB))), 0)
+             FROM loopback_effects)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| A2AError::internal("receiver aggregate size query failed"))?;
+    if usize::try_from(bytes).unwrap_or(usize::MAX) > MAX_STORE_JSON_BYTES {
+        return Err(A2AError::internal("receiver store byte capacity reached"));
+    }
+    Ok(())
+}
+
+fn ensure_stream_capacity(connection: &Connection) -> Result<(), A2AError> {
+    let bytes: i64 = connection
+        .query_row(
+            "SELECT (SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB)) +
+                 length(CAST(message_id AS BLOB)) + length(CAST(dispatch_id AS BLOB)) +
+                 length(CAST(task_id AS BLOB)) + length(CAST(state AS BLOB)) +
+                 COALESCE(length(CAST(transcript_digest AS BLOB)), 0) +
+                 COALESCE(length(CAST(interruption_error AS BLOB)), 0)), 0)
+                 FROM stream_transcripts) +
+             (SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB)) +
+                 length(CAST(message_id AS BLOB)) + length(CAST(frame_kind AS BLOB)) +
+                 length(CAST(frame_json AS BLOB)) + length(CAST(frame_digest AS BLOB))), 0)
+                 FROM stream_frames)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| A2AError::internal("stream aggregate size query failed"))?;
+    if usize::try_from(bytes).unwrap_or(usize::MAX) > MAX_STORE_JSON_BYTES {
+        return Err(A2AError::internal(
+            "stream transcript byte capacity reached",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_atomic_capacity(connection: &Connection) -> Result<(), A2AError> {
@@ -1289,9 +3402,11 @@ fn legal_transition(from: &a2a::TaskState, to: &a2a::TaskState) -> bool {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Terminal task, replay, and stream interruption remain atomic.
 fn dead_letter_task(
     transaction: &rusqlite::Transaction<'_>,
     task_id: &str,
+    dispatch_id: &str,
     error: &str,
     now: i64,
 ) -> Result<(), A2AError> {
@@ -1376,10 +3491,40 @@ fn dead_letter_task(
         .execute(
             "UPDATE idempotency_records SET state = 'completed', final_result_json = ?2,
                  updated_at = ?3
-             WHERE tenant_scope = ?1 AND task_id = ?4 AND state = 'in_progress'",
-            params![TRUSTED_SINGLE_TENANT_SCOPE, final_json, now, task_id],
+             WHERE tenant_scope = ?1 AND task_id = ?4 AND state = 'in_progress'
+               AND message_id = (SELECT message_id FROM outbox WHERE dispatch_id = ?5)",
+            params![
+                TRUSTED_SINGLE_TENANT_SCOPE,
+                final_json,
+                now,
+                task_id,
+                dispatch_id
+            ],
         )
         .map_err(|_| A2AError::internal("dead-letter idempotency completion failed"))?;
+    let diagnostic_limit = MAX_ATOMIC_TEXT_BYTES - STREAM_INTERRUPTION_PREFIX.len();
+    let mut diagnostic_end = error.len().min(diagnostic_limit);
+    while !error.is_char_boundary(diagnostic_end) {
+        diagnostic_end -= 1;
+    }
+    let mut interruption = String::with_capacity(STREAM_INTERRUPTION_PREFIX.len() + diagnostic_end);
+    interruption.push_str(STREAM_INTERRUPTION_PREFIX);
+    interruption.push_str(&error[..diagnostic_end]);
+    transaction
+        .execute(
+            "UPDATE stream_transcripts SET state = 'interrupted',
+                 interruption_error = ?2, updated_at = ?3
+             WHERE tenant_scope = ?1 AND task_id = ?4 AND dispatch_id = ?5 AND state = 'open'",
+            params![
+                TRUSTED_SINGLE_TENANT_SCOPE,
+                interruption,
+                now,
+                task_id,
+                dispatch_id
+            ],
+        )
+        .map_err(|_| A2AError::internal("dead-letter stream interruption failed"))?;
+    ensure_stream_capacity(transaction)?;
     Ok(())
 }
 
@@ -1397,7 +3542,10 @@ fn open_database(
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
-    if !matches!(version, 0 | 1 | SCHEMA_VERSION) {
+    if !matches!(
+        version,
+        0 | 1 | V2_SCHEMA_VERSION | V3_SCHEMA_VERSION | SCHEMA_VERSION
+    ) {
         return Err(SqliteStoreError::InvalidSchema);
     }
     let application_id: i64 = connection
@@ -1441,14 +3589,40 @@ fn open_database(
     }
     let (cursor_key, receipt_key) = match version {
         0 => initialize_schema(&mut connection),
-        1 => migrate_v1_to_v2(&mut connection, max_tasks),
+        1 => {
+            migrate_v1_to_v2(&mut connection, max_tasks)?;
+            migrate_v2_to_v3(&mut connection, max_tasks)?;
+            migrate_v3_to_v4(&mut connection, max_tasks)
+        }
+        V2_SCHEMA_VERSION => {
+            migrate_v2_to_v3(&mut connection, max_tasks)?;
+            migrate_v3_to_v4(&mut connection, max_tasks)
+        }
+        V3_SCHEMA_VERSION => migrate_v3_to_v4(&mut connection, max_tasks),
         SCHEMA_VERSION => validate_schema(&connection),
         _ => Err(SqliteStoreError::InvalidSchema),
     }?;
+    validate_foreign_keys(&connection)?;
     validate_persisted_records(&connection, max_tasks)?;
     validate_atomic_records(&connection)?;
+    validate_receiver_records(&connection)?;
+    validate_stream_records(&connection)?;
+    validate_cancellation_records(&connection)?;
     recover_orphaned_tasks(&mut connection)?;
     Ok((connection, cursor_key, receipt_key))
+}
+
+fn validate_foreign_keys(connection: &Connection) -> Result<(), SqliteStoreError> {
+    let violations: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if violations == 0 {
+        Ok(())
+    } else {
+        Err(SqliteStoreError::InvalidSchema)
+    }
 }
 
 fn validate_persisted_records(
@@ -1503,6 +3677,105 @@ fn validate_persisted_records(
                 timestamp.as_deref(),
                 &encoded,
             )
+        {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+    }
+    Ok(())
+}
+
+fn validate_pre_v4_atomic_records(connection: &Connection) -> Result<(), SqliteStoreError> {
+    let bytes: i64 = connection
+        .query_row(
+            "SELECT
+                 (SELECT COALESCE(SUM(length(CAST(event_json AS BLOB))), 0) FROM task_events) +
+                 (SELECT COALESCE(SUM(length(CAST(admission_result_json AS BLOB)) +
+                     COALESCE(length(CAST(final_result_json AS BLOB)), 0)), 0)
+                    FROM idempotency_records) +
+                 (SELECT COALESCE(SUM(length(CAST(payload_json AS BLOB)) +
+                     COALESCE(length(CAST(last_error AS BLOB)), 0)), 0) FROM outbox)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if usize::try_from(bytes).unwrap_or(usize::MAX) > MAX_STORE_JSON_BYTES {
+        return Err(SqliteStoreError::Capacity);
+    }
+    let mut events = connection
+        .prepare(
+            "SELECT tenant_scope, task_id, task_revision, event_kind, to_state, event_json
+             FROM task_events",
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let rows = events
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    for row in rows {
+        let (scope, task_id, revision, event_kind, state, encoded) =
+            row.map_err(|_| SqliteStoreError::InvalidSchema)?;
+        let task: Task =
+            serde_json::from_str(&encoded).map_err(|_| SqliteStoreError::InvalidSchema)?;
+        if scope != TRUSTED_SINGLE_TENANT_SCOPE
+            || revision <= 0
+            || event_kind.is_empty()
+            || event_kind.len() > MAX_ATOMIC_TEXT_BYTES
+            || task.id != task_id
+            || !state_key(&task).is_ok_and(|actual| actual == state)
+            || encoded.len() > MAX_ATOMIC_JSON_BYTES
+        {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+    }
+    drop(events);
+
+    let invalid_json: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM idempotency_records
+                 WHERE json_valid(admission_result_json) = 0
+                    OR (final_result_json IS NOT NULL AND json_valid(final_result_json) = 0)
+                    OR ((state = 'completed') != (final_result_json IS NOT NULL))
+                 UNION ALL
+                 SELECT 1 FROM outbox
+                 WHERE json_valid(payload_json) = 0
+                    OR attempt_count < 0 OR max_attempts <= 0
+                    OR attempt_count > max_attempts)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if invalid_json {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    let mut outbox = connection
+        .prepare("SELECT tenant_scope, dispatch_id, payload_json, payload_digest FROM outbox")
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let rows = outbox
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    for row in rows {
+        let (scope, dispatch_id, payload, digest) =
+            row.map_err(|_| SqliteStoreError::InvalidSchema)?;
+        if scope != TRUSTED_SINGLE_TENANT_SCOPE
+            || dispatch_id.is_empty()
+            || serde_json::from_str::<MeshRequest>(&payload).is_err()
+            || digest != content_digest(payload.as_bytes())
+            || payload.len() > MAX_ATOMIC_JSON_BYTES
         {
             return Err(SqliteStoreError::InvalidSchema);
         }
@@ -1603,6 +3876,11 @@ fn validate_atomic_records(connection: &Connection) -> Result<(), SqliteStoreErr
                 },
             )
         };
+        let valid_final = final_result.as_ref().is_none_or(|result| {
+            result.len() <= MAX_ATOMIC_JSON_BYTES
+                && final_result_matches_persisted_event(connection, &task_id, result)
+                    .unwrap_or(false)
+        });
         if scope != TRUSTED_SINGLE_TENANT_SCOPE
             || message_id.is_empty()
             || message_id.len() > 4096
@@ -1612,9 +3890,7 @@ fn validate_atomic_records(connection: &Connection) -> Result<(), SqliteStoreErr
             || (record_state == "completed") != final_result.is_some()
             || admission.len() > MAX_ATOMIC_JSON_BYTES
             || !response_matches(&admission)
-            || final_result.as_ref().is_some_and(|result| {
-                result.len() > MAX_ATOMIC_JSON_BYTES || !response_matches(result)
-            })
+            || !valid_final
         {
             return Err(SqliteStoreError::InvalidSchema);
         }
@@ -1622,7 +3898,8 @@ fn validate_atomic_records(connection: &Connection) -> Result<(), SqliteStoreErr
 
     let mut outbox = connection
         .prepare(
-            "SELECT o.tenant_scope, o.task_id, o.dispatch_id, o.payload_json, o.payload_digest,
+            "SELECT o.tenant_scope, o.task_id, o.dispatch_id, o.message_id,
+                    o.causative_revision, o.payload_json, o.payload_digest,
                     o.attempt_count, o.max_attempts, o.last_error, t.context_id, o.lease_owner
              FROM outbox o JOIN tasks t ON t.task_id = o.task_id",
         )
@@ -1634,12 +3911,14 @@ fn validate_atomic_records(connection: &Connection) -> Result<(), SqliteStoreErr
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, String>(8)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, Option<String>>(11)?,
             ))
         })
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
@@ -1648,6 +3927,8 @@ fn validate_atomic_records(connection: &Connection) -> Result<(), SqliteStoreErr
             scope,
             task_id,
             dispatch_id,
+            message_id,
+            causative_revision,
             payload,
             digest,
             attempts,
@@ -1658,9 +3939,48 @@ fn validate_atomic_records(connection: &Connection) -> Result<(), SqliteStoreErr
         ) = row.map_err(|_| SqliteStoreError::InvalidSchema)?;
         let request: MeshRequest =
             serde_json::from_str(&payload).map_err(|_| SqliteStoreError::InvalidSchema)?;
+        let causative_task_json: String = connection
+            .query_row(
+                "SELECT event_json FROM task_events
+                 WHERE tenant_scope = ?1 AND task_id = ?2 AND task_revision = ?3",
+                params![scope, task_id, causative_revision],
+                |row| row.get(0),
+            )
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        let causative_task: Task = serde_json::from_str(&causative_task_json)
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        let causative_message = causative_task
+            .history
+            .as_ref()
+            .and_then(|history| history.last())
+            .filter(|message| message.message_id == message_id)
+            .ok_or(SqliteStoreError::InvalidSchema)?;
+        let canonical_request = MeshRequest::from_a2a(
+            task_id.clone(),
+            context_id.clone(),
+            causative_message,
+            InputLimits {
+                max_text_bytes: usize::MAX,
+            },
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        let identity_matches: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM idempotency_records WHERE tenant_scope = ?1
+                 AND message_id = ?2 AND task_id = ?3)",
+                params![scope, message_id, task_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
         if scope != TRUSTED_SINGLE_TENANT_SCOPE
             || task_id != request.task_id
             || context_id != request.context_id
+            || request != canonical_request
+            || message_id.is_empty()
+            || message_id.len() > MAX_ATOMIC_TEXT_BYTES
+            || dispatch_id
+                != content_digest(format!("{scope}\0send-message\0{message_id}").as_bytes())
+            || !identity_matches
             || dispatch_id.is_empty()
             || digest != content_digest(payload.as_bytes())
             || payload.len() > MAX_ATOMIC_JSON_BYTES
@@ -1750,6 +4070,265 @@ fn validate_atomic_records(connection: &Connection) -> Result<(), SqliteStoreErr
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // One fail-closed pass validates cross-table receiver invariants.
+fn validate_receiver_records(connection: &Connection) -> Result<(), SqliteStoreError> {
+    let bytes: i64 = connection
+        .query_row(
+            "SELECT (SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB)) +
+             length(CAST(dispatch_id AS BLOB)) + length(CAST(payload_digest AS BLOB)) +
+             length(CAST(payload_json AS BLOB)) + length(CAST(task_id AS BLOB)) +
+             length(CAST(context_id AS BLOB)) + COALESCE(length(CAST(lease_owner AS BLOB)), 0) +
+             COALESCE(length(CAST(lease_token AS BLOB)), 0) +
+             COALESCE(length(CAST(transcript_digest AS BLOB)), 0) +
+             COALESCE(length(CAST(termination_json AS BLOB)), 0)), 0) FROM receiver_inbox) +
+         (SELECT COALESCE(SUM(length(CAST(frame_json AS BLOB)) +
+             length(CAST(frame_digest AS BLOB))), 0) FROM receiver_frames) +
+         (SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB)) +
+             length(CAST(dispatch_id AS BLOB)) + length(CAST(effect_kind AS BLOB))), 0)
+             FROM loopback_effects)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if usize::try_from(bytes).unwrap_or(usize::MAX) > MAX_STORE_JSON_BYTES {
+        return Err(SqliteStoreError::Capacity);
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT tenant_scope, dispatch_id, payload_digest, payload_json, task_id, context_id,
+                state, lease_epoch, lease_owner, lease_token, lease_until, frame_count,
+                transcript_digest, completion_kind, termination_json FROM receiver_inbox",
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+            ))
+        })
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    for row in rows {
+        let (
+            scope,
+            dispatch_id,
+            digest,
+            payload,
+            task_id,
+            context_id,
+            state,
+            epoch,
+            owner,
+            token,
+            lease_until,
+            frame_count,
+            transcript_digest,
+            completion_kind,
+            termination_json,
+        ) = row.map_err(|_| SqliteStoreError::InvalidSchema)?;
+        let request: MeshRequest =
+            serde_json::from_str(&payload).map_err(|_| SqliteStoreError::InvalidSchema)?;
+        if scope != TRUSTED_SINGLE_TENANT_SCOPE
+            || dispatch_id.is_empty()
+            || dispatch_id.len() > 256
+            || !receiver_request_is_valid(&request, payload.len())
+            || digest != content_digest(payload.as_bytes())
+            || request.task_id != task_id
+            || request.context_id != context_id
+            || epoch <= 0
+            || owner
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > MAX_ATOMIC_TEXT_BYTES)
+            || token
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 256)
+            || (state == "processing")
+                != (owner.is_some() && token.is_some() && lease_until.is_some())
+        {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+        if state == "completed" {
+            let expected_count = frame_count.ok_or(SqliteStoreError::InvalidSchema)?;
+            let expected_digest = transcript_digest
+                .as_deref()
+                .ok_or(SqliteStoreError::InvalidSchema)?;
+            let events =
+                load_receiver_frames(connection, &dispatch_id, expected_count, expected_digest)
+                    .map_err(|_| SqliteStoreError::InvalidSchema)?;
+            let termination = decode_receiver_termination(
+                completion_kind.as_deref(),
+                termination_json.as_deref(),
+            )
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
+            validate_receiver_outcome(&events, &termination)
+                .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        } else if completion_kind.is_some() || termination_json.is_some() {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+    }
+    let invalid_effects: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM loopback_effects effect
+             LEFT JOIN receiver_inbox inbox
+               ON inbox.tenant_scope = effect.tenant_scope
+              AND inbox.dispatch_id = effect.dispatch_id
+             WHERE effect.tenant_scope != ?1 OR effect.effect_kind != 'accepted'
+                OR inbox.dispatch_id IS NULL OR inbox.state != 'completed')",
+            [TRUSTED_SINGLE_TENANT_SCOPE],
+            |row| row.get(0),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if invalid_effects {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines, clippy::type_complexity)]
+fn validate_stream_records(connection: &Connection) -> Result<(), SqliteStoreError> {
+    ensure_stream_capacity(connection).map_err(|error| {
+        if error.to_string().contains("capacity") {
+            SqliteStoreError::Capacity
+        } else {
+            SqliteStoreError::InvalidSchema
+        }
+    })?;
+    let mut statement = connection
+        .prepare(
+            "SELECT stream.tenant_scope, stream.message_id, stream.dispatch_id, stream.task_id,
+                    stream.transcript_version, stream.state, stream.frame_count,
+                    stream.transcript_digest, stream.terminal_seq, stream.interruption_error,
+                    identity.state, identity.task_id, outbox.state, outbox.task_id
+             FROM stream_transcripts stream
+             LEFT JOIN idempotency_records identity
+               ON identity.tenant_scope = stream.tenant_scope
+              AND identity.message_id = stream.message_id
+             LEFT JOIN outbox ON outbox.dispatch_id = stream.dispatch_id",
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+            ))
+        })
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    for row in rows {
+        let (
+            scope,
+            message_id,
+            dispatch_id,
+            task_id,
+            version,
+            state,
+            frame_count,
+            digest,
+            terminal_seq,
+            interruption,
+            identity_state,
+            identity_task,
+            outbox_state,
+            outbox_task,
+        ) = row.map_err(|_| SqliteStoreError::InvalidSchema)?;
+        if scope != TRUSTED_SINGLE_TENANT_SCOPE
+            || message_id.is_empty()
+            || message_id.len() > MAX_ATOMIC_TEXT_BYTES
+            || dispatch_id.is_empty()
+            || dispatch_id.len() > 256
+            || task_id.is_empty()
+            || version != STREAM_TRANSCRIPT_VERSION
+            || identity_task.as_deref() != Some(task_id.as_str())
+            || outbox_task.as_deref() != Some(task_id.as_str())
+            || (state == "open"
+                && (identity_state.as_deref() != Some("in_progress")
+                    || !matches!(outbox_state.as_deref(), Some("pending" | "leased"))))
+            || (state == "terminal"
+                && (identity_state.as_deref() != Some("completed")
+                    || !matches!(outbox_state.as_deref(), Some("delivered" | "superseded"))))
+            || (state == "interrupted"
+                && (identity_state.as_deref() != Some("completed")
+                    || !matches!(outbox_state.as_deref(), Some("dead" | "superseded"))))
+            || (state == "terminal" && terminal_seq != Some(frame_count))
+            || (state != "terminal" && terminal_seq.is_some())
+        {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+        load_public_stream_frames(
+            connection,
+            &message_id,
+            frame_count,
+            digest.as_deref(),
+            &state,
+            interruption.as_deref(),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    }
+    Ok(())
+}
+
+fn validate_cancellation_records(connection: &Connection) -> Result<(), SqliteStoreError> {
+    let (count, bytes, invalid): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(length(CAST(cancel.tenant_scope AS BLOB))
+                       + length(CAST(cancel.dispatch_id AS BLOB))
+                       + length(CAST(cancel.task_id AS BLOB))
+                       + length(CAST(cancel.state AS BLOB))), 0),
+                    COALESCE(SUM(CASE
+                      WHEN cancel.tenant_scope != ?1 OR cancel.task_id != outbox.task_id
+                        OR receiver.dispatch_id IS NULL
+                        OR (cancel.state = 'requested' AND (
+                            receiver.state != 'processing'
+                            OR task.state IN ('\"TASK_STATE_COMPLETED\"', '\"TASK_STATE_FAILED\"',
+                                              '\"TASK_STATE_CANCELED\"', '\"TASK_STATE_REJECTED\"')
+                            OR outbox.state NOT IN ('pending', 'leased')))
+                        OR (cancel.state = 'receiver_canceled' AND (
+                            receiver.state != 'completed'
+                            OR outbox.state NOT IN ('leased', 'delivered'))) THEN 1 ELSE 0 END), 0)
+             FROM cancellation_intents cancel
+             JOIN outbox ON outbox.dispatch_id = cancel.dispatch_id
+             JOIN tasks task ON task.task_id = cancel.task_id
+             LEFT JOIN receiver_inbox receiver ON receiver.tenant_scope = cancel.tenant_scope
+               AND receiver.dispatch_id = cancel.dispatch_id",
+            [TRUSTED_SINGLE_TENANT_SCOPE],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if count < 0
+        || invalid != 0
+        || usize::try_from(bytes).unwrap_or(usize::MAX) > MAX_STORE_JSON_BYTES
+    {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    Ok(())
+}
+
 fn initialize_schema(
     connection: &mut Connection,
 ) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
@@ -1765,12 +4344,22 @@ fn initialize_schema(
     }
     let cursor_key: [u8; 32] = rand::random();
     let receipt_key: [u8; 32] = rand::random();
-    let migration_hash = content_digest(SCHEMA_SQL.as_bytes());
+    let migration_hash = schema_v4_hash();
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
-        .execute_batch(SCHEMA_SQL)
+        .execute_batch(V2_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(RECEIVER_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    rebuild_outbox_with_message_ids(&transaction)?;
+    transaction
+        .execute_batch(OUTBOX_MESSAGE_IMMUTABILITY_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(CANCELLATION_SCHEMA_SQL)
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
         .execute(
@@ -1809,8 +4398,11 @@ fn expected_schema_sql(schema: &str, object_name: &str) -> Option<String> {
         let normalized = normalize_schema_sql(statement);
         let table_prefix = format!("createtable{object_name}(");
         let index_prefix = format!("createindex{object_name}on");
-        (normalized.starts_with(&table_prefix) || normalized.starts_with(&index_prefix))
-            .then_some(normalized)
+        let unique_index_prefix = format!("createuniqueindex{object_name}on");
+        (normalized.starts_with(&table_prefix)
+            || normalized.starts_with(&index_prefix)
+            || normalized.starts_with(&unique_index_prefix))
+        .then_some(normalized)
     })
 }
 
@@ -1828,6 +4420,74 @@ const V2_OBJECTS: &[&str] = &[
     "outbox_task_state",
     "outbox_attempts",
 ];
+
+const V4_OBJECTS: &[&str] = &[
+    "store_metadata",
+    "tasks",
+    "tasks_context_state_time",
+    "task_events",
+    "task_events_task_revision",
+    "idempotency_records",
+    "idempotency_records_task",
+    "outbox",
+    "outbox_due",
+    "outbox_task_state",
+    "outbox_message_identity",
+    "outbox_message_immutable",
+    "outbox_attempts",
+    "receiver_inbox",
+    "receiver_inbox_reclaim",
+    "receiver_frames",
+    "loopback_effects",
+    "stream_transcripts",
+    "stream_transcripts_task",
+    "stream_frames",
+    "cancellation_intents",
+    "cancellation_intents_task",
+];
+const V3_OBJECTS: &[&str] = &[
+    "store_metadata",
+    "tasks",
+    "tasks_context_state_time",
+    "task_events",
+    "task_events_task_revision",
+    "idempotency_records",
+    "idempotency_records_task",
+    "outbox",
+    "outbox_due",
+    "outbox_task_state",
+    "outbox_attempts",
+    "receiver_inbox",
+    "receiver_inbox_reclaim",
+    "receiver_frames",
+    "loopback_effects",
+    "stream_transcripts",
+    "stream_transcripts_task",
+    "stream_frames",
+];
+
+fn schema_v3_hash() -> String {
+    content_digest(
+        [V2_SCHEMA_SQL.as_bytes(), RECEIVER_SCHEMA_SQL.as_bytes()]
+            .concat()
+            .as_slice(),
+    )
+}
+
+fn schema_v4_hash() -> String {
+    content_digest(
+        [
+            V2_SCHEMA_SQL.as_bytes(),
+            RECEIVER_SCHEMA_SQL.as_bytes(),
+            V4_OUTBOX_TABLE_SQL.as_bytes(),
+            OUTBOX_MESSAGE_BINDING_SQL.as_bytes(),
+            OUTBOX_MESSAGE_IMMUTABILITY_SQL.as_bytes(),
+            CANCELLATION_SCHEMA_SQL.as_bytes(),
+        ]
+        .concat()
+        .as_slice(),
+    )
+}
 
 fn validate_schema_version(
     connection: &Connection,
@@ -1851,7 +4511,24 @@ fn validate_schema_version(
                 |row| row.get(0),
             )
             .map_err(|_| SqliteStoreError::InvalidSchema)?;
-        if Some(normalize_schema_sql(&actual)) != expected_schema_sql(schema, object_name) {
+        let expected = expected_schema_sql(schema, object_name)
+            .or_else(|| expected_schema_sql(RECEIVER_SCHEMA_SQL, object_name))
+            .or_else(|| expected_schema_sql(OUTBOX_MESSAGE_BINDING_SQL, object_name))
+            .or_else(|| expected_schema_sql(CANCELLATION_SCHEMA_SQL, object_name));
+        let actual = normalize_schema_sql(&actual);
+        let matches_expected = if *object_name == "outbox_message_immutable" {
+            actual == normalize_schema_sql(OUTBOX_MESSAGE_IMMUTABILITY_SQL)
+        } else if version == SCHEMA_VERSION && *object_name == "outbox" {
+            let expected = normalize_schema_sql(V4_OUTBOX_TABLE_SQL)
+                .replace("outbox_v4", "outbox")
+                .replace('"', "");
+            actual.replace('"', "") == expected
+        } else {
+            expected
+                .as_ref()
+                .is_some_and(|expected| actual == *expected)
+        };
+        if !matches_expected {
             return Err(SqliteStoreError::InvalidSchema);
         }
     }
@@ -1876,8 +4553,13 @@ fn validate_schema_version(
             |row| row.get(0),
         )
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let expected_hash = match version {
+        SCHEMA_VERSION => schema_v4_hash(),
+        V3_SCHEMA_VERSION => schema_v3_hash(),
+        _ => content_digest(schema.as_bytes()),
+    };
     if metadata.0 != version
-        || metadata.1 != content_digest(schema.as_bytes())
+        || metadata.1 != expected_hash
         || metadata.2.len() != 32
         || metadata.3.len() != 32
         || actual_task_columns
@@ -1900,7 +4582,7 @@ fn validate_schema_version(
 }
 
 fn validate_schema(connection: &Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
-    validate_schema_version(connection, SCHEMA_VERSION, SCHEMA_SQL, V2_OBJECTS)
+    validate_schema_version(connection, SCHEMA_VERSION, V2_SCHEMA_SQL, V4_OBJECTS)
 }
 
 fn migrate_v1_to_v2(
@@ -1926,18 +4608,171 @@ fn migrate_v1_to_v2(
             params![TRUSTED_SINGLE_TENANT_SCOPE, now],
         )
         .map_err(|_| SqliteStoreError::Initialization)?;
+    validate_foreign_keys(&transaction)?;
+    validate_persisted_records(&transaction, max_tasks)?;
+    validate_pre_v4_atomic_records(&transaction)?;
     transaction
         .execute(
             "UPDATE store_metadata SET schema_version = ?1, migration_hash = ?2
              WHERE singleton = 1",
-            params![SCHEMA_VERSION, content_digest(SCHEMA_SQL.as_bytes())],
+            params![V2_SCHEMA_VERSION, content_digest(V2_SCHEMA_SQL.as_bytes())],
+        )
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .pragma_update(None, "user_version", V2_SCHEMA_VERSION)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    validate_persisted_records(&transaction, max_tasks)?;
+    let validated =
+        validate_schema_version(&transaction, V2_SCHEMA_VERSION, V2_SCHEMA_SQL, V2_OBJECTS)?;
+    if validated != keys {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    transaction
+        .commit()
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    Ok(validated)
+}
+
+fn migrate_v2_to_v3(
+    connection: &mut Connection,
+    max_tasks: usize,
+) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_version(connection, V2_SCHEMA_VERSION, V2_SCHEMA_SQL, V2_OBJECTS)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    validate_foreign_keys(&transaction)?;
+    transaction
+        .execute_batch(RECEIVER_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    validate_persisted_records(&transaction, max_tasks)?;
+    validate_pre_v4_atomic_records(&transaction)?;
+    transaction.execute(
+        "UPDATE store_metadata SET schema_version = ?1, migration_hash = ?2 WHERE singleton = 1",
+        params![V3_SCHEMA_VERSION, schema_v3_hash()],
+    ).map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .pragma_update(None, "user_version", V3_SCHEMA_VERSION)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    let validated =
+        validate_schema_version(&transaction, V3_SCHEMA_VERSION, V2_SCHEMA_SQL, V3_OBJECTS)?;
+    if validated != keys {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    transaction
+        .commit()
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    Ok(validated)
+}
+
+fn rebuild_outbox_with_message_ids(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), SqliteStoreError> {
+    let before: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0))
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .pragma_update(None, "defer_foreign_keys", true)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(V4_OUTBOX_TABLE_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    let mut statement = transaction
+        .prepare("SELECT outbox_id, tenant_scope, dispatch_id, task_id FROM outbox")
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|_| SqliteStoreError::Initialization)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    drop(statement);
+    for (outbox_id, scope, dispatch_id, task_id) in rows {
+        let mut identities = transaction
+            .prepare(
+                "SELECT message_id FROM idempotency_records
+                 WHERE tenant_scope = ?1 AND task_id = ?2",
+            )
+            .map_err(|_| SqliteStoreError::Initialization)?;
+        let candidates = identities
+            .query_map(params![scope, task_id], |row| row.get::<_, String>(0))
+            .map_err(|_| SqliteStoreError::Initialization)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SqliteStoreError::Initialization)?;
+        drop(identities);
+        let message_id = candidates
+            .into_iter()
+            .find(|message_id| {
+                dispatch_id
+                    == content_digest(format!("{scope}\0send-message\0{message_id}").as_bytes())
+            })
+            .ok_or(SqliteStoreError::InvalidSchema)?;
+        transaction
+            .execute(
+                "INSERT INTO outbox_v4 SELECT outbox_id, dispatch_id, tenant_scope, task_id,
+                     ?2, causative_revision, payload_json, payload_digest, state, attempt_count,
+                     max_attempts, available_at, lease_owner, lease_token, lease_until,
+                     last_error, created_at, updated_at FROM outbox WHERE outbox_id = ?1",
+                params![outbox_id, message_id],
+            )
+            .map_err(|_| SqliteStoreError::Initialization)?;
+    }
+    let after: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM outbox_v4", [], |row| row.get(0))
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    if after != before {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    transaction
+        .execute_batch(
+            "DROP TABLE outbox;
+             ALTER TABLE outbox_v4 RENAME TO outbox;
+             CREATE INDEX outbox_due ON outbox(state, available_at, lease_until, outbox_id);
+             CREATE INDEX outbox_task_state ON outbox(task_id, state);",
+        )
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(OUTBOX_MESSAGE_BINDING_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(
+    connection: &mut Connection,
+    max_tasks: usize,
+) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_version(connection, V3_SCHEMA_VERSION, V2_SCHEMA_SQL, V3_OBJECTS)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    rebuild_outbox_with_message_ids(&transaction)?;
+    transaction
+        .execute_batch(OUTBOX_MESSAGE_IMMUTABILITY_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(CANCELLATION_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    validate_foreign_keys(&transaction)?;
+    validate_persisted_records(&transaction, max_tasks)?;
+    validate_atomic_records(&transaction)?;
+    validate_receiver_records(&transaction)?;
+    validate_stream_records(&transaction)?;
+    validate_cancellation_records(&transaction)?;
+    transaction
+        .execute(
+            "UPDATE store_metadata SET schema_version = ?1, migration_hash = ?2 WHERE singleton = 1",
+            params![SCHEMA_VERSION, schema_v4_hash()],
         )
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| SqliteStoreError::Initialization)?;
-    validate_persisted_records(&transaction, max_tasks)?;
-    validate_atomic_records(&transaction)?;
     let validated = validate_schema(&transaction)?;
     if validated != keys {
         return Err(SqliteStoreError::InvalidSchema);
@@ -1964,18 +4799,45 @@ fn recover_orphaned_tasks(connection: &mut Connection) -> Result<(), SqliteStore
     // Ownership lock proves the prior process is gone. Reclaim its leases without
     // failing tasks that still have a durable dispatch intent.
     let recovery_now = chrono::Utc::now().timestamp_millis();
+    transaction
+        .execute(
+            "UPDATE receiver_inbox SET lease_until = 0, updated_at = ?1 WHERE state = 'processing'",
+            [recovery_now],
+        )
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute(
+            "UPDATE outbox SET lease_until = 0, updated_at = ?1
+             WHERE state = 'leased'
+               AND EXISTS (
+                   SELECT 1 FROM receiver_inbox receiver
+                   WHERE receiver.tenant_scope = outbox.tenant_scope
+                     AND receiver.dispatch_id = outbox.dispatch_id
+                     AND receiver.payload_digest = outbox.payload_digest
+                     AND receiver.state IN ('processing', 'completed')
+               )",
+            [recovery_now],
+        )
+        .map_err(|_| SqliteStoreError::Initialization)?;
     loop {
-        let expired_final: Option<(i64, String)> = transaction
+        let expired_final: Option<(i64, String, String)> = transaction
             .query_row(
-                "SELECT outbox_id, task_id FROM outbox
+                "SELECT outbox_id, task_id, dispatch_id FROM outbox
                  WHERE state = 'leased' AND attempt_count >= max_attempts
+                   AND NOT EXISTS (
+                       SELECT 1 FROM receiver_inbox receiver
+                       WHERE receiver.tenant_scope = outbox.tenant_scope
+                         AND receiver.dispatch_id = outbox.dispatch_id
+                         AND receiver.payload_digest = outbox.payload_digest
+                         AND receiver.state IN ('processing', 'completed')
+                   )
                  ORDER BY outbox_id LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|_| SqliteStoreError::Initialization)?;
-        let Some((outbox_id, task_id)) = expired_final else {
+        let Some((outbox_id, task_id, dispatch_id)) = expired_final else {
             break;
         };
         let error = "final outbox attempt was abandoned by the prior process";
@@ -1995,7 +4857,7 @@ fn recover_orphaned_tasks(connection: &mut Connection) -> Result<(), SqliteStore
                 |row| row.get(0),
             )
             .map_err(|_| SqliteStoreError::Initialization)?;
-        dead_letter_task(&transaction, &task_id, error, recovery_now)
+        dead_letter_task(&transaction, &task_id, &dispatch_id, error, recovery_now)
             .map_err(|_| SqliteStoreError::Initialization)?;
         transaction
             .execute(
@@ -2012,24 +4874,24 @@ fn recover_orphaned_tasks(connection: &mut Connection) -> Result<(), SqliteStore
             .map_err(|_| SqliteStoreError::Initialization)?;
     }
     loop {
-        let delivered_nonterminal: Option<String> = transaction
+        let delivered_nonterminal: Option<(String, String)> = transaction
             .query_row(
-                "SELECT o.task_id
+                "SELECT o.task_id, o.dispatch_id
                  FROM outbox o JOIN tasks t ON t.task_id = o.task_id
-                 WHERE o.state = 'delivered'
+                 WHERE o.state = 'delivered' AND o.causative_revision = t.revision
                    AND t.state NOT IN ('\"TASK_STATE_COMPLETED\"', '\"TASK_STATE_FAILED\"',
                                        '\"TASK_STATE_CANCELED\"', '\"TASK_STATE_REJECTED\"')
                  ORDER BY o.outbox_id LIMIT 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|_| SqliteStoreError::Initialization)?;
-        let Some(task_id) = delivered_nonterminal else {
+        let Some((task_id, dispatch_id)) = delivered_nonterminal else {
             break;
         };
         let error = "delivered outbox intent lacked a terminal transition at restart; downstream effect outcome is unknown";
-        dead_letter_task(&transaction, &task_id, error, recovery_now)
+        dead_letter_task(&transaction, &task_id, &dispatch_id, error, recovery_now)
             .map_err(|_| SqliteStoreError::Initialization)?;
         transaction
             .execute(
@@ -2043,7 +4905,14 @@ fn recover_orphaned_tasks(connection: &mut Connection) -> Result<(), SqliteStore
         .execute(
             "UPDATE outbox_attempts SET finished_at = ?1, outcome = 'abandoned'
              WHERE finished_at IS NULL AND outbox_id IN
-                 (SELECT outbox_id FROM outbox WHERE state = 'leased')",
+                 (SELECT outbox_id FROM outbox
+                  WHERE state = 'leased' AND NOT EXISTS (
+                      SELECT 1 FROM receiver_inbox receiver
+                      WHERE receiver.tenant_scope = outbox.tenant_scope
+                        AND receiver.dispatch_id = outbox.dispatch_id
+                        AND receiver.payload_digest = outbox.payload_digest
+                        AND receiver.state IN ('processing', 'completed')
+                  ))",
             [recovery_now],
         )
         .map_err(|_| SqliteStoreError::Initialization)?;
@@ -2051,7 +4920,13 @@ fn recover_orphaned_tasks(connection: &mut Connection) -> Result<(), SqliteStore
         .execute(
             "UPDATE outbox SET state = 'pending', available_at = MIN(available_at, ?1),
                  lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = ?1
-             WHERE state = 'leased'",
+             WHERE state = 'leased' AND NOT EXISTS (
+                 SELECT 1 FROM receiver_inbox receiver
+                 WHERE receiver.tenant_scope = outbox.tenant_scope
+                   AND receiver.dispatch_id = outbox.dispatch_id
+                   AND receiver.payload_digest = outbox.payload_digest
+                   AND receiver.state IN ('processing', 'completed')
+             )",
             [recovery_now],
         )
         .map_err(|_| SqliteStoreError::Initialization)?;

@@ -41,6 +41,7 @@ CREATE TABLE outbox (
     dispatch_id TEXT NOT NULL UNIQUE,
     tenant_scope TEXT NOT NULL,
     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+    message_id TEXT NOT NULL,
     causative_revision BIGINT NOT NULL CHECK (causative_revision > 0),
     payload_json TEXT NOT NULL,
     payload_digest TEXT NOT NULL,
@@ -57,6 +58,7 @@ CREATE TABLE outbox (
 );
 CREATE INDEX outbox_due ON outbox(state, available_at, lease_until, outbox_id);
 CREATE INDEX outbox_task_state ON outbox(task_id, state);
+CREATE UNIQUE INDEX outbox_message_identity ON outbox(tenant_scope, message_id);
 
 CREATE TABLE outbox_attempts (
     outbox_id BIGINT NOT NULL REFERENCES outbox(outbox_id) ON DELETE RESTRICT,

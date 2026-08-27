@@ -21,7 +21,7 @@ use smesh_a2a::{
     MeshRequest, VersionedCompletionPolicy, artifact_set_digest, build_router_with_policy,
     content_digest,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 struct TestServer {
@@ -559,16 +559,18 @@ type EventSender = mpsc::Sender<MeshEventResult>;
 #[derive(Clone, Default)]
 struct ControlledDispatcher {
     senders: Arc<Mutex<HashMap<String, EventSender>>>,
+    started: Arc<Notify>,
 }
 
 impl ControlledDispatcher {
     async fn sender_for(&self, task_id: &str) -> EventSender {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
+                let notified = self.started.notified();
                 if let Some(sender) = self.senders.lock().unwrap().get(task_id).cloned() {
                     return sender;
                 }
-                tokio::task::yield_now().await;
+                notified.await;
             }
         })
         .await
@@ -584,6 +586,7 @@ impl MeshDispatcher for ControlledDispatcher {
     ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
         let (sender, receiver) = mpsc::channel(8);
         self.senders.lock().unwrap().insert(request.task_id, sender);
+        self.started.notify_waiters();
         Box::pin(ReceiverStream::new(receiver))
     }
 
