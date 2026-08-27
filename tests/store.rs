@@ -46,3 +46,25 @@ async fn store_never_allows_a_terminal_task_to_regress() {
     );
     assert!(error.message.contains("terminal"));
 }
+
+#[tokio::test]
+async fn store_only_accepts_exact_terminal_idempotence() {
+    let store = BoundedTaskStore::new(2);
+    let mut completed = task("terminal-idempotent");
+    completed.status.state = TaskState::Completed;
+    store.create(completed.clone()).await.unwrap();
+    assert!(store.update(completed.clone()).await.is_ok());
+
+    completed.metadata =
+        Some(serde_json::from_value(serde_json::json!({"different": true})).unwrap());
+    assert!(store.update(completed).await.is_err());
+    assert!(
+        store
+            .get("terminal-idempotent")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .is_none()
+    );
+}

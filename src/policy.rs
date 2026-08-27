@@ -371,13 +371,29 @@ impl Default for VersionedCompletionPolicy {
 }
 
 impl VersionedCompletionPolicy {
+    pub(crate) fn receipt_key(&self) -> [u8; 32] {
+        *self.receipt_key
+    }
+
     /// Build and validate a deterministic policy profile.
     ///
     /// # Errors
     ///
     /// Returns [`PolicyError::InvalidPolicy`] for invalid thresholds, limits,
     /// duplicate authorities, or an unusable human-ratification configuration.
-    pub fn new(mut spec: CompletionPolicySpec) -> Result<Self, PolicyError> {
+    pub fn new(spec: CompletionPolicySpec) -> Result<Self, PolicyError> {
+        Self::new_with_receipt_key(spec, rand::random())
+    }
+
+    /// Build a policy with restart-stable receipt/checkpoint key material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::InvalidPolicy`] under the same conditions as [`Self::new`].
+    pub fn new_with_receipt_key(
+        mut spec: CompletionPolicySpec,
+        receipt_key: [u8; 32],
+    ) -> Result<Self, PolicyError> {
         validate_text("policyId", &spec.policy_id)?;
         if spec.version != 1 {
             return Err(PolicyError::InvalidPolicy(
@@ -448,7 +464,7 @@ impl VersionedCompletionPolicy {
         Ok(Self {
             spec,
             policy_hash,
-            receipt_key: Arc::new(rand::random()),
+            receipt_key: Arc::new(receipt_key),
         })
     }
 

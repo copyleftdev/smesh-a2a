@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use smesh_a2a::{
     CorrelatingRuntimeProcessor, GatewayConfig, GatewayMode, LoopbackDispatcher,
-    RuntimeAdmissionProcessor, RuntimeEventCapture, RuntimeModeConfig, RuntimeWorker, build_router,
+    RuntimeAdmissionProcessor, RuntimeEventCapture, RuntimeModeConfig, RuntimeWorker,
+    SqliteTaskStore, build_router, build_router_with_sqlite, build_router_with_sqlite_and_trace,
     build_router_with_trace,
 };
 use smesh_core::{Network, Node};
@@ -35,19 +36,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mesh_bind = std::env::var("SMESH_A2A_MESH_BIND").ok();
     let bootstrap = std::env::var("SMESH_A2A_BOOTSTRAP").ok();
     let mode = GatewayMode::parse(mode.as_deref(), mesh_bind.as_deref(), bootstrap.as_deref())?;
+    let sqlite_path = std::env::var_os("SMESH_A2A_SQLITE_PATH").map(std::path::PathBuf::from);
 
     match mode {
         GatewayMode::Loopback => {
-            let app = build_router(
-                GatewayConfig::new(&public_base_url, &gateway_node_id),
-                LoopbackDispatcher,
-            );
+            let config = GatewayConfig::new(&public_base_url, &gateway_node_id);
+            let app = if let Some(path) = sqlite_path {
+                let store = SqliteTaskStore::open(path, config.max_tasks).await?;
+                build_router_with_sqlite(config, LoopbackDispatcher, store)?
+            } else {
+                build_router(config, LoopbackDispatcher)
+            };
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(%bind, %public_base_url, mode = "loopback", "SMESH A2A gateway listening");
             axum::serve(listener, app).await?;
         }
         GatewayMode::Runtime(runtime_config) => {
-            run_runtime_gateway(bind, public_base_url, gateway_node_id, runtime_config).await?;
+            run_runtime_gateway(
+                bind,
+                public_base_url,
+                gateway_node_id,
+                runtime_config,
+                sqlite_path,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -59,6 +71,7 @@ async fn run_runtime_gateway(
     public_base_url: String,
     gateway_node_id: String,
     runtime_config: RuntimeModeConfig,
+    sqlite_path: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut network = Network::new();
     network.add_node(Node::named(&gateway_node_id));
@@ -123,11 +136,13 @@ async fn run_runtime_gateway(
         64,
     )
     .await?;
-    let app = build_router_with_trace(
-        GatewayConfig::new(&public_base_url, &gateway_node_id),
-        dispatcher,
-        Arc::clone(&capture),
-    );
+    let config = GatewayConfig::new(&public_base_url, &gateway_node_id);
+    let app = if let Some(path) = sqlite_path {
+        let store = SqliteTaskStore::open(path, config.max_tasks).await?;
+        build_router_with_sqlite_and_trace(config, dispatcher, store, Arc::clone(&capture))?
+    } else {
+        build_router_with_trace(config, dispatcher, Arc::clone(&capture))
+    };
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(
         %bind,

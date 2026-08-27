@@ -13,6 +13,7 @@ mod runtime_config;
 mod runtime_trace;
 mod runtime_worker;
 mod server;
+mod sqlite_store;
 mod store;
 
 pub use bridge::{DispatchError, MeshDispatcher, MeshEvent, MeshRequest};
@@ -41,7 +42,8 @@ pub use runtime_worker::{
     RuntimeWorkerConfig, RuntimeWorkerHandle,
 };
 pub use server::{
-    GatewayConfig, build_router, build_router_with_policy, build_router_with_store,
-    build_router_with_trace,
+    GatewayConfig, build_router, build_router_with_policy, build_router_with_policy_and_trace,
+    build_router_with_sqlite, build_router_with_sqlite_and_trace, build_router_with_trace,
 };
+pub use sqlite_store::{SqliteStoreError, SqliteTaskStore};
 pub use store::BoundedTaskStore;

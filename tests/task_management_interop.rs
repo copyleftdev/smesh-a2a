@@ -17,8 +17,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{StreamExt, stream::BoxStream};
 use smesh_a2a::{
     ArtifactManifest, BoundedTaskStore, CompletionEvidence, CompletionReceipt, DispatchError,
-    GatewayConfig, LoopbackDispatcher, MeshDispatcher, MeshEvent, MeshRequest, artifact_set_digest,
-    build_router_with_store, content_digest,
+    GatewayConfig, LoopbackDispatcher, MeshDispatcher, MeshEvent, MeshRequest,
+    VersionedCompletionPolicy, artifact_set_digest, build_router_with_policy, content_digest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -36,16 +36,18 @@ impl TestServer {
     async fn start_with_store<D, S>(dispatcher: D, store: S) -> Self
     where
         D: MeshDispatcher,
-        S: TaskStore + Clone,
+        S: TaskStore + Clone + 'static,
     {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let base_url = format!("http://{address}");
-        let app = build_router_with_store(
+        let app = build_router_with_policy(
             GatewayConfig::new(&base_url, "task-management-test"),
             dispatcher,
             store,
-        );
+            VersionedCompletionPolicy::default(),
+        )
+        .unwrap();
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Self { base_url, task }
     }

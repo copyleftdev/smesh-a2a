@@ -21,7 +21,8 @@ SMESH remains the internal coordination substrate: signals diffuse, decay, reinf
 - Terminal-state and task-ID reuse guards
 - Mandatory versioned completion policy with buffered candidate artifacts, contradiction veto,
   deterministic receipt claims, and optional signed human ratification
-- Process-local HMAC sealing and read-path validation for accepted completion receipts
+- HMAC sealing and read-path validation for accepted completion receipts; SQLite mode persists the
+  sealing key with the task ledger so receipts remain verifiable after restart
 
 ## Architecture
 
@@ -115,8 +116,20 @@ Configuration:
 SMESH_A2A_BIND=127.0.0.1:4000 \
 SMESH_A2A_PUBLIC_URL=http://127.0.0.1:4000 \
 SMESH_A2A_NODE_ID=gateway-west \
+SMESH_A2A_SQLITE_PATH=/var/lib/smesh-a2a/tasks.sqlite3 \
 cargo run --bin smesh-a2a-gateway
 ```
+
+`SMESH_A2A_SQLITE_PATH` enables the persistent SQLite task store in either gateway mode. Persistent
+SQLite mode is supported on Unix platforms only and enforces exactly one open writer per database
+with a nonblocking lifetime file lock; a second gateway/store open fails before restart recovery and
+cannot terminalize live work. On non-Unix platforms persistent open fails explicitly. The path must
+be absolute and its existing parent directory must be owned by the gateway user with no group or
+world permissions (normally mode `0700`). The database and SQLite sidecars are held at `0600`.
+After restart, terminal tasks remain unchanged; nonterminal tasks that no longer have a live
+execution are recovered fail-closed as `Failed` with a fresh timestamp and restart diagnostic rather
+than being exposed as orphaned work. The SQLite metadata persists the completion-receipt key, so
+receipts accepted before restart can be verified afterward.
 
 Run the built-in real runtime worker with a live QUIC endpoint:
 
@@ -192,7 +205,7 @@ The MVP is intentionally localhost-first and single-tenant.
   gateway's locally configured completion policy accepts a sealed evidence snapshot.
 - The binary refuses non-loopback binds unless `SMESH_A2A_UNSAFE_PUBLIC=1` is explicit.
 
-Do not expose the MVP directly to an untrusted network. `SMESH_A2A_UNSAFE_PUBLIC=1` only disables the bind guard; it does not add security. Production deployment still requires authenticated principals, tenant-aware authorization, a persistent task store, TLS, distributed quotas, and observability.
+Do not expose the MVP directly to an untrusted network. `SMESH_A2A_UNSAFE_PUBLIC=1` only disables the bind guard; it does not add security. Production deployment still requires authenticated principals, tenant-aware authorization, TLS, tenant-aware persistence, distributed quotas, and observability.
 
 ## Test and verify
 
