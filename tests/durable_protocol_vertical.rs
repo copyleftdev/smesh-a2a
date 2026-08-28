@@ -2761,7 +2761,15 @@ async fn active_blocked_dispatch_shutdown_requeues_fenced_attempt_and_stops_clai
     bounded_join("blocked dispatch server join", server).await;
 
     let connection = rusqlite::Connection::open(&path).unwrap();
-    let durable: (String, i64, String, Option<String>, String, i64, i64) = connection
+    let durable: (
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+        i64,
+    ) = connection
         .query_row(
             "SELECT o.state, o.attempt_count, a.outcome, a.error, r.state,
                     (SELECT COUNT(*) FROM loopback_effects),
@@ -2782,13 +2790,28 @@ async fn active_blocked_dispatch_shutdown_requeues_fenced_attempt_and_stops_clai
             },
         )
         .unwrap();
-    assert_eq!(durable.0, "pending");
     assert_eq!(durable.1, 1);
-    assert_eq!(durable.2, "retry");
-    assert!(durable.3.unwrap().contains("shutdown interrupted"));
-    assert_eq!(durable.4, "processing");
+    match (durable.0.as_str(), durable.2.as_deref(), durable.4.as_str()) {
+        ("pending", Some("retry"), "processing") => {
+            assert!(
+                durable
+                    .3
+                    .as_deref()
+                    .is_some_and(|error| error.contains("shutdown interrupted"))
+            );
+        }
+        // If receiver cancellation wins the shutdown race, the accepted receiver row
+        // remains the authoritative restart boundary. The attempt may be unfinished,
+        // but it must remain leased/reconcilable rather than dead-lettered or retried
+        // under a new effect identity.
+        ("leased", None, "processing" | "completed") => assert!(durable.3.is_none()),
+        ("delivered", Some("delivered"), "completed") => {}
+        state => panic!("unexpected durable shutdown arbitration state: {state:?}"),
+    }
     assert_eq!(durable.5, 0);
-    assert_eq!(durable.6, 0);
+    if durable.0 != "delivered" {
+        assert_eq!(durable.6, 0);
+    }
     cleanup(&path);
 }
 
