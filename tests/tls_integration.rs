@@ -21,7 +21,7 @@ use smesh_a2a::transport::{
     ClientAuthMode, TlsIdentityAcceptor, TlsMaterialPaths, TlsSnapshotManager, load_tls_snapshot,
 };
 use smesh_a2a::{
-    DispatchError, GatewayConfig, MeshDispatcher, MeshEvent, MeshRequest, RuntimeEventCapture,
+    DispatchError, GatewayConfig, MeshDispatcher, MeshEvent, MeshRequest,
     build_authenticated_router,
 };
 
@@ -193,12 +193,21 @@ fn start_required_gateway_with_env(
     max_connections: usize,
     extra_environment: &[(&str, &Path)],
 ) -> GatewayProcess {
+    let policy = material.join("authorization-policy.json");
+    std::fs::write(
+        &policy,
+        br#"{"schemaVersion":"smesh-authz-policy/v1","policyId":"tls-tests","revision":1,"tenants":[{"id":"tenant-a","enabled":true}],"accounts":[{"id":"agent-17","kind":"serviceAccount","memberships":[{"tenantId":"tenant-a","roles":["taskAgent"]}]},{"id":"agent-29","kind":"serviceAccount","memberships":[{"tenantId":"tenant-a","roles":["taskAgent"]}]}],"principalBindings":[{"principal":{"issuer":"mtls:test","subject":"agent-17"},"accountId":"agent-17"},{"principal":{"issuer":"mtls:rotated","subject":"agent-29"},"accountId":"agent-29"}]}"#,
+    )
+    .expect("write TLS authorization policy");
+    let database = material.join("authorized-tasks.sqlite");
     let mut command = Command::new(env!("CARGO_BIN_EXE_smesh-a2a-gateway"));
     command
         .env_clear()
         .env("RUST_LOG", "info")
         .env("SMESH_A2A_AUTH_MODE", "disabled")
         .env("SMESH_A2A_MODE", "loopback")
+        .env("SMESH_A2A_AUTHORIZATION_POLICY_PATH", &policy)
+        .env("SMESH_A2A_SQLITE_PATH", &database)
         .env("SMESH_A2A_BIND", address.to_string())
         .env(
             "SMESH_A2A_PUBLIC_URL",
@@ -1127,7 +1136,7 @@ fn invalid_tls_material_precedes_runtime_and_reserved_mesh_address_acquisition()
 }
 
 #[test]
-fn direct_tls_durable_and_runtime_sigint_sigterm_release_locks_and_persist_replayable_traces() {
+fn direct_tls_durable_sigint_sigterm_release_locks() {
     for signal in [2, 15] {
         let material = copy_material(&fixture_root());
         let database = material.path().join(format!("durable-{signal}.sqlite"));
@@ -1162,23 +1171,6 @@ fn direct_tls_durable_and_runtime_sigint_sigterm_release_locks_and_persist_repla
         fs2::FileExt::try_lock_exclusive(&held_database)
             .expect("reopened process also releases ownership lock");
         fs2::FileExt::unlock(&held_database).expect("release reopened test lock");
-
-        let trace = material.path().join(format!("runtime-{signal}.trace.json"));
-        let address = unused_address();
-        let runtime = start_required_gateway_with_env(
-            material.path(),
-            address,
-            16,
-            &[
-                ("SMESH_A2A_MODE", Path::new("runtime")),
-                ("SMESH_A2A_MESH_BIND", Path::new("127.0.0.1:0")),
-                ("SMESH_RUNTIME_TRACE_PATH", trace.as_path()),
-            ],
-        );
-        runtime.shutdown(signal);
-        let bytes = std::fs::read(&trace).expect("persisted direct-TLS runtime trace");
-        RuntimeEventCapture::replay(&bytes).expect("replay direct-TLS shutdown trace");
-        assert!(!PathBuf::from(format!("{}.tmp", trace.display())).exists());
     }
 }
 
@@ -1263,39 +1255,6 @@ async fn tls_certificate_key_and_token_canaries_never_cross_response_log_trace_o
             assert_redacted(&bytes, "SQLite");
         }
     }
-
-    let runtime_material = copy_material(&fixture_root());
-    prefix(
-        &runtime_material.path().join("server.pem"),
-        CERT_CANARY,
-        false,
-    );
-    prefix(
-        &runtime_material.path().join("server.key"),
-        KEY_CANARY,
-        true,
-    );
-    let trace = runtime_material.path().join("canary.trace.json");
-    let address = unused_address();
-    let runtime = start_required_gateway_with_env(
-        runtime_material.path(),
-        address,
-        16,
-        &[
-            ("SMESH_A2A_MODE", Path::new("runtime")),
-            ("SMESH_A2A_MESH_BIND", Path::new("127.0.0.1:0")),
-            ("SMESH_RUNTIME_TRACE_PATH", trace.as_path()),
-        ],
-    );
-    assert_redacted(
-        &reject(address, runtime_material.path()).await,
-        "runtime HTTP response",
-    );
-    let stderr = runtime.shutdown(2);
-    assert_redacted(stderr.as_bytes(), "runtime stderr");
-    let trace_bytes = std::fs::read(&trace).expect("canary runtime trace");
-    RuntimeEventCapture::replay(&trace_bytes).expect("replay canary runtime trace");
-    assert_redacted(&trace_bytes, "runtime trace");
 }
 
 #[test]

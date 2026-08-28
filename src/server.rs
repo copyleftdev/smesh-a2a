@@ -12,6 +12,7 @@ use crate::{
     InjectedClock, InputLimits, MeshDispatcher, PolicyError, RuntimeEventCapture, SmeshExecutor,
     SqliteTaskStore, VersionedCompletionPolicy,
     auth::{AuthState, authenticate_request},
+    authorization::{AuthorizationMiddlewareState, AuthorizationPolicy, authorize_request},
     build_agent_card, build_secured_agent_card_with_policy,
     durable_handler::DurableRequestHandler,
     guard::GuardedRequestHandler,
@@ -203,12 +204,16 @@ pub fn build_durable_loopback_gateway(
     clock: InjectedClock,
 ) -> Result<DurableGateway, PolicyError> {
     Ok(build_durable_gateway_inner(
-        config, store, endpoint, clock, None,
+        config, store, endpoint, clock, None, None,
     ))
 }
 
-/// Build the durable loopback gateway with bearer authentication protecting
-/// every JSON-RPC and REST operation while leaving the well-known card public.
+/// Build the durable loopback gateway with authentication only.
+///
+/// # Security
+/// This compatibility builder does **not** install tenant authorization and is
+/// therefore development-only and non-multitenant. Production callers must use
+/// [`build_authorized_durable_loopback_gateway`].
 ///
 /// # Errors
 /// Returns an error if durable gateway policy construction fails.
@@ -225,6 +230,30 @@ pub fn build_authenticated_durable_loopback_gateway(
         endpoint,
         clock,
         Some(auth),
+        None,
+    ))
+}
+
+/// Build the authenticated durable gateway with server-owned tenant policy.
+/// This is the only authenticated builder intended for production use.
+///
+/// # Errors
+/// Returns an error if durable gateway policy construction fails.
+pub fn build_authorized_durable_loopback_gateway(
+    config: GatewayConfig,
+    store: SqliteTaskStore,
+    endpoint: DurableLoopbackEndpoint,
+    clock: InjectedClock,
+    auth: AuthState,
+    policy: Arc<AuthorizationPolicy>,
+) -> Result<DurableGateway, PolicyError> {
+    Ok(build_durable_gateway_inner(
+        config,
+        store,
+        endpoint,
+        clock,
+        Some(auth),
+        Some(policy),
     ))
 }
 
@@ -234,6 +263,7 @@ fn build_durable_gateway_inner(
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
     auth: Option<AuthState>,
+    authorization: Option<Arc<AuthorizationPolicy>>,
 ) -> DurableGateway {
     let GatewayConfig {
         public_base_url,
@@ -249,7 +279,7 @@ fn build_durable_gateway_inner(
         input_limits,
     ));
     let rest_handler = Arc::new(
-        DurableRequestHandler::new(store.clone(), driver.control(), clock, input_limits)
+        DurableRequestHandler::new(store.clone(), driver.control(), clock.clone(), input_limits)
             .with_errors_before_stream(),
     );
     let mut durable_card = if let Some(auth) = auth.as_ref() {
@@ -271,11 +301,17 @@ fn build_durable_gateway_inner(
     let protocol = if let Some(auth) = auth {
         let jsonrpc = auth.wrap_handler(jsonrpc_handler);
         let rest = auth.wrap_handler(rest_handler);
-        Router::new()
+        let protocol = Router::new()
             .nest("/jsonrpc", a2a_server::jsonrpc::jsonrpc_router(jsonrpc))
             .nest("/rest", a2a_server::rest::rest_router(rest))
-            .layer(RequestBodyLimitLayer::new(max_body_bytes))
-            .layer(middleware::from_fn_with_state(auth, authenticate_request))
+            .layer(RequestBodyLimitLayer::new(max_body_bytes));
+        let protocol = if let Some(policy) = authorization {
+            let state = AuthorizationMiddlewareState::with_sqlite(policy, store.clone(), clock);
+            protocol.layer(middleware::from_fn_with_state(state, authorize_request))
+        } else {
+            protocol
+        };
+        protocol.layer(middleware::from_fn_with_state(auth, authenticate_request))
     } else {
         Router::new()
             .nest(
@@ -302,9 +338,12 @@ where
     build_router_with_store(config, dispatcher, store)
 }
 
-/// Compose opt-in bearer-authenticated official JSON-RPC and REST routers.
-/// The well-known agent card remains public. Existing loopback builders stay
-/// intentionally unauthenticated for source-compatible local tests.
+/// Compose authentication-only official JSON-RPC and REST routers.
+///
+/// # Security
+/// Upstream `DefaultRequestHandler` loses explicit tenant scope after spawning;
+/// this compatibility API is development-only and must not be used as a
+/// multitenant production boundary. The production binary refuses this path.
 pub fn build_authenticated_router<D>(
     config: GatewayConfig,
     dispatcher: D,

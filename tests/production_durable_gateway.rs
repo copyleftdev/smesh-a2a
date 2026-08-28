@@ -358,7 +358,7 @@ async fn production_system_clock_wakes_busy_receiver_backoff_without_manual_adva
     .unwrap();
     bounded(
         "busy fixture message admission",
-        store.admit_send_message(SendMessageAdmission {
+        Box::pin(store.admit_send_message(SendMessageAdmission {
             request: request.clone(),
             streaming: false,
             task: task.clone(),
@@ -366,7 +366,7 @@ async fn production_system_clock_wakes_busy_receiver_backoff_without_manual_adva
             input_limits: InputLimits::default(),
             now,
             max_attempts: 8,
-        }),
+        })),
     )
     .await
     .unwrap();
@@ -514,7 +514,7 @@ async fn dropped_gateway_aborts_worker_and_releases_sqlite_with_router_clone_ali
     .unwrap();
     bounded(
         "drop-release message admission",
-        store.admit_send_message(SendMessageAdmission {
+        Box::pin(store.admit_send_message(SendMessageAdmission {
             request,
             streaming: false,
             task: task.clone(),
@@ -522,7 +522,7 @@ async fn dropped_gateway_aborts_worker_and_releases_sqlite_with_router_clone_ali
             input_limits: InputLimits::default(),
             now,
             max_attempts: 1,
-        }),
+        })),
     )
     .await
     .unwrap();

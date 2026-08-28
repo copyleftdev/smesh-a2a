@@ -73,7 +73,7 @@ fn decode_cursor(
     key: &[u8; 32],
 ) -> Result<TaskCursor, A2AError> {
     if token.len() > MAX_PAGE_TOKEN_BYTES {
-        return Err(A2AError::invalid_params("pageToken is too large"));
+        return Err(A2AError::invalid_params("invalid pageToken"));
     }
     let mut bytes = URL_SAFE_NO_PAD
         .decode(token)
@@ -86,16 +86,14 @@ fn decode_cursor(
         .map_err(|_| A2AError::internal("failed to initialize page cursor verifier"))?;
     mac.update(&bytes);
     mac.verify_slice(&tag)
-        .map_err(|_| A2AError::invalid_params("invalid pageToken signature"))?;
+        .map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
     let cursor: TaskCursor = serde_json::from_slice(&bytes)
         .map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
     if cursor.version != CURSOR_VERSION {
-        return Err(A2AError::invalid_params("unsupported pageToken version"));
+        return Err(A2AError::invalid_params("invalid pageToken"));
     }
     if &cursor.scope != expected_scope {
-        return Err(A2AError::invalid_params(
-            "pageToken does not match the list query",
-        ));
+        return Err(A2AError::invalid_params("invalid pageToken"));
     }
     Ok(cursor)
 }
