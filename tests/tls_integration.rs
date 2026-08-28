@@ -207,6 +207,7 @@ fn start_required_gateway_with_env(
         .env("SMESH_A2A_AUTH_MODE", "disabled")
         .env("SMESH_A2A_MODE", "loopback")
         .env("SMESH_A2A_AUTHORIZATION_POLICY_PATH", &policy)
+        .env("SMESH_A2A_DURABLE_BACKEND", "sqlite")
         .env("SMESH_A2A_SQLITE_PATH", &database)
         .env("SMESH_A2A_BIND", address.to_string())
         .env(
@@ -1023,6 +1024,7 @@ fn invalid_tls_material_fails_before_listener_or_durable_resource_acquisition_an
                 "SMESH_A2A_TLS_PRINCIPAL_MAP_PATH",
                 material.path().join("principals.json"),
             )
+            .env("SMESH_A2A_DURABLE_BACKEND", "sqlite")
             .env("SMESH_A2A_SQLITE_PATH", &database)
             .env("SMESH_RUNTIME_TRACE_PATH", &trace)
             .stdout(Stdio::piped())
@@ -1145,7 +1147,10 @@ fn direct_tls_durable_sigint_sigterm_release_locks() {
             material.path(),
             address,
             16,
-            &[("SMESH_A2A_SQLITE_PATH", database.as_path())],
+            &[
+                ("SMESH_A2A_DURABLE_BACKEND", std::path::Path::new("sqlite")),
+                ("SMESH_A2A_SQLITE_PATH", database.as_path()),
+            ],
         );
         let held_database = std::fs::OpenOptions::new()
             .read(true)
@@ -1165,7 +1170,10 @@ fn direct_tls_durable_sigint_sigterm_release_locks() {
             material.path(),
             unused_address(),
             16,
-            &[("SMESH_A2A_SQLITE_PATH", database.as_path())],
+            &[
+                ("SMESH_A2A_DURABLE_BACKEND", std::path::Path::new("sqlite")),
+                ("SMESH_A2A_SQLITE_PATH", database.as_path()),
+            ],
         );
         reopened.shutdown(if signal == 2 { 15 } else { 2 });
         fs2::FileExt::try_lock_exclusive(&held_database)
@@ -1241,7 +1249,10 @@ async fn tls_certificate_key_and_token_canaries_never_cross_response_log_trace_o
         durable_material.path(),
         address,
         16,
-        &[("SMESH_A2A_SQLITE_PATH", database.as_path())],
+        &[
+            ("SMESH_A2A_DURABLE_BACKEND", std::path::Path::new("sqlite")),
+            ("SMESH_A2A_SQLITE_PATH", database.as_path()),
+        ],
     );
     assert_redacted(
         &reject(address, durable_material.path()).await,

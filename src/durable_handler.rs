@@ -19,13 +19,20 @@ use tokio::sync::Notify;
 
 use crate::{
     AdmissionOutcome, AuthorizationAuditInput, AuthorizationContext, AuthorizationDecisionEffect,
-    CancellationOutcome, DurableAuthority, InjectedClock, InputLimits, OwnedTaskScope,
-    SendMessageAdmission, SubscriptionCursor,
-    authorization::{Operation, current_authorization_context},
+    AuthorizedMutation, CancellationOutcome, DurableAuthority, InjectedClock, InputLimits,
+    OwnedTaskScope, SendMessageAdmission, SubscriptionCursor,
+    authorization::{Operation, current_authorization_context, current_quota_reservation},
     content_digest,
     durable_authority::LocalDevelopmentCompatibility,
     outbox_driver::{DurableDriverControl, WaiterGuard},
 };
+
+fn authorized_mutation(command: SendMessageAdmission) -> AuthorizedMutation<SendMessageAdmission> {
+    match current_quota_reservation() {
+        Some(quota) => AuthorizedMutation::with_quota(command, quota),
+        None => AuthorizedMutation::without_quota(command),
+    }
+}
 
 struct DurableStreamState {
     store: Arc<dyn DurableAuthority>,
@@ -654,7 +661,9 @@ impl RequestHandler for DurableRequestHandler {
                 )
             },
         );
-        let replay = if let Some((context, scope)) = authorization.as_ref() {
+        let replay = if let Some((context, scope)) = authorization.as_ref()
+            && !self.store.capabilities().quota_reservations
+        {
             self.store
                 .replay_authorized(
                     scope,
@@ -664,6 +673,10 @@ impl RequestHandler for DurableRequestHandler {
                     self.audit(context, operation, "message", &request.message.message_id)?,
                 )
                 .await?
+        } else if authorization.is_some() {
+            // Authorized replay is part of the same atomic mutation path as
+            // quota reservation insertion/verification below.
+            None
         } else {
             self.local()?.replay(&request, false).await?
         };
@@ -696,9 +709,9 @@ impl RequestHandler for DurableRequestHandler {
             };
             if let Some((context, scope)) = authorization.as_ref() {
                 self.store
-                    .authorize_and_continue(
+                    .authorize_and_continue_mutation(
                         scope,
-                        command,
+                        authorized_mutation(command),
                         self.audit(context, Operation::TaskContinue, "task", &task.id)?,
                     )
                     .await?
@@ -718,9 +731,9 @@ impl RequestHandler for DurableRequestHandler {
             };
             if let Some((context, scope)) = authorization.as_ref() {
                 self.store
-                    .authorize_and_admit(
+                    .authorize_and_admit_mutation(
                         scope,
-                        command,
+                        authorized_mutation(command),
                         self.audit(
                             context,
                             Operation::TaskCreate,
@@ -798,7 +811,9 @@ impl RequestHandler for DurableRequestHandler {
         let admitted = async {
             self.ensure_driver_healthy()?;
             Self::reject_message_options(&request)?;
-            let replay = if let Some((context, scope)) = authorization.as_ref() {
+            let replay = if let Some((context, scope)) = authorization.as_ref()
+                && !self.store.capabilities().quota_reservations
+            {
                 self.store
                     .replay_authorized(
                         scope,
@@ -808,6 +823,10 @@ impl RequestHandler for DurableRequestHandler {
                         self.audit(context, operation, "message", &request.message.message_id)?,
                     )
                     .await?
+            } else if authorization.is_some() {
+                // Authorized replay must verify the server task-local quota
+                // binding in authorize_and_*_mutation atomically.
+                None
             } else {
                 self.local()?.replay(&request, true).await?
             };
@@ -831,9 +850,9 @@ impl RequestHandler for DurableRequestHandler {
             if request.message.task_id.is_some() {
                 if let Some((context, scope)) = authorization.as_ref() {
                     self.store
-                        .authorize_and_continue(
+                        .authorize_and_continue_mutation(
                             scope,
-                            command,
+                            authorized_mutation(command),
                             self.audit(context, Operation::TaskContinue, "task", &task.id)?,
                         )
                         .await?;
@@ -842,9 +861,9 @@ impl RequestHandler for DurableRequestHandler {
                 }
             } else if let Some((context, scope)) = authorization.as_ref() {
                 self.store
-                    .authorize_and_admit(
+                    .authorize_and_admit_mutation(
                         scope,
-                        command,
+                        authorized_mutation(command),
                         self.audit(
                             context,
                             Operation::TaskCreate,
@@ -1014,11 +1033,12 @@ impl RequestHandler for DurableRequestHandler {
         }
         let outcome = if let Some((context, scope)) = authorization.as_ref() {
             self.store
-                .cancel_authorized(
+                .cancel_authorized_with_quota(
                     scope,
                     &request.id,
                     self.clock.now(),
                     self.audit(context, Operation::TaskCancel, "task", &request.id)?,
+                    current_quota_reservation().as_ref(),
                 )
                 .await?
         } else {

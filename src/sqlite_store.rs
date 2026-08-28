@@ -2908,24 +2908,25 @@ impl SqliteTaskStore {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("receiver admission transaction failed"))?;
             let tenant_scope = envelope.tenant_scope.clone();
-            let owned_outbox: bool = tx
+            let owned_outbox: Option<(i64, String)> = tx
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM outbox WHERE tenant_scope=?1 AND dispatch_id=?2
-                 AND task_id=?3 AND payload_digest=?4)",
+                    "SELECT attempt_count, lease_token FROM outbox WHERE tenant_scope=?1 AND dispatch_id=?2
+                 AND task_id=?3 AND payload_digest=?4 AND state='leased' AND lease_token IS NOT NULL",
                     params![
                         tenant_scope,
                         envelope.dispatch_id,
                         envelope.request.task_id,
                         envelope.payload_digest
                     ],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
+                .optional()
                 .map_err(|_| A2AError::internal("receiver outbox ownership lookup failed"))?;
-            if !owned_outbox {
+            let Some((sender_attempt, sender_token)) = owned_outbox else {
                 return Err(A2AError::invalid_params(
                     "invalid durable receiver envelope",
                 ));
-            }
+            };
             #[allow(clippy::type_complexity)]
             let existing: Option<(
                 String,
@@ -3043,8 +3044,12 @@ impl SqliteTaskStore {
                     .map_err(|_| A2AError::internal("receiver reclaim commit failed"))?;
                 return Ok(ReceiverAdmission::Execute(ReceiverLease {
                     tenant_scope: tenant_scope.clone(),
+                    task_id: envelope.request.task_id,
                     dispatch_id: envelope.dispatch_id,
                     payload_digest: envelope.payload_digest,
+                    sender_attempt_no: u32::try_from(sender_attempt)
+                        .map_err(|_| A2AError::internal("sender attempt is corrupt"))?,
+                    sender_lease_token: sender_token,
                     lease_owner,
                     lease_token: token,
                     lease_epoch: u64::try_from(next_epoch)
@@ -3090,8 +3095,12 @@ impl SqliteTaskStore {
                 .map_err(|_| A2AError::internal("receiver acceptance commit failed"))?;
             Ok(ReceiverAdmission::Execute(ReceiverLease {
                 tenant_scope,
+                task_id: envelope.request.task_id,
                 dispatch_id: envelope.dispatch_id,
                 payload_digest: envelope.payload_digest,
+                sender_attempt_no: u32::try_from(sender_attempt)
+                    .map_err(|_| A2AError::internal("sender attempt is corrupt"))?,
+                sender_lease_token: sender_token,
                 lease_owner,
                 lease_token: token,
                 lease_epoch: 1,
@@ -7228,6 +7237,13 @@ impl crate::IntoDurableAuthority for SqliteTaskStore {
 }
 
 impl crate::AuthorityIdentity for SqliteTaskStore {
+    fn capabilities(&self) -> crate::AuthorityCapabilities {
+        crate::AuthorityCapabilities {
+            lease_renewal: false,
+            quota_reservations: false,
+        }
+    }
+
     fn completion_receipt_key(&self) -> Option<[u8; 32]> {
         Some(SqliteTaskStore::completion_receipt_key(self))
     }
@@ -7313,6 +7329,36 @@ impl crate::TaskAdmission for SqliteTaskStore {
     ) -> Result<AdmissionOutcome, A2AError> {
         SqliteTaskStore::authorize_and_continue(self, scope, command, audit).await
     }
+
+    async fn authorize_and_admit_mutation(
+        &self,
+        scope: &OwnedTaskScope,
+        mutation: crate::AuthorizedMutation<SendMessageAdmission>,
+        audit: AuthorizationAuditInput,
+    ) -> Result<AdmissionOutcome, A2AError> {
+        let (command, quota) = mutation.into_parts();
+        if quota.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "quota reservations are unsupported by SQLite",
+            ));
+        }
+        SqliteTaskStore::authorize_and_admit(self, scope, command, audit).await
+    }
+
+    async fn authorize_and_continue_mutation(
+        &self,
+        scope: &OwnedTaskScope,
+        mutation: crate::AuthorizedMutation<SendMessageAdmission>,
+        audit: AuthorizationAuditInput,
+    ) -> Result<AdmissionOutcome, A2AError> {
+        let (command, quota) = mutation.into_parts();
+        if quota.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "quota reservations are unsupported by SQLite",
+            ));
+        }
+        SqliteTaskStore::authorize_and_continue(self, scope, command, audit).await
+    }
 }
 
 #[async_trait]
@@ -7337,6 +7383,22 @@ impl crate::CancellationAuthority for SqliteTaskStore {
     ) -> Result<CancellationOutcome, A2AError> {
         SqliteTaskStore::cancel_authorized(self, scope, task_id, now, audit).await
     }
+
+    async fn cancel_authorized_with_quota(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        now: i64,
+        audit: AuthorizationAuditInput,
+        quota: Option<&crate::QuotaReservationInput>,
+    ) -> Result<CancellationOutcome, A2AError> {
+        if quota.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "quota reservations are unsupported by SQLite",
+            ));
+        }
+        SqliteTaskStore::cancel_authorized(self, scope, task_id, now, audit).await
+    }
 }
 
 #[async_trait]
@@ -7348,6 +7410,14 @@ impl crate::OutboxAuthority for SqliteTaskStore {
         lease_duration: i64,
     ) -> Result<Option<OutboxLease>, A2AError> {
         SqliteTaskStore::claim_outbox(self, lease_owner.to_owned(), now, lease_duration).await
+    }
+
+    async fn renew_outbox_lease(
+        &self,
+        _: &OutboxLease,
+        _: i64,
+    ) -> Result<crate::LeaseRenewalOutcome, A2AError> {
+        Ok(crate::LeaseRenewalOutcome::Unsupported)
     }
 
     async fn task_for_outbox(&self, lease: &OutboxLease) -> Result<Option<Task>, A2AError> {
@@ -7400,6 +7470,14 @@ impl crate::ReceiverAuthority for SqliteTaskStore {
         lease_duration: i64,
     ) -> Result<ReceiverAdmission, A2AError> {
         SqliteTaskStore::begin_receive(self, envelope, lease_owner, now, lease_duration).await
+    }
+
+    async fn renew_receiver_lease(
+        &self,
+        _: &ReceiverLease,
+        _: i64,
+    ) -> Result<crate::LeaseRenewalOutcome, A2AError> {
+        Ok(crate::LeaseRenewalOutcome::Unsupported)
     }
 
     async fn complete_loopback_receive(

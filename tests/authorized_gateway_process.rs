@@ -4,12 +4,16 @@ use std::io::{BufRead as _, BufReader};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(debug_assertions)]
+use std::str::FromStr as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use a2a::{Task, TaskState, TaskStatus};
 use smesh_a2a::content_digest;
+#[cfg(debug_assertions)]
+use smesh_a2a::{PostgresStoreConfig, PostgresTaskStore};
 use wait_timeout::ChildExt as _;
 
 const WATCHDOG: Duration = Duration::from_secs(8);
@@ -188,6 +192,7 @@ fn command(root: &Path, database: &Path, bind: std::net::SocketAddr) -> Command 
             "SMESH_A2A_PUBLIC_URL",
             format!("https://localhost:{}", bind.port()),
         )
+        .env("SMESH_A2A_DURABLE_BACKEND", "sqlite")
         .env("SMESH_A2A_SQLITE_PATH", database)
         .env(
             "SMESH_A2A_AUTHORIZATION_POLICY_PATH",
@@ -454,4 +459,193 @@ async fn production_mtls_gateway_migrates_restarts_and_serves_both_protocols() {
     .await;
     assert_eq!(rpc_list["result"]["totalSize"], 3);
     stop(restarted);
+}
+
+#[tokio::test]
+#[cfg(debug_assertions)]
+#[allow(clippy::too_many_lines)] // One production-process lifecycle intentionally stays linear.
+async fn production_binary_selects_postgres_and_replays_after_graceful_restart() {
+    let admin = match std::env::var("SMESH_TEST_POSTGRES_ADMIN_URL") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent)
+            if std::env::var("SMESH_POSTGRES_TEST_REQUIRED").as_deref() == Ok("1") =>
+        {
+            panic!("SMESH_TEST_POSTGRES_ADMIN_URL is required")
+        }
+        Err(std::env::VarError::NotPresent) => return,
+        Err(error) => panic!("SMESH_TEST_POSTGRES_ADMIN_URL is invalid: {error}"),
+    };
+    let runtime = std::env::var("SMESH_TEST_POSTGRES_RUNTIME_URL")
+        .expect("SMESH_TEST_POSTGRES_RUNTIME_URL is required");
+    let fixture = Fixture::new();
+    let tls = copy_tls(&fixture.0);
+    policy(&fixture.0.join("policy.json"));
+    let schema = format!("smesh_binary_{:016x}", rand::random::<u64>());
+    let cleanup = PostgresStoreConfig::new(&admin, &runtime, &schema)
+        .unwrap()
+        .with_test_only_insecure_loopback(true);
+    let make_command = |address: std::net::SocketAddr, replica: &str| {
+        let placeholder = fixture.0.join("unused.sqlite");
+        let mut value = command(&fixture.0, &placeholder, address);
+        value
+            .env_remove("SMESH_A2A_SQLITE_PATH")
+            .env("SMESH_A2A_DURABLE_BACKEND", "postgres")
+            .env("SMESH_A2A_POSTGRES_MIGRATOR_URL", &admin)
+            .env("SMESH_A2A_POSTGRES_RUNTIME_URL", &runtime)
+            .env("SMESH_A2A_POSTGRES_SCHEMA", &schema)
+            .env("SMESH_A2A_REPLICA_ID", replica)
+            .env("SMESH_TEST_POSTGRES_INSECURE_LOOPBACK", "1")
+            .env("SMESH_TEST_POSTGRES_PARENT_MANAGED_CLEANUP", "1");
+        value
+    };
+
+    for (label, configure) in [("mixed", 0_u8), ("disabled-auth", 1_u8)] {
+        let address = free_address();
+        let mut rejected = make_command(address, "binary-pg-rejected");
+        if configure == 0 {
+            rejected.env(
+                "SMESH_A2A_SQLITE_PATH",
+                fixture.0.join("must-not-exist.sqlite"),
+            );
+        } else {
+            rejected
+                .env("SMESH_A2A_CLIENT_AUTH_MODE", "disabled")
+                .env_remove("SMESH_A2A_AUTHORIZATION_POLICY_PATH");
+        }
+        rejected.stderr(Stdio::null());
+        let mut rejected = rejected.spawn().unwrap();
+        assert!(!bounded_failed_start(&mut rejected, label).success());
+        drop(std::net::TcpListener::bind(address).expect("rejection precedes listener bind"));
+    }
+    let pg = tokio_postgres::Config::from_str(&admin).unwrap();
+    let (admin_client, admin_connection) = pg.connect(tokio_postgres::NoTls).await.unwrap();
+    let admin_driver = tokio::spawn(async move {
+        let _ = admin_connection.await;
+    });
+    let schema_exists: bool = admin_client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)",
+            &[&schema],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!schema_exists, "rejected configuration acquired PostgreSQL");
+    drop(admin_client);
+    admin_driver.abort();
+
+    let address = free_address();
+    let first = launch(make_command(address, "binary-pg-a"));
+    let client = mtls_client(&tls);
+    let base = format!("https://localhost:{}", address.port());
+    let send = serde_json::json!({
+        "jsonrpc":"2.0","id":"postgres-send","method":a2a::jsonrpc::methods::SEND_MESSAGE,
+        "params":{"message":{"messageId":"production-postgres-message","role":"ROLE_USER","parts":[{"text":"production PostgreSQL work"}]},"configuration":{"returnImmediately":false}}
+    });
+    let first_result = json(client.post(format!("{base}/jsonrpc")).json(&send)).await;
+    let task_id = first_result["result"]["task"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("unexpected PostgreSQL send response: {first_result}"))
+        .to_owned();
+    assert_eq!(
+        json(client.get(format!("{base}/rest/tasks/{task_id}"))).await["id"],
+        task_id
+    );
+    assert_eq!(
+        json(client.get(format!("{base}/rest/tasks"))).await["totalSize"],
+        1
+    );
+    let sse = client
+        .post(format!("{base}/rest/message:stream"))
+        .json(&serde_json::json!({
+            "message":{"messageId":"production-postgres-stream","role":"ROLE_USER","parts":[{"text":"production PostgreSQL stream"}]},
+            "configuration":{"returnImmediately":false}
+        }))
+        .send()
+        .await
+        .unwrap();
+    let sse_status = sse.status();
+    let sse_body = sse.text().await.unwrap();
+    assert!(sse_status.is_success(), "{sse_status}: {sse_body}");
+    assert!(sse_body.contains("TASK_STATE_COMPLETED"));
+    stop(first);
+
+    let address = free_address();
+    let restarted = launch(make_command(address, "binary-pg-b"));
+    let restarted_base = format!("https://localhost:{}", address.port());
+    let replay = json(client.post(format!("{restarted_base}/jsonrpc")).json(&send)).await;
+    assert_eq!(replay["result"], first_result["result"]);
+    stop(restarted);
+    PostgresTaskStore::drop_test_schema(&cleanup).await.unwrap();
+}
+
+#[test]
+#[cfg(not(debug_assertions))]
+fn release_binary_rejects_plaintext_postgres_and_auth_misconfiguration_before_resources() {
+    use std::io::Read as _;
+
+    let fixture = Fixture::new();
+    copy_tls(&fixture.0);
+    policy(&fixture.0.join("policy.json"));
+    let make_command = |address: std::net::SocketAddr| {
+        let placeholder = fixture.0.join("must-not-exist.sqlite");
+        let mut value = command(&fixture.0, &placeholder, address);
+        value
+            .env_remove("SMESH_A2A_SQLITE_PATH")
+            .env("SMESH_A2A_DURABLE_BACKEND", "postgres")
+            .env(
+                "SMESH_A2A_POSTGRES_MIGRATOR_URL",
+                "postgresql://migrator:secret@127.0.0.1:9/postgres",
+            )
+            .env(
+                "SMESH_A2A_POSTGRES_RUNTIME_URL",
+                "postgresql://runtime:secret@127.0.0.1:9/postgres",
+            )
+            .env("SMESH_A2A_POSTGRES_SCHEMA", "release_plaintext_probe")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        value
+    };
+
+    for case in ["plaintext", "mixed", "disabled-auth"] {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = occupied.local_addr().unwrap();
+        let mut rejected = make_command(address);
+        match case {
+            "mixed" => {
+                rejected.env(
+                    "SMESH_A2A_SQLITE_PATH",
+                    fixture.0.join("must-not-exist.sqlite"),
+                );
+            }
+            "disabled-auth" => {
+                rejected
+                    .env("SMESH_A2A_CLIENT_AUTH_MODE", "disabled")
+                    .env_remove("SMESH_A2A_AUTHORIZATION_POLICY_PATH");
+            }
+            "plaintext" => {}
+            _ => unreachable!(),
+        }
+        let mut child = rejected.spawn().unwrap();
+        let status = bounded_failed_start(&mut child, case);
+        assert!(!status.success(), "{case} configuration must fail closed");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .as_mut()
+            .expect("captured stderr")
+            .read_to_string(&mut stderr)
+            .unwrap();
+        if case == "plaintext" {
+            assert!(
+                stderr.contains("TlsRequired") || stderr.contains("PostgreSQL TLS is required"),
+                "release plaintext rejection must be TlsRequired: {stderr}"
+            );
+        }
+        assert!(
+            !fixture.0.join("must-not-exist.sqlite").exists(),
+            "{case} rejection must not acquire SQLite"
+        );
+        drop(occupied);
+    }
 }

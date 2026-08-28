@@ -1,6 +1,6 @@
 # PostgreSQL schema-v6 durable authority
 
-The executable PostgreSQL authority is implemented by `PostgresTaskStore` and the checked-in migration at `migrations/postgres/0001_authority_schema_v6.sql`. The older `reference/postgres_v2_logical_schema.sql` is retained only as historical design input and must not be applied.
+The executable PostgreSQL authority is implemented by `PostgresTaskStore`; revision 1 is the logical schema-v6 baseline and `0002_quota_reservation_seam.sql` adds the PostgreSQL-only atomic quota reservation seam without changing SQLite v6. The older `reference/postgres_v2_logical_schema.sql` is retained only as historical design input and must not be applied.
 
 ## Physical parity
 
@@ -8,7 +8,7 @@ The migration creates the 17 schema-v6 authority tables plus `schema_migrations`
 
 `PostgresTaskStore::open` accepts distinct migrator and runtime URLs, validates both before acquisition, takes a transaction-scoped advisory migration lock, applies the baseline atomically, and verifies a migration checksum plus a persisted manifest over relations, exact columns/types/defaults, constraints, indexes, trigger/function bodies, policies, grants, role attributes, and membership. It also scans complete task-event chains (sequence, revision, transitions, typed JSON and current-row equality), task identities/state/timestamps, payload and frame digests, transcript seals, and frozen-snapshot metadata before opening a bounded runtime-only pool. The migrator connection is dropped before the pool is built. Reopen preserves key/store identity. Unexpected or mutated managed catalog or semantic state blocks startup.
 
-Task admission and every aggregate byte/snapshot capacity decision are transaction-advisory-lock serialized across independent pools. Payload-bearing authority rows are checked with PostgreSQL `octet_length` against the 64 MiB UTF-8 budget before mutation commits. Frozen pages persist projected task JSON, revisions, order, total, metadata HMACs, and only SHA-256 hashes of HMAC-derived opaque page capabilities; page replay remains fixed across task mutation and process restart.
+Task admission and every aggregate byte/snapshot capacity decision are transaction-advisory-lock serialized across independent pools. Payload-bearing authority rows, including PostgreSQL-only quota reservations, are checked with PostgreSQL `octet_length` against the 64 MiB UTF-8 budget before mutation commits. `QuotaReservationInput` is bounded and server-resolved; admission, continuation, and cancellation insert or verify its unique tenant reservation key in the same transaction as task/event/idempotency/outbox/transcript/audit/cancellation state. Exact replay cannot double reserve, conflicting bindings fail without mutation, and startup validates reservation bounds, expiry, JSON metadata, task foreign keys, and account ownership. SQLite advertises quota reservations unsupported and keeps exact schema v6. Issue #14 supplies policy/dimension selection through the server task-local seam; caller A2A fields cannot populate it. Frozen pages persist projected task JSON, revisions, order, total, metadata HMACs, and only SHA-256 hashes of HMAC-derived opaque page capabilities; page replay remains fixed across task mutation and process restart.
 
 ## Security and roles
 
@@ -16,7 +16,7 @@ The migration creates a schema-specific `NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSR
 
 Production URLs must require TLS. Plaintext is accepted only by the explicit test-only loopback switch used by the real PostgreSQL fixture. URLs and passwords are never formatted into adapter errors or `Debug` output.
 
-Production outbox and receiver claims, finishes, deliveries, completions, and cancellation/lease arbitration derive the effective milliseconds from `db_millis()` inside the same transaction; caller clocks cannot extend or prematurely invalidate a fence. The explicit loopback-only deterministic test seam retains injected command times so the SQLite/PostgreSQL conformance fixture can compare exact records. Removing that test seam and wiring renewal across replicas remains part of #63.
+Production outbox and receiver claims, renewals, finishes, deliveries, completions, and cancellation/lease arbitration derive the effective milliseconds from `db_millis()` inside the same transaction; caller clocks cannot extend or prematurely invalidate a fence. The explicit loopback-only deterministic test seam retains injected command times so the SQLite/PostgreSQL conformance fixture can compare exact records. PostgreSQL advertises required lease renewal capability and fully fences renewal by tenant, durable identity, owner, token, attempt/epoch, prior expiry, state, and database time. SQLite explicitly advertises unsupported renewal and retains exclusive-process behavior.
 
 ## Operations runbook
 
@@ -26,6 +26,9 @@ Production outbox and receiver claims, finishes, deliveries, completions, and ca
 4. Open the adapter during readiness. Any migration checksum/catalog/policy/index drift is a hard failure; repair through a reviewed migration, never by editing the ledger.
 5. Monitor pool saturation, the five-second transaction statement/lock watchdogs, serialization/deadlock errors, outbox age, receiver leases, audit/snapshot growth, backups, and PostgreSQL recovery/read-only status.
 6. Shutdown stops claims at the runtime owner and closes only that adapter pool. Independent stores/pools remain valid.
+7. Set `SMESH_A2A_DURABLE_BACKEND=postgres`, distinct TLS `SMESH_A2A_POSTGRES_MIGRATOR_URL` and `SMESH_A2A_POSTGRES_RUNTIME_URL`, `SMESH_A2A_POSTGRES_SCHEMA`, and an optional validated `SMESH_A2A_REPLICA_ID`. Authentication plus authorization policy and loopback durable mode are mandatory. Mixed SQLite/PostgreSQL configuration is rejected before listener/database/runtime acquisition.
+
+Migration leadership is transaction-scoped: any replica may take the advisory migration lock, but readiness is published only after both revisions and the exact catalog validate. Cut over explicitly after backup and quiescing SQLite writers; there is no automatic SQLite-to-PostgreSQL data migration.
 
 Local verification:
 
@@ -35,10 +38,11 @@ export SMESH_TEST_POSTGRES_ADMIN_URL='postgresql://smesh_migrator:<migrator-pass
 export SMESH_TEST_POSTGRES_RUNTIME_URL='postgresql://smesh_test_runtime:<runtime-password>@127.0.0.1:55432/smesh_test'
 export SMESH_POSTGRES_TEST_REQUIRED=1
 cargo test --locked --test postgres_store -- --test-threads=1
+cargo test --locked --test postgres_multi_replica -- --test-threads=1
 ```
 
 Tests create random isolated schemas/roles, wrap each PostgreSQL test in a 30-second watchdog, and remove managed objects. If the migrator URL is absent they print an explicit skip unless `SMESH_POSTGRES_TEST_REQUIRED=1`.
 
 ## Non-goals
 
-Production backend selection/wiring, cross-replica lease renewal and gateway driver failover are issue #63. Distributed quota policy is issue #14. PostgreSQL HA provisioning, split-brain prevention, backup retention, and live SQLite/PostgreSQL migration remain external/non-goals.
+Quota dimensions, counters, policy, and operator overrides remain issue #14. PostgreSQL HA provisioning, exactly-once external effects, split-brain prevention, backup retention, and live SQLite/PostgreSQL migration remain external/non-goals.

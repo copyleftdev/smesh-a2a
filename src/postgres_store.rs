@@ -13,7 +13,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -34,11 +34,12 @@ use url::Url;
 
 use crate::{
     AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition,
-    AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput,
-    AuthorizationAuditParts, AuthorizationAuditSink, AuthorizationDecisionEffect,
-    AuthorizedTaskRead, CancellationAuthority, CancellationOutcome, ChangeObservation,
-    ChangeObserver, DurableDispatchEnvelope, DurableReceiverResult, DurableReceiverTermination,
-    MeshEvent, MeshRequest, OutboxAuthority, OutboxLease, OwnedTaskScope, ReceiverAdmission,
+    AuthorityCapabilities, AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown,
+    AuthorizationAuditInput, AuthorizationAuditParts, AuthorizationAuditSink,
+    AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead, CancellationAuthority,
+    CancellationOutcome, ChangeObservation, ChangeObserver, DurableDispatchEnvelope,
+    DurableReceiverResult, DurableReceiverTermination, LeaseRenewalOutcome, MeshEvent, MeshRequest,
+    OutboxAuthority, OutboxLease, OwnedTaskScope, QuotaReservationInput, ReceiverAdmission,
     ReceiverAuthority, ReceiverLease, SendMessageAdmission, StreamTranscriptBatch,
     SubscriptionCursor, TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority,
     TransitionOutcome, VisibilityScope, authorized_message_identity,
@@ -47,6 +48,12 @@ use crate::{
 
 const MIGRATION_SQL: &str = include_str!("../migrations/postgres/0001_authority_schema_v6.sql");
 const MIGRATION_NAME: &str = "0001_authority_schema_v6";
+const QUOTA_MIGRATION_SQL: &str =
+    include_str!("../migrations/postgres/0002_quota_reservation_seam.sql");
+const QUOTA_MIGRATION_NAME: &str = "0002_quota_reservation_seam";
+const RECEIVER_FENCE_MIGRATION_SQL: &str =
+    include_str!("../migrations/postgres/0003_receiver_sender_fence.sql");
+const RECEIVER_FENCE_MIGRATION_NAME: &str = "0003_receiver_sender_fence";
 const LOGICAL_SCHEMA_VERSION: i64 = 6;
 const MAX_CONFIG_BYTES: usize = 4096;
 const PAGE_TOKEN_VERSION: i64 = 1;
@@ -57,6 +64,8 @@ const MAX_ACTIVE_SNAPSHOTS: i64 = 128;
 const MAX_SNAPSHOT_BYTES: i64 = 64 * 1024 * 1024;
 const MAX_TRANSACTION_ATTEMPTS: usize = 3;
 const RETRYABLE_TRANSACTION_MARKER: &str = "__smesh_retryable_postgres_transaction__";
+const FINAL_EXPIRY_ERROR: &str = "final outbox attempt lease expired before receiver acceptance";
+const STREAM_INTERRUPTION_PREFIX: &str = "durable stream interrupted: ";
 
 /// Deterministic loopback-only transaction faults used by integration tests.
 #[doc(hidden)]
@@ -77,6 +86,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "loopback_effects",
     "outbox",
     "outbox_attempts",
+    "quota_reservations",
     "receiver_frames",
     "receiver_inbox",
     "schema_migrations",
@@ -97,6 +107,7 @@ const TENANT_TABLES: &[&str] = &[
     "loopback_effects",
     "outbox",
     "outbox_attempts",
+    "quota_reservations",
     "receiver_frames",
     "receiver_inbox",
     "stream_frames",
@@ -115,6 +126,7 @@ const EXPECTED_CUSTOM_INDEXES: &[&str] = &[
     "list_snapshots_expiry",
     "outbox_due",
     "outbox_task_state",
+    "quota_reservations_principal_state",
     "receiver_inbox_reclaim",
     "stream_transcripts_task",
     "task_events_task_revision",
@@ -140,16 +152,21 @@ pub struct PostgresStoreConfig {
     trust_injected_time: bool,
     max_tasks: usize,
     transaction_test_faults: Arc<Mutex<VecDeque<PostgresTransactionTestFault>>>,
+    receiver_renewal_test_probe: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     test_cleanup: Option<Arc<PostgresTestCleanup>>,
 }
 
 struct PostgresTestCleanup {
     migrator_url: Arc<str>,
     schema: Arc<str>,
+    armed: AtomicBool,
 }
 
 impl Drop for PostgresTestCleanup {
     fn drop(&mut self) {
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
+        }
         let url = Arc::clone(&self.migrator_url);
         let schema = Arc::clone(&self.schema);
         let _ = std::thread::spawn(move || {
@@ -188,6 +205,10 @@ impl fmt::Debug for PostgresStoreConfig {
                     .transaction_test_faults
                     .lock()
                     .map_or(0, |faults| faults.len()),
+            )
+            .field(
+                "receiver_renewal_test_probe_enabled",
+                &self.receiver_renewal_test_probe.is_some(),
             )
             .finish()
     }
@@ -231,6 +252,7 @@ impl PostgresStoreConfig {
             trust_injected_time: false,
             max_tasks: 1024,
             transaction_test_faults: Arc::new(Mutex::new(VecDeque::new())),
+            receiver_renewal_test_probe: None,
             test_cleanup: None,
         })
     }
@@ -246,8 +268,19 @@ impl PostgresStoreConfig {
             Arc::new(PostgresTestCleanup {
                 migrator_url: Arc::clone(&self.migrator_url),
                 schema: Arc::clone(&self.schema),
+                armed: AtomicBool::new(true),
             })
         });
+        self
+    }
+
+    /// Keep cleanup ownership in a parent process for a shared multi-process fixture.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_test_only_parent_managed_cleanup(mut self) -> Self {
+        if let Some(cleanup) = self.test_cleanup.take() {
+            cleanup.armed.store(false, Ordering::SeqCst);
+        }
         self
     }
 
@@ -303,9 +336,30 @@ impl PostgresStoreConfig {
         self
     }
 
+    /// Installs entry/release checkpoints around receiver renewal for lifecycle tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_receiver_renewal_test_probe(
+        mut self,
+        entered: Arc<tokio::sync::Notify>,
+        released: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.receiver_renewal_test_probe = Some((entered, released));
+        self
+    }
+
     #[must_use]
     pub fn schema_name(&self) -> &str {
         &self.schema
+    }
+
+    /// Validate PostgreSQL transport policy without opening a connection.
+    ///
+    /// This is used by the production binary to reject plaintext configuration
+    /// before binding its listener or acquiring durable resources.
+    #[doc(hidden)]
+    pub fn validate_tls_policy(&self) -> Result<(), PostgresStoreError> {
+        validate_tls(self).map(|_| ())
     }
 }
 
@@ -344,6 +398,7 @@ pub struct PostgresTaskStore {
     trust_injected_time: bool,
     transaction_test_faults: Arc<Mutex<VecDeque<PostgresTransactionTestFault>>>,
     transaction_attempts: Arc<AtomicUsize>,
+    receiver_renewal_test_probe: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     _test_cleanup: Option<Arc<PostgresTestCleanup>>,
 }
 
@@ -485,6 +540,7 @@ impl PostgresTaskStore {
             trust_injected_time: config.trust_injected_time,
             transaction_test_faults: config.transaction_test_faults,
             transaction_attempts: Arc::new(AtomicUsize::new(0)),
+            receiver_renewal_test_probe: config.receiver_renewal_test_probe,
             _test_cleanup: config.test_cleanup,
         })
     }
@@ -684,6 +740,100 @@ impl PostgresTaskStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_quota_reservation(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        quota: Option<&QuotaReservationInput>,
+        tenant: &str,
+        account: &str,
+        task_id: &str,
+        now: i64,
+        insert_if_missing: bool,
+    ) -> Result<(), A2AError> {
+        if let Some(quota) = quota
+            && (quota.tenant_scope() != tenant || quota.account_id() != account)
+        {
+            return Err(A2AError::invalid_request(
+                "quota reservation scope mismatch",
+            ));
+        }
+        if insert_if_missing && let Some(quota) = quota {
+            if quota.expires_at() <= now {
+                return Err(A2AError::invalid_request("quota reservation expired"));
+            }
+            let insert = self.q("INSERT INTO __S__.quota_reservations(tenant_scope,reservation_id,account_id,principal_scope,operation,dimension,units,task_id,expires_at,metadata_json,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(tenant_scope,reservation_id) DO NOTHING");
+            tx.execute(
+                &insert,
+                &[
+                    &tenant,
+                    &quota.reservation_id(),
+                    &account,
+                    &quota.principal_scope(),
+                    &quota.operation(),
+                    &quota.dimension(),
+                    &i64::try_from(quota.units())
+                        .map_err(|_| A2AError::invalid_request("invalid quota units"))?,
+                    &task_id,
+                    &quota.expires_at(),
+                    &quota.metadata(),
+                    &now,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                Self::transaction_body_error(
+                    &error,
+                    A2AError::internal("quota reservation insert failed"),
+                )
+            })?;
+        }
+        let Some(quota) = quota else {
+            let lookup = self.q("SELECT 1 FROM __S__.quota_reservations WHERE tenant_scope=$1 AND task_id=$2 LIMIT 1");
+            if tx
+                .query_opt(&lookup, &[&tenant, &task_id])
+                .await
+                .map_err(|error| {
+                    Self::transaction_body_error(
+                        &error,
+                        A2AError::internal("quota reservation lookup failed"),
+                    )
+                })?
+                .is_some()
+            {
+                return Err(A2AError::invalid_request(
+                    "quota reservation is required for replay",
+                ));
+            }
+            return Ok(());
+        };
+        let lookup = self.q("SELECT account_id,principal_scope,operation,dimension,units,task_id,expires_at,metadata_json FROM __S__.quota_reservations WHERE tenant_scope=$1 AND reservation_id=$2");
+        let row = tx
+            .query_opt(&lookup, &[&tenant, &quota.reservation_id()])
+            .await
+            .map_err(|error| {
+                Self::transaction_body_error(
+                    &error,
+                    A2AError::internal("quota reservation lookup failed"),
+                )
+            })?
+            .ok_or_else(|| {
+                A2AError::invalid_request("quota reservation is not bound to this mutation")
+            })?;
+        let exact = row.get::<_, String>(0) == account
+            && row.get::<_, String>(1) == quota.principal_scope()
+            && row.get::<_, String>(2) == quota.operation()
+            && row.get::<_, String>(3) == quota.dimension()
+            && row.get::<_, i64>(4) == i64::try_from(quota.units()).unwrap_or(-1)
+            && row.get::<_, String>(5) == task_id
+            && row.get::<_, i64>(6) == quota.expires_at()
+            && row.get::<_, Option<String>>(7).as_deref() == quota.metadata();
+        if !exact {
+            return Err(A2AError::invalid_request("quota reservation key conflict"));
+        }
+        Ok(())
+    }
+
     async fn insert_audit(
         &self,
         tx: &tokio_postgres::Transaction<'_>,
@@ -750,6 +900,7 @@ impl PostgresTaskStore {
           UNION ALL SELECT octet_length(tenant_scope)+octet_length(message_id)+octet_length(frame_kind)+octet_length(frame_json)+octet_length(frame_digest) FROM __S__.stream_frames WHERE tenant_scope=$1
           UNION ALL SELECT octet_length(tenant_scope)+octet_length(dispatch_id)+octet_length(task_id)+octet_length(state) FROM __S__.cancellation_intents WHERE tenant_scope=$1
           UNION ALL SELECT octet_length(decision_id)+octet_length(tenant_scope)+octet_length(actor_account_id)+octet_length(policy_id)+octet_length(policy_digest)+octet_length(operation)+octet_length(effect)+octet_length(reason)+octet_length(resource_kind)+octet_length(resource_digest)+COALESCE(octet_length(task_id),0) FROM __S__.authorization_decisions WHERE tenant_scope=$1
+          UNION ALL SELECT octet_length(tenant_scope)+octet_length(reservation_id)+octet_length(account_id)+octet_length(principal_scope)+octet_length(operation)+octet_length(dimension)+octet_length(task_id)+COALESCE(octet_length(metadata_json),0) FROM __S__.quota_reservations WHERE tenant_scope=$1
           UNION ALL SELECT octet_length(tenant_scope)+octet_length(snapshot_id)+octet_length(owner_account_id)+octet_length(scope_digest)+octet_length(query_digest)+octet_length(metadata_digest) FROM __S__.list_snapshots WHERE tenant_scope=$1
           UNION ALL SELECT octet_length(tenant_scope)+octet_length(snapshot_id)+octet_length(task_id)+octet_length(task_digest)+octet_length(task_json) FROM __S__.list_snapshot_entries WHERE tenant_scope=$1
           UNION ALL SELECT octet_length(tenant_scope)+octet_length(token_hash)+octet_length(snapshot_id)+octet_length(scope_digest)+octet_length(query_digest) FROM __S__.list_page_tokens WHERE tenant_scope=$1
@@ -1003,6 +1154,100 @@ async fn migrate(
             return Err(PostgresStoreError::InvalidSchema);
         }
     }
+    let quota_checksum = content_digest(QUOTA_MIGRATION_SQL.as_bytes());
+    let quota_row = tx
+        .query_opt(
+            &format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=2"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if let Some(row) = quota_row {
+        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+            || row.get::<_, String>(1) != quota_checksum
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    } else {
+        let sql = QUOTA_MIGRATION_SQL
+            .replace("__SCHEMA__", schema)
+            .replace("__ROLE__", &format!("{schema}_runtime"));
+        tx.batch_execute(&sql)
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {schema}.schema_migrations VALUES(2,6,$1,$2,{schema}.db_millis())"
+            ),
+            &[&QUOTA_MIGRATION_NAME, &quota_checksum],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        let catalog = catalog_digest(&tx, schema).await?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata DISABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!("UPDATE {schema}.store_metadata SET catalog_hash=$1 WHERE singleton=1"),
+            &[&catalog],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    }
+    let fence_checksum = content_digest(RECEIVER_FENCE_MIGRATION_SQL.as_bytes());
+    let fence_row = tx
+        .query_opt(
+            &format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=3"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if let Some(row) = fence_row {
+        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+            || row.get::<_, String>(1) != fence_checksum
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    } else {
+        let sql = RECEIVER_FENCE_MIGRATION_SQL
+            .replace("__SCHEMA__", schema)
+            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        tx.batch_execute(&sql)
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {schema}.schema_migrations VALUES(3,6,$1,$2,{schema}.db_millis())"
+            ),
+            &[&RECEIVER_FENCE_MIGRATION_NAME, &fence_checksum],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        let catalog = catalog_digest(&tx, schema).await?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata DISABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!("UPDATE {schema}.store_metadata SET catalog_hash=$1 WHERE singleton=1"),
+            &[&catalog],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    }
     tx.commit()
         .await
         .map_err(|_| PostgresStoreError::Initialization)
@@ -1222,6 +1467,72 @@ where
             return Err(PostgresStoreError::InvalidSchema);
         }
     }
+    let invalid_receiver_fences: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM {schema}.receiver_inbox r
+                 LEFT JOIN {schema}.outbox o
+                   ON o.tenant_scope=r.tenant_scope AND o.dispatch_id=r.dispatch_id
+                  AND o.task_id=r.task_id AND o.payload_digest=r.payload_digest
+                 LEFT JOIN {schema}.outbox_attempts a
+                   ON a.tenant_scope=r.tenant_scope AND a.outbox_id=o.outbox_id
+                  AND a.attempt_no=r.sender_attempt_no
+                  AND a.lease_token=r.sender_lease_token
+                 LEFT JOIN {schema}.tasks t
+                   ON t.tenant_scope=r.tenant_scope AND t.task_id=r.task_id
+                 WHERE o.outbox_id IS NULL OR a.outbox_id IS NULL OR t.task_id IS NULL
+                    OR r.sender_attempt_no<1 OR r.sender_attempt_no>o.max_attempts"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?
+        .get(0);
+    if invalid_receiver_fences != 0 {
+        return Err(PostgresStoreError::InvalidSchema);
+    }
+    let quota_rows = client.query(
+        &format!("SELECT q.tenant_scope,q.reservation_id,q.account_id,q.principal_scope,q.operation,q.dimension,q.units,q.task_id,q.expires_at,q.metadata_json,q.created_at,t.owner_account_id FROM {schema}.quota_reservations q LEFT JOIN {schema}.tasks t ON t.tenant_scope=q.tenant_scope AND t.task_id=q.task_id"),
+        &[],
+    ).await.map_err(|_| PostgresStoreError::InvalidSchema)?;
+    for row in quota_rows {
+        let metadata: Option<String> = row.get(9);
+        let tenant: String = row.get(0);
+        let reservation_id: String = row.get(1);
+        let account: String = row.get(2);
+        let principal: String = row.get(3);
+        let operation: String = row.get(4);
+        let dimension: String = row.get(5);
+        let units: i64 = row.get(6);
+        let task_id: String = row.get(7);
+        let expires_at: i64 = row.get(8);
+        let created_at: i64 = row.get(10);
+        let owner: Option<String> = row.get(11);
+        let reconstructed = u64::try_from(units).ok().and_then(|units| {
+            QuotaReservationInput::new(
+                tenant.clone(),
+                account.clone(),
+                principal,
+                operation,
+                dimension,
+                units,
+                reservation_id,
+                expires_at,
+                metadata.clone(),
+            )
+            .ok()
+        });
+        if reconstructed.is_none()
+            || task_id.is_empty()
+            || task_id.len() > 4_096
+            || created_at <= 0
+            || created_at > 253_402_300_799_999
+            || expires_at <= created_at
+            || owner.as_deref() != Some(account.as_str())
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    }
     Ok(())
 }
 
@@ -1288,6 +1599,45 @@ async fn validate_catalog(
     let index_rows=client.query("SELECT i.relname FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class t ON t.oid=x.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace LEFT JOIN pg_constraint c ON c.conindid=i.oid WHERE n.nspname=$1 AND c.oid IS NULL ORDER BY i.relname", &[&schema]).await.map_err(|_|PostgresStoreError::InvalidSchema)?;
     let indexes: Vec<&str> = index_rows.iter().map(|r| r.get(0)).collect();
     if indexes != EXPECTED_CUSTOM_INDEXES {
+        return Err(PostgresStoreError::InvalidSchema);
+    }
+    let migration_rows = client
+        .query(
+            &format!(
+                "SELECT revision,logical_schema_version,name,checksum FROM {schema}.schema_migrations ORDER BY revision"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    let expected_migrations = [
+        (
+            1_i64,
+            MIGRATION_NAME,
+            content_digest(MIGRATION_SQL.as_bytes()),
+        ),
+        (
+            2_i64,
+            QUOTA_MIGRATION_NAME,
+            content_digest(QUOTA_MIGRATION_SQL.as_bytes()),
+        ),
+        (
+            3_i64,
+            RECEIVER_FENCE_MIGRATION_NAME,
+            content_digest(RECEIVER_FENCE_MIGRATION_SQL.as_bytes()),
+        ),
+    ];
+    if migration_rows.len() != expected_migrations.len()
+        || migration_rows
+            .iter()
+            .zip(expected_migrations.iter())
+            .any(|(row, expected)| {
+                row.get::<_, i64>(0) != expected.0
+                    || row.get::<_, i64>(1) != LOGICAL_SCHEMA_VERSION
+                    || row.get::<_, &str>(2) != expected.1
+                    || row.get::<_, &str>(3) != expected.2
+            })
+    {
         return Err(PostgresStoreError::InvalidSchema);
     }
     let query = format!(
@@ -1379,6 +1729,145 @@ fn transcript_digest(frames: &[StreamResponse]) -> Result<String, A2AError> {
     serde_json::to_vec(frames)
         .map(|v| content_digest(&v))
         .map_err(|_| A2AError::internal("failed to digest transcript"))
+}
+
+#[allow(clippy::too_many_arguments)] // One atomic lifecycle needs the complete durable identity.
+async fn materialize_postgres_dead_letter(
+    store: &PostgresTaskStore,
+    tx: &tokio_postgres::Transaction<'_>,
+    tenant: &str,
+    task_id: &str,
+    message_id: &str,
+    dispatch_id: &str,
+    error: &str,
+    now: i64,
+) -> Result<bool, A2AError> {
+    let task_sql = store.q(
+        "SELECT task_json,state,revision FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 FOR UPDATE",
+    );
+    let task_row = tx
+        .query_one(&task_sql, &[&tenant, &task_id])
+        .await
+        .map_err(|error| {
+            PostgresTaskStore::transaction_body_error(
+                &error,
+                A2AError::internal("dead-letter task lookup failed"),
+            )
+        })?;
+    let mut task: Task = serde_json::from_str(task_row.get::<_, &str>(0))
+        .map_err(|_| A2AError::internal("stored task is corrupt"))?;
+    let prior_state: String = task_row.get(1);
+    let revision: i64 = task_row.get(2);
+    let was_terminal = task.status.state.is_terminal();
+    if was_terminal {
+        return Ok(true);
+    }
+    task.status.state = a2a::TaskState::Failed;
+    task.status.timestamp = chrono::DateTime::from_timestamp_millis(now);
+    let mut message = Message::new(
+        Role::Agent,
+        vec![Part::text(format!(
+            "Dispatch dead-lettered after bounded retries: {error}"
+        ))],
+    );
+    message.task_id = Some(task.id.clone());
+    message.context_id = Some(task.context_id.clone());
+    task.status.message = Some(message);
+    let next_revision = revision
+        .checked_add(1)
+        .ok_or_else(|| A2AError::internal("persistent task revision exhausted"))?;
+    let task_json = serde_json::to_string(&task)
+        .map_err(|_| A2AError::internal("dead-letter task encoding failed"))?;
+    let failed_state = state_key(&task)?;
+    let update_task = store.q("UPDATE __S__.tasks SET state=$1,status_timestamp=$2,revision=$3,task_json=$4 WHERE tenant_scope=$5 AND task_id=$6 AND revision=$7");
+    if tx
+        .execute(
+            &update_task,
+            &[
+                &failed_state,
+                &task.status.timestamp.map(|value| value.to_rfc3339()),
+                &next_revision,
+                &task_json,
+                &tenant,
+                &task_id,
+                &revision,
+            ],
+        )
+        .await
+        .map_err(|error| {
+            PostgresTaskStore::transaction_body_error(
+                &error,
+                A2AError::internal("dead-letter task CAS failed"),
+            )
+        })?
+        != 1
+    {
+        return Err(A2AError::internal("dead-letter task arbitration failed"));
+    }
+    let event = store.q("INSERT INTO __S__.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) SELECT $1,$2,COALESCE(max(event_seq),0)+1,$3,'dead_lettered',$4,$5,$6,$7 FROM __S__.task_events WHERE tenant_scope=$1 AND task_id=$2");
+    tx.execute(
+        &event,
+        &[
+            &tenant,
+            &task_id,
+            &next_revision,
+            &prior_state,
+            &failed_state,
+            &task_json,
+            &now,
+        ],
+    )
+    .await
+    .map_err(|error| {
+        PostgresTaskStore::transaction_body_error(
+            &error,
+            A2AError::internal("dead-letter event append failed"),
+        )
+    })?;
+    let final_json = serde_json::to_string(&SendMessageResponse::Task(task))
+        .map_err(|_| A2AError::internal("dead-letter result encoding failed"))?;
+    let idem = store.q("UPDATE __S__.idempotency_records SET state='completed',final_result_json=$1,updated_at=$2 WHERE tenant_scope=$3 AND message_id=$4 AND task_id=$5 AND state='in_progress'");
+    if tx
+        .execute(&idem, &[&final_json, &now, &tenant, &message_id, &task_id])
+        .await
+        .map_err(|error| {
+            PostgresTaskStore::transaction_body_error(
+                &error,
+                A2AError::internal("dead-letter idempotency completion failed"),
+            )
+        })?
+        != 1
+    {
+        return Err(A2AError::internal(
+            "dead-letter idempotency binding is corrupt",
+        ));
+    }
+    let diagnostic_limit = 4096_usize.saturating_sub(STREAM_INTERRUPTION_PREFIX.len());
+    let mut end = error.len().min(diagnostic_limit);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    let interruption = format!("{STREAM_INTERRUPTION_PREFIX}{}", &error[..end]);
+    let transcript = store.q("UPDATE __S__.stream_transcripts SET state='interrupted',interruption_error=$1,updated_at=$2 WHERE tenant_scope=$3 AND message_id=$4 AND dispatch_id=$5 AND task_id=$6 AND state='open'");
+    tx.execute(
+        &transcript,
+        &[
+            &interruption,
+            &now,
+            &tenant,
+            &message_id,
+            &dispatch_id,
+            &task_id,
+        ],
+    )
+    .await
+    .map_err(|error| {
+        PostgresTaskStore::transaction_body_error(
+            &error,
+            A2AError::internal("dead-letter stream interruption failed"),
+        )
+    })?;
+    Ok(false)
 }
 
 fn is_dispatch_closed(state: &a2a::TaskState) -> bool {
@@ -1648,7 +2137,20 @@ fn decode_page_token_hash(token: &str) -> Result<[u8; 32], A2AError> {
     Ok(Sha256::digest(raw).into())
 }
 
+impl crate::IntoDurableAuthority for PostgresTaskStore {
+    fn into_durable_authority(self) -> Arc<dyn crate::DurableAuthority> {
+        Arc::new(self)
+    }
+}
+
 impl AuthorityIdentity for PostgresTaskStore {
+    fn capabilities(&self) -> AuthorityCapabilities {
+        AuthorityCapabilities {
+            lease_renewal: true,
+            quota_reservations: true,
+        }
+    }
+
     fn completion_receipt_key(&self) -> Option<[u8; 32]> {
         Some(*self.receipt_key)
     }
@@ -1775,6 +2277,31 @@ impl TaskAdmission for PostgresTaskStore {
         command: SendMessageAdmission,
         audit: AuthorizationAuditInput,
     ) -> Result<AdmissionOutcome, A2AError> {
+        self.authorize_and_admit_mutation(scope, AuthorizedMutation::without_quota(command), audit)
+            .await
+    }
+
+    async fn authorize_and_continue(
+        &self,
+        scope: &OwnedTaskScope,
+        command: SendMessageAdmission,
+        audit: AuthorizationAuditInput,
+    ) -> Result<AdmissionOutcome, A2AError> {
+        self.authorize_and_continue_mutation(
+            scope,
+            AuthorizedMutation::without_quota(command),
+            audit,
+        )
+        .await
+    }
+
+    async fn authorize_and_admit_mutation(
+        &self,
+        scope: &OwnedTaskScope,
+        mutation: AuthorizedMutation<SendMessageAdmission>,
+        audit: AuthorizationAuditInput,
+    ) -> Result<AdmissionOutcome, A2AError> {
+        let (command, quota_reservation) = mutation.into_parts();
         if audit.tenant_scope() != scope.tenant_scope()
             || audit.actor_account_id() != scope.owner_account_id()
             || audit.effect() != AuthorizationDecisionEffect::Allow
@@ -1844,11 +2371,13 @@ impl TaskAdmission for PostgresTaskStore {
             let state = state.clone();
             let timestamp = timestamp.clone();
             let dispatch_id = dispatch_id.clone();
+            let quota_reservation = quota_reservation.clone();
             Box::pin(async move {
+        let quota_now = store.effective_now(tx, command.now).await?;
         tx.query_one("SELECT pg_advisory_xact_lock(6001136200063)", &[])
             .await
             .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("admission capacity lock failed")))?;
-        let existing_sql=store.q("SELECT request_digest,admission_result_json,final_result_json FROM __S__.idempotency_records WHERE tenant_scope=$1 AND message_id=$2 FOR UPDATE");
+        let existing_sql=store.q("SELECT request_digest,admission_result_json,final_result_json,task_id FROM __S__.idempotency_records WHERE tenant_scope=$1 AND message_id=$2 FOR UPDATE");
         if let Some(row) = tx
             .query_opt(&existing_sql, &[&tenant, &message_id])
             .await
@@ -1857,11 +2386,13 @@ impl TaskAdmission for PostgresTaskStore {
             let stored: String = row.get(0);
             let admission: String = row.get(1);
             let final_json: Option<String> = row.get(2);
-            if stored != request_digest || admission != result_json {
+            let stored_task_id: String = row.get(3);
+            if stored != request_digest {
                 return Err(A2AError::invalid_request(
                     "idempotency key is already bound to different request or admission semantics",
                 ));
             }
+            store.insert_quota_reservation(tx, quota_reservation.as_ref(), &tenant, &owner, &stored_task_id, quota_now, false).await?;
             return serde_json::from_str(final_json.as_deref().unwrap_or(&admission))
                 .map(AdmissionOutcome::Replay)
                 .map_err(|_| A2AError::internal("stored idempotency result is corrupt"));
@@ -1896,6 +2427,7 @@ impl TaskAdmission for PostgresTaskStore {
         .map_err(|error| {
             Self::transaction_body_error(&error, A2AError::invalid_request("task already exists"))
         })?;
+        store.insert_quota_reservation(tx, quota_reservation.as_ref(), &tenant, &owner, &command.task.id, quota_now, true).await?;
         let event=store.q("INSERT INTO __S__.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) VALUES($1,$2,1,1,'admitted',NULL,$3,$4,$5)");
         tx.execute(
             &event,
@@ -1994,12 +2526,13 @@ impl TaskAdmission for PostgresTaskStore {
         .await
     }
 
-    async fn authorize_and_continue(
+    async fn authorize_and_continue_mutation(
         &self,
         scope: &OwnedTaskScope,
-        command: SendMessageAdmission,
+        mutation: AuthorizedMutation<SendMessageAdmission>,
         audit: AuthorizationAuditInput,
     ) -> Result<AdmissionOutcome, A2AError> {
+        let (command, quota_reservation) = mutation.into_parts();
         if audit.tenant_scope() != scope.tenant_scope()
             || audit.actor_account_id() != scope.owner_account_id()
             || audit.effect() != AuthorizationDecisionEffect::Allow
@@ -2048,7 +2581,9 @@ impl TaskAdmission for PostgresTaskStore {
             let digest = digest.clone();
             let dispatch_id = dispatch_id.clone();
             let request_json = request_json.clone();
+            let quota_reservation = quota_reservation.clone();
             Box::pin(async move {
+        let quota_now = store.effective_now(tx, command.now).await?;
         let existing=store.q("SELECT request_digest,admission_result_json,final_result_json FROM __S__.idempotency_records WHERE tenant_scope=$1 AND message_id=$2 FOR UPDATE");
         if let Some(row) = tx
             .query_opt(&existing, &[&tenant, &message_id])
@@ -2062,6 +2597,7 @@ impl TaskAdmission for PostgresTaskStore {
             }
             let admission: String = row.get(1);
             let final_json: Option<String> = row.get(2);
+            store.insert_quota_reservation(tx, quota_reservation.as_ref(), &tenant, &owner, &command.task.id, quota_now, false).await?;
             let replay = serde_json::from_str(final_json.as_deref().unwrap_or(&admission))
                 .map_err(|_| A2AError::internal("stored continuation result is corrupt"))?;
             store.insert_audit(
@@ -2081,6 +2617,7 @@ impl TaskAdmission for PostgresTaskStore {
             .await
             .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("continuation task lookup failed")))?
             .ok_or_else(|| A2AError::task_not_found(&command.task.id))?;
+        store.insert_quota_reservation(tx, quota_reservation.as_ref(), &tenant, &owner, &command.task.id, quota_now, true).await?;
         let durable_json: String = row.get(0);
         let old_state: String = row.get(1);
         let revision: i64 = row.get(2);
@@ -2732,21 +3269,117 @@ impl OutboxAuthority for PostgresTaskStore {
             .query_opt(&sql, &[&now, &lease_owner, &token, &until])
             .await
             .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox claim failed")))?;
-        store.ensure_all_tenant_capacity(tx).await?;
         let Some(row) = row else {
+            store.ensure_all_tenant_capacity(tx).await?;
             return Ok(None);
         };
+        let tenant: String = row.get(0);
+        let outbox_id: i64 = row.get(1);
+        let dispatch_id: String = row.get(2);
+        let task_id: String = row.get(3);
+        let encoded_attempt_no: i64 = row.get(4);
+        let expired_final = encoded_attempt_no < 0;
+        let attempt_no = if expired_final {
+            encoded_attempt_no
+                .checked_neg()
+                .ok_or_else(|| A2AError::internal("outbox attempt is corrupt"))?
+        } else {
+            encoded_attempt_no
+        };
+        let max_attempts: i64 = row.get(5);
         let payload: String = row.get(6);
+
+        if expired_final {
+            store.set_tenant(tx, &tenant, None).await?;
+            let final_fence = store.q("SELECT message_id,payload_digest FROM __S__.outbox WHERE tenant_scope=$1 AND outbox_id=$2 AND dispatch_id=$3 AND task_id=$4 AND state='leased' AND lease_owner=$5 AND lease_token=$6 AND lease_until=$7 AND attempt_count=$8 AND max_attempts=$9 FOR UPDATE");
+            let Some(fence) = tx.query_opt(&final_fence, &[&tenant, &outbox_id, &dispatch_id, &task_id, &lease_owner, &token, &until, &attempt_no, &max_attempts]).await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("expired final attempt fence failed")))?
+            else {
+                return Ok(None);
+            };
+            let message_id: String = fence.get(0);
+            let payload_digest: String = fence.get(1);
+            let receiver_sql = store.q("SELECT payload_digest,state,lease_until,sender_attempt_no,sender_lease_token FROM __S__.receiver_inbox WHERE tenant_scope=$1 AND dispatch_id=$2 AND task_id=$3 FOR UPDATE");
+            let receiver = tx.query_opt(&receiver_sql, &[&tenant, &dispatch_id, &task_id]).await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("final attempt receiver lookup failed")))?;
+            if let Some(receiver) = &receiver {
+                if receiver.get::<_, String>(0) != payload_digest {
+                    return Err(A2AError::internal("receiver dispatch identity is bound to a conflicting payload"));
+                }
+                let receiver_state: String = receiver.get(1);
+                let receiver_until: Option<i64> = receiver.get(2);
+                if receiver_state == "processing" && receiver_until.is_some_and(|value| value > now) {
+                    store.ensure_capacity(tx, &tenant).await?;
+                    return Ok(None);
+                }
+                if receiver_state == "processing" {
+                    let receiver_attempt: i64 = receiver.get(3);
+                    let receiver_sender_token: String = receiver.get(4);
+                    let receiver_fence = store.q("UPDATE __S__.receiver_inbox SET sender_attempt_no=$1,sender_lease_token=$2 WHERE tenant_scope=$3 AND dispatch_id=$4 AND task_id=$5 AND payload_digest=$6 AND state='processing' AND sender_attempt_no=$7 AND sender_lease_token=$8");
+                    if tx.execute(&receiver_fence, &[&attempt_no, &token, &tenant, &dispatch_id, &task_id, &payload_digest, &receiver_attempt, &receiver_sender_token]).await
+                        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("final attempt receiver fence update failed")))? != 1
+                    {
+                        return Err(A2AError::internal("final attempt receiver fence is stale"));
+                    }
+                }
+                if matches!(receiver_state.as_str(), "processing" | "completed") {
+                    store.ensure_capacity(tx, &tenant).await?;
+                    let request = serde_json::from_str(&payload)
+                        .map_err(|_| A2AError::internal("outbox payload is corrupt"))?;
+                    return Ok(Some(OutboxLease {
+                        tenant_scope: tenant,
+                        outbox_id,
+                        dispatch_id,
+                        task_id,
+                        attempt_no: u32::try_from(attempt_no).map_err(|_| A2AError::internal("outbox attempt is corrupt"))?,
+                        max_attempts: u32::try_from(max_attempts).map_err(|_| A2AError::internal("outbox bound is corrupt"))?,
+                        lease_owner: lease_owner.clone(),
+                        lease_token: token,
+                        lease_until: until,
+                        request,
+                    }));
+                }
+            }
+
+            let was_terminal = materialize_postgres_dead_letter(
+                store,
+                tx,
+                &tenant,
+                &task_id,
+                &message_id,
+                &dispatch_id,
+                FINAL_EXPIRY_ERROR,
+                now,
+            )
+            .await?;
+            let attempt = store.q("UPDATE __S__.outbox_attempts SET finished_at=$1,outcome='dead',error=$2,next_attempt_at=NULL WHERE tenant_scope=$3 AND outbox_id=$4 AND attempt_no=$5 AND lease_token=$6 AND finished_at IS NULL");
+            if tx.execute(&attempt, &[&now, &FINAL_EXPIRY_ERROR, &tenant, &outbox_id, &attempt_no, &token]).await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("expired final attempt close failed")))? != 1
+            {
+                return Err(A2AError::internal("expired final attempt fence is corrupt"));
+            }
+            let terminal_state = if was_terminal { "superseded" } else { "dead" };
+            let dead = store.q("UPDATE __S__.outbox SET state=$1,lease_owner=NULL,lease_token=NULL,lease_until=NULL,last_error=$2,updated_at=$3 WHERE tenant_scope=$4 AND outbox_id=$5 AND dispatch_id=$6 AND task_id=$7 AND state='leased' AND lease_owner=$8 AND lease_token=$9 AND lease_until=$10 AND attempt_count=$11 AND max_attempts=$12");
+            if tx.execute(&dead, &[&terminal_state, &FINAL_EXPIRY_ERROR, &now, &tenant, &outbox_id, &dispatch_id, &task_id, &lease_owner, &token, &until, &attempt_no, &max_attempts]).await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("expired final dead-letter failed")))? != 1
+            {
+                return Err(A2AError::internal("expired final dead-letter fence is stale"));
+            }
+            store.ensure_capacity(tx, &tenant).await?;
+            return Ok(None);
+        }
+
+        store.ensure_all_tenant_capacity(tx).await?;
         let request = serde_json::from_str(&payload)
             .map_err(|_| A2AError::internal("outbox payload is corrupt"))?;
         let lease = OutboxLease {
-            tenant_scope: row.get(0),
-            outbox_id: row.get(1),
-            dispatch_id: row.get(2),
-            task_id: row.get(3),
-            attempt_no: u32::try_from(row.get::<_, i64>(4))
+            tenant_scope: tenant,
+            outbox_id,
+            dispatch_id,
+            task_id,
+            attempt_no: u32::try_from(attempt_no)
                 .map_err(|_| A2AError::internal("outbox attempt is corrupt"))?,
-            max_attempts: u32::try_from(row.get::<_, i64>(5))
+            max_attempts: u32::try_from(max_attempts)
                 .map_err(|_| A2AError::internal("outbox bound is corrupt"))?,
             lease_owner: lease_owner.clone(),
             lease_token: token,
@@ -2758,6 +3391,31 @@ impl OutboxAuthority for PostgresTaskStore {
         })
         .await
     }
+
+    async fn renew_outbox_lease(
+        &self,
+        lease: &OutboxLease,
+        lease_duration: i64,
+    ) -> Result<LeaseRenewalOutcome, A2AError> {
+        if !(10..=300_000).contains(&lease_duration) {
+            return Err(A2AError::invalid_params("invalid outbox renewal duration"));
+        }
+        let tenant = lease.tenant_scope.clone();
+        self.run_retryable_transaction(&tenant, None, |store, tx| {
+            let lease = lease.clone();
+            Box::pin(async move {
+                let now: i64 = tx.query_one(&store.q("SELECT __S__.db_millis()"), &[]).await
+                    .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("lease database clock failed")))?.get(0);
+                let until = now.checked_add(lease_duration)
+                    .ok_or_else(|| A2AError::invalid_params("outbox renewal time overflow"))?;
+                let sql = store.q("UPDATE __S__.outbox SET lease_until=$1,updated_at=$2 WHERE tenant_scope=$3 AND outbox_id=$4 AND dispatch_id=$5 AND task_id=$6 AND state='leased' AND lease_owner=$7 AND lease_token=$8 AND attempt_count=$9 AND max_attempts=$10 AND lease_until=$11 AND lease_until>$2");
+                let changed = tx.execute(&sql, &[&until, &now, &lease.tenant_scope, &lease.outbox_id, &lease.dispatch_id, &lease.task_id, &lease.lease_owner, &lease.lease_token, &i64::from(lease.attempt_no), &i64::from(lease.max_attempts), &lease.lease_until]).await
+                    .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox lease renewal failed")))?;
+                Ok(if changed == 1 { LeaseRenewalOutcome::Applied { lease_until: until } } else { LeaseRenewalOutcome::Stale })
+            })
+        }).await
+    }
+
     async fn task_for_outbox(&self, lease: &OutboxLease) -> Result<Option<Task>, A2AError> {
         // ALLOWLIST: read-only task/lease snapshot; no serialization writes.
         let mut client = self.connection().await?;
@@ -2803,62 +3461,72 @@ impl OutboxAuthority for PostgresTaskStore {
             let disposition = disposition.clone();
             Box::pin(async move {
         let now = store.effective_now(tx, now).await?;
-        let (state, available, error, outcome) = match disposition {
-            AttemptDisposition::Retry {
-                available_at,
-                error,
-            } => ("pending", Some(available_at), error, "retry"),
-            AttemptDisposition::Permanent { error } => ("dead", None, error, "permanent"),
+        let fence = store.q("SELECT message_id,payload_digest FROM __S__.outbox WHERE tenant_scope=$1 AND outbox_id=$2 AND dispatch_id=$3 AND task_id=$4 AND state='leased' AND lease_owner=$5 AND lease_token=$6 AND lease_until=$7 AND attempt_count=$8 AND max_attempts=$9 AND lease_until>$10 FOR UPDATE");
+        let Some(row) = tx.query_opt(&fence, &[&lease.tenant_scope, &lease.outbox_id, &lease.dispatch_id, &lease.task_id, &lease.lease_owner, &lease.lease_token, &lease.lease_until, &i64::from(lease.attempt_no), &i64::from(lease.max_attempts), &now]).await
+            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox fence lookup failed")))?
+        else { return Ok(TransitionOutcome::Stale); };
+        let message_id: String = row.get(0);
+        let payload_digest: String = row.get(1);
+        let cancellation: bool = tx.query_one(
+            &store.q("SELECT EXISTS(SELECT 1 FROM __S__.cancellation_intents WHERE tenant_scope=$1 AND dispatch_id=$2 AND task_id=$3 AND state='requested')"),
+            &[&lease.tenant_scope, &lease.dispatch_id, &lease.task_id],
+        ).await.map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox cancellation arbitration failed")))?.get(0);
+        if cancellation { return Ok(TransitionOutcome::Stale); }
+        let exhausted = lease.attempt_no >= lease.max_attempts;
+        let dead = exhausted || matches!(disposition, AttemptDisposition::Permanent { .. });
+        let (available, error) = match disposition {
+            AttemptDisposition::Retry { available_at, error } => (Some(available_at), error),
+            AttemptDisposition::Permanent { error } => (None, error),
         };
-        let sql=store.q("UPDATE __S__.outbox SET state=$1,available_at=COALESCE($2,available_at),last_error=$3,lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at=$4 WHERE tenant_scope=$5 AND outbox_id=$6 AND dispatch_id=$7 AND task_id=$8 AND state='leased' AND lease_owner=$9 AND lease_token=$10 AND lease_until=$11 AND attempt_count=$12 AND max_attempts=$13 AND lease_until>$4");
-        let changed = tx
-            .execute(
-                &sql,
-                &[
-                    &state,
-                    &available,
-                    &error,
-                    &now,
-                    &lease.tenant_scope,
-                    &lease.outbox_id,
-                    &lease.dispatch_id,
-                    &lease.task_id,
-                    &lease.lease_owner,
-                    &lease.lease_token,
-                    &lease.lease_until,
-                    &i64::from(lease.attempt_no),
-                    &i64::from(lease.max_attempts),
-                ],
-            )
-            .await
-            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox finish failed")))?;
-        if changed == 1 {
-            let attempt=store.q("UPDATE __S__.outbox_attempts SET finished_at=$1,outcome=$2,error=$3,next_attempt_at=$4 WHERE tenant_scope=$5 AND outbox_id=$6 AND attempt_no=$7 AND lease_token=$8 AND finished_at IS NULL");
-            tx.execute(
-                &attempt,
-                &[
-                    &now,
-                    &outcome,
-                    &error,
-                    &available,
-                    &lease.tenant_scope,
-                    &lease.outbox_id,
-                    &i64::from(lease.attempt_no),
-                    &lease.lease_token,
-                ],
-            )
-            .await
-            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox attempt close failed")))?;
+        if error.len() > 4096 {
+            return Err(A2AError::invalid_params("outbox error diagnostic exceeds limit"));
         }
-                Ok(if changed == 1 {
-            if state == "dead" {
-                TransitionOutcome::DeadLettered
-            } else {
-                TransitionOutcome::Applied
+        if dead {
+            let receiver = tx.query_opt(
+                &store.q("SELECT payload_digest,state FROM __S__.receiver_inbox WHERE tenant_scope=$1 AND dispatch_id=$2 AND task_id=$3 FOR UPDATE"),
+                &[&lease.tenant_scope, &lease.dispatch_id, &lease.task_id],
+            ).await.map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox finish receiver lookup failed")))?;
+            if let Some(receiver) = receiver {
+                if receiver.get::<_, String>(0) != payload_digest {
+                    return Err(A2AError::internal("receiver dispatch identity is bound to a conflicting payload"));
+                }
+                if matches!(receiver.get::<_, &str>(1), "processing" | "completed") {
+                    let token = content_digest(&rand::random::<[u8; 32]>());
+                    let update = store.q("UPDATE __S__.outbox SET lease_owner='receiver-reconciliation',lease_token=$1,lease_until=$2,updated_at=$2 WHERE tenant_scope=$3 AND outbox_id=$4 AND lease_token=$5");
+                    tx.execute(&update, &[&token, &now, &lease.tenant_scope, &lease.outbox_id, &lease.lease_token]).await
+                        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox finish reconciliation fence failed")))?;
+                    let attempt = store.q("UPDATE __S__.outbox_attempts SET lease_token=$1,started_at=$2,finished_at=NULL,outcome=NULL,error=NULL,next_attempt_at=NULL WHERE tenant_scope=$3 AND outbox_id=$4 AND attempt_no=$5 AND finished_at IS NULL");
+                    tx.execute(&attempt, &[&token, &now, &lease.tenant_scope, &lease.outbox_id, &i64::from(lease.attempt_no)]).await
+                        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox finish reconciliation attempt failed")))?;
+                    let receiver_fence = store.q("UPDATE __S__.receiver_inbox SET sender_lease_token=$1 WHERE tenant_scope=$2 AND dispatch_id=$3 AND task_id=$4 AND sender_attempt_no=$5 AND sender_lease_token=$6");
+                    if tx.execute(&receiver_fence, &[&token, &lease.tenant_scope, &lease.dispatch_id, &lease.task_id, &i64::from(lease.attempt_no), &lease.lease_token]).await
+                        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("receiver reconciliation fence update failed")))? != 1
+                    {
+                        return Err(A2AError::internal("receiver reconciliation fence is stale"));
+                    }
+                    return Ok(TransitionOutcome::Applied);
+                }
             }
-        } else {
-            TransitionOutcome::Stale
-                })
+        }
+        let attempt_outcome = if dead { "dead" } else { "retry" };
+        let attempt=store.q("UPDATE __S__.outbox_attempts SET finished_at=$1,outcome=$2,error=$3,next_attempt_at=$4 WHERE tenant_scope=$5 AND outbox_id=$6 AND attempt_no=$7 AND lease_token=$8 AND finished_at IS NULL");
+        if tx.execute(&attempt, &[&now, &attempt_outcome, &error, &available, &lease.tenant_scope, &lease.outbox_id, &i64::from(lease.attempt_no), &lease.lease_token]).await
+            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox attempt close failed")))? != 1
+        { return Ok(TransitionOutcome::Stale); }
+        if !dead {
+            let retry = store.q("UPDATE __S__.outbox SET state='pending',available_at=$1,last_error=$2,lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at=$3 WHERE tenant_scope=$4 AND outbox_id=$5 AND lease_token=$6");
+            if tx.execute(&retry, &[&available, &error, &now, &lease.tenant_scope, &lease.outbox_id, &lease.lease_token]).await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox retry schedule failed")))? != 1
+            { return Ok(TransitionOutcome::Stale); }
+            return Ok(TransitionOutcome::Applied);
+        }
+        let was_terminal = materialize_postgres_dead_letter(store, tx, &lease.tenant_scope, &lease.task_id, &message_id, &lease.dispatch_id, &error, now).await?;
+        let terminal_state = if was_terminal { "superseded" } else { "dead" };
+        let finish = store.q("UPDATE __S__.outbox SET state=$1,last_error=$2,lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at=$3 WHERE tenant_scope=$4 AND outbox_id=$5 AND lease_token=$6");
+        if tx.execute(&finish, &[&terminal_state, &error, &now, &lease.tenant_scope, &lease.outbox_id, &lease.lease_token]).await
+            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox dead-letter failed")))? != 1
+        { return Ok(TransitionOutcome::Stale); }
+        Ok(TransitionOutcome::DeadLettered)
             })
         })
         .await
@@ -3184,13 +3852,14 @@ impl ReceiverAuthority for PostgresTaskStore {
         let until = now
             .checked_add(duration)
             .ok_or_else(|| A2AError::invalid_params("receiver lease overflow"))?;
-        let ownership_sql=store.q("SELECT EXISTS(SELECT 1 FROM __S__.outbox WHERE tenant_scope=$1 AND dispatch_id=$2 AND task_id=$3 AND payload_digest=$4 AND payload_json=$5)");
-        let authoritative: bool = tx.query_one(&ownership_sql, &[&envelope.tenant_scope, &envelope.dispatch_id, &envelope.request.task_id, &envelope.payload_digest, &payload]).await
+        let ownership_sql=store.q("SELECT attempt_count,lease_token FROM __S__.outbox WHERE tenant_scope=$1 AND dispatch_id=$2 AND task_id=$3 AND payload_digest=$4 AND payload_json=$5 AND state='leased' AND lease_token IS NOT NULL FOR UPDATE");
+        let Some(sender) = tx.query_opt(&ownership_sql, &[&envelope.tenant_scope, &envelope.dispatch_id, &envelope.request.task_id, &envelope.payload_digest, &payload]).await
             .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("receiver outbox ownership lookup failed")))?
-            .get(0);
-        if !authoritative {
+        else {
             return Err(A2AError::invalid_params("invalid durable receiver envelope"));
-        }
+        };
+        let sender_attempt: i64 = sender.get(0);
+        let sender_token: String = sender.get(1);
         let lookup=store.q("SELECT payload_digest,state,lease_until,lease_epoch,completion_kind,termination_json,frame_count,transcript_digest FROM __S__.receiver_inbox WHERE tenant_scope=$1 AND dispatch_id=$2 FOR UPDATE");
         if let Some(row) = tx
             .query_opt(&lookup, &[&envelope.tenant_scope, &envelope.dispatch_id])
@@ -3241,7 +3910,7 @@ impl ReceiverAuthority for PostgresTaskStore {
                 return Ok(ReceiverAdmission::Busy);
             }
             let epoch = row.get::<_, i64>(3) + 1;
-            let update=store.q("UPDATE __S__.receiver_inbox SET lease_epoch=$1,lease_owner=$2,lease_token=$3,lease_until=$4,updated_at=$5 WHERE tenant_scope=$6 AND dispatch_id=$7");
+            let update=store.q("UPDATE __S__.receiver_inbox SET lease_epoch=$1,lease_owner=$2,lease_token=$3,lease_until=$4,updated_at=$5,sender_attempt_no=$6,sender_lease_token=$7 WHERE tenant_scope=$8 AND task_id=$9 AND dispatch_id=$10 AND payload_digest=$11 AND state='processing'");
             tx.execute(
                 &update,
                 &[
@@ -3250,16 +3919,24 @@ impl ReceiverAuthority for PostgresTaskStore {
                     &token,
                     &until,
                     &now,
+                    &sender_attempt,
+                    &sender_token,
                     &envelope.tenant_scope,
+                    &envelope.request.task_id,
                     &envelope.dispatch_id,
+                    &envelope.payload_digest,
                 ],
             )
             .await
             .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("receiver reclaim failed")))?;
             return Ok(ReceiverAdmission::Execute(ReceiverLease {
                 tenant_scope: envelope.tenant_scope,
+                task_id: envelope.request.task_id,
                 dispatch_id: envelope.dispatch_id,
                 payload_digest: envelope.payload_digest,
+                sender_attempt_no: u32::try_from(sender_attempt)
+                    .map_err(|_| A2AError::internal("sender attempt corrupt"))?,
+                sender_lease_token: sender_token,
                 lease_owner: owner.clone(),
                 lease_token: token,
                 lease_epoch: u64::try_from(epoch)
@@ -3267,7 +3944,7 @@ impl ReceiverAuthority for PostgresTaskStore {
                 lease_until: until,
             }));
         }
-        let insert=store.q("INSERT INTO __S__.receiver_inbox(tenant_scope,dispatch_id,payload_digest,payload_json,task_id,context_id,state,lease_epoch,lease_owner,lease_token,lease_until,accepted_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,'processing',1,$7,$8,$9,$10,$10)");
+        let insert=store.q("INSERT INTO __S__.receiver_inbox(tenant_scope,dispatch_id,payload_digest,payload_json,task_id,context_id,state,lease_epoch,lease_owner,lease_token,lease_until,accepted_at,updated_at,sender_attempt_no,sender_lease_token) VALUES($1,$2,$3,$4,$5,$6,'processing',1,$7,$8,$9,$10,$10,$11,$12)");
         tx.execute(
             &insert,
             &[
@@ -3281,14 +3958,20 @@ impl ReceiverAuthority for PostgresTaskStore {
                 &token,
                 &until,
                 &now,
+                &sender_attempt,
+                &sender_token,
             ],
         )
         .await
         .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("receiver admission failed")))?;
                 Ok(ReceiverAdmission::Execute(ReceiverLease {
             tenant_scope: envelope.tenant_scope,
+            task_id: envelope.request.task_id,
             dispatch_id: envelope.dispatch_id,
             payload_digest: envelope.payload_digest,
+            sender_attempt_no: u32::try_from(sender_attempt)
+                .map_err(|_| A2AError::internal("sender attempt corrupt"))?,
+            sender_lease_token: sender_token,
             lease_owner: owner.clone(),
             lease_token: token,
             lease_epoch: 1,
@@ -3298,6 +3981,48 @@ impl ReceiverAuthority for PostgresTaskStore {
         })
         .await
     }
+
+    async fn renew_receiver_lease(
+        &self,
+        lease: &ReceiverLease,
+        lease_duration: i64,
+    ) -> Result<LeaseRenewalOutcome, A2AError> {
+        struct RenewalProbe(Arc<tokio::sync::Notify>);
+        impl Drop for RenewalProbe {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let _probe = self
+            .receiver_renewal_test_probe
+            .as_ref()
+            .map(|(entered, released)| {
+                entered.notify_one();
+                RenewalProbe(Arc::clone(released))
+            });
+        if !(10..=300_000).contains(&lease_duration) {
+            return Err(A2AError::invalid_params(
+                "invalid receiver renewal duration",
+            ));
+        }
+        let tenant = lease.tenant_scope.clone();
+        self.run_retryable_transaction(&tenant, None, |store, tx| {
+            let lease = lease.clone();
+            Box::pin(async move {
+                let now: i64 = tx.query_one(&store.q("SELECT __S__.db_millis()"), &[]).await
+                    .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("lease database clock failed")))?.get(0);
+                let until = now.checked_add(lease_duration)
+                    .ok_or_else(|| A2AError::invalid_params("receiver renewal time overflow"))?;
+                let epoch = i64::try_from(lease.lease_epoch)
+                    .map_err(|_| A2AError::invalid_params("receiver lease epoch overflow"))?;
+                let sql = store.q("UPDATE __S__.receiver_inbox SET lease_until=$1,updated_at=$2 WHERE tenant_scope=$3 AND task_id=$4 AND dispatch_id=$5 AND payload_digest=$6 AND sender_attempt_no=$7 AND sender_lease_token=$8 AND state='processing' AND lease_owner=$9 AND lease_token=$10 AND lease_epoch=$11 AND lease_until=$12 AND lease_until>$2");
+                let changed = tx.execute(&sql, &[&until, &now, &lease.tenant_scope, &lease.task_id, &lease.dispatch_id, &lease.payload_digest, &i64::from(lease.sender_attempt_no), &lease.sender_lease_token, &lease.lease_owner, &lease.lease_token, &epoch, &lease.lease_until]).await
+                    .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("receiver lease renewal failed")))?;
+                Ok(if changed == 1 { LeaseRenewalOutcome::Applied { lease_until: until } } else { LeaseRenewalOutcome::Stale })
+            })
+        }).await
+    }
+
     async fn complete_loopback_receive(
         &self,
         lease: &ReceiverLease,
@@ -3434,14 +4159,17 @@ impl PostgresTaskStore {
             let termination_json = termination_json.clone();
             Box::pin(async move {
         let now = store.effective_now(tx, now).await?;
-        let fence=store.q("SELECT 1 FROM __S__.receiver_inbox WHERE tenant_scope=$1 AND dispatch_id=$2 AND payload_digest=$3 AND state='processing' AND lease_owner=$4 AND lease_token=$5 AND lease_epoch=$6 AND lease_until=$7 AND lease_until>$8 AND (EXISTS(SELECT 1 FROM __S__.cancellation_intents c WHERE c.tenant_scope=$1 AND c.dispatch_id=$2 AND c.state='requested'))=$9 FOR UPDATE");
+        let fence=store.q("SELECT 1 FROM __S__.receiver_inbox WHERE tenant_scope=$1 AND task_id=$2 AND dispatch_id=$3 AND payload_digest=$4 AND sender_attempt_no=$5 AND sender_lease_token=$6 AND state='processing' AND lease_owner=$7 AND lease_token=$8 AND lease_epoch=$9 AND lease_until=$10 AND lease_until>$11 AND (EXISTS(SELECT 1 FROM __S__.cancellation_intents c WHERE c.tenant_scope=$1 AND c.dispatch_id=$3 AND c.state='requested'))=$12 FOR UPDATE");
         if tx
             .query_opt(
                 &fence,
                 &[
                     &lease.tenant_scope,
+                    &lease.task_id,
                     &lease.dispatch_id,
                     &lease.payload_digest,
+                    &i64::from(lease.sender_attempt_no),
+                    &lease.sender_lease_token,
                     &lease.lease_owner,
                     &lease.lease_token,
                     &i64::try_from(lease.lease_epoch).unwrap_or(i64::MAX),
@@ -3824,6 +4552,18 @@ impl CancellationAuthority for PostgresTaskStore {
         now: i64,
         audit: AuthorizationAuditInput,
     ) -> Result<CancellationOutcome, A2AError> {
+        self.cancel_authorized_with_quota(scope, task_id, now, audit, None)
+            .await
+    }
+
+    async fn cancel_authorized_with_quota(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        now: i64,
+        audit: AuthorizationAuditInput,
+        quota_reservation: Option<&QuotaReservationInput>,
+    ) -> Result<CancellationOutcome, A2AError> {
         if audit.tenant_scope() != scope.tenant_scope()
             || audit.actor_account_id() != scope.owner_account_id()
             || audit.effect() != AuthorizationDecisionEffect::Allow
@@ -3836,11 +4576,13 @@ impl CancellationAuthority for PostgresTaskStore {
         let account = scope.owner_account_id().to_owned();
         let own = scope.visibility() == VisibilityScope::Own;
         let task_id = task_id.to_owned();
+        let quota_reservation = quota_reservation.cloned();
         self.run_retryable_transaction(&tenant, Some(&account), |store, tx| {
             let tenant = tenant.clone();
             let account = account.clone();
             let task_id = task_id.clone();
             let audit = audit.clone();
+            let quota_reservation = quota_reservation.clone();
             Box::pin(async move {
         let now = store.effective_now(tx, now).await?;
         let sql=store.q("SELECT t.task_json,t.revision,i.message_id,o.dispatch_id,o.state FROM __S__.tasks t JOIN __S__.outbox o ON o.tenant_scope=t.tenant_scope AND o.task_id=t.task_id JOIN __S__.idempotency_records i ON i.tenant_scope=o.tenant_scope AND i.message_id=o.message_id AND i.task_id=o.task_id WHERE t.tenant_scope=$1 AND t.task_id=$2 AND ($3::boolean=false OR t.owner_account_id=$4) ORDER BY (o.state IN ('pending','leased','delivered')) DESC,o.outbox_id DESC LIMIT 1 FOR UPDATE OF t,o");
@@ -3857,6 +4599,7 @@ impl CancellationAuthority for PostgresTaskStore {
             .await
             .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("cancellation lookup failed")))?
             .ok_or_else(|| A2AError::task_not_found(&task_id))?;
+        store.insert_quota_reservation(tx, quota_reservation.as_ref(), &tenant, &account, &task_id, now, true).await?;
         let mut task: Task = serde_json::from_str(row.get::<_, &str>(0))
             .map_err(|_| A2AError::internal("stored task is corrupt"))?;
         let revision: i64 = row.get(1);

@@ -73,6 +73,7 @@ fn absent_auth_mode_fails_before_listener_and_sqlite_initialization() {
         .env_clear()
         .env("SMESH_A2A_MODE", "loopback")
         .env("SMESH_A2A_BIND", address.to_string())
+        .env("SMESH_A2A_DURABLE_BACKEND", "sqlite")
         .env("SMESH_A2A_SQLITE_PATH", &database)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -183,6 +184,7 @@ fn bind_conflicts_fail_before_durable_or_runtime_resources() {
         .env("SMESH_A2A_AUTH_MODE", "disabled")
         .env("SMESH_A2A_MODE", "loopback")
         .env("SMESH_A2A_BIND", public_address.to_string())
+        .env("SMESH_A2A_DURABLE_BACKEND", "sqlite")
         .env("SMESH_A2A_SQLITE_PATH", &database)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -246,6 +248,7 @@ fn mismatched_tls_public_host_fails_before_listener_and_sqlite() {
             "SMESH_A2A_TLS_PRINCIPAL_MAP_PATH",
             fixtures.join("principals.json"),
         )
+        .env("SMESH_A2A_DURABLE_BACKEND", "sqlite")
         .env("SMESH_A2A_SQLITE_PATH", &database)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -298,6 +301,7 @@ fn authentication_and_policy_startup_matrix_fails_closed_before_resources() {
         .env_clear()
         .env("SMESH_A2A_AUTH_MODE", "disabled")
         .env("SMESH_A2A_AUTHORIZATION_POLICY_PATH", &policy)
+        .env("SMESH_A2A_DURABLE_BACKEND", "sqlite")
         .env("SMESH_A2A_SQLITE_PATH", &database)
         .env("SMESH_A2A_MODE", "loopback")
         .env("SMESH_A2A_BIND", address.to_string())

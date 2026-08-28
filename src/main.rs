@@ -10,11 +10,11 @@ use smesh_a2a::transport::{
 };
 use smesh_a2a::{
     AuthorizationPolicy, CorrelatingRuntimeProcessor, DurableLoopbackEndpoint, GatewayConfig,
-    GatewayMode, InjectedClock, LegacyTenantBinding, LoopbackDispatcher, RuntimeAdmissionProcessor,
-    RuntimeEventCapture, RuntimeModeConfig, RuntimeWorker, SqliteTaskStore, SystemClockTicker,
-    build_authenticated_router, build_authenticated_router_with_trace,
-    build_authorized_durable_loopback_gateway, build_durable_loopback_gateway, build_router,
-    build_router_with_trace,
+    GatewayMode, InjectedClock, LegacyTenantBinding, LoopbackDispatcher, PostgresStoreConfig,
+    PostgresTaskStore, RuntimeAdmissionProcessor, RuntimeEventCapture, RuntimeModeConfig,
+    RuntimeWorker, SqliteTaskStore, SystemClockTicker, build_authenticated_router,
+    build_authenticated_router_with_trace, build_authorized_durable_loopback_gateway,
+    build_durable_loopback_gateway, build_router, build_router_with_trace,
 };
 use smesh_core::{Network, Node};
 use smesh_runtime::{MeshConfig, RuntimeConfig, SmeshRuntime};
@@ -400,13 +400,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap = std::env::var("SMESH_A2A_BOOTSTRAP").ok();
     let mode = GatewayMode::parse(mode.as_deref(), mesh_bind.as_deref(), bootstrap.as_deref())?;
     let sqlite_path = std::env::var_os("SMESH_A2A_SQLITE_PATH").map(std::path::PathBuf::from);
-    if matches!(mode, GatewayMode::Runtime(_)) && sqlite_path.is_some() {
-        return Err("durable runtime receiver/effect replay is unsupported; SQLite durable routing is supported only in loopback mode".into());
+    let pg_migrator = std::env::var("SMESH_A2A_POSTGRES_MIGRATOR_URL").ok();
+    let pg_runtime = std::env::var("SMESH_A2A_POSTGRES_RUNTIME_URL").ok();
+    let pg_schema = std::env::var("SMESH_A2A_POSTGRES_SCHEMA").ok();
+    let backend = std::env::var("SMESH_A2A_DURABLE_BACKEND").ok();
+    if let Ok(replica_id) = std::env::var("SMESH_A2A_REPLICA_ID")
+        && (replica_id.is_empty()
+            || replica_id.len() > 128
+            || !replica_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte)))
+    {
+        return Err(
+            "SMESH_A2A_REPLICA_ID must be 1..=128 ASCII letters, digits, '.', '_', ':', or '-'"
+                .into(),
+        );
+    }
+    let postgres_config = match backend.as_deref() {
+        None if sqlite_path.is_none() && pg_migrator.is_none() && pg_runtime.is_none() && pg_schema.is_none() => None,
+        None => return Err("SMESH_A2A_DURABLE_BACKEND=sqlite|postgres is required when durable authority configuration is present".into()),
+        Some("sqlite") if sqlite_path.is_some() && pg_migrator.is_none() && pg_runtime.is_none() && pg_schema.is_none() => None,
+        Some("postgres") if sqlite_path.is_none() => {
+            if !authentication_enabled || !matches!(mode, GatewayMode::Loopback) {
+                return Err("PostgreSQL durable authority requires authenticated authorized loopback mode".into());
+            }
+            let config = PostgresStoreConfig::new(
+                pg_migrator.ok_or("SMESH_A2A_POSTGRES_MIGRATOR_URL is required")?,
+                pg_runtime.ok_or("SMESH_A2A_POSTGRES_RUNTIME_URL is required")?,
+                pg_schema.ok_or("SMESH_A2A_POSTGRES_SCHEMA is required")?,
+            )?;
+            #[cfg(debug_assertions)]
+            let config = {
+                let mut config = config;
+                if std::env::var("SMESH_TEST_POSTGRES_INSECURE_LOOPBACK").as_deref() == Ok("1") {
+                    config = config.with_test_only_insecure_loopback(true);
+                    if std::env::var("SMESH_TEST_POSTGRES_PARENT_MANAGED_CLEANUP").as_deref()
+                        == Ok("1")
+                    {
+                        config = config.with_test_only_parent_managed_cleanup();
+                    }
+                }
+                config
+            };
+            config.validate_tls_policy()?;
+            Some(config)
+        }
+        Some("sqlite") => return Err("SQLite backend requires only SMESH_A2A_SQLITE_PATH; PostgreSQL configuration must be absent".into()),
+        Some("postgres") => return Err("PostgreSQL backend cannot be combined with SMESH_A2A_SQLITE_PATH".into()),
+        Some(_) => return Err("SMESH_A2A_DURABLE_BACKEND must be sqlite or postgres".into()),
+    };
+    let durable_configured = sqlite_path.is_some() || postgres_config.is_some();
+    if matches!(mode, GatewayMode::Runtime(_)) && durable_configured {
+        return Err("durable authority routing is supported only in loopback mode".into());
     }
     if tenant_authorization_enabled
-        && (!matches!(mode, GatewayMode::Loopback) || sqlite_path.is_none())
+        && (!matches!(mode, GatewayMode::Loopback) || !durable_configured)
     {
-        return Err("authenticated task operations require the authorized durable SQLite loopback gateway; generic authenticated handlers are development-only and not tenant-safe".into());
+        return Err("authenticated task operations require an authorized durable loopback gateway; generic authenticated handlers are development-only and not tenant-safe".into());
     }
 
     let mut auth = auth_state_from_environment().await?;
@@ -436,6 +486,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     auth,
                     authorization.clone(),
                     legacy_binding,
+                    http_transport.clone(),
+                )
+                .await?;
+            } else if let Some(postgres_config) = postgres_config {
+                run_postgres_durable_loopback_gateway(
+                    listener,
+                    bind,
+                    public_base_url,
+                    config,
+                    postgres_config,
+                    auth,
+                    authorization.clone(),
                     http_transport.clone(),
                 )
                 .await?;
@@ -512,6 +574,42 @@ async fn run_durable_loopback_gateway(
     tracing::info!(%bind, %public_base_url, mode = "loopback", durable = true, "SMESH A2A gateway listening");
     let serve_result = serve_router(listener, app, transport).await;
 
+    let ticker_result = ticker.shutdown().await;
+    let gateway_result = gateway.shutdown().await;
+    serve_result?;
+    ticker_result?;
+    gateway_result?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_postgres_durable_loopback_gateway(
+    listener: std::net::TcpListener,
+    bind: SocketAddr,
+    public_base_url: String,
+    config: GatewayConfig,
+    postgres_config: PostgresStoreConfig,
+    auth: Option<AuthState>,
+    authorization: Option<Arc<AuthorizationPolicy>>,
+    transport: HttpTransport,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let auth = auth.ok_or("PostgreSQL durable authority requires authentication")?;
+    let policy =
+        authorization.ok_or("PostgreSQL durable authority requires authorization policy")?;
+    let store = PostgresTaskStore::open(postgres_config).await?;
+    let clock = InjectedClock::new(chrono::Utc::now().timestamp_millis());
+    let gateway = build_authorized_durable_loopback_gateway(
+        config,
+        store,
+        DurableLoopbackEndpoint::new(),
+        clock.clone(),
+        auth,
+        policy,
+    )?;
+    let ticker = SystemClockTicker::spawn(clock);
+    let app = gateway.router();
+    tracing::info!(%bind, %public_base_url, mode = "loopback", durable = true, backend = "postgres", "SMESH A2A gateway listening");
+    let serve_result = serve_router(listener, app, transport).await;
     let ticker_result = ticker.shutdown().await;
     let gateway_result = gateway.shutdown().await;
     serve_result?;
