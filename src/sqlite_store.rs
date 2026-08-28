@@ -1089,7 +1089,9 @@ impl SqliteTaskStore {
         let scoped_request = request.clone();
         let scope_digest = cursor_scope_digest.to_owned();
         let cursor_key = *self.cursor_key;
-        let now = audit.decided_at;
+        // Durable page-token expiry is wall-clock based so it remains coherent across
+        // process restart. The injected audit clock remains audit evidence only.
+        let now = chrono::Utc::now().timestamp_millis();
         let decision = audit.decided(AuthorizationDecisionEffect::Allow, "visible_set", None);
         self.run(move |connection| {
             frozen_list_transaction(
@@ -4754,7 +4756,7 @@ fn open_database(
         _ => Err(SqliteStoreError::InvalidSchema),
     }?;
     validate_foreign_keys(&connection)?;
-    validate_snapshot_chains(&connection)?;
+    validate_snapshot_chains(&connection, None)?;
     validate_persisted_records(&connection, max_tasks)?;
     validate_atomic_records(&connection)?;
     validate_receiver_records(&connection)?;
@@ -4786,7 +4788,10 @@ fn validate_foreign_keys(connection: &Connection) -> Result<(), SqliteStoreError
 }
 
 #[allow(clippy::too_many_lines)]
-fn validate_snapshot_chains(connection: &Connection) -> Result<(), SqliteStoreError> {
+fn validate_snapshot_chains(
+    connection: &Connection,
+    only_snapshot: Option<&[u8]>,
+) -> Result<(), SqliteStoreError> {
     let key: Vec<u8> = connection
         .query_row(
             "SELECT cursor_key FROM store_metadata WHERE singleton=1",
@@ -4800,10 +4805,11 @@ fn validate_snapshot_chains(connection: &Connection) -> Result<(), SqliteStoreEr
     let now = chrono::Utc::now().timestamp_millis();
     let mut snapshots = connection.prepare(
         "SELECT snapshot_id,scope_digest,query_digest,total_size,page_size,issued_at,expires_at,
-                projection_version,frozen_bytes,metadata_digest FROM list_snapshots",
+                projection_version,frozen_bytes,metadata_digest FROM list_snapshots
+         WHERE ?1 IS NULL OR snapshot_id=?1",
     ).map_err(|_| SqliteStoreError::InvalidSchema)?;
     let rows = snapshots
-        .query_map([], |row| {
+        .query_map([only_snapshot], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, String>(1)?,
@@ -7191,7 +7197,6 @@ fn frozen_list_transaction(
         .filter(|value| !value.is_empty())
     {
         let hash = decode_page_token_hash(token)?;
-        validate_snapshot_chains(&tx).map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
         let record: Option<PageTokenRow> = tx
             .query_row(
                 "SELECT t.snapshot_id,t.next_position,t.scope_digest,t.query_digest,t.token_version,
@@ -7218,6 +7223,8 @@ fn frozen_list_transaction(
         else {
             return Err(A2AError::invalid_params("invalid pageToken"));
         };
+        validate_snapshot_chains(&tx, Some(&snapshot_id))
+            .map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
         if stored_scope != scope_digest
             || stored_query != query_digest
             || version != PAGE_TOKEN_VERSION

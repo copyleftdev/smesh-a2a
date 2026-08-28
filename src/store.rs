@@ -170,6 +170,18 @@ fn gc_memory_snapshots(state: &mut StoreState, now: u64) {
     });
 }
 
+fn reusable_snapshot<'a>(
+    state: &'a StoreState,
+    scope: &CursorScope,
+    now: u64,
+) -> Option<&'a MemorySnapshot> {
+    state
+        .snapshots
+        .iter()
+        .map(|(_, snapshot)| snapshot)
+        .find(|snapshot| snapshot.expires_at > now && snapshot.scope == *scope)
+}
+
 fn conservative_snapshot_bytes(
     tasks: &[Vec<u8>],
     task_capacity: usize,
@@ -326,6 +338,13 @@ impl TaskStore for BoundedTaskStore {
                 return Err(A2AError::invalid_params("invalid pageToken"));
             }
             return memory_page(snapshot, position);
+        }
+
+        // A retry of the same first-page request reuses its live frozen view instead
+        // of allocating another five-minute capability chain. This bounds anonymous
+        // retry pressure without evicting snapshots whose tokens remain in use.
+        if let Some(snapshot) = reusable_snapshot(&state, &scope, now) {
+            return memory_page(snapshot, 0);
         }
 
         let tasks = freeze_projection(state.tasks.values().cloned().collect(), req);

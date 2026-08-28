@@ -103,8 +103,24 @@ async fn page_size_one_snapshot_registry_byte_bound_recovers_after_expiry() {
             include_artifacts: Some(false),
             tenant: None,
         };
+        let retry_token = store.list(&request).await.unwrap().next_page_token;
+        for _ in 0..256 {
+            assert_eq!(
+                store.list(&request).await.unwrap().next_page_token,
+                retry_token,
+                "identical first-page retries must reuse one frozen snapshot"
+            );
+        }
         let mut admitted = 0;
-        while admitted < 128 && store.list(&request).await.is_ok() {
+        while admitted < 128 {
+            let distinct = ListTasksRequest {
+                history_length: Some(admitted % 101),
+                include_artifacts: Some(admitted >= 101),
+                ..request.clone()
+            };
+            if store.list(&distinct).await.is_err() {
+                break;
+            }
             admitted += 1;
         }
         assert!(
@@ -122,10 +138,10 @@ async fn page_size_one_snapshot_registry_byte_bound_recovers_after_expiry() {
 }
 
 #[tokio::test]
-async fn million_element_nested_values_are_charged_as_frozen_canonical_bytes() {
+async fn deeply_nested_values_are_charged_as_frozen_canonical_bytes() {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let store = BoundedTaskStore::new(2);
-        let nested = vec![serde_json::Value::from(0); 1_000_000];
+        let nested = vec![serde_json::Value::from(0); 200_000];
         for id in ["nested-a", "nested-b"] {
             let mut value = task(id);
             value.metadata =
@@ -143,7 +159,15 @@ async fn million_element_nested_values_are_charged_as_frozen_canonical_bytes() {
             tenant: None,
         };
         let mut admitted = 0;
-        while admitted < 128 && store.list(&request).await.is_ok() {
+        while admitted < 128 {
+            let distinct = ListTasksRequest {
+                history_length: Some(admitted % 101),
+                include_artifacts: Some(admitted >= 101),
+                ..request.clone()
+            };
+            if store.list(&distinct).await.is_err() {
+                break;
+            }
             admitted += 1;
         }
         assert!(

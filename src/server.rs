@@ -90,24 +90,6 @@ impl CompletionPolicyStore for BoundedTaskStore {
     fn list_pages_are_self_authenticating(&self) -> bool {
         true
     }
-
-    async fn validate_list_page(
-        &self,
-        request: &ListTasksRequest,
-        response: &ListTasksResponse,
-    ) -> Result<(), A2AError> {
-        if request
-            .page_token
-            .as_deref()
-            .is_some_and(|token| !token.is_empty())
-        {
-            if self.list(request).await? == *response {
-                return Ok(());
-            }
-            return Err(A2AError::invalid_agent_response());
-        }
-        validate_current_list_page(self, request, response).await
-    }
 }
 
 #[async_trait]
@@ -118,24 +100,6 @@ impl CompletionPolicyStore for SqliteTaskStore {
 
     fn list_pages_are_self_authenticating(&self) -> bool {
         true
-    }
-
-    async fn validate_list_page(
-        &self,
-        request: &ListTasksRequest,
-        response: &ListTasksResponse,
-    ) -> Result<(), A2AError> {
-        if request
-            .page_token
-            .as_deref()
-            .is_some_and(|token| !token.is_empty())
-        {
-            if self.list(request).await? == *response {
-                return Ok(());
-            }
-            return Err(A2AError::invalid_agent_response());
-        }
-        validate_current_list_page(self, request, response).await
     }
 }
 
