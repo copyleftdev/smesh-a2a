@@ -25,7 +25,7 @@ use crate::{
     DurableDispatchEnvelope, DurableReceiverResult, DurableReceiverTermination, InputLimits,
     MeshEvent, MeshRequest, OutboxLease, OwnedTaskScope, ReceiverAdmission, ReceiverLease,
     SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor, TaskEventBatch,
-    TransitionOutcome, authorized_message_identity, canonical_send_message_digest,
+    TransitionOutcome, VisibilityScope, authorized_message_identity, canonical_send_message_digest,
     canonical_send_message_digest_v2, content_digest, durable_authority::valid_bounded_identity,
 };
 
@@ -7351,8 +7351,12 @@ impl crate::OutboxAuthority for SqliteTaskStore {
     }
 
     async fn task_for_outbox(&self, lease: &OutboxLease) -> Result<Option<Task>, A2AError> {
-        let task = TaskStore::get(self, &lease.task_id).await?;
-        Ok(task.filter(|task| task.id == lease.task_id))
+        let scope = OwnedTaskScope::new(
+            &lease.tenant_scope,
+            "durable-outbox-driver",
+            VisibilityScope::Tenant,
+        )?;
+        SqliteTaskStore::get_scoped(self, &scope, &lease.task_id).await
     }
 
     async fn finish_outbox_attempt(
