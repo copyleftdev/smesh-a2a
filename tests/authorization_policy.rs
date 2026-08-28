@@ -334,6 +334,7 @@ fn selector_selects_membership_but_never_grants_and_omission_is_ambiguous() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn selector_denials_append_digest_only_durable_audits() {
     use axum::{Router, body::Body, http::Request, middleware, routing::get};
     use smesh_a2a::{
@@ -419,6 +420,24 @@ async fn selector_denials_append_digest_only_durable_audits() {
     );
     assert_eq!(store.authorization_decision_count().await.unwrap(), 4);
     store.shutdown_shared().await.unwrap();
+    let database = rusqlite::Connection::open(&db_path).unwrap();
+    let reasons = database
+        .prepare("SELECT reason FROM authorization_decisions ORDER BY decision_order")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        reasons,
+        [
+            "malformed_selector",
+            "selector_denied",
+            "ambiguous_selector",
+            "selector_denied",
+        ]
+    );
+    drop(database);
     let bytes = std::fs::read(&db_path).unwrap();
     assert!(
         !bytes

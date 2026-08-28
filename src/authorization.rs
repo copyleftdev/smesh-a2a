@@ -108,7 +108,7 @@ impl AuthorizationMiddlewareState {
             self.policy.digest(),
             "TenantSelectorResolve",
             AuthorizationDecisionEffect::Deny,
-            "selector_denied",
+            reason,
             "tenant-selector",
             resource_digest,
             None,

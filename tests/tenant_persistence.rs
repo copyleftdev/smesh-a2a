@@ -410,6 +410,14 @@ fn digest_v2_binds_tenant_actor_invocation_and_semantics() {
         base,
         canonical_send_message_digest_v2("tenant-a", "account-a", &request, true).unwrap()
     );
+    let mut different_caller_tenant = request.clone();
+    different_caller_tenant.tenant = Some("untrusted-other-tenant".to_owned());
+    assert_eq!(
+        base,
+        canonical_send_message_digest_v2("tenant-a", "account-a", &different_caller_tenant, false,)
+            .unwrap(),
+        "caller tenant data must not enter the server-authoritative digest"
+    );
 }
 
 #[tokio::test]

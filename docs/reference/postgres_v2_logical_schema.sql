@@ -73,6 +73,7 @@ CREATE TABLE outbox (
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (tenant_scope, outbox_id),
     UNIQUE (tenant_scope, dispatch_id),
     UNIQUE (tenant_scope, actor_account_id, message_id),
     FOREIGN KEY (tenant_scope, task_id) REFERENCES tasks(tenant_scope, task_id) ON DELETE RESTRICT,
@@ -93,7 +94,8 @@ CREATE TABLE outbox_attempts (
     error TEXT,
     next_attempt_at TIMESTAMPTZ,
     PRIMARY KEY (tenant_scope, outbox_id, attempt_no),
-    FOREIGN KEY (outbox_id) REFERENCES outbox(outbox_id) ON DELETE RESTRICT
+    FOREIGN KEY (tenant_scope, outbox_id)
+      REFERENCES outbox(tenant_scope, outbox_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE authorization_decisions (

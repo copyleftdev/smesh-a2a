@@ -911,15 +911,20 @@ impl RequestHandler for DurableRequestHandler {
                 .await?;
         }
         if let Some((context, scope)) = authorization.as_ref() {
+            let visibility = match scope.visibility() {
+                crate::VisibilityScope::Own => "own",
+                crate::VisibilityScope::Tenant => "tenant",
+            };
             let cursor_scope = content_digest(
                 format!(
-                    "{}\0{}\0{}\0{}\0{}\0{:?}",
+                    "{}\0{}\0{}\0{}\0{}\0{}\0{}",
                     context.tenant_id(),
                     context.account_id(),
                     context.policy_id(),
                     context.policy_revision(),
                     context.policy_digest(),
-                    scope,
+                    scope.owner_account_id(),
+                    visibility,
                 )
                 .as_bytes(),
             );
