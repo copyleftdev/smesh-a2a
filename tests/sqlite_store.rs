@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+use std::ffi::OsStr;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,6 +9,8 @@ use a2a::{
     Artifact, ListTasksRequest, Message, Part, PartContent, Role, Task, TaskState, TaskStatus,
 };
 use a2a_server::TaskStore;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use sha2::{Digest as _, Sha256};
 use smesh_a2a::{
     ArtifactManifest, CompletionEvidence, CompletionPolicySpec, CompletionReceipt,
     CompletionSnapshot, PolicyDecision, SqliteTaskStore, VersionedCompletionPolicy,
@@ -106,7 +110,39 @@ fn attach_completion_receipt(task: &mut Task, receipt: &CompletionReceipt) {
     );
 }
 
-fn database_path() -> PathBuf {
+struct FixturePath(PathBuf);
+
+impl Deref for FixturePath {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for FixturePath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<OsStr> for FixturePath {
+    fn as_ref(&self) -> &OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for FixturePath {
+    fn drop(&mut self) {
+        if let Some(directory) = self.0.parent()
+            && directory.exists()
+        {
+            std::fs::remove_dir_all(directory).expect("RAII SQLite fixture cleanup must succeed");
+        }
+    }
+}
+
+fn database_path() -> FixturePath {
     let directory = std::env::temp_dir().join(format!(
         "smesh-a2a-store-{}-{}",
         std::process::id(),
@@ -121,15 +157,15 @@ fn database_path() -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    directory.join("tasks.sqlite3")
+    FixturePath(directory.join("tasks.sqlite3"))
 }
 
 fn cleanup(path: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let candidate = PathBuf::from(format!("{}{suffix}", path.display()));
-        let _ = std::fs::remove_file(candidate);
+    let directory = path.parent().expect("database fixture has parent");
+    if directory.exists() {
+        std::fs::remove_dir_all(directory).expect("SQLite fixture cleanup must succeed");
     }
-    let _ = std::fs::remove_dir(path.parent().unwrap());
+    assert!(!directory.exists(), "SQLite fixture directory leaked");
 }
 
 fn list_request(page_size: i32, page_token: Option<String>) -> ListTasksRequest {
@@ -143,6 +179,18 @@ fn list_request(page_size: i32, page_token: Option<String>) -> ListTasksRequest 
         include_artifacts: Some(true),
         tenant: None,
     }
+}
+
+#[test]
+fn sqlite_fixture_raii_cleans_up_during_unwind() {
+    let fixture = database_path();
+    let directory = fixture.parent().unwrap().to_path_buf();
+    let result = std::panic::catch_unwind(move || {
+        let _fixture = fixture;
+        panic!("exercise fixture unwind cleanup");
+    });
+    assert!(result.is_err());
+    assert!(!directory.exists(), "RAII fixture leaked after panic");
 }
 
 #[tokio::test]
@@ -244,6 +292,221 @@ async fn page_tokens_and_capacity_survive_restart() {
     );
     drop(reopened);
     cleanup(&path);
+}
+
+#[tokio::test]
+async fn sqlite_pagination_freezes_total_membership_and_projection_across_restart() {
+    let path = database_path();
+    let store = SqliteTaskStore::open(&path, 8).await.unwrap();
+    for (id, second) in [("snap-a", 3), ("snap-b", 2), ("snap-c", 1)] {
+        let mut value = rich_task(id, TaskState::Working);
+        value.status.timestamp = Some(
+            chrono::DateTime::parse_from_rfc3339(&format!("2026-01-01T00:00:0{second}Z"))
+                .unwrap()
+                .to_utc(),
+        );
+        store.create(value).await.unwrap();
+    }
+    let request = list_request(1, None);
+    let first = store.list(&request).await.unwrap();
+    assert_eq!(first.total_size, 3);
+    assert_eq!(first.tasks[0].id, "snap-a");
+    let token_raw = URL_SAFE_NO_PAD.decode(&first.next_page_token).unwrap();
+    assert_eq!(token_raw.len(), 32, "token is one opaque random capability");
+    let reader = rusqlite::Connection::open(&path).unwrap();
+    let stored_hash: Vec<u8> = reader
+        .query_row(
+            "SELECT token_hash FROM list_page_tokens WHERE next_position=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_hash.len(), 32);
+    assert_eq!(stored_hash, Sha256::digest(&token_raw).as_slice());
+    assert_ne!(stored_hash, token_raw, "only a token hash may be persisted");
+    let raw_token = first.next_page_token.as_bytes();
+    for suffix in ["", "-wal", "-shm"] {
+        let candidate = PathBuf::from(format!("{}{suffix}", path.display()));
+        if candidate.exists() {
+            let bytes = std::fs::read(candidate).unwrap();
+            assert!(
+                !bytes
+                    .windows(raw_token.len())
+                    .any(|window| window == raw_token),
+                "raw page capability leaked to SQLite file {suffix}"
+            );
+        }
+    }
+    let token_columns: String = reader
+        .query_row(
+            "SELECT group_concat(name, ',') FROM pragma_table_info('list_page_tokens')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!token_columns.contains("plaintext"));
+    assert!(!token_columns.contains("token_value"));
+    drop(reader);
+
+    let mut changed = store.get("snap-b").await.unwrap().unwrap();
+    changed.status.state = TaskState::Completed;
+    changed.status.timestamp = Some(
+        chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .unwrap()
+            .to_utc(),
+    );
+    changed
+        .metadata
+        .as_mut()
+        .unwrap()
+        .insert("snapshotMutation".to_owned(), serde_json::json!(true));
+    store.update(changed).await.unwrap();
+    store
+        .create(task("snap-new", TaskState::Working))
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened = SqliteTaskStore::open(&path, 8).await.unwrap();
+    let second_request = list_request(1, Some(first.next_page_token));
+    let second = reopened.list(&second_request).await.unwrap();
+    let replay = reopened.list(&second_request).await.unwrap();
+    assert_eq!(second, replay);
+    assert_eq!(second.total_size, 3);
+    assert_eq!(second.tasks[0].id, "snap-b");
+    assert_eq!(second.tasks[0].status.state, TaskState::Working);
+    assert!(
+        second.tasks[0]
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("snapshotMutation")
+            .is_none()
+    );
+    let third = reopened
+        .list(&list_request(1, Some(second.next_page_token)))
+        .await
+        .unwrap();
+    assert_eq!(third.total_size, 3);
+    assert_eq!(third.tasks[0].id, "snap-c");
+    assert!(third.next_page_token.is_empty());
+    drop(reopened);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn reopen_rejects_every_snapshot_chain_corruption_class() {
+    let corruptions = [
+        "UPDATE list_snapshots SET total_size=total_size+1",
+        "DELETE FROM list_snapshot_entries WHERE ordinal=1",
+        "UPDATE list_snapshots SET frozen_bytes=0",
+        "UPDATE list_snapshot_entries SET task_id='forged' WHERE ordinal=1",
+        "UPDATE list_snapshot_entries SET task_digest='sha256:0000000000000000000000000000000000000000000000000000000000000000' WHERE ordinal=1",
+        "UPDATE list_page_tokens SET scope_digest='forged'",
+        "DELETE FROM list_page_tokens WHERE next_position=2",
+        "UPDATE list_page_tokens SET token_hash=zeroblob(32) WHERE next_position=1",
+        "INSERT INTO list_page_tokens(token_hash,snapshot_id,next_position,scope_digest,query_digest,token_version,key_generation,issued_at,expires_at) SELECT randomblob(32),snapshot_id,3,scope_digest,query_digest,token_version,key_generation,issued_at,expires_at FROM list_page_tokens LIMIT 1",
+        "UPDATE list_snapshots SET scope_digest='forged'; UPDATE list_page_tokens SET scope_digest='forged'",
+        "UPDATE list_snapshots SET query_digest='forged'; UPDATE list_page_tokens SET query_digest='forged'",
+        "UPDATE list_snapshots SET issued_at=issued_at+9999999999,expires_at=expires_at+9999999999; UPDATE list_page_tokens SET issued_at=issued_at+9999999999,expires_at=expires_at+9999999999",
+        "UPDATE list_snapshot_entries SET task_revision=task_revision+1000 WHERE ordinal=1",
+        "UPDATE list_snapshot_entries SET ordinal=100 WHERE ordinal=0; UPDATE list_snapshot_entries SET ordinal=0 WHERE ordinal=1; UPDATE list_snapshot_entries SET ordinal=1 WHERE ordinal=100",
+        "UPDATE list_snapshots SET metadata_digest=zeroblob(32)",
+        "PRAGMA ignore_check_constraints=ON; UPDATE list_page_tokens SET key_generation=2",
+    ];
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        for statement in corruptions {
+            let path = database_path();
+            let store = SqliteTaskStore::open(&path, 4).await.unwrap();
+            for id in ["a", "b", "c"] {
+                store.create(task(id, TaskState::Completed)).await.unwrap();
+            }
+            let first = store.list(&list_request(1, None)).await.unwrap();
+            assert!(!first.next_page_token.is_empty());
+            store.shutdown_shared().await.unwrap();
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch(statement).unwrap();
+            drop(db);
+            assert!(
+                SqliteTaskStore::open(&path, 4).await.is_err(),
+                "reopen accepted corruption: {statement}"
+            );
+            cleanup(&path);
+        }
+    })
+    .await
+    .expect("snapshot corruption matrix watchdog expired");
+}
+
+#[tokio::test]
+async fn followup_page_fails_generically_when_snapshot_metadata_is_tampered() {
+    let path = database_path();
+    let store = SqliteTaskStore::open(&path, 4).await.unwrap();
+    for id in ["follow-a", "follow-b", "follow-c"] {
+        store.create(task(id, TaskState::Completed)).await.unwrap();
+    }
+    let first = store.list(&list_request(1, None)).await.unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE list_snapshot_entries SET task_revision=task_revision+1000 WHERE ordinal=1",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let error = store
+        .list(&list_request(1, Some(first.next_page_token)))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, a2a::error_code::INVALID_PARAMS);
+    assert_eq!(error.message, "invalid pageToken");
+    store.shutdown_shared().await.unwrap();
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn failed_oversized_admission_cannot_roll_back_complete_expired_snapshot_gc() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let path = database_path();
+        let store = SqliteTaskStore::open(&path, 100).await.unwrap();
+        for id in ["small-a", "small-b"] {
+            store.create(task(id, TaskState::Completed)).await.unwrap();
+        }
+        let db = rusqlite::Connection::open(&path).unwrap();
+        for byte in 0_u8..128 {
+            db.execute(
+                "INSERT INTO list_snapshots(snapshot_id,scope_digest,query_digest,total_size,page_size,
+                 issued_at,expires_at,projection_version,frozen_bytes,metadata_digest)
+                 VALUES(?1,'scope','query',2,1,0,1,1,524288,zeroblob(32))",
+                [vec![byte; 32]],
+            )
+            .unwrap();
+        }
+        let payload = "x".repeat(1_040_000);
+        for index in 0..65 {
+            let mut value = task(&format!("large-{index:02}"), TaskState::Completed);
+            value.metadata =
+                Some(serde_json::from_value(serde_json::json!({"payload": payload})).unwrap());
+            let encoded = serde_json::to_string(&value).unwrap();
+            assert!(encoded.len() <= 1024 * 1024);
+            db.execute(
+                "INSERT INTO tasks(task_id,context_id,state,status_timestamp,revision,task_json,
+                 tenant_scope,owner_account_id) VALUES(?1,?2,?3,?4,1,?5,?6,?7)",
+                rusqlite::params![value.id,value.context_id,"\"TASK_STATE_COMPLETED\"",
+                    value.status.timestamp.map(|timestamp| timestamp.to_rfc3339()),encoded,
+                    smesh_a2a::TRUSTED_SINGLE_TENANT_SCOPE,"smesh-dev-only-account"],
+            )
+            .unwrap();
+        }
+        assert!(store.list(&list_request(1, None)).await.unwrap_err().message.contains("capacity"));
+        let expired: i64 = db.query_row("SELECT COUNT(*) FROM list_snapshots", [], |row| row.get(0)).unwrap();
+        assert_eq!(expired, 0, "capacity rejection rolled back expired snapshot GC");
+        db.execute("DELETE FROM tasks WHERE task_id LIKE 'large-%'", []).unwrap();
+        let bounded = store.list(&list_request(1, None)).await.unwrap();
+        assert_eq!(bounded.total_size, 2);
+        store.shutdown_shared().await.unwrap();
+        drop(db);
+        cleanup(&path);
+    }).await.expect("snapshot GC/capacity watchdog expired");
 }
 
 #[tokio::test]

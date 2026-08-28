@@ -13,7 +13,6 @@ use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::{A2AClient, A2AClientFactory, Transport};
 use a2a_server::TaskStore;
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{StreamExt, stream::BoxStream};
 use smesh_a2a::{
     ArtifactManifest, BoundedTaskStore, CompletionEvidence, CompletionPolicyStore,
@@ -215,6 +214,7 @@ async fn official_clients_receive_the_most_recent_bounded_history_messages() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn preloaded_tasks_cannot_bypass_policy_receipt_and_artifact_visibility_guards() {
     let store = BoundedTaskStore::new(8);
     for (id, state) in [
@@ -233,6 +233,21 @@ async fn preloaded_tasks_cannot_bypass_policy_receipt_and_artifact_visibility_gu
         }]);
         store.create(task).await.unwrap();
     }
+    let mut forged_nonterminal_metadata = fixture_task(
+        "forged-working-metadata",
+        "unverified-context",
+        "2026-01-01T00:00:00Z",
+    );
+    forged_nonterminal_metadata.metadata = Some(
+        serde_json::from_value(serde_json::json!({
+            "smesh.completionPolicy": {
+                "status": "accepted",
+                "record": {"attackerControlled": true}
+            }
+        }))
+        .unwrap(),
+    );
+    store.create(forged_nonterminal_metadata).await.unwrap();
     let server = TestServer::start_with_store(LoopbackDispatcher, store.clone()).await;
     let client = server.client(TRANSPORT_PROTOCOL_JSONRPC).await;
     let valid = send_completed(&client, "valid receipt", "unverified-context").await;
@@ -283,6 +298,7 @@ async fn preloaded_tasks_cannot_bypass_policy_receipt_and_artifact_visibility_gu
     for id in [
         "unverified-completed",
         "unverified-working",
+        "forged-working-metadata",
         "replayed-receipt",
     ] {
         let error = client
@@ -417,18 +433,9 @@ async fn assert_cursor_survives_concurrent_insert(
     assert!(page_one.tasks.iter().all(|task| task.history.is_none()));
     assert!(page_one.tasks.iter().all(|task| task.artifacts.is_none()));
 
-    let mut token_bytes = URL_SAFE_NO_PAD
-        .decode(&page_one.next_page_token)
-        .expect("server-issued cursor");
-    let signature = token_bytes.split_off(token_bytes.len() - 32);
-    let mut forged_payload: serde_json::Value =
-        serde_json::from_slice(&token_bytes).expect("cursor payload");
-    forged_payload["taskId"] = serde_json::Value::String(page_one.tasks[0].id.clone());
-    forged_payload["statusTimestamp"] =
-        serde_json::to_value(page_one.tasks[0].status.timestamp).unwrap();
-    let mut forged_bytes = serde_json::to_vec(&forged_payload).unwrap();
-    forged_bytes.extend_from_slice(&signature);
-    let forged_token = URL_SAFE_NO_PAD.encode(forged_bytes);
+    let mut forged_bytes = page_one.next_page_token.as_bytes().to_vec();
+    forged_bytes[0] = if forged_bytes[0] == b'A' { b'B' } else { b'A' };
+    let forged_token = String::from_utf8(forged_bytes).unwrap();
     let forged_error = client
         .list_tasks(&ListTasksRequest {
             page_token: Some(forged_token),
@@ -457,6 +464,18 @@ async fn assert_cursor_survives_concurrent_insert(
         .unwrap_err();
     assert_eq!(oversized_error.code, error_code::INVALID_PARAMS);
 
+    let frozen_later_id = expected
+        .iter()
+        .find(|id| !page_one.tasks.iter().any(|task| &task.id == *id))
+        .expect("one task remains on the frozen second page")
+        .clone();
+    let mut live_mutation = store.get(&frozen_later_id).await.unwrap().unwrap();
+    live_mutation.status.timestamp = Some(chrono::Utc::now());
+    live_mutation.metadata = Some(
+        serde_json::from_value(serde_json::json!({"liveMutationAfterPageOne": true})).unwrap(),
+    );
+    store.update(live_mutation).await.unwrap();
+
     let inserted_after_page_one = inserted_task.id.clone();
     store.create(inserted_task).await.unwrap();
     let page_two = client
@@ -467,7 +486,7 @@ async fn assert_cursor_survives_concurrent_insert(
         .await
         .unwrap();
     assert_eq!(page_two.tasks.len(), 1);
-    assert_eq!(page_two.total_size, 4);
+    assert_eq!(page_two.total_size, 3);
     assert!(page_two.next_page_token.is_empty());
     assert!(
         page_two

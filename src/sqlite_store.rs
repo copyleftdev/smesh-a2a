@@ -1,5 +1,6 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
+use std::fmt::Write as _;
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -11,17 +12,20 @@ use a2a::{
 };
 use a2a_server::TaskStore;
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac as _};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
+use subtle::ConstantTimeEq as _;
 use thiserror::Error;
 
 use crate::{
     DurableDispatchEnvelope, DurableReceiverResult, DurableReceiverTermination, InputLimits,
-    MeshEvent, MeshRequest, content_digest, store::list_tasks_response,
+    MeshEvent, MeshRequest, content_digest,
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
+const V5_SCHEMA_VERSION: i64 = 5;
 const V4_SCHEMA_VERSION: i64 = 4;
 const V2_SCHEMA_VERSION: i64 = 2;
 const V3_SCHEMA_VERSION: i64 = 3;
@@ -39,6 +43,13 @@ pub const TRUSTED_SINGLE_TENANT_SCOPE: &str = "smesh-dev-only-tenant";
 pub const DEV_ONLY_ACCOUNT_ID: &str = "smesh-dev-only-account";
 const LEGACY_V4_SENTINEL_SCOPE: &str = "smesh:trusted-single-tenant:v1";
 const MAX_AUTHORIZATION_DECISIONS: usize = 65_536;
+const PAGE_TOKEN_VERSION: i64 = 1;
+const PAGE_TOKEN_KEY_GENERATION: i64 = 1;
+const MAX_PAGE_TOKEN_BYTES: usize = 4096;
+const SNAPSHOT_TTL_MILLIS: i64 = 5 * 60 * 1_000;
+const MAX_ACTIVE_SNAPSHOTS: i64 = 128;
+const MAX_SNAPSHOT_BYTES: i64 = 64 * 1024 * 1024;
+type PageTokenRow = (Vec<u8>, i64, String, String, i64, i64, i64, i64, i64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyTenantBinding {
@@ -673,6 +684,50 @@ const V5_SCHEMA_SQL: &str = "CREATE TABLE store_identity (
  CREATE TRIGGER cancellation_identity_update BEFORE UPDATE OF tenant_scope, dispatch_id, task_id ON cancellation_intents
  WHEN NEW.tenant_scope IS NOT OLD.tenant_scope OR NEW.dispatch_id IS NOT OLD.dispatch_id OR NEW.task_id IS NOT OLD.task_id
  BEGIN SELECT RAISE(ABORT, 'cancellation identity is immutable'); END;";
+const V6_SCHEMA_SQL: &str = "CREATE TABLE list_snapshots (
+ snapshot_id BLOB PRIMARY KEY CHECK(length(snapshot_id)=32),
+ scope_digest TEXT NOT NULL CHECK(length(CAST(scope_digest AS BLOB)) BETWEEN 1 AND 256),
+ query_digest TEXT NOT NULL CHECK(length(CAST(query_digest AS BLOB)) BETWEEN 1 AND 256),
+ total_size INTEGER NOT NULL CHECK(total_size >= 0),
+ page_size INTEGER NOT NULL CHECK(page_size BETWEEN 1 AND 100),
+ issued_at INTEGER NOT NULL,
+ expires_at INTEGER NOT NULL CHECK(expires_at > issued_at),
+ projection_version INTEGER NOT NULL CHECK(projection_version = 1),
+ frozen_bytes INTEGER NOT NULL CHECK(frozen_bytes >= 0),
+ metadata_digest BLOB NOT NULL CHECK(length(metadata_digest)=32)
+ );
+ CREATE INDEX list_snapshots_expiry ON list_snapshots(expires_at,snapshot_id);
+ CREATE TABLE list_snapshot_entries (
+ snapshot_id BLOB NOT NULL REFERENCES list_snapshots(snapshot_id) ON DELETE CASCADE,
+ ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+ task_id TEXT NOT NULL,
+ task_revision INTEGER NOT NULL CHECK(task_revision > 0),
+ task_digest TEXT NOT NULL CHECK(length(CAST(task_digest AS BLOB)) = 71),
+ task_json TEXT NOT NULL CHECK(json_valid(task_json)),
+ PRIMARY KEY(snapshot_id,ordinal),
+ UNIQUE(snapshot_id,task_id)
+ );
+ CREATE TABLE list_page_tokens (
+ token_hash BLOB PRIMARY KEY CHECK(length(token_hash)=32),
+ snapshot_id BLOB NOT NULL REFERENCES list_snapshots(snapshot_id) ON DELETE CASCADE,
+ next_position INTEGER NOT NULL CHECK(next_position > 0),
+ scope_digest TEXT NOT NULL CHECK(length(CAST(scope_digest AS BLOB)) BETWEEN 1 AND 256),
+ query_digest TEXT NOT NULL CHECK(length(CAST(query_digest AS BLOB)) BETWEEN 1 AND 256),
+ token_version INTEGER NOT NULL CHECK(token_version = 1),
+ key_generation INTEGER NOT NULL CHECK(key_generation = 1),
+ issued_at INTEGER NOT NULL,
+ expires_at INTEGER NOT NULL CHECK(expires_at > issued_at),
+ UNIQUE(snapshot_id,next_position)
+ );
+ CREATE INDEX list_page_tokens_snapshot ON list_page_tokens(snapshot_id,next_position);
+ CREATE INDEX tasks_tenant_time_v6 ON tasks(tenant_scope,status_timestamp DESC,task_id ASC);
+ CREATE INDEX tasks_tenant_state_time_v6 ON tasks(tenant_scope,state,status_timestamp DESC,task_id ASC);
+ CREATE INDEX tasks_tenant_context_time_v6 ON tasks(tenant_scope,context_id,status_timestamp DESC,task_id ASC);
+ CREATE INDEX tasks_tenant_context_state_time_v6 ON tasks(tenant_scope,context_id,state,status_timestamp DESC,task_id ASC);
+ CREATE INDEX tasks_tenant_owner_time_v6 ON tasks(tenant_scope,owner_account_id,status_timestamp DESC,task_id ASC);
+ CREATE INDEX tasks_tenant_owner_state_time_v6 ON tasks(tenant_scope,owner_account_id,state,status_timestamp DESC,task_id ASC);
+ CREATE INDEX tasks_tenant_owner_context_time_v6 ON tasks(tenant_scope,owner_account_id,context_id,status_timestamp DESC,task_id ASC);
+ CREATE INDEX tasks_tenant_owner_context_state_time_v6 ON tasks(tenant_scope,owner_account_id,context_id,state,status_timestamp DESC,task_id ASC);";
 
 #[derive(Debug, Error)]
 pub enum SqliteStoreError {
@@ -888,6 +943,7 @@ impl SqliteTaskStore {
         }
         let encoded = encode_task(&task)?;
         let state = state_key(&task)?;
+        let timestamp = task.status.timestamp.map(|value| value.to_rfc3339());
         let tenant = scope.tenant_scope.clone();
         let owner = scope.owner_account_id.clone();
         let max_tasks = self.max_tasks;
@@ -901,8 +957,8 @@ impl SqliteTaskStore {
             }
             tx.execute(
                 "INSERT INTO tasks(task_id,context_id,state,status_timestamp,revision,task_json,tenant_scope,owner_account_id)
-                 VALUES(?1,?2,?3,NULL,1,?4,?5,?6)",
-                params![task.id, task.context_id, state, encoded, tenant, owner],
+                 VALUES(?1,?2,?3,?4,1,?5,?6,?7)",
+                params![task.id, task.context_id, state, timestamp, encoded, tenant, owner],
             ).map_err(|_| A2AError::internal("scoped task insert failed"))?;
             tx.execute(
                 "INSERT INTO task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at)
@@ -1030,38 +1086,25 @@ impl SqliteTaskStore {
         let tenant = scope.tenant_scope.clone();
         let owner = scope.owner_account_id.clone();
         let own_only = scope.visibility == crate::authorization::VisibilityScope::Own;
-        let mut scoped_request = request.clone();
-        scoped_request.tenant = Some(cursor_scope_digest.to_owned());
+        let scoped_request = request.clone();
+        let scope_digest = cursor_scope_digest.to_owned();
         let cursor_key = *self.cursor_key;
+        // Durable page-token expiry is wall-clock based so it remains coherent across
+        // process restart. The injected audit clock remains audit evidence only.
+        let now = chrono::Utc::now().timestamp_millis();
+        let decision = audit.decided(AuthorizationDecisionEffect::Allow, "visible_set", None);
         self.run(move |connection| {
-            let tx = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|_| A2AError::internal("authorized list transaction failed"))?;
-            let mut statement = tx
-                .prepare(
-                    "SELECT task_json FROM tasks WHERE tenant_scope=?1
-                 AND (?2=0 OR owner_account_id=?3) ORDER BY created_order",
-                )
-                .map_err(|_| A2AError::internal("authorized task list failed"))?;
-            let encoded = statement
-                .query_map(params![tenant, i64::from(own_only), owner], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(|_| A2AError::internal("authorized task list failed"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| A2AError::internal("authorized task list failed"))?;
-            drop(statement);
-            let tasks = encoded
-                .iter()
-                .map(|value| decode_task(value))
-                .collect::<Result<Vec<_>, _>>()?;
-            let response = list_tasks_response(tasks, &scoped_request, &cursor_key)?;
-            let decision = audit.decided(AuthorizationDecisionEffect::Allow, "visible_set", None);
-            insert_authorization_audit(&tx, &decision)?;
-            ensure_authorization_capacity(&tx)?;
-            tx.commit()
-                .map_err(|_| A2AError::internal("authorized list commit failed"))?;
-            Ok(response)
+            frozen_list_transaction(
+                connection,
+                &tenant,
+                &owner,
+                own_only,
+                &scoped_request,
+                &scope_digest,
+                &cursor_key,
+                now,
+                Some(&decision),
+            )
         })
         .await
     }
@@ -4626,7 +4669,12 @@ fn open_database(
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
     if !matches!(
         version,
-        0 | 1 | V2_SCHEMA_VERSION | V3_SCHEMA_VERSION | V4_SCHEMA_VERSION | SCHEMA_VERSION
+        0 | 1
+            | V2_SCHEMA_VERSION
+            | V3_SCHEMA_VERSION
+            | V4_SCHEMA_VERSION
+            | V5_SCHEMA_VERSION
+            | SCHEMA_VERSION
     ) {
         return Err(SqliteStoreError::InvalidSchema);
     }
@@ -4685,22 +4733,30 @@ fn open_database(
             migrate_v1_to_v2(&mut connection, max_tasks)?;
             migrate_v2_to_v3(&mut connection, max_tasks)?;
             migrate_v3_to_v4(&mut connection, max_tasks)?;
-            migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)
+            migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
+            migrate_v5_to_v6(&mut connection)
         }
         V2_SCHEMA_VERSION => {
             migrate_v2_to_v3(&mut connection, max_tasks)?;
             migrate_v3_to_v4(&mut connection, max_tasks)?;
-            migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)
+            migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
+            migrate_v5_to_v6(&mut connection)
         }
         V3_SCHEMA_VERSION => {
             migrate_v3_to_v4(&mut connection, max_tasks)?;
-            migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)
+            migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
+            migrate_v5_to_v6(&mut connection)
         }
-        V4_SCHEMA_VERSION => migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding),
+        V4_SCHEMA_VERSION => {
+            migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
+            migrate_v5_to_v6(&mut connection)
+        }
+        V5_SCHEMA_VERSION => migrate_v5_to_v6(&mut connection),
         SCHEMA_VERSION => validate_schema(&connection),
         _ => Err(SqliteStoreError::InvalidSchema),
     }?;
     validate_foreign_keys(&connection)?;
+    validate_snapshot_chains(&connection, None)?;
     validate_persisted_records(&connection, max_tasks)?;
     validate_atomic_records(&connection)?;
     validate_receiver_records(&connection)?;
@@ -4729,6 +4785,219 @@ fn validate_foreign_keys(connection: &Connection) -> Result<(), SqliteStoreError
     } else {
         Err(SqliteStoreError::InvalidSchema)
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_snapshot_chains(
+    connection: &Connection,
+    only_snapshot: Option<&[u8]>,
+) -> Result<(), SqliteStoreError> {
+    let key: Vec<u8> = connection
+        .query_row(
+            "SELECT cursor_key FROM store_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let cursor_key: [u8; 32] = key
+        .try_into()
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut snapshots = connection.prepare(
+        "SELECT snapshot_id,scope_digest,query_digest,total_size,page_size,issued_at,expires_at,
+                projection_version,frozen_bytes,metadata_digest FROM list_snapshots
+         WHERE ?1 IS NULL OR snapshot_id=?1",
+    ).map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let rows = snapshots
+        .query_map([only_snapshot], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Vec<u8>>(9)?,
+            ))
+        })
+        .map_err(|_| SqliteStoreError::InvalidSchema)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    drop(snapshots);
+
+    for (
+        id,
+        scope,
+        query,
+        total,
+        page_size,
+        issued,
+        expires,
+        projection,
+        frozen_bytes,
+        stored_metadata,
+    ) in rows
+    {
+        if id.len() != 32
+            || scope.is_empty()
+            || query.is_empty()
+            || total <= page_size
+            || !(1..=100).contains(&page_size)
+            || issued < 0
+            || issued > now
+            || issued.checked_add(SNAPSHOT_TTL_MILLIS) != Some(expires)
+            || projection != 1
+            || frozen_bytes < 0
+            || stored_metadata.len() != 32
+        {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT ordinal,task_id,task_revision,task_digest,task_json
+             FROM list_snapshot_entries WHERE snapshot_id=?1 ORDER BY ordinal",
+            )
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        let entries = statement
+            .query_map([&id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|_| SqliteStoreError::InvalidSchema)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        if i64::try_from(entries.len()).ok() != Some(total) {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+        let mut bytes = 0_i64;
+        let mut seals = Vec::with_capacity(entries.len());
+        let mut previous: Option<Task> = None;
+        for (expected_ordinal, (ordinal, task_id, revision, digest, encoded)) in
+            entries.iter().enumerate()
+        {
+            if *ordinal != i64::try_from(expected_ordinal).unwrap_or(i64::MAX) || *revision <= 0 {
+                return Err(SqliteStoreError::InvalidSchema);
+            }
+            let task = decode_task(encoded).map_err(|_| SqliteStoreError::InvalidSchema)?;
+            if task.id != *task_id || *digest != content_digest(encoded.as_bytes()) {
+                return Err(SqliteStoreError::InvalidSchema);
+            }
+            if let Some(left) = previous.as_ref() {
+                let invalid = match (left.status.timestamp, task.status.timestamp) {
+                    (None, Some(_)) => true,
+                    (Some(left_time), Some(right_time)) => {
+                        left_time < right_time || (left_time == right_time && left.id > task.id)
+                    }
+                    (None, None) => left.id > task.id,
+                    (Some(_), None) => false,
+                };
+                if invalid {
+                    return Err(SqliteStoreError::InvalidSchema);
+                }
+            }
+            let revision_exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_events WHERE task_id=?1 AND task_revision=?2)",
+                params![task_id, revision], |row| row.get(0),
+            ).map_err(|_| SqliteStoreError::InvalidSchema)?;
+            if !revision_exists {
+                return Err(SqliteStoreError::InvalidSchema);
+            }
+            bytes = bytes
+                .checked_add(
+                    i64::try_from(encoded.len()).map_err(|_| SqliteStoreError::InvalidSchema)?,
+                )
+                .ok_or(SqliteStoreError::InvalidSchema)?;
+            seals.push((*ordinal, task_id.clone(), *revision, digest.clone()));
+            previous = Some(task);
+        }
+        if bytes != frozen_bytes {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+        let expected_metadata = snapshot_metadata_digest(
+            &cursor_key,
+            &id,
+            &scope,
+            &query,
+            total,
+            page_size,
+            issued,
+            expires,
+            projection,
+            frozen_bytes,
+            &seals,
+        );
+        if !bool::from(expected_metadata.ct_eq(stored_metadata.as_slice())) {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+        let mut token_statement = connection.prepare(
+            "SELECT next_position,token_hash,scope_digest,query_digest,token_version,key_generation,
+                    issued_at,expires_at FROM list_page_tokens WHERE snapshot_id=?1 ORDER BY next_position",
+        ).map_err(|_| SqliteStoreError::InvalidSchema)?;
+        let tokens = token_statement
+            .query_map([&id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .map_err(|_| SqliteStoreError::InvalidSchema)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        let expected_count = usize::try_from((total - 1) / page_size)
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        if tokens.len() != expected_count {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+        for (
+            index,
+            (
+                position,
+                stored_hash,
+                token_scope,
+                token_query,
+                version,
+                generation,
+                token_issued,
+                token_expires,
+            ),
+        ) in tokens.iter().enumerate()
+        {
+            let expected_position = i64::try_from(index + 1)
+                .ok()
+                .and_then(|step| step.checked_mul(page_size))
+                .ok_or(SqliteStoreError::InvalidSchema)?;
+            let (_, expected_hash) =
+                derive_page_token(&cursor_key, &id, expected_position, &expected_metadata)
+                    .map_err(|_| SqliteStoreError::InvalidSchema)?;
+            if *position != expected_position
+                || stored_hash.len() != 32
+                || !bool::from(expected_hash.ct_eq(stored_hash.as_slice()))
+                || token_scope != &scope
+                || token_query != &query
+                || *version != PAGE_TOKEN_VERSION
+                || *generation != PAGE_TOKEN_KEY_GENERATION
+                || *token_issued != issued
+                || *token_expires != expires
+            {
+                return Err(SqliteStoreError::InvalidSchema);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_persisted_records(
@@ -5565,7 +5834,7 @@ fn initialize_schema(
     }
     let cursor_key: [u8; 32] = rand::random();
     let receipt_key: [u8; 32] = rand::random();
-    let migration_hash = schema_v5_hash();
+    let migration_hash = schema_v6_hash();
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| SqliteStoreError::Initialization)?;
@@ -5599,6 +5868,9 @@ fn initialize_schema(
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
         .execute_batch(V5_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(V6_SCHEMA_SQL)
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction.execute(
         "INSERT INTO store_identity(singleton, tenant_scope, owner_account_id, policy_id, policy_revision, policy_digest)
@@ -5745,6 +6017,69 @@ const V5_OBJECTS: &[&str] = &[
     "stream_frames_identity_update",
     "cancellation_identity_update",
 ];
+const V6_OBJECTS: &[&str] = &[
+    "store_metadata",
+    "tasks",
+    "tasks_context_state_time",
+    "task_events",
+    "task_events_task_revision",
+    "idempotency_records",
+    "idempotency_records_task",
+    "outbox",
+    "outbox_due",
+    "outbox_task_state",
+    "outbox_message_identity",
+    "outbox_message_immutable",
+    "outbox_attempts",
+    "receiver_inbox",
+    "receiver_inbox_reclaim",
+    "receiver_frames",
+    "loopback_effects",
+    "stream_transcripts",
+    "stream_transcripts_task",
+    "stream_frames",
+    "cancellation_intents",
+    "cancellation_intents_task",
+    "store_identity",
+    "tasks_tenant_owner_time",
+    "authorization_decisions",
+    "authorization_decisions_tenant_time",
+    "authorization_decisions_actor_time",
+    "authorization_decisions_resource_time",
+    "tasks_ownership_immutable",
+    "authorization_decisions_no_update",
+    "authorization_decisions_no_delete",
+    "authorization_decisions_task_scope",
+    "task_events_tenant_match",
+    "idempotency_tenant_match",
+    "outbox_tenant_match",
+    "stream_transcripts_tenant_match",
+    "cancellation_tenant_match",
+    "task_events_identity_update",
+    "idempotency_identity_update",
+    "outbox_identity_update",
+    "outbox_attempts_identity_update",
+    "receiver_inbox_task_match",
+    "receiver_inbox_identity_update",
+    "receiver_frames_identity_update",
+    "loopback_effects_identity_update",
+    "stream_transcripts_identity_update",
+    "stream_frames_identity_update",
+    "cancellation_identity_update",
+    "list_snapshots",
+    "list_snapshots_expiry",
+    "list_snapshot_entries",
+    "list_page_tokens",
+    "list_page_tokens_snapshot",
+    "tasks_tenant_time_v6",
+    "tasks_tenant_state_time_v6",
+    "tasks_tenant_context_time_v6",
+    "tasks_tenant_context_state_time_v6",
+    "tasks_tenant_owner_time_v6",
+    "tasks_tenant_owner_state_time_v6",
+    "tasks_tenant_owner_context_time_v6",
+    "tasks_tenant_owner_context_state_time_v6",
+];
 const V3_OBJECTS: &[&str] = &[
     "store_metadata",
     "tasks",
@@ -5797,6 +6132,14 @@ fn schema_v5_hash() -> String {
     )
 }
 
+fn schema_v6_hash() -> String {
+    content_digest(
+        [schema_v5_hash().as_bytes(), V6_SCHEMA_SQL.as_bytes()]
+            .concat()
+            .as_slice(),
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn validate_schema_version(
     connection: &Connection,
@@ -5824,16 +6167,17 @@ fn validate_schema_version(
             .or_else(|| expected_schema_sql(RECEIVER_SCHEMA_SQL, object_name))
             .or_else(|| expected_schema_sql(OUTBOX_MESSAGE_BINDING_SQL, object_name))
             .or_else(|| expected_schema_sql(CANCELLATION_SCHEMA_SQL, object_name))
-            .or_else(|| expected_schema_sql(V5_SCHEMA_SQL, object_name));
+            .or_else(|| expected_schema_sql(V5_SCHEMA_SQL, object_name))
+            .or_else(|| expected_schema_sql(V6_SCHEMA_SQL, object_name));
         let actual = normalize_schema_sql(&actual);
-        let matches_expected = if version == SCHEMA_VERSION && *object_name == "tasks" {
+        let matches_expected = if version >= V5_SCHEMA_VERSION && *object_name == "tasks" {
             let base = expected_schema_sql(V2_SCHEMA_SQL, "tasks").expect("v2 tasks schema");
             let expected_tasks = format!(
                 "{},tenant_scopetextnotnulldefault'smesh-dev-only-tenant',owner_account_idtextnotnulldefault'smesh-dev-only-account')",
                 base.strip_suffix(')').expect("tasks schema closes")
             );
             actual == expected_tasks
-        } else if version == SCHEMA_VERSION && *object_name == "idempotency_records" {
+        } else if version >= V5_SCHEMA_VERSION && *object_name == "idempotency_records" {
             let base = expected_schema_sql(V2_SCHEMA_SQL, "idempotency_records")
                 .expect("v2 idempotency schema");
             let expected_idempotency = base.replace(
@@ -5841,7 +6185,7 @@ fn validate_schema_version(
                 ",digest_versionintegernotnulldefault2check(digest_versionin(1,2)),actor_account_idtext,causative_request_jsontext,invocation_kindtextcheck(invocation_kindin('unary','streaming')),primarykey(tenant_scope,message_id)",
             );
             actual == expected_idempotency
-        } else if version == SCHEMA_VERSION && *object_name == "outbox" {
+        } else if version >= V5_SCHEMA_VERSION && *object_name == "outbox" {
             let base = normalize_schema_sql(V4_OUTBOX_TABLE_SQL)
                 .replace("outbox_v4", "outbox")
                 .replace('"', "");
@@ -5888,7 +6232,8 @@ fn validate_schema_version(
         )
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
     let expected_hash = match version {
-        SCHEMA_VERSION => schema_v5_hash(),
+        SCHEMA_VERSION => schema_v6_hash(),
+        V5_SCHEMA_VERSION => schema_v5_hash(),
         V4_SCHEMA_VERSION => schema_v4_hash(),
         V3_SCHEMA_VERSION => schema_v3_hash(),
         _ => content_digest(schema.as_bytes()),
@@ -5898,7 +6243,7 @@ fn validate_schema_version(
         || metadata.2.len() != 32
         || metadata.3.len() != 32
         || actual_task_columns
-            != if version == SCHEMA_VERSION {
+            != if version >= V5_SCHEMA_VERSION {
                 "created_order:INTEGER:0:1,task_id:TEXT:1:0,context_id:TEXT:1:0,state:TEXT:1:0,status_timestamp:TEXT:0:0,revision:INTEGER:1:0,task_json:TEXT:1:0,tenant_scope:TEXT:1:0,owner_account_id:TEXT:1:0"
             } else {
                 "created_order:INTEGER:0:1,task_id:TEXT:1:0,context_id:TEXT:1:0,state:TEXT:1:0,status_timestamp:TEXT:0:0,revision:INTEGER:1:0,task_json:TEXT:1:0"
@@ -5921,7 +6266,7 @@ fn validate_schema_version(
 }
 
 fn validate_schema(connection: &Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
-    validate_schema_version(connection, SCHEMA_VERSION, V2_SCHEMA_SQL, V5_OBJECTS)
+    validate_schema_version(connection, SCHEMA_VERSION, V2_SCHEMA_SQL, V6_OBJECTS)
 }
 
 fn migrate_v1_to_v2(
@@ -6221,13 +6566,14 @@ fn migrate_v4_to_v5(
     transaction
         .execute(
             "UPDATE store_metadata SET schema_version=?1, migration_hash=?2 WHERE singleton=1",
-            params![SCHEMA_VERSION, schema_v5_hash()],
+            params![V5_SCHEMA_VERSION, schema_v5_hash()],
         )
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
-        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .pragma_update(None, "user_version", V5_SCHEMA_VERSION)
         .map_err(|_| SqliteStoreError::Initialization)?;
-    let validated = validate_schema(&transaction)?;
+    let validated =
+        validate_schema_version(&transaction, V5_SCHEMA_VERSION, V2_SCHEMA_SQL, V5_OBJECTS)?;
     if validated != keys {
         return Err(SqliteStoreError::InvalidSchema);
     }
@@ -6240,6 +6586,35 @@ fn migrate_v4_to_v5(
     validate_stream_records(&transaction)?;
     validate_cancellation_records(&transaction)?;
     validate_tenant_authorization_records(&transaction)?;
+    transaction
+        .commit()
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    Ok(validated)
+}
+
+fn migrate_v5_to_v6(connection: &mut Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_version(connection, V5_SCHEMA_VERSION, V2_SCHEMA_SQL, V5_OBJECTS)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(V6_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute(
+            "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
+            params![SCHEMA_VERSION, schema_v6_hash()],
+        )
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    validate_foreign_keys(&transaction)?;
+    let validated =
+        validate_schema_version(&transaction, SCHEMA_VERSION, V2_SCHEMA_SQL, V6_OBJECTS)?;
+    if validated != keys {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
     transaction
         .commit()
         .map_err(|_| SqliteStoreError::Initialization)?;
@@ -6630,6 +7005,507 @@ fn state_key(task: &Task) -> Result<String, A2AError> {
         .map_err(|_| A2AError::internal("failed to encode persistent task state"))
 }
 
+fn normalized_list_digest(request: &ListTasksRequest, page_size: i32) -> Result<String, A2AError> {
+    serde_json::to_vec(&serde_json::json!({
+        "contextId": request.context_id,
+        "status": request.status,
+        "pageSize": page_size,
+        "historyLength": request.history_length,
+        "statusTimestampAfter": request.status_timestamp_after,
+        "includeArtifacts": request.include_artifacts.unwrap_or(false),
+        "projectionVersion": 1,
+    }))
+    .map(|encoded| content_digest(&encoded))
+    .map_err(|_| A2AError::internal("failed to normalize task-list request"))
+}
+
+fn validate_snapshot_request(request: &ListTasksRequest) -> Result<(i32, String), A2AError> {
+    if request
+        .history_length
+        .is_some_and(|length| !(0..=100).contains(&length))
+    {
+        return Err(A2AError::invalid_params(
+            "historyLength must be between 0 and 100",
+        ));
+    }
+    let page_size = request.page_size.unwrap_or(50);
+    if !(1..=100).contains(&page_size) {
+        return Err(A2AError::invalid_params(
+            "pageSize must be between 1 and 100",
+        ));
+    }
+    normalized_list_digest(request, page_size).map(|digest| (page_size, digest))
+}
+
+fn project_snapshot_task(mut task: Task, request: &ListTasksRequest) -> Task {
+    if !request.include_artifacts.unwrap_or(false) {
+        task.artifacts = None;
+    }
+    let history_length = request
+        .history_length
+        .and_then(|value| usize::try_from(value).ok());
+    if history_length == Some(0) {
+        task.history = None;
+    } else if let (Some(limit), Some(history)) = (history_length, task.history.as_mut())
+        && history.len() > limit
+    {
+        history.drain(..history.len() - limit);
+    }
+    task
+}
+
+fn mac_field(mac: &mut Hmac<Sha256>, bytes: &[u8]) {
+    mac.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    mac.update(bytes);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn snapshot_metadata_digest(
+    key: &[u8; 32],
+    snapshot_id: &[u8],
+    scope_digest: &str,
+    query_digest: &str,
+    total_size: i64,
+    page_size: i64,
+    issued_at: i64,
+    expires_at: i64,
+    projection_version: i64,
+    frozen_bytes: i64,
+    entries: &[(i64, String, i64, String)],
+) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts a 32-byte key");
+    mac.update(b"smesh-list-snapshot-metadata-v1\0");
+    mac_field(&mut mac, snapshot_id);
+    mac_field(&mut mac, scope_digest.as_bytes());
+    mac_field(&mut mac, query_digest.as_bytes());
+    for value in [
+        total_size,
+        page_size,
+        issued_at,
+        expires_at,
+        projection_version,
+        frozen_bytes,
+        PAGE_TOKEN_VERSION,
+        PAGE_TOKEN_KEY_GENERATION,
+    ] {
+        mac.update(&value.to_be_bytes());
+    }
+    for (ordinal, task_id, revision, task_digest) in entries {
+        mac.update(&ordinal.to_be_bytes());
+        mac_field(&mut mac, task_id.as_bytes());
+        mac.update(&revision.to_be_bytes());
+        mac_field(&mut mac, task_digest.as_bytes());
+    }
+    mac.finalize().into_bytes().into()
+}
+
+fn derive_page_token(
+    key: &[u8; 32],
+    snapshot_id: &[u8],
+    position: i64,
+    metadata_digest: &[u8; 32],
+) -> Result<(String, [u8; 32]), A2AError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|_| A2AError::internal("page-token derivation failed"))?;
+    mac.update(b"smesh-list-tasks-page-v1\0");
+    mac.update(&PAGE_TOKEN_VERSION.to_be_bytes());
+    mac.update(&PAGE_TOKEN_KEY_GENERATION.to_be_bytes());
+    mac_field(&mut mac, snapshot_id);
+    mac.update(&position.to_be_bytes());
+    mac.update(metadata_digest);
+    let raw: [u8; 32] = mac.finalize().into_bytes().into();
+    let hash: [u8; 32] = Sha256::digest(raw).into();
+    Ok((URL_SAFE_NO_PAD.encode(raw), hash))
+}
+
+fn decode_page_token_hash(token: &str) -> Result<[u8; 32], A2AError> {
+    if token.len() > MAX_PAGE_TOKEN_BYTES {
+        return Err(A2AError::invalid_params("invalid pageToken"));
+    }
+    let raw = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
+    if raw.len() != 32 {
+        return Err(A2AError::invalid_params("invalid pageToken"));
+    }
+    Ok(Sha256::digest(raw).into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_page_token(
+    tx: &rusqlite::Transaction<'_>,
+    key: &[u8; 32],
+    snapshot_id: &[u8],
+    position: i64,
+    metadata_digest: &[u8; 32],
+    scope_digest: &str,
+    query_digest: &str,
+    issued_at: i64,
+    expires_at: i64,
+) -> Result<String, A2AError> {
+    let (token, hash) = derive_page_token(key, snapshot_id, position, metadata_digest)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO list_page_tokens(token_hash,snapshot_id,next_position,scope_digest,
+         query_digest,token_version,key_generation,issued_at,expires_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            hash.as_slice(),
+            snapshot_id,
+            position,
+            scope_digest,
+            query_digest,
+            PAGE_TOKEN_VERSION,
+            PAGE_TOKEN_KEY_GENERATION,
+            issued_at,
+            expires_at
+        ],
+    )
+    .map_err(|_| A2AError::internal("page-token persistence failed"))?;
+    Ok(token)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn frozen_list_transaction(
+    connection: &mut Connection,
+    tenant: &str,
+    owner: &str,
+    own_only: bool,
+    request: &ListTasksRequest,
+    scope_digest: &str,
+    cursor_key: &[u8; 32],
+    now: i64,
+    audit: Option<&AuthorizationAuditInput>,
+) -> Result<ListTasksResponse, A2AError> {
+    let (page_size, query_digest) = validate_snapshot_request(request)?;
+    // Expiry reclamation commits independently so an oversized admission cannot roll it back.
+    {
+        let gc = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| A2AError::internal("task snapshot cleanup failed"))?;
+        gc.execute("DELETE FROM list_snapshots WHERE expires_at<=?1", [now])
+            .map_err(|_| A2AError::internal("task snapshot cleanup failed"))?;
+        gc.commit()
+            .map_err(|_| A2AError::internal("task snapshot cleanup failed"))?;
+    }
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| A2AError::internal("task snapshot transaction failed"))?;
+
+    let response = if let Some(token) = request
+        .page_token
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        let hash = decode_page_token_hash(token)?;
+        let record: Option<PageTokenRow> = tx
+            .query_row(
+                "SELECT t.snapshot_id,t.next_position,t.scope_digest,t.query_digest,t.token_version,
+                        t.key_generation,t.issued_at,t.expires_at,s.total_size
+                 FROM list_page_tokens t JOIN list_snapshots s ON s.snapshot_id=t.snapshot_id
+                 WHERE t.token_hash=?1",
+                [hash.as_slice()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,
+                           row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+            )
+            .optional()
+            .map_err(|_| A2AError::internal("page-token lookup failed"))?;
+        let Some((
+            snapshot_id,
+            position,
+            stored_scope,
+            stored_query,
+            version,
+            generation,
+            issued_at,
+            expires_at,
+            total_size,
+        )) = record
+        else {
+            return Err(A2AError::invalid_params("invalid pageToken"));
+        };
+        validate_snapshot_chains(&tx, Some(&snapshot_id))
+            .map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
+        if stored_scope != scope_digest
+            || stored_query != query_digest
+            || version != PAGE_TOKEN_VERSION
+            || generation != PAGE_TOKEN_KEY_GENERATION
+            || issued_at < 0
+            || issued_at > now
+            || issued_at.checked_add(SNAPSHOT_TTL_MILLIS) != Some(expires_at)
+            || expires_at <= now
+            || position <= 0
+            || position >= total_size
+            || position % i64::from(page_size) != 0
+        {
+            return Err(A2AError::invalid_params("invalid pageToken"));
+        }
+        let snapshot_meta: (String, String, i64, i64, i64, i64, i64, Vec<u8>) = tx
+            .query_row(
+                "SELECT scope_digest,query_digest,page_size,issued_at,expires_at,projection_version,frozen_bytes,metadata_digest
+                 FROM list_snapshots WHERE snapshot_id=?1",
+                [&snapshot_id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+            )
+            .map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
+        if snapshot_meta.0 != stored_scope
+            || snapshot_meta.1 != stored_query
+            || snapshot_meta.2 != i64::from(page_size)
+            || snapshot_meta.3 != issued_at
+            || snapshot_meta.4 != expires_at
+            || snapshot_meta.5 != 1
+            || snapshot_meta.6 < 0
+            || snapshot_meta.7.len() != 32
+            || total_size <= i64::from(page_size)
+        {
+            return Err(A2AError::invalid_params("invalid pageToken"));
+        }
+        let entries = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT ordinal,task_id,task_digest,task_json FROM list_snapshot_entries WHERE snapshot_id=?1
+                          AND ordinal>=?2 ORDER BY ordinal LIMIT ?3",
+                )
+                .map_err(|_| A2AError::internal("task snapshot page failed"))?;
+            statement
+                .query_map(params![snapshot_id, position, page_size], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|_| A2AError::internal("task snapshot page failed"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| A2AError::internal("task snapshot page failed"))?
+        };
+        let expected_len = (total_size - position).min(i64::from(page_size));
+        if i64::try_from(entries.len()).unwrap_or(i64::MAX) != expected_len {
+            return Err(A2AError::invalid_params("invalid pageToken"));
+        }
+        let mut tasks = Vec::with_capacity(entries.len());
+        for (offset, (ordinal, task_id, digest, encoded)) in entries.iter().enumerate() {
+            if *ordinal != position.saturating_add(i64::try_from(offset).unwrap_or(i64::MAX)) {
+                return Err(A2AError::invalid_params("invalid pageToken"));
+            }
+            let task = decode_task(encoded)?;
+            if task.id != *task_id || *digest != content_digest(encoded.as_bytes()) {
+                return Err(A2AError::internal("persistent task snapshot is corrupt"));
+            }
+            tasks.push(task);
+        }
+        let end = position.saturating_add(i64::try_from(tasks.len()).unwrap_or(i64::MAX));
+        let next_page_token = if end < total_size {
+            let metadata_digest: [u8; 32] = snapshot_meta
+                .7
+                .as_slice()
+                .try_into()
+                .map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
+            derive_page_token(cursor_key, &snapshot_id, end, &metadata_digest)?.0
+        } else {
+            String::new()
+        };
+        ListTasksResponse {
+            tasks,
+            next_page_token,
+            page_size,
+            total_size: i32::try_from(total_size).unwrap_or(i32::MAX),
+        }
+    } else {
+        let index = match (
+            own_only,
+            request.context_id.is_some(),
+            request.status.is_some(),
+        ) {
+            (false, false, false) => "tasks_tenant_time_v6",
+            (false, false, true) => "tasks_tenant_state_time_v6",
+            (false, true, false) => "tasks_tenant_context_time_v6",
+            (false, true, true) => "tasks_tenant_context_state_time_v6",
+            (true, false, false) => "tasks_tenant_owner_time_v6",
+            (true, false, true) => "tasks_tenant_owner_state_time_v6",
+            (true, true, false) => "tasks_tenant_owner_context_time_v6",
+            (true, true, true) => "tasks_tenant_owner_context_state_time_v6",
+        };
+        let mut sql = format!(
+            "SELECT task_id,context_id,state,status_timestamp,revision,task_json FROM tasks INDEXED BY {index} WHERE tenant_scope=?1"
+        );
+        let mut values = vec![rusqlite::types::Value::Text(tenant.to_owned())];
+        if own_only {
+            write!(&mut sql, " AND owner_account_id=?{}", values.len() + 1)
+                .expect("writing to String cannot fail");
+            values.push(rusqlite::types::Value::Text(owner.to_owned()));
+        }
+        if let Some(context) = &request.context_id {
+            write!(&mut sql, " AND context_id=?{}", values.len() + 1)
+                .expect("writing to String cannot fail");
+            values.push(rusqlite::types::Value::Text(context.clone()));
+        }
+        if let Some(status) = &request.status {
+            write!(&mut sql, " AND state=?{}", values.len() + 1)
+                .expect("writing to String cannot fail");
+            values.push(rusqlite::types::Value::Text(
+                serde_json::to_string(status)
+                    .map_err(|_| A2AError::internal("task status encoding failed"))?,
+            ));
+        }
+        if let Some(after) = request.status_timestamp_after {
+            write!(&mut sql, " AND status_timestamp>=?{}", values.len() + 1)
+                .expect("writing to String cannot fail");
+            values.push(rusqlite::types::Value::Text(after.to_rfc3339()));
+        }
+        sql.push_str(" ORDER BY status_timestamp DESC,task_id ASC");
+        let rows = {
+            let mut statement = tx
+                .prepare(&sql)
+                .map_err(|_| A2AError::internal("indexed task snapshot query failed"))?;
+            statement
+                .query_map(rusqlite::params_from_iter(values), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })
+                .map_err(|_| A2AError::internal("indexed task snapshot query failed"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| A2AError::internal("indexed task snapshot query failed"))?
+        };
+        let mut frozen = Vec::with_capacity(rows.len());
+        let mut frozen_bytes = 0_i64;
+        for (task_id, context_id, state, timestamp, revision, encoded) in rows {
+            if !persisted_task_matches(
+                &task_id,
+                &context_id,
+                &state,
+                timestamp.as_deref(),
+                &encoded,
+            ) {
+                return Err(A2AError::internal("persistent task record is corrupt"));
+            }
+            let task = project_snapshot_task(decode_task(&encoded)?, request);
+            let projected = encode_task(&task)?;
+            frozen_bytes = frozen_bytes
+                .checked_add(
+                    i64::try_from(projected.len())
+                        .map_err(|_| A2AError::internal("task snapshot capacity reached"))?,
+                )
+                .ok_or_else(|| A2AError::internal("task snapshot capacity reached"))?;
+            frozen.push((task_id, revision, projected, task));
+        }
+        let total_size = i64::try_from(frozen.len()).unwrap_or(i64::MAX);
+        let first_len = usize::try_from(page_size)
+            .expect("validated page size")
+            .min(frozen.len());
+        let first_tasks = frozen[..first_len]
+            .iter()
+            .map(|entry| entry.3.clone())
+            .collect();
+        if total_size <= i64::from(page_size) {
+            ListTasksResponse {
+                tasks: first_tasks,
+                next_page_token: String::new(),
+                page_size,
+                total_size: i32::try_from(total_size).unwrap_or(i32::MAX),
+            }
+        } else {
+            let (active, bytes): (i64, i64) = tx
+                .query_row(
+                    "SELECT COUNT(*),COALESCE(SUM(frozen_bytes),0) FROM list_snapshots",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| A2AError::internal("task snapshot capacity check failed"))?;
+            if active >= MAX_ACTIVE_SNAPSHOTS
+                || bytes.saturating_add(frozen_bytes) > MAX_SNAPSHOT_BYTES
+            {
+                return Err(A2AError::internal("task snapshot capacity reached"));
+            }
+            let snapshot_id = rand::random::<[u8; 32]>();
+            let expires_at = now
+                .checked_add(SNAPSHOT_TTL_MILLIS)
+                .ok_or_else(|| A2AError::internal("task snapshot clock exhausted"))?;
+            let seals = frozen
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (task_id, revision, encoded, _))| {
+                    (
+                        i64::try_from(ordinal).unwrap_or(i64::MAX),
+                        task_id.clone(),
+                        *revision,
+                        content_digest(encoded.as_bytes()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let metadata_digest = snapshot_metadata_digest(
+                cursor_key,
+                &snapshot_id,
+                scope_digest,
+                &query_digest,
+                total_size,
+                i64::from(page_size),
+                now,
+                expires_at,
+                1,
+                frozen_bytes,
+                &seals,
+            );
+            tx.execute(
+                "INSERT INTO list_snapshots(snapshot_id,scope_digest,query_digest,total_size,page_size,
+                 issued_at,expires_at,projection_version,frozen_bytes,metadata_digest)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9)",
+                params![snapshot_id.as_slice(),scope_digest,query_digest,total_size,page_size,now,expires_at,frozen_bytes,metadata_digest.as_slice()],
+            )
+            .map_err(|_| A2AError::internal("task snapshot persistence failed"))?;
+            for (ordinal, (task_id, revision, encoded, _)) in frozen.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO list_snapshot_entries(snapshot_id,ordinal,task_id,task_revision,task_digest,task_json)
+                     VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![snapshot_id.as_slice(),i64::try_from(ordinal).unwrap_or(i64::MAX),task_id,revision,content_digest(encoded.as_bytes()),encoded],
+                )
+                .map_err(|_| A2AError::internal("task snapshot entry persistence failed"))?;
+            }
+            let mut next_page_token = String::new();
+            let step = i64::from(page_size);
+            let mut position = step;
+            while position < total_size {
+                let token = insert_page_token(
+                    &tx,
+                    cursor_key,
+                    &snapshot_id,
+                    position,
+                    &metadata_digest,
+                    scope_digest,
+                    &query_digest,
+                    now,
+                    expires_at,
+                )?;
+                if position == step {
+                    next_page_token = token;
+                }
+                position = position
+                    .checked_add(step)
+                    .ok_or_else(|| A2AError::internal("task snapshot position exhausted"))?;
+            }
+            ListTasksResponse {
+                tasks: first_tasks,
+                next_page_token,
+                page_size,
+                total_size: i32::try_from(total_size).unwrap_or(i32::MAX),
+            }
+        }
+    };
+    if let Some(audit) = audit {
+        insert_authorization_audit(&tx, audit)?;
+        ensure_authorization_capacity(&tx)?;
+    }
+    tx.commit()
+        .map_err(|_| A2AError::internal("task snapshot commit failed"))?;
+    Ok(response)
+}
+
 fn persisted_task_matches(
     task_id: &str,
     context_id: &str,
@@ -6862,40 +7738,23 @@ impl TaskStore for SqliteTaskStore {
     async fn list(&self, request: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
         let request = request.clone();
         let cursor_key = *self.cursor_key;
+        let tenant = self.default_scope.to_string();
+        let owner = self.default_account.to_string();
+        let scope_digest =
+            content_digest(format!("development-list-v1\0{tenant}\0{owner}").as_bytes());
+        let now = chrono::Utc::now().timestamp_millis();
         self.run(move |connection| {
-            let mut statement = connection
-                .prepare(
-                    "SELECT task_id, context_id, state, status_timestamp, task_json
-                     FROM tasks ORDER BY created_order ASC",
-                )
-                .map_err(|_| A2AError::internal("persistent task query failed"))?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })
-                .map_err(|_| A2AError::internal("persistent task query failed"))?;
-            let mut tasks = Vec::new();
-            for row in rows {
-                let (task_id, context_id, state, timestamp, encoded) =
-                    row.map_err(|_| A2AError::internal("persistent task query failed"))?;
-                if !persisted_task_matches(
-                    &task_id,
-                    &context_id,
-                    &state,
-                    timestamp.as_deref(),
-                    &encoded,
-                ) {
-                    return Err(A2AError::internal("persistent task record is corrupt"));
-                }
-                tasks.push(decode_task(&encoded)?);
-            }
-            list_tasks_response(tasks, &request, &cursor_key)
+            frozen_list_transaction(
+                connection,
+                &tenant,
+                &owner,
+                false,
+                &request,
+                &scope_digest,
+                &cursor_key,
+                now,
+                None,
+            )
         })
         .await
     }
@@ -6917,6 +7776,62 @@ mod tests {
             expected_schema_sql(reordered, "outbox_due"),
             Some("createindexoutbox_dueonoutbox(state)".to_owned())
         );
+    }
+
+    #[test]
+    fn list_query_families_use_exact_ordering_indexes_without_temp_sort() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
+        let families = [
+            ("tasks_tenant_time_v6", "tenant_scope=?1"),
+            ("tasks_tenant_state_time_v6", "tenant_scope=?1 AND state=?2"),
+            (
+                "tasks_tenant_context_time_v6",
+                "tenant_scope=?1 AND context_id=?2",
+            ),
+            (
+                "tasks_tenant_context_state_time_v6",
+                "tenant_scope=?1 AND context_id=?2 AND state=?3",
+            ),
+            (
+                "tasks_tenant_owner_time_v6",
+                "tenant_scope=?1 AND owner_account_id=?2",
+            ),
+            (
+                "tasks_tenant_owner_state_time_v6",
+                "tenant_scope=?1 AND owner_account_id=?2 AND state=?3",
+            ),
+            (
+                "tasks_tenant_owner_context_time_v6",
+                "tenant_scope=?1 AND owner_account_id=?2 AND context_id=?3",
+            ),
+            (
+                "tasks_tenant_owner_context_state_time_v6",
+                "tenant_scope=?1 AND owner_account_id=?2 AND context_id=?3 AND state=?4",
+            ),
+        ];
+        for (index, predicate) in families {
+            let sql = format!(
+                "EXPLAIN QUERY PLAN SELECT task_id,revision,task_json FROM tasks
+                 INDEXED BY {index} WHERE {predicate}
+                 ORDER BY status_timestamp DESC,task_id ASC LIMIT 11"
+            );
+            let mut statement = connection.prepare(&sql).unwrap();
+            let parameter_count = statement.parameter_count();
+            let values =
+                (0..parameter_count).map(|_| rusqlite::types::Value::Text("fixture".to_owned()));
+            let details = statement
+                .query_map(rusqlite::params_from_iter(values), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" ");
+            assert!(details.contains(index), "{sql}: {details}");
+            assert!(!details.contains("SCAN tasks"), "{sql}: {details}");
+            assert!(!details.contains("TEMP B-TREE"), "{sql}: {details}");
+        }
     }
 
     fn task(id: &str, state: a2a::TaskState) -> Task {

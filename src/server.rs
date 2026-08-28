@@ -22,20 +22,84 @@ use crate::{
 struct SharedTaskStore<S>(Arc<S>);
 
 /// A task store that declares whether completion receipts must use durable key material.
+#[async_trait]
 pub trait CompletionPolicyStore: TaskStore {
     /// Return the durable receipt key for persistent stores, or `None` for ephemeral stores.
     fn durable_receipt_key(&self) -> Option<[u8; 32]>;
+
+    /// Whether `list` is a repository-owned, self-authenticating snapshot source.
+    ///
+    /// Generic implementations remain false and are checked against current `get`
+    /// rows. The two repository stores return true because the guard calls their
+    /// `list` method directly and they authenticate frozen pages internally.
+    fn list_pages_are_self_authenticating(&self) -> bool {
+        false
+    }
+
+    /// Validate that a list page originated from this authoritative store.
+    ///
+    /// Generic stores use current-row validation. Stores that issue frozen snapshots may
+    /// override this hook for follow-up pages while retaining authoritative provenance.
+    async fn validate_list_page(
+        &self,
+        request: &ListTasksRequest,
+        response: &ListTasksResponse,
+    ) -> Result<(), A2AError> {
+        validate_current_list_page(self, request, response).await
+    }
 }
 
+async fn validate_current_list_page<S: TaskStore + Sync + ?Sized>(
+    store: &S,
+    request: &ListTasksRequest,
+    response: &ListTasksResponse,
+) -> Result<(), A2AError> {
+    for task in &response.tasks {
+        let mut expected = store
+            .get(&task.id)
+            .await?
+            .ok_or_else(|| A2AError::task_not_found(&task.id))?;
+        if !request.include_artifacts.unwrap_or(false) {
+            expected.artifacts = None;
+        }
+        if let Some(limit) = request
+            .history_length
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            if limit == 0 {
+                expected.history = None;
+            } else if let Some(history) = expected.history.as_mut()
+                && history.len() > limit
+            {
+                history.drain(..history.len() - limit);
+            }
+        }
+        if &expected != task {
+            return Err(A2AError::invalid_agent_response());
+        }
+    }
+    Ok(())
+}
+
+#[async_trait]
 impl CompletionPolicyStore for BoundedTaskStore {
     fn durable_receipt_key(&self) -> Option<[u8; 32]> {
         None
     }
+
+    fn list_pages_are_self_authenticating(&self) -> bool {
+        true
+    }
 }
 
+#[async_trait]
 impl CompletionPolicyStore for SqliteTaskStore {
     fn durable_receipt_key(&self) -> Option<[u8; 32]> {
         Some(self.completion_receipt_key())
+    }
+
+    fn list_pages_are_self_authenticating(&self) -> bool {
+        true
     }
 }
 
@@ -64,6 +128,28 @@ where
 
     async fn list(&self, request: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
         self.0.list(request).await
+    }
+}
+
+#[async_trait]
+impl<S> CompletionPolicyStore for SharedTaskStore<S>
+where
+    S: CompletionPolicyStore,
+{
+    fn durable_receipt_key(&self) -> Option<[u8; 32]> {
+        self.0.durable_receipt_key()
+    }
+
+    fn list_pages_are_self_authenticating(&self) -> bool {
+        self.0.list_pages_are_self_authenticating()
+    }
+
+    async fn validate_list_page(
+        &self,
+        request: &ListTasksRequest,
+        response: &ListTasksResponse,
+    ) -> Result<(), A2AError> {
+        self.0.validate_list_page(request, response).await
     }
 }
 
@@ -431,7 +517,7 @@ where
 fn build_router_with_store<D, S>(config: GatewayConfig, dispatcher: D, store: S) -> Router
 where
     D: MeshDispatcher,
-    S: TaskStore,
+    S: CompletionPolicyStore,
 {
     compose_router_with_policy_and_trace(
         config,
@@ -545,7 +631,7 @@ fn compose_router_with_policy_and_trace<D, S>(
 ) -> Router
 where
     D: MeshDispatcher,
-    S: TaskStore,
+    S: CompletionPolicyStore,
 {
     let max_body_bytes = config.max_body_bytes;
     let store = SharedTaskStore(Arc::new(store));
