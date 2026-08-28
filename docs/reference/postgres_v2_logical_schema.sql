@@ -20,6 +20,63 @@ CREATE INDEX tasks_tenant_owner_time
 CREATE INDEX tasks_tenant_context_state_time
     ON tasks(tenant_scope, context_id, state, status_timestamp, task_id);
 
+-- Schema-v6 frozen ListTasks query families. Keep separate tenant/owner shapes;
+-- production queries must not use an optional-owner OR predicate.
+CREATE INDEX tasks_tenant_time_v6
+    ON tasks(tenant_scope, status_timestamp DESC NULLS LAST, task_id ASC);
+CREATE INDEX tasks_tenant_state_time_v6
+    ON tasks(tenant_scope, state, status_timestamp DESC NULLS LAST, task_id ASC);
+CREATE INDEX tasks_tenant_context_time_v6
+    ON tasks(tenant_scope, context_id, status_timestamp DESC NULLS LAST, task_id ASC);
+CREATE INDEX tasks_tenant_context_state_time_v6
+    ON tasks(tenant_scope, context_id, state, status_timestamp DESC NULLS LAST, task_id ASC);
+CREATE INDEX tasks_tenant_owner_time_v6
+    ON tasks(tenant_scope, owner_account_id, status_timestamp DESC NULLS LAST, task_id ASC);
+CREATE INDEX tasks_tenant_owner_state_time_v6
+    ON tasks(tenant_scope, owner_account_id, state, status_timestamp DESC NULLS LAST, task_id ASC);
+CREATE INDEX tasks_tenant_owner_context_time_v6
+    ON tasks(tenant_scope, owner_account_id, context_id, status_timestamp DESC NULLS LAST, task_id ASC);
+CREATE INDEX tasks_tenant_owner_context_state_time_v6
+    ON tasks(tenant_scope, owner_account_id, context_id, state, status_timestamp DESC NULLS LAST, task_id ASC);
+
+CREATE TABLE list_snapshots (
+    snapshot_id BYTEA PRIMARY KEY CHECK (octet_length(snapshot_id) = 32),
+    scope_digest TEXT NOT NULL,
+    query_digest TEXT NOT NULL,
+    total_size BIGINT NOT NULL CHECK (total_size >= 0),
+    page_size INTEGER NOT NULL CHECK (page_size BETWEEN 1 AND 100),
+    issued_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL CHECK (expires_at > issued_at),
+    projection_version SMALLINT NOT NULL CHECK (projection_version = 1),
+    frozen_bytes BIGINT NOT NULL CHECK (frozen_bytes >= 0),
+    metadata_digest BYTEA NOT NULL CHECK (octet_length(metadata_digest) = 32)
+);
+CREATE INDEX list_snapshots_expiry ON list_snapshots(expires_at, snapshot_id);
+
+CREATE TABLE list_snapshot_entries (
+    snapshot_id BYTEA NOT NULL REFERENCES list_snapshots(snapshot_id) ON DELETE CASCADE,
+    ordinal BIGINT NOT NULL CHECK (ordinal >= 0),
+    task_id TEXT NOT NULL,
+    task_revision BIGINT NOT NULL CHECK (task_revision > 0),
+    task_digest TEXT NOT NULL CHECK (octet_length(task_digest) = 71),
+    task_json JSONB NOT NULL,
+    PRIMARY KEY (snapshot_id, ordinal),
+    UNIQUE (snapshot_id, task_id)
+);
+
+CREATE TABLE list_page_tokens (
+    token_hash BYTEA PRIMARY KEY CHECK (octet_length(token_hash) = 32),
+    snapshot_id BYTEA NOT NULL REFERENCES list_snapshots(snapshot_id) ON DELETE CASCADE,
+    next_position BIGINT NOT NULL CHECK (next_position > 0),
+    scope_digest TEXT NOT NULL,
+    query_digest TEXT NOT NULL,
+    token_version SMALLINT NOT NULL CHECK (token_version = 1),
+    key_generation SMALLINT NOT NULL CHECK (key_generation = 1),
+    issued_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL CHECK (expires_at > issued_at),
+    UNIQUE (snapshot_id, next_position)
+);
+
 CREATE TABLE task_events (
     event_order BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_scope TEXT NOT NULL,

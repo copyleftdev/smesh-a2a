@@ -4,9 +4,9 @@
 
 - Strict server-owned authorization policy keyed by verified `(issuer, subject)`, with stable account/tenant memberships, a closed role matrix, policy ID/revision/digest, and default deny.
 - Authentication middleware → authorization middleware → repository-owned durable handler production stack. Deferred REST SSE state owns its resolved authorization context and scoped datastore predicate.
-- SQLite schema v5 stores immutable task tenant/owner, v1/v2 digest versions, append-only authorization decisions, and tenant-match triggers.
+- SQLite schema v6 stores immutable task tenant/owner, v1/v2 digest versions, append-only authorization decisions, tenant-match triggers, and bounded frozen list snapshots.
 - Admission, continuation, cancellation, replay, get, list, subscription, transcript, task-event, and final-result datastore paths use tenant/account predicates. Role denials are durably audited before the protocol denial is returned.
-- Page tokens are MAC-protected and bind the normalized query plus tenant, account, visibility, policy ID, revision, and digest. All malformed, forged, query-reused, cross-account, cross-tenant, and stale-policy tokens report the generic `invalid pageToken` error.
+- Page tokens are opaque derived capabilities persisted only by hash and bind the normalized query plus tenant, account, visibility, policy ID, revision, and digest. All malformed, forged, query-reused, cross-account, cross-tenant, expired, and stale-policy tokens report the generic `invalid pageToken` error.
 - Authorized admission and cancellation include their allow audit in the protected mutation transaction; injected audit writes prove rollback.
 
 ## Repeatable focused evidence

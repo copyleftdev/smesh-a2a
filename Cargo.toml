@@ -35,6 +35,7 @@ tower = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+subtle = "2.6"
 smesh-core = { git = "https://github.com/copyleftdev/smesh-rust", rev = "ff0a88ba75590957e2e108f99e90135cd4b6de80" }
 smesh-runtime = { git = "https://github.com/copyleftdev/smesh-rust", rev = "ff0a88ba75590957e2e108f99e90135cd4b6de80" }
 thiserror = "2"

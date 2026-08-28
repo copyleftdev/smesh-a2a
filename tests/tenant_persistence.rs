@@ -1,10 +1,11 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use a2a::{Message, Part, Role, SendMessageRequest, Task, TaskState, TaskStatus};
+use a2a::{ListTasksRequest, Message, Part, Role, SendMessageRequest, Task, TaskState, TaskStatus};
 use smesh_a2a::{
     AdmissionOutcome, AuthorizationAuditInput, AuthorizationDecisionEffect, InputLimits,
     LegacyTenantBinding, OwnedTaskScope, SendMessageAdmission, SqliteTaskStore, VisibilityScope,
@@ -129,7 +130,7 @@ async fn admit_v2(store: &SqliteTaskStore, task_id: &str) {
 }
 
 #[tokio::test]
-async fn fresh_database_is_v5_with_immutable_ownership_and_append_only_audit() {
+async fn fresh_database_is_v6_with_immutable_ownership_and_append_only_audit() {
     let path = path("fresh");
     let store = SqliteTaskStore::open(&path, 8).await.unwrap();
     drop(store);
@@ -137,7 +138,7 @@ async fn fresh_database_is_v5_with_immutable_ownership_and_append_only_audit() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        5
+        6
     );
     let task_columns: Vec<String> = db
         .prepare("SELECT name FROM pragma_table_info('tasks') ORDER BY cid")
@@ -186,6 +187,184 @@ async fn scoped_reads_hide_foreign_and_audit_is_append_only() {
         db.execute("DELETE FROM authorization_decisions", [])
             .is_err()
     );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Explicit race fixtures avoid sharing production ordering logic.
+async fn authorized_list_persists_timestamps_and_freezes_filtered_canonical_pages() {
+    let path = path("authorized-timestamp-pages");
+    let store = SqliteTaskStore::open(&path, 8).await.unwrap();
+    let owner = OwnedTaskScope::new("tenant-a", "account-a", VisibilityScope::Own).unwrap();
+    let threshold = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:01Z")
+        .unwrap()
+        .to_utc();
+    for (id, timestamp) in [
+        ("a", Some("2026-01-01T00:00:02Z")),
+        ("雪", Some("2026-01-01T00:00:02Z")),
+        ("c", Some("2026-01-01T00:00:01Z")),
+        ("null", None),
+    ] {
+        let mut value = task(id);
+        value.status.timestamp = timestamp.map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .to_utc()
+        });
+        store
+            .create_scoped(
+                &owner,
+                value,
+                audit(
+                    AuthorizationDecisionEffect::Allow,
+                    &format!("sha256:create-{id}"),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    let request = ListTasksRequest {
+        context_id: Some("ctx".to_owned()),
+        status: Some(TaskState::Submitted),
+        page_size: Some(1),
+        page_token: None,
+        history_length: Some(0),
+        status_timestamp_after: Some(threshold),
+        include_artifacts: Some(false),
+        tenant: None,
+    };
+    let first_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let first_page = {
+        let store = store.clone();
+        let owner = owner.clone();
+        let request = request.clone();
+        let barrier = Arc::clone(&first_barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .list_authorized(
+                    &owner,
+                    &request,
+                    audit(AuthorizationDecisionEffect::Allow, "sha256:list-1"),
+                    "sha256:timestamp-scope",
+                )
+                .await
+        })
+    };
+    let first_insert = {
+        let store = store.clone();
+        let owner = owner.clone();
+        let barrier = Arc::clone(&first_barrier);
+        tokio::spawn(async move {
+            let mut inserted = task("new");
+            inserted.status.timestamp = Some(
+                chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:03Z")
+                    .unwrap()
+                    .to_utc(),
+            );
+            barrier.wait().await;
+            store
+                .create_scoped(
+                    &owner,
+                    inserted,
+                    audit(AuthorizationDecisionEffect::Allow, "sha256:create-new"),
+                )
+                .await
+        })
+    };
+    let first = tokio::time::timeout(Duration::from_secs(5), first_page)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), first_insert)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let expected: &[&str] = if first.tasks[0].id == "new" {
+        &["new", "a", "雪", "c"]
+    } else {
+        &["a", "雪", "c"]
+    };
+    assert_eq!(usize::try_from(first.total_size).unwrap(), expected.len());
+    let mut ids = vec![first.tasks[0].id.clone()];
+    let later_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let second_page = {
+        let store = store.clone();
+        let owner = owner.clone();
+        let request = ListTasksRequest {
+            page_token: Some(first.next_page_token),
+            ..request.clone()
+        };
+        let barrier = Arc::clone(&later_barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .list_authorized(
+                    &owner,
+                    &request,
+                    audit(AuthorizationDecisionEffect::Allow, "sha256:list-2"),
+                    "sha256:timestamp-scope",
+                )
+                .await
+        })
+    };
+    let later_insert = {
+        let store = store.clone();
+        let owner = owner.clone();
+        let barrier = Arc::clone(&later_barrier);
+        tokio::spawn(async move {
+            let mut inserted = task("later");
+            inserted.status.timestamp = Some(
+                chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:04Z")
+                    .unwrap()
+                    .to_utc(),
+            );
+            barrier.wait().await;
+            store
+                .create_scoped(
+                    &owner,
+                    inserted,
+                    audit(AuthorizationDecisionEffect::Allow, "sha256:create-later"),
+                )
+                .await
+        })
+    };
+    let second = tokio::time::timeout(Duration::from_secs(5), second_page)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), later_insert)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    ids.extend(second.tasks.into_iter().map(|task| task.id));
+    let mut token = second.next_page_token;
+    let mut page_number = 3;
+    while !token.is_empty() {
+        let page = store
+            .list_authorized(
+                &owner,
+                &ListTasksRequest {
+                    page_token: Some(token),
+                    ..request.clone()
+                },
+                audit(
+                    AuthorizationDecisionEffect::Allow,
+                    &format!("sha256:list-{page_number}"),
+                ),
+                "sha256:timestamp-scope",
+            )
+            .await
+            .unwrap();
+        ids.extend(page.tasks.into_iter().map(|task| task.id));
+        token = page.next_page_token;
+        page_number += 1;
+        assert!(page_number <= 6, "page token chain did not terminate");
+    }
+    assert_eq!(ids, expected);
 }
 
 #[tokio::test]
@@ -570,7 +749,7 @@ async fn audit_write_fault_rolls_back_authorized_admission_and_cancellation() {
 }
 
 #[tokio::test]
-async fn v5_schema_rejects_partial_index_mutation() {
+async fn v6_schema_rejects_partial_index_mutation() {
     let path = path("partial-index");
     let store = SqliteTaskStore::open(&path, 8).await.unwrap();
     store.shutdown_shared().await.unwrap();

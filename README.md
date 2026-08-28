@@ -136,12 +136,22 @@ retry ticker within bounded deadlines, then closes shared SQLite state and relea
 When OIDC or optional/required mTLS is enabled, `SMESH_A2A_AUTHORIZATION_POLICY_PATH` and
 `SMESH_A2A_SQLITE_PATH` are mandatory. The production binary accepts authentication and tenant
 authorization only as one combined boundary, validates policy before listener/SQLite/runtime/mesh
-acquisition where possible, and routes protected JSON-RPC/REST operations through the schema-v5
+acquisition where possible, and routes protected JSON-RPC/REST operations through the schema-v6
 tenant/owner predicates and durable authorization audit. A policy with authentication disabled,
 authentication without policy, or authenticated non-loopback/non-SQLite serving fails closed. See
 [`docs/TENANT_AUTHORIZATION_RUNBOOK.md`](docs/TENANT_AUTHORIZATION_RUNBOOK.md) and
 [`evidence/m2/issue-13.md`](evidence/m2/issue-13.md). Authentication-only library builders remain
 explicit development compatibility APIs and are not multitenant-safe.
+
+`ListTasks` uses expiring frozen-snapshot pagination. Page one fixes authorized membership,
+canonical order (`statusTimestamp` present first and descending, then task ID ascending), projected
+task JSON, and a constant `totalSize`; later inserts and updates cannot enter, disappear from, move,
+or alter that chain. Tokens are opaque HMAC-derived URL-safe capabilities (no tenant/account/filter/ID
+plaintext), are reusable for retry, and persist only as hashes in SQLite. Snapshot metadata is also
+HMAC-bound to every ordered frozen entry and the complete expected token-position chain. The
+in-memory bounded store
+provides the same snapshot semantics but intentionally invalidates tokens when the process/store is
+recreated.
 
 `SMESH_A2A_MODE=runtime` combined with `SMESH_A2A_SQLITE_PATH` fails closed before opening SQLite,
 starting the runtime/event drain or worker, or binding/joining the mesh. Durable runtime routing is not

@@ -1870,7 +1870,7 @@ fn canonical_digest_binds_semantics_not_caller_tenant_or_transport() {
 }
 
 #[tokio::test]
-async fn exact_v1_schema_migrates_to_v5_with_explicit_binding_preserving_keys_and_task() {
+async fn exact_v1_schema_migrates_to_v6_with_explicit_binding_preserving_keys_and_task() {
     const V1: &str = "CREATE TABLE store_metadata (
      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
      schema_version INTEGER NOT NULL,
@@ -1967,7 +1967,7 @@ async fn exact_v1_schema_migrates_to_v5_with_explicit_binding_preserving_keys_an
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     assert_eq!(event_kind, "migration_snapshot");
 }
 
@@ -3069,7 +3069,7 @@ async fn outbox_message_binding_is_immutable_and_startup_validates_dispatch_iden
 }
 
 #[tokio::test]
-async fn fresh_v5_outbox_structurally_requires_message_id() {
+async fn fresh_v6_outbox_structurally_requires_message_id() {
     let path = path();
     let store = open_store(&path, 8).await.unwrap();
     let connection = rusqlite::Connection::open(&path).unwrap();

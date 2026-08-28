@@ -11,7 +11,7 @@ Authenticated task serving is available only in durable SQLite loopback mode. Se
 
 The policy is loaded and completely validated before the listener and durable/runtime resources are acquired. The file is bounded to 256 KiB and rejects symlinks, unknown fields, duplicate identifiers/bindings, disabled or missing memberships, and human/service role confusion. Authentication-only generic handlers remain development-only because upstream spawned execution does not retain explicit tenant context.
 
-A fresh database is schema v5. Opening an existing v1-v4 database requires both:
+A fresh database is schema v6. Opening an existing v1-v5 database requires both:
 
 ```text
 SMESH_A2A_LEGACY_TENANT_ID=tenant-a
@@ -50,7 +50,8 @@ Verified bearer and mTLS presentations of the same exact issuer and subject reso
 - Continuation first performs an owner/tenant-scoped task query, then rechecks the same scope in its write transaction.
 - Get, list, cancellation, subscription snapshot, transcript polling, task-event polling, and final-result polling retain explicit scope after the request future returns.
 - Foreign and missing tasks return an opaque `TASK_NOT_FOUND`; REST/SSE adapters perform this preflight before opening an event stream.
-- List SQL applies tenant/owner scope before filtering and counting. Page tokens are MAC-protected and bind an opaque digest of tenant, account, policy revision/digest, and visibility.
+- List SQL uses separate tenant-wide and owner-only indexed query families and pushes context, status, and inclusive timestamp-after filters into SQLite. The first page atomically materializes a five-minute frozen projection: membership, order (`status_timestamp DESC NULLS LAST, task_id ASC`), revisions, history/artifacts, and `totalSize` cannot change while traversing it.
+- Page tokens are 32-byte URL-safe opaque HMAC-derived capabilities. SQLite stores only SHA-256 token hashes. A snapshot metadata HMAC binds the snapshot ID, normalized query/projection, authorization-scope digest, page/total/frozen-byte/version/key-generation/time fields, and every ordered frozen entry identity/digest/revision. Exact token positions are `P, 2P, ... < N`; startup and follow-up recompute the metadata and complete token chain from the durable cursor key in fixed time. Tokens are retry-safe, survive restart, and malformed, expired, cross-scope, cross-query, unknown, or corrupt tokens all return `invalid pageToken`. Expired snapshots are removed transactionally; active snapshot count and frozen UTF-8 bytes are capped.
 - Allow audits for admission, continuation, and cancellation commit in the mutation transaction. Read/list decisions are appended before data is returned. Denials use resource digests and never store a resolved foreign task ID.
 - Outbox envelopes use the claimed lease tenant. Receiver admission validates the envelope against the durable outbox row and never falls back to a caller/default tenant.
 
