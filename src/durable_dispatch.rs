@@ -482,56 +482,65 @@ impl DurableLoopbackEndpoint {
                 // This is the dispatch owner's finally-like cleanup. Every path,
                 // including owner cancellation and preparation failure, joins renewal.
                 let fenced = stop_receiver_renewal(&mut renewal, &lease).await;
-                let result = match (prepared, fenced) {
-                    (_, Err(error)) | (Err(error), Ok(_)) => Err(error),
-                    (Ok(_), Ok(_)) if owner_cancel.is_cancelled() => {
-                        Err(DurableDispatchError::OwnerCancelled)
-                    }
-                    (Ok(completion), Ok(fenced)) => match completion {
-                        ReceiverCompletion::Canceled(events) => {
-                            authority
-                                .complete_canceled_receive(&fenced, &events, clock.now())
-                                .await?;
-                            Ok(DurableDispatchOutcome::Delivered(events))
+                let result = async {
+                    match (prepared, fenced) {
+                        (_, Err(error)) | (Err(error), Ok(_)) => Err(error),
+                        (Ok(_), Ok(_)) if owner_cancel.is_cancelled() => {
+                            Err(DurableDispatchError::OwnerCancelled)
                         }
-                        ReceiverCompletion::Interrupted(outcome) => {
-                            authority
-                                .complete_loopback_outcome(&fenced, &outcome, clock.now())
-                                .await?;
-                            self.effects.fetch_add(1, Ordering::SeqCst);
-                            Ok(DurableDispatchOutcome::Interrupted(outcome))
-                        }
-                        ReceiverCompletion::Delivered(events) => {
-                            if let Err(error) = authority
-                                .complete_loopback_receive(&fenced, &events, clock.now())
-                                .await
-                            {
-                                if authority
-                                    .cancellation_requested(&envelope.dispatch_id)
-                                    .await?
+                        (Ok(completion), Ok(fenced)) => match completion {
+                            ReceiverCompletion::Canceled(events) => {
+                                authority
+                                    .complete_canceled_receive(&fenced, &events, clock.now())
+                                    .await?;
+                                Ok(DurableDispatchOutcome::Delivered(events))
+                            }
+                            ReceiverCompletion::Interrupted(outcome) => {
+                                authority
+                                    .complete_loopback_outcome(&fenced, &outcome, clock.now())
+                                    .await?;
+                                self.effects.fetch_add(1, Ordering::SeqCst);
+                                Ok(DurableDispatchOutcome::Interrupted(outcome))
+                            }
+                            ReceiverCompletion::Delivered(events) => {
+                                if let Err(error) = authority
+                                    .complete_loopback_receive(&fenced, &events, clock.now())
+                                    .await
                                 {
-                                    let canceled = canceled_events();
-                                    authority
-                                        .complete_canceled_receive(&fenced, &canceled, clock.now())
-                                        .await?;
-                                    return Ok(DurableDispatchOutcome::Delivered(canceled));
-                                }
-                                return Err(error.into());
-                            }
-                            self.effects.fetch_add(1, Ordering::SeqCst);
-                            if let Some((completed, publish_release)) = &self.completion_committed {
-                                completed.notify_one();
-                                tokio::select! {
-                                    () = owner_cancel.cancelled() => {
-                                        return Err(DurableDispatchError::OwnerCancelled);
+                                    if authority
+                                        .cancellation_requested(&envelope.dispatch_id)
+                                        .await?
+                                    {
+                                        let canceled = canceled_events();
+                                        authority
+                                            .complete_canceled_receive(
+                                                &fenced,
+                                                &canceled,
+                                                clock.now(),
+                                            )
+                                            .await?;
+                                        return Ok(DurableDispatchOutcome::Delivered(canceled));
                                     }
-                                    () = publish_release.notified() => {}
+                                    return Err(error.into());
                                 }
+                                self.effects.fetch_add(1, Ordering::SeqCst);
+                                if let Some((completed, publish_release)) =
+                                    &self.completion_committed
+                                {
+                                    completed.notify_one();
+                                    tokio::select! {
+                                        () = owner_cancel.cancelled() => {
+                                            return Err(DurableDispatchError::OwnerCancelled);
+                                        }
+                                        () = publish_release.notified() => {}
+                                    }
+                                }
+                                Ok(DurableDispatchOutcome::Delivered(events))
                             }
-                            Ok(DurableDispatchOutcome::Delivered(events))
-                        }
-                    },
-                };
+                        },
+                    }
+                }
+                .await;
                 if let Ok(mut active) = self.active.lock() {
                     active.remove(&envelope.dispatch_id);
                 }

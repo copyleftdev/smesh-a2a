@@ -445,6 +445,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.validate_tls_policy()?;
             Some(config)
         }
+        Some("sqlite") if sqlite_path.is_none() => {
+            return Err("SMESH_A2A_SQLITE_PATH is required when SMESH_A2A_DURABLE_BACKEND=sqlite".into());
+        }
         Some("sqlite") => return Err("SQLite backend requires only SMESH_A2A_SQLITE_PATH; PostgreSQL configuration must be absent".into()),
         Some("postgres") => return Err("PostgreSQL backend cannot be combined with SMESH_A2A_SQLITE_PATH".into()),
         Some(_) => return Err("SMESH_A2A_DURABLE_BACKEND must be sqlite or postgres".into()),
@@ -490,6 +493,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
             } else if let Some(postgres_config) = postgres_config {
+                if legacy_binding.is_some() {
+                    return Err(
+                        "legacy tenant binding is not supported by the PostgreSQL backend".into(),
+                    );
+                }
                 run_postgres_durable_loopback_gateway(
                     listener,
                     bind,

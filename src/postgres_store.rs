@@ -3911,7 +3911,7 @@ impl ReceiverAuthority for PostgresTaskStore {
             }
             let epoch = row.get::<_, i64>(3) + 1;
             let update=store.q("UPDATE __S__.receiver_inbox SET lease_epoch=$1,lease_owner=$2,lease_token=$3,lease_until=$4,updated_at=$5,sender_attempt_no=$6,sender_lease_token=$7 WHERE tenant_scope=$8 AND task_id=$9 AND dispatch_id=$10 AND payload_digest=$11 AND state='processing'");
-            tx.execute(
+            if tx.execute(
                 &update,
                 &[
                     &epoch,
@@ -3928,7 +3928,11 @@ impl ReceiverAuthority for PostgresTaskStore {
                 ],
             )
             .await
-            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("receiver reclaim failed")))?;
+            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("receiver reclaim failed")))?
+                != 1
+            {
+                return Err(A2AError::internal("receiver reclaim failed"));
+            }
             return Ok(ReceiverAdmission::Execute(ReceiverLease {
                 tenant_scope: envelope.tenant_scope,
                 task_id: envelope.request.task_id,
