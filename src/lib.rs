@@ -19,6 +19,7 @@ mod lifeline;
 mod loopback;
 mod outbox_driver;
 mod policy;
+mod postgres_store;
 mod runtime_config;
 mod runtime_trace;
 mod runtime_worker;
@@ -65,6 +66,9 @@ pub use policy::{
     PolicyCheckpoint, PolicyDecision, PolicyError, RatificationReceipt, RatificationStatement,
     TrustedAuthority, VersionedCompletionPolicy, artifact_set_digest, completion_evidence_digest,
     content_digest,
+};
+pub use postgres_store::{
+    PostgresStoreConfig, PostgresStoreError, PostgresTaskStore, PostgresTransactionTestFault,
 };
 pub use runtime_config::{GatewayMode, GatewayModeError, RuntimeModeConfig};
 pub use runtime_trace::{

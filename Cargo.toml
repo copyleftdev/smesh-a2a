@@ -31,6 +31,11 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 rustix = { version = "1", features = ["fs", "process"] }
 arc-swap = "1"
 tokio-rustls = "0.26"
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+tokio-postgres-rustls = "0.13"
+rustls-native-certs = "0.8"
+rustls = "0.23"
 tower = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
