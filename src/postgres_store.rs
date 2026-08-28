@@ -235,6 +235,9 @@ impl PostgresStoreConfig {
         })
     }
 
+    /// Enables plaintext loopback transport and deterministic caller time for the
+    /// integration fixture only. Production callers must never enable this escape hatch.
+    #[doc(hidden)]
     #[must_use]
     pub fn with_test_only_insecure_loopback(mut self, enabled: bool) -> Self {
         self.test_only_insecure_loopback = enabled;

@@ -222,7 +222,6 @@ pub async fn populate_pagination_and_active_cancellation(authority: Arc<dyn Dura
     assert!(
         matches!(authority.begin_receive(envelope, "parity-interrupted-replay", NOW + 8, 500).await.unwrap(), ReceiverAdmission::ReplayOutcome(replayed) if replayed == outcome)
     );
-    authority.shutdown().await.unwrap();
 }
 
 fn audit(

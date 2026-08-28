@@ -11,7 +11,10 @@ use smesh_a2a::{
     PostgresTransactionTestFault, ReceiverAuthority, SqliteTaskStore, TaskAdmission,
     VisibilityScope,
 };
-use support::authority_row_parity::{AUTHORITY_TABLES, dump_postgres, dump_sqlite};
+use support::authority_row_parity::{
+    AUTHORITY_TABLES, assert_postgres_tables_match, assert_sqlite_tables_match, dump_postgres,
+    dump_sqlite,
+};
 use support::durable_authority_conformance::{
     run_continuation_cancellation_conformance, run_durable_authority_command_conformance,
     run_durable_authority_command_conformance_open,
@@ -342,13 +345,17 @@ postgres_test!(
 
         let sqlite_authority: Arc<dyn DurableAuthority> = sqlite;
         run_durable_authority_command_conformance_open(sqlite_authority.clone()).await;
-        populate_pagination_and_active_cancellation(sqlite_authority).await;
+        populate_pagination_and_active_cancellation(sqlite_authority.clone()).await;
+        sqlite_authority.shutdown().await.unwrap();
         let postgres_authority: Arc<dyn DurableAuthority> = postgres;
         run_durable_authority_command_conformance_open(postgres_authority.clone()).await;
-        populate_pagination_and_active_cancellation(postgres_authority).await;
+        populate_pagination_and_active_cancellation(postgres_authority.clone()).await;
+        postgres_authority.shutdown().await.unwrap();
 
+        assert_sqlite_tables_match(&sqlite_path);
         let sqlite_dump = dump_sqlite(&sqlite_path);
         let (client, driver) = admin_client(&superuser_url()).await;
+        assert_postgres_tables_match(&client, pg_config.schema_name()).await;
         let postgres_dump = dump_postgres(&client, pg_config.schema_name()).await;
         assert_eq!(sqlite_dump.counts.len(), AUTHORITY_TABLES.len());
         assert_eq!(postgres_dump.counts.len(), AUTHORITY_TABLES.len());
@@ -505,14 +512,15 @@ postgres_test!(startup_rejects_runtime_membership_in_migrator, {
         .batch_execute(&format!("GRANT {migrator} TO {runtime}"))
         .await
         .unwrap();
-    assert!(matches!(
-        PostgresTaskStore::open(config).await,
-        Err(smesh_a2a::PostgresStoreError::InvalidSchema)
-    ));
+    let result = PostgresTaskStore::open(config).await;
     client
         .batch_execute(&format!("REVOKE {migrator} FROM {runtime}"))
         .await
         .unwrap();
+    assert!(matches!(
+        result,
+        Err(smesh_a2a::PostgresStoreError::InvalidSchema)
+    ));
     drop(client);
     driver.abort();
 });
@@ -890,7 +898,8 @@ postgres_test!(populated_external_query_families_use_bounded_index_plans, {
     let store = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
     let authority: Arc<dyn DurableAuthority> = store;
     run_durable_authority_command_conformance_open(authority.clone()).await;
-    populate_pagination_and_active_cancellation(authority).await;
+    populate_pagination_and_active_cancellation(authority.clone()).await;
+    authority.shutdown().await.unwrap();
     let (client, driver) = admin_client(&superuser_url()).await;
     client
         .batch_execute(&format!(

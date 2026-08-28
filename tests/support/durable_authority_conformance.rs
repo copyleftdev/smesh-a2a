@@ -576,6 +576,15 @@ struct FakeState {
 
 /// Exercise the successful interrupted continuation followed by immediate cancellation.
 pub async fn run_continuation_cancellation_conformance(authority: Arc<dyn DurableAuthority>) {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run_continuation_cancellation_conformance_inner(authority),
+    )
+    .await
+    .expect("continuation cancellation conformance watchdog");
+}
+
+async fn run_continuation_cancellation_conformance_inner(authority: Arc<dyn DurableAuthority>) {
     let scope = OwnedTaskScope::new(TENANT, OWNER, VisibilityScope::Own).unwrap();
     let AdmissionOutcome::Admitted(_) = authority
         .authorize_and_admit(

@@ -1,6 +1,9 @@
 #![allow(dead_code, clippy::too_many_lines)]
 
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use rusqlite::{Connection, types::ValueRef};
 use serde_json::{Map, Value};
@@ -25,6 +28,48 @@ pub const AUTHORITY_TABLES: [&str; 17] = [
     "list_snapshot_entries",
     "list_page_tokens",
 ];
+
+fn expected_tables() -> BTreeSet<String> {
+    AUTHORITY_TABLES
+        .iter()
+        .map(|table| (*table).to_owned())
+        .collect()
+}
+
+pub fn assert_sqlite_tables_match(path: &Path) {
+    let connection = Connection::open(path).expect("open SQLite parity database");
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .expect("prepare SQLite authority table inventory");
+    let actual = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query SQLite authority table inventory")
+        .collect::<Result<BTreeSet<_>, _>>()
+        .expect("read SQLite authority table inventory");
+    assert_eq!(
+        actual,
+        expected_tables(),
+        "SQLite authority table set drifted"
+    );
+}
+
+pub async fn assert_postgres_tables_match(client: &Client, schema: &str) {
+    let actual = client
+        .query(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema=$1 AND table_type='BASE TABLE' AND table_name<>'schema_migrations'",
+            &[&schema],
+        )
+        .await
+        .expect("query PostgreSQL authority table inventory")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual,
+        expected_tables(),
+        "PostgreSQL authority table set drifted"
+    );
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalAuthorityDump {
