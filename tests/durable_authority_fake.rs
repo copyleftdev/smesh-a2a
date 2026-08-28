@@ -13,7 +13,8 @@ use smesh_a2a::{
 
 mod support;
 use support::durable_authority_conformance::{
-    RecordingAuthority, run_durable_authority_fixture_conformance,
+    RecordingAuthority, run_continuation_cancellation_conformance,
+    run_durable_authority_fixture_conformance,
 };
 
 #[test]
@@ -189,4 +190,14 @@ async fn sqlite_runs_the_same_backend_neutral_command_conformance() {
         |directory| async move { drop(directory) },
     )
     .await;
+}
+
+#[tokio::test]
+async fn sqlite_runs_continuation_and_cancellation_conformance() {
+    let directory = SecureTempDir::new();
+    let store = SqliteTaskStore::open(directory.path().join("continuation.sqlite3"), 8)
+        .await
+        .unwrap();
+    let authority: std::sync::Arc<dyn smesh_a2a::DurableAuthority> = std::sync::Arc::new(store);
+    run_continuation_cancellation_conformance(authority).await;
 }

@@ -70,3 +70,46 @@ jobs:
         run: |
           cargo run --quiet --bin lifeline-trace -- /tmp/lifeline.trace.jsonl
           cmp /tmp/lifeline.trace.jsonl demo/lifeline.trace.jsonl
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: smesh-ci-postgres
+          POSTGRES_DB: smesh_test
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SMESH_TEST_POSTGRES_SUPERUSER_URL: postgresql://postgres:smesh-ci-postgres@127.0.0.1:55432/smesh_test
+      SMESH_TEST_POSTGRES_ADMIN_URL: postgresql://smesh_migrator:smesh-ci-migrator@127.0.0.1:55432/smesh_test
+      SMESH_TEST_POSTGRES_RUNTIME_URL: postgresql://smesh_test_runtime:smesh-ci-runtime@127.0.0.1:55432/smesh_test
+      SMESH_POSTGRES_TEST_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify PostgreSQL readiness
+        env:
+          PGPASSWORD: smesh-ci-postgres
+        run: |
+          pg_isready -h 127.0.0.1 -p 55432 -U postgres -d smesh_test
+          psql -h 127.0.0.1 -p 55432 -U postgres -d smesh_test -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE smesh_migrator LOGIN PASSWORD 'smesh-ci-migrator' NOSUPERUSER NOBYPASSRLS NOCREATEDB CREATEROLE NOREPLICATION NOINHERIT;
+          CREATE ROLE smesh_test_runtime LOGIN PASSWORD 'smesh-ci-runtime' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT;
+          GRANT CREATE ON DATABASE smesh_test TO smesh_migrator;
+          SQL
+          PGPASSWORD=smesh-ci-migrator psql -h 127.0.0.1 -p 55432 -U smesh_migrator -d smesh_test -c 'SELECT current_user'
+          PGPASSWORD=smesh-ci-runtime psql -h 127.0.0.1 -p 55432 -U smesh_test_runtime -d smesh_test -c 'SELECT current_user'
+      - name: PostgreSQL schema-v6 conformance
+        run: timeout --signal=TERM --kill-after=15s 15m cargo test --locked --test postgres_store -- --test-threads=1

@@ -196,6 +196,18 @@ fn receiver_lease() -> ReceiverLease {
 /// Runs the backend-neutral command contract directly against an authority.
 /// Every await is watchdog-bounded; the function owns and verifies shutdown.
 pub async fn run_durable_authority_command_conformance(authority: Arc<dyn DurableAuthority>) {
+    run_durable_authority_command_conformance_inner(authority, true).await;
+}
+
+/// Runs the command contract while leaving the authority open for parity extensions.
+pub async fn run_durable_authority_command_conformance_open(authority: Arc<dyn DurableAuthority>) {
+    run_durable_authority_command_conformance_inner(authority, false).await;
+}
+
+async fn run_durable_authority_command_conformance_inner(
+    authority: Arc<dyn DurableAuthority>,
+    shutdown: bool,
+) {
     tokio::time::timeout(Duration::from_secs(5), async move {
         assert!(authority.completion_receipt_key().is_some());
         let digest = authority
@@ -519,8 +531,10 @@ pub async fn run_durable_authority_command_conformance(authority: Arc<dyn Durabl
         assert_eq!(counts.idempotency_records, 1);
         assert_eq!(counts.outbox, 1);
         assert_eq!(authority.durable_effect_count().await.unwrap(), 1);
-        authority.shutdown().await.unwrap();
-        authority.close_owned_sync();
+        if shutdown {
+            authority.shutdown().await.unwrap();
+            authority.close_owned_sync();
+        }
     })
     .await
     .expect("durable authority conformance watchdog");
@@ -558,6 +572,130 @@ struct FakeState {
     admitted: bool,
     delivered: bool,
     audit_failure_seen: bool,
+}
+
+/// Exercise the successful interrupted continuation followed by immediate cancellation.
+pub async fn run_continuation_cancellation_conformance(authority: Arc<dyn DurableAuthority>) {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run_continuation_cancellation_conformance_inner(authority),
+    )
+    .await
+    .expect("continuation cancellation conformance watchdog");
+}
+
+async fn run_continuation_cancellation_conformance_inner(authority: Arc<dyn DurableAuthority>) {
+    let scope = OwnedTaskScope::new(TENANT, OWNER, VisibilityScope::Own).unwrap();
+    let AdmissionOutcome::Admitted(_) = authority
+        .authorize_and_admit(
+            &scope,
+            command("interrupt-me"),
+            audit("cc-admit", "TaskCreate", AuthorizationDecisionEffect::Allow),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("initial admission must win")
+    };
+    let lease = authority
+        .claim_outbox("cc-worker", NOW, 500)
+        .await
+        .unwrap()
+        .unwrap();
+    let admitted = authority.task_for_outbox(&lease).await.unwrap().unwrap();
+    let payload = serde_json::to_vec(&lease.request).unwrap();
+    let envelope = DurableDispatchEnvelope {
+        tenant_scope: TENANT.into(),
+        dispatch_id: lease.dispatch_id.clone(),
+        payload_digest: content_digest(&payload),
+        request: lease.request.clone(),
+    };
+    let ReceiverAdmission::Execute(receiver) = authority
+        .begin_receive(envelope, "cc-receiver", NOW, 700)
+        .await
+        .unwrap()
+    else {
+        panic!("receiver must execute")
+    };
+    authority
+        .complete_loopback_outcome(
+            &receiver,
+            &DurableReceiverResult {
+                events: vec![MeshEvent::Progress("need input".into())],
+                termination: DurableReceiverTermination::InputRequired {
+                    message: "provide input".into(),
+                },
+            },
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    let mut interrupted = admitted.clone();
+    interrupted.status = TaskStatus {
+        state: TaskState::InputRequired,
+        message: None,
+        timestamp: chrono::DateTime::from_timestamp_millis(NOW + 2),
+    };
+    let terminal = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        task_id: TASK_ID.into(),
+        context_id: interrupted.context_id.clone(),
+        status: interrupted.status.clone(),
+        metadata: None,
+    });
+    assert_eq!(
+        authority
+            .commit_delivery(
+                &lease,
+                interrupted.clone(),
+                SendMessageResponse::Task(interrupted.clone()),
+                &[StreamResponse::Task(admitted), terminal],
+                NOW + 2
+            )
+            .await
+            .unwrap(),
+        TransitionOutcome::Applied
+    );
+    let mut message = Message::new(Role::User, vec![Part::text("continued input")]);
+    message.message_id = "continuation-conformance-success".into();
+    message.task_id = Some(TASK_ID.into());
+    message.context_id = Some(interrupted.context_id.clone());
+    let continuation = SendMessageAdmission {
+        request: SendMessageRequest {
+            message,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        },
+        streaming: true,
+        task: interrupted.clone(),
+        original_result: SendMessageResponse::Task(interrupted),
+        input_limits: InputLimits::default(),
+        now: NOW + 3,
+        max_attempts: 4,
+    };
+    let AdmissionOutcome::Admitted(record) = authority
+        .authorize_and_continue(
+            &scope,
+            continuation.clone(),
+            audit(
+                "cc-continue",
+                "TaskContinue",
+                AuthorizationDecisionEffect::Allow,
+            ),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("continuation must admit")
+    };
+    assert_eq!(record.revision, 3);
+    assert!(
+        matches!(authority.authorize_and_continue(&scope,continuation,audit("cc-replay","TaskContinue",AuthorizationDecisionEffect::Allow)).await.unwrap(),AdmissionOutcome::Replay(SendMessageResponse::Task(task)) if task.status.state==TaskState::Working)
+    );
+    assert!(
+        matches!(authority.cancel_authorized(&scope,TASK_ID,NOW+4,audit("cc-cancel","TaskCancel",AuthorizationDecisionEffect::Allow)).await.unwrap(),CancellationOutcome::Canceled(task) if task.status.state==TaskState::Canceled)
+    );
+    authority.shutdown().await.unwrap();
 }
 
 /// Fully recording deterministic backend used to prove the harness itself.
