@@ -133,6 +133,16 @@ world permissions (normally mode `0700`). The database and SQLite sidecars are h
 On SIGINT, durable loopback stops HTTP admission gracefully, joins its outbox driver and real-time
 retry ticker within bounded deadlines, then closes shared SQLite state and releases the lock.
 
+When OIDC or optional/required mTLS is enabled, `SMESH_A2A_AUTHORIZATION_POLICY_PATH` and
+`SMESH_A2A_SQLITE_PATH` are mandatory. The production binary accepts authentication and tenant
+authorization only as one combined boundary, validates policy before listener/SQLite/runtime/mesh
+acquisition where possible, and routes protected JSON-RPC/REST operations through the schema-v5
+tenant/owner predicates and durable authorization audit. A policy with authentication disabled,
+authentication without policy, or authenticated non-loopback/non-SQLite serving fails closed. See
+[`docs/TENANT_AUTHORIZATION_RUNBOOK.md`](docs/TENANT_AUTHORIZATION_RUNBOOK.md) and
+[`evidence/m2/issue-13.md`](evidence/m2/issue-13.md). Authentication-only library builders remain
+explicit development compatibility APIs and are not multitenant-safe.
+
 `SMESH_A2A_MODE=runtime` combined with `SMESH_A2A_SQLITE_PATH` fails closed before opening SQLite,
 starting the runtime/event drain or worker, or binding/joining the mesh. Durable runtime routing is not
 supported until a repository-owned runtime effect-idempotency adapter can durably deduplicate stable

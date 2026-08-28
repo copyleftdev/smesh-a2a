@@ -13,8 +13,9 @@ use a2a::{
 };
 use smesh_a2a::{
     AdmissionOutcome, AttemptDisposition, CancellationOutcome, DurableDispatchEnvelope,
-    InputLimits, MeshEvent, MeshRequest, ReceiverAdmission, SendMessageAdmission, SqliteTaskStore,
-    TRUSTED_SINGLE_TENANT_SCOPE, TransitionOutcome, canonical_send_message_digest, content_digest,
+    InputLimits, LegacyTenantBinding, MeshEvent, MeshRequest, ReceiverAdmission,
+    SendMessageAdmission, SqliteTaskStore, TransitionOutcome, canonical_send_message_digest,
+    content_digest,
 };
 
 const WATCHDOG: Duration = Duration::from_secs(5);
@@ -27,6 +28,25 @@ async fn open_store(
     tokio::time::timeout(WATCHDOG, SqliteTaskStore::open(&path, max_tasks))
         .await
         .unwrap_or_else(|_| panic!("timed out opening SQLite task store at {}", path.display()))
+}
+
+async fn open_store_with_binding(
+    path: impl AsRef<Path>,
+    max_tasks: usize,
+) -> Result<SqliteTaskStore, smesh_a2a::SqliteStoreError> {
+    SqliteTaskStore::open_with_legacy_binding(
+        path,
+        max_tasks,
+        LegacyTenantBinding::new(
+            "migrated-tenant",
+            "migrated-account",
+            "migration-policy",
+            1,
+            content_digest(b"migration-policy"),
+        )
+        .unwrap(),
+    )
+    .await
 }
 
 async fn shutdown_store(store: &SqliteTaskStore) -> Result<(), a2a::A2AError> {
@@ -212,17 +232,6 @@ fn digest(label: &str) -> String {
     content_digest(label.as_bytes())
 }
 
-fn receiver_envelope() -> DurableDispatchEnvelope {
-    let request = request("receiver-crash-task");
-    let payload = serde_json::to_vec(&request).unwrap();
-    DurableDispatchEnvelope {
-        tenant_scope: TRUSTED_SINGLE_TENANT_SCOPE.to_owned(),
-        dispatch_id: digest("receiver-crash-dispatch"),
-        payload_digest: content_digest(&payload),
-        request,
-    }
-}
-
 fn receiver_events() -> Vec<MeshEvent> {
     vec![MeshEvent::Completed {
         summary: "receiver completed".to_owned(),
@@ -232,11 +241,39 @@ fn receiver_events() -> Vec<MeshEvent> {
 fn envelope_for_lease(lease: &smesh_a2a::OutboxLease) -> DurableDispatchEnvelope {
     let payload = serde_json::to_vec(&lease.request).unwrap();
     DurableDispatchEnvelope {
-        tenant_scope: TRUSTED_SINGLE_TENANT_SCOPE.to_owned(),
+        tenant_scope: lease.tenant_scope.clone(),
         dispatch_id: lease.dispatch_id.clone(),
         payload_digest: content_digest(&payload),
         request: lease.request.clone(),
     }
+}
+
+async fn admit_and_claim_receiver_fixture(
+    store: &SqliteTaskStore,
+    sender: &str,
+    now: i64,
+    lease_ms: i64,
+) -> smesh_a2a::OutboxLease {
+    let submitted = task("receiver-crash-task", TaskState::Submitted);
+    assert!(matches!(
+        store
+            .admit_fixture(
+                submitted.clone(),
+                "receiver-crash",
+                SendMessageResponse::Task(submitted),
+                request("receiver-crash-task"),
+                now,
+                3,
+            )
+            .await
+            .unwrap(),
+        AdmissionOutcome::Admitted(_)
+    ));
+    store
+        .claim_outbox(sender, now, lease_ms)
+        .await
+        .unwrap()
+        .expect("receiver fixture must have a durable sender lease")
 }
 
 #[tokio::test]
@@ -645,6 +682,7 @@ async fn simultaneous_claimers_produce_exactly_one_lease_and_attempt() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn expired_and_forged_outbox_leases_are_rejected_by_durable_fence() {
     let path = path();
     let store = open_store(&path, 8).await.unwrap();
@@ -703,6 +741,36 @@ async fn expired_and_forged_outbox_leases_are_rejected_by_durable_fence() {
             .unwrap(),
         TransitionOutcome::Stale
     );
+    let mut forged_tenant = reclaimed.clone();
+    forged_tenant.tenant_scope = "tenant-b".to_owned();
+    assert_eq!(
+        store
+            .finish_outbox_attempt(
+                &forged_tenant,
+                AttemptDisposition::Permanent {
+                    error: "forged tenant".to_owned(),
+                },
+                152,
+            )
+            .await
+            .unwrap(),
+        TransitionOutcome::Stale
+    );
+    let mut forged_dispatch = reclaimed.clone();
+    forged_dispatch.dispatch_id = "forged-dispatch".to_owned();
+    assert_eq!(
+        store
+            .finish_outbox_attempt(
+                &forged_dispatch,
+                AttemptDisposition::Permanent {
+                    error: "forged dispatch".to_owned(),
+                },
+                152,
+            )
+            .await
+            .unwrap(),
+        TransitionOutcome::Stale
+    );
     let victim = task("fence-victim", TaskState::Submitted);
     store
         .admit_fixture(
@@ -739,6 +807,12 @@ async fn expired_and_forged_outbox_leases_are_rejected_by_durable_fence() {
             .state,
         TaskState::Submitted
     );
+    let mut forged_ack_tenant = reclaimed.clone();
+    forged_ack_tenant.tenant_scope = "tenant-b".to_owned();
+    assert!(!store.ack_outbox(&forged_ack_tenant, 152).await.unwrap());
+    let mut forged_ack_dispatch = reclaimed.clone();
+    forged_ack_dispatch.dispatch_id = "forged-dispatch".to_owned();
+    assert!(!store.ack_outbox(&forged_ack_dispatch, 152).await.unwrap());
     assert!(store.ack_outbox(&reclaimed, 152).await.unwrap());
 }
 
@@ -1796,7 +1870,7 @@ fn canonical_digest_binds_semantics_not_caller_tenant_or_transport() {
 }
 
 #[tokio::test]
-async fn exact_v1_schema_migrates_to_v4_preserving_keys_and_task() {
+async fn exact_v1_schema_migrates_to_v5_with_explicit_binding_preserving_keys_and_task() {
     const V1: &str = "CREATE TABLE store_metadata (
      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
      schema_version INTEGER NOT NULL,
@@ -1845,7 +1919,27 @@ async fn exact_v1_schema_migrates_to_v4_preserving_keys_and_task() {
             .pragma_update(None, "user_version", 1_i64)
             .unwrap();
     }
-    let store = open_store(&path, 8).await.unwrap();
+    assert!(open_store(&path, 8).await.is_err());
+    let store = open_store_with_binding(&path, 8)
+        .await
+        .unwrap_or_else(|error| {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let version: i64 = connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            let objects: Vec<String> = connection
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+                )
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            panic!(
+                "explicit migration failed at version {version} with {error:?}; objects={objects:?}"
+            )
+        });
     assert_eq!(store.completion_receipt_key(), receipt_key);
     assert_eq!(
         a2a_server::TaskStore::get(&store, "migrated-terminal")
@@ -1873,7 +1967,7 @@ async fn exact_v1_schema_migrates_to_v4_preserving_keys_and_task() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     assert_eq!(event_kind, "migration_snapshot");
 }
 
@@ -2399,8 +2493,10 @@ fn crash_barrier_helper() {
                 .unwrap();
             println!("FINAL_RECEIVER_COMPLETED");
         } else if mode == "receiver_accepted" || mode == "receiver_completed" {
+            let sender =
+                admit_and_claim_receiver_fixture(&store, "crash-child-sender", 100, 10).await;
             let ReceiverAdmission::Execute(lease) = store
-                .begin_receive(receiver_envelope(), "crash-child", 100, 10)
+                .begin_receive(envelope_for_lease(&sender), "crash-child", 100, 10)
                 .await
                 .unwrap()
             else {
@@ -2530,8 +2626,10 @@ async fn subprocess_crash_after_receiver_complete_before_sender_commit_max_attem
 async fn receiver_rejects_nonterminal_completion_without_committing_effect_or_replay() {
     let path = path();
     let store = open_store(&path, 8).await.unwrap();
+    let sender = admit_and_claim_receiver_fixture(&store, "sender", 100, 10).await;
+    let envelope = envelope_for_lease(&sender);
     let ReceiverAdmission::Execute(lease) = store
-        .begin_receive(receiver_envelope(), "receiver", 100, 10)
+        .begin_receive(envelope.clone(), "receiver", 100, 10)
         .await
         .unwrap()
     else {
@@ -2549,7 +2647,7 @@ async fn receiver_rejects_nonterminal_completion_without_committing_effect_or_re
     assert_eq!(store.durable_effect_count().await.unwrap(), 0);
     assert!(matches!(
         store
-            .begin_receive(receiver_envelope(), "duplicate", 101, 10)
+            .begin_receive(envelope, "duplicate", 101, 10)
             .await
             .unwrap(),
         ReceiverAdmission::Busy
@@ -2560,9 +2658,10 @@ async fn receiver_rejects_nonterminal_completion_without_committing_effect_or_re
 async fn receiver_reopen_rejects_payload_that_violates_live_envelope_bounds() {
     let path = path();
     let store = open_store(&path, 8).await.unwrap();
+    let sender = admit_and_claim_receiver_fixture(&store, "sender", 100, 10).await;
     assert!(matches!(
         store
-            .begin_receive(receiver_envelope(), "receiver", 100, 10)
+            .begin_receive(envelope_for_lease(&sender), "receiver", 100, 10)
             .await
             .unwrap(),
         ReceiverAdmission::Execute(_)
@@ -2592,8 +2691,14 @@ async fn receiver_crash_barriers_preserve_atomic_durable_loopback_effect_marker_
     kill_at_barrier(&accepted, "receiver_accepted", "RECEIVER_ACCEPTED");
     let store = open_store(&accepted, 8).await.unwrap();
     assert_eq!(store.durable_effect_count().await.unwrap(), 0);
+    let sender = store
+        .claim_outbox("reclaimer-sender", 110, 10)
+        .await
+        .unwrap()
+        .expect("expired sender lease must be reclaimed");
+    let envelope = envelope_for_lease(&sender);
     let ReceiverAdmission::Execute(reclaimed) = store
-        .begin_receive(receiver_envelope(), "reclaimer", 110, 10)
+        .begin_receive(envelope.clone(), "reclaimer", 110, 10)
         .await
         .unwrap()
     else {
@@ -2606,7 +2711,7 @@ async fn receiver_crash_barriers_preserve_atomic_durable_loopback_effect_marker_
     assert_eq!(store.durable_effect_count().await.unwrap(), 1);
     assert!(matches!(
         store
-            .begin_receive(receiver_envelope(), "replay", 112, 10)
+            .begin_receive(envelope, "replay", 112, 10)
             .await
             .unwrap(),
         ReceiverAdmission::Replay(events) if events == receiver_events()
@@ -2617,9 +2722,14 @@ async fn receiver_crash_barriers_preserve_atomic_durable_loopback_effect_marker_
     let completed = path();
     kill_at_barrier(&completed, "receiver_completed", "RECEIVER_COMPLETED");
     let store = open_store(&completed, 8).await.unwrap();
+    let sender = store
+        .claim_outbox("sender-replay-claim", 110, 10)
+        .await
+        .unwrap()
+        .expect("completed receiver must remain bound to a reclaimable sender row");
     assert!(matches!(
         store
-            .begin_receive(receiver_envelope(), "sender-replay", 102, 10)
+            .begin_receive(envelope_for_lease(&sender), "sender-replay", 110, 10)
             .await
             .unwrap(),
         ReceiverAdmission::Replay(events) if events == receiver_events()
@@ -2947,6 +3057,7 @@ async fn outbox_message_binding_is_immutable_and_startup_validates_dispatch_iden
     connection
         .execute_batch(
             "DROP TRIGGER outbox_message_immutable;
+        DROP TRIGGER outbox_identity_update;
         UPDATE outbox SET message_id = 'forged';",
         )
         .unwrap();
@@ -2958,7 +3069,7 @@ async fn outbox_message_binding_is_immutable_and_startup_validates_dispatch_iden
 }
 
 #[tokio::test]
-async fn fresh_v4_outbox_structurally_requires_message_id() {
+async fn fresh_v5_outbox_structurally_requires_message_id() {
     let path = path();
     let store = open_store(&path, 8).await.unwrap();
     let connection = rusqlite::Connection::open(&path).unwrap();

@@ -384,7 +384,7 @@ async fn completion_published_after_empty_read_before_changed_wakes_waiter() {
         .with_after_empty_read_gate(Arc::clone(&empty_read), Arc::clone(&release_read)),
     );
     let message_id = request.message.message_id.clone();
-    let waiter = tokio::spawn(async move { handler.wait_for_result(&message_id).await });
+    let waiter = tokio::spawn(async move { handler.wait_for_result(&message_id, None).await });
     bounded("handler empty final-result read", empty_read.notified()).await;
     before_claim.release.notify_one();
     bounded(
@@ -446,7 +446,7 @@ async fn fatal_claim_error_publishes_failure_wakes_waiter_and_shutdown_releases_
         InputLimits::default(),
     ));
     let message_id = request.message.message_id.clone();
-    let waiter = tokio::spawn(async move { handler.wait_for_result(&message_id).await });
+    let waiter = tokio::spawn(async move { handler.wait_for_result(&message_id, None).await });
     wait_for_waiters(&control, 1).await;
     before_claim.release.notify_one();
 
@@ -545,7 +545,7 @@ async fn fatal_sender_commit_error_publishes_failure_and_wakes_attached_waiter()
         InputLimits::default(),
     ));
     let message_id = request.message.message_id.clone();
-    let waiter = tokio::spawn(async move { handler.wait_for_result(&message_id).await });
+    let waiter = tokio::spawn(async move { handler.wait_for_result(&message_id, None).await });
     wait_for_waiters(&control, 1).await;
     release_receiver.notify_one();
 
@@ -679,7 +679,7 @@ async fn busy_retry_idles_until_injected_clock_reclaims_receiver_with_stable_dis
         InputLimits::default(),
     ));
     let message_id = request.message.message_id.clone();
-    let waiter = tokio::spawn(async move { handler.wait_for_result(&message_id).await });
+    let waiter = tokio::spawn(async move { handler.wait_for_result(&message_id, None).await });
     wait_for_waiters(&control, 1).await;
     bounded("driver idle after receiver Busy", idle.notified()).await;
     assert!(
@@ -846,7 +846,7 @@ async fn recovered_processing_cancel_finishes_from_sqlite_without_live_control()
     );
     let result = bounded(
         "recovered cancellation result",
-        handler.wait_for_result(&request.message.message_id),
+        handler.wait_for_result(&request.message.message_id, None),
     )
     .await
     .unwrap();

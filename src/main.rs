@@ -9,11 +9,11 @@ use smesh_a2a::transport::{
     TlsSnapshotManager, TransportMode, load_tls_snapshot,
 };
 use smesh_a2a::{
-    CorrelatingRuntimeProcessor, DurableLoopbackEndpoint, GatewayConfig, GatewayMode,
-    InjectedClock, LoopbackDispatcher, RuntimeAdmissionProcessor, RuntimeEventCapture,
-    RuntimeModeConfig, RuntimeWorker, SqliteTaskStore, SystemClockTicker,
-    build_authenticated_durable_loopback_gateway, build_authenticated_router,
-    build_authenticated_router_with_trace, build_durable_loopback_gateway, build_router,
+    AuthorizationPolicy, CorrelatingRuntimeProcessor, DurableLoopbackEndpoint, GatewayConfig,
+    GatewayMode, InjectedClock, LegacyTenantBinding, LoopbackDispatcher, RuntimeAdmissionProcessor,
+    RuntimeEventCapture, RuntimeModeConfig, RuntimeWorker, SqliteTaskStore, SystemClockTicker,
+    build_authenticated_router, build_authenticated_router_with_trace,
+    build_authorized_durable_loopback_gateway, build_durable_loopback_gateway, build_router,
     build_router_with_trace,
 };
 use smesh_core::{Network, Node};
@@ -317,6 +317,7 @@ async fn serve_router(
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -331,6 +332,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let public_base_url =
         std::env::var("SMESH_A2A_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
     let oidc_enabled = std::env::var("SMESH_A2A_AUTH_MODE").as_deref() != Ok("disabled");
+    if oidc_enabled && std::env::var_os("SMESH_A2A_OIDC_ISSUER").is_none() {
+        return Err("SMESH_A2A_OIDC_ISSUER is required when OIDC authentication is enabled".into());
+    }
+    let client_auth_mode = match std::env::var("SMESH_A2A_CLIENT_AUTH_MODE").as_deref() {
+        Ok("optional") => ClientAuthMode::Optional,
+        Ok("required") => ClientAuthMode::Required,
+        Ok("disabled") | Err(std::env::VarError::NotPresent) => ClientAuthMode::Disabled,
+        _ => {
+            return Err(
+                "SMESH_A2A_CLIENT_AUTH_MODE must be disabled, optional, or required".into(),
+            );
+        }
+    };
+    let authentication_enabled = oidc_enabled || client_auth_mode != ClientAuthMode::Disabled;
+    let policy_configured = std::env::var_os("SMESH_A2A_AUTHORIZATION_POLICY_PATH").is_some();
+    if authentication_enabled != policy_configured {
+        return Err(if authentication_enabled {
+            "SMESH_A2A_AUTHORIZATION_POLICY_PATH is required when authentication is enabled"
+        } else {
+            "an authorization policy requires OIDC or mTLS authentication"
+        }
+        .into());
+    }
+    let tenant_authorization_enabled = authentication_enabled;
+    let authorization = if tenant_authorization_enabled {
+        let path = std::env::var_os("SMESH_A2A_AUTHORIZATION_POLICY_PATH").ok_or(
+            "SMESH_A2A_AUTHORIZATION_POLICY_PATH is required when authentication is enabled",
+        )?;
+        Some(Arc::new(AuthorizationPolicy::load(
+            std::path::PathBuf::from(path),
+        )?))
+    } else {
+        None
+    };
+    let legacy_binding = match (
+        std::env::var("SMESH_A2A_LEGACY_TENANT_ID").ok(),
+        std::env::var("SMESH_A2A_LEGACY_OWNER_ACCOUNT_ID").ok(),
+    ) {
+        (None, None) => None,
+        (Some(tenant), Some(account)) if tenant_authorization_enabled => Some(
+            authorization
+                .as_ref()
+                .ok_or("authorization policy missing for legacy binding")?
+                .legacy_tenant_binding(&tenant, &account)?,
+        ),
+        (Some(_), Some(_)) => {
+            return Err("legacy tenant binding is only valid in authenticated durable mode".into());
+        }
+        _ => return Err(
+            "SMESH_A2A_LEGACY_TENANT_ID and SMESH_A2A_LEGACY_OWNER_ACCOUNT_ID must be set together"
+                .into(),
+        ),
+    };
     let (transport_config, http_transport) =
         transport_from_environment(bind, &public_base_url, oidc_enabled)?;
     let legacy_unsafe_public = std::env::var("SMESH_A2A_UNSAFE_PUBLIC").as_deref() == Ok("1");
@@ -349,6 +403,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(mode, GatewayMode::Runtime(_)) && sqlite_path.is_some() {
         return Err("durable runtime receiver/effect replay is unsupported; SQLite durable routing is supported only in loopback mode".into());
     }
+    if tenant_authorization_enabled
+        && (!matches!(mode, GatewayMode::Loopback) || sqlite_path.is_none())
+    {
+        return Err("authenticated task operations require the authorized durable SQLite loopback gateway; generic authenticated handlers are development-only and not tenant-safe".into());
+    }
+
     let mut auth = auth_state_from_environment().await?;
     if transport_config.client_auth != ClientAuthMode::Disabled {
         auth = Some(match auth {
@@ -374,6 +434,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     config,
                     path,
                     auth,
+                    authorization.clone(),
+                    legacy_binding,
                     http_transport.clone(),
                 )
                 .await?;
@@ -403,6 +465,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_durable_loopback_gateway(
     listener: std::net::TcpListener,
     bind: SocketAddr,
@@ -410,18 +473,32 @@ async fn run_durable_loopback_gateway(
     config: GatewayConfig,
     sqlite_path: std::path::PathBuf,
     auth: Option<AuthState>,
+    authorization: Option<Arc<AuthorizationPolicy>>,
+    legacy_binding: Option<LegacyTenantBinding>,
     transport: HttpTransport,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let store = SqliteTaskStore::open(sqlite_path, config.max_tasks).await?;
+    if auth.is_some() != authorization.is_some() {
+        return Err("durable production authentication and tenant authorization must be configured together".into());
+    }
+    let store = if let Some(binding) = legacy_binding {
+        SqliteTaskStore::open_with_legacy_binding(sqlite_path, config.max_tasks, binding).await?
+    } else {
+        SqliteTaskStore::open(sqlite_path, config.max_tasks).await?
+    };
     let clock = InjectedClock::new(chrono::Utc::now().timestamp_millis());
     let gateway = if let Some(auth) = auth {
-        build_authenticated_durable_loopback_gateway(
-            config,
-            store,
-            DurableLoopbackEndpoint::new(),
-            clock.clone(),
-            auth,
-        )?
+        if let Some(policy) = authorization {
+            build_authorized_durable_loopback_gateway(
+                config,
+                store,
+                DurableLoopbackEndpoint::new(),
+                clock.clone(),
+                auth,
+                policy,
+            )?
+        } else {
+            unreachable!("authentication without tenant authorization was rejected before SQLite")
+        }
     } else {
         build_durable_loopback_gateway(
             config,

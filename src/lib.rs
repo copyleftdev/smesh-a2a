@@ -2,6 +2,8 @@
 
 /// Bearer and mTLS principal verification and request-scoping boundaries.
 pub mod auth;
+/// Server-owned tenant authorization policy and immutable request context.
+pub mod authorization;
 mod bridge;
 mod card;
 mod channel;
@@ -25,6 +27,10 @@ mod store;
 /// Production exposure policy, TLS material loading, reload, and bounded acceptor.
 pub mod transport;
 
+pub use authorization::{
+    AuthorizationContext, AuthorizationError, AuthorizationMiddlewareState, AuthorizationPolicy,
+    Operation, TENANT_SELECTOR_HEADER, TenantRole, VisibilityScope, current_authorization_context,
+};
 pub use bridge::{DispatchError, MeshDispatcher, MeshEvent, MeshRequest};
 pub use card::{
     build_agent_card, build_authenticated_agent_card, build_secured_agent_card,
@@ -61,13 +67,16 @@ pub use runtime_worker::{
 pub use server::{
     CompletionPolicyStore, DurableGateway, GatewayConfig,
     build_authenticated_durable_loopback_gateway, build_authenticated_router,
-    build_authenticated_router_with_trace, build_durable_loopback_gateway, build_router,
-    build_router_with_policy, build_router_with_policy_and_trace, build_router_with_sqlite,
+    build_authenticated_router_with_trace, build_authorized_durable_loopback_gateway,
+    build_durable_loopback_gateway, build_router, build_router_with_policy,
+    build_router_with_policy_and_trace, build_router_with_sqlite,
     build_router_with_sqlite_and_trace, build_router_with_trace,
 };
 pub use sqlite_store::{
-    AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition, CancellationOutcome,
-    OutboxLease, ReceiverAdmission, ReceiverLease, SendMessageAdmission, SqliteStoreError,
-    SqliteTaskStore, TRUSTED_SINGLE_TENANT_SCOPE, TransitionOutcome, canonical_send_message_digest,
+    AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition,
+    AuthorizationAuditInput, AuthorizationDecisionEffect, CancellationOutcome, LegacyTenantBinding,
+    OutboxLease, OwnedTaskScope, ReceiverAdmission, ReceiverLease, SendMessageAdmission,
+    SqliteStoreError, SqliteTaskStore, TRUSTED_SINGLE_TENANT_SCOPE, TransitionOutcome,
+    canonical_send_message_digest, canonical_send_message_digest_v2,
 };
 pub use store::BoundedTaskStore;

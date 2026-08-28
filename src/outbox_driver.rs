@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AttemptDisposition, DurableDispatchEnvelope, DurableLoopbackEndpoint,
-    DurableReceiverTermination, InjectedClock, MeshEvent, SqliteTaskStore,
-    TRUSTED_SINGLE_TENANT_SCOPE, TransitionOutcome, content_digest,
+    DurableReceiverTermination, InjectedClock, MeshEvent, SqliteTaskStore, TransitionOutcome,
+    content_digest,
     durable_dispatch::{DURABLE_CANCELED_SUMMARY, DurableDispatchOutcome},
 };
 
@@ -232,24 +232,32 @@ fn spawn_durable_driver_inner(
                 let payload = serde_json::to_string(&lease.request)
                     .map_err(|_| a2a::A2AError::internal("failed to encode durable dispatch"))?;
                 let envelope = DurableDispatchEnvelope {
-                    tenant_scope: TRUSTED_SINGLE_TENANT_SCOPE.to_owned(),
+                    tenant_scope: lease.tenant_scope.clone(),
                     dispatch_id: lease.dispatch_id.clone(),
                     payload_digest: content_digest(payload.as_bytes()),
                     request: lease.request.clone(),
                 };
-                if let Some(task) = store.get(&lease.task_id).await? {
+                let committed_progress = if let Some(task) = store.get(&lease.task_id).await? {
                     let progress = build_progress_frame(
                         &task,
                         "SMESH swarm is processing the durable dispatch".to_owned(),
                         clock.now(),
                     );
-                    if store
-                        .append_stream_progress(&lease.dispatch_id, progress, clock.now())
-                        .await?
-                    {
+                    let committed = store
+                        .append_stream_progress(
+                            &lease.tenant_scope,
+                            &lease.dispatch_id,
+                            progress,
+                            clock.now(),
+                        )
+                        .await?;
+                    if committed.is_some() {
                         worker_control.changed();
                     }
-                }
+                    committed
+                } else {
+                    None
+                };
                 let dispatch = tokio::select! {
                     () = worker_control.cancel.cancelled() => {
                         let _ = store.finish_outbox_attempt(
@@ -320,8 +328,13 @@ fn spawn_durable_driver_inner(
                     &termination,
                     clock.now(),
                 )?;
-                let public_transcript =
-                    build_public_transcript(&admitted_task, &task, &events, clock.now());
+                let public_transcript = build_public_transcript(
+                    &admitted_task,
+                    &task,
+                    &events,
+                    committed_progress,
+                    clock.now(),
+                );
                 let result = SendMessageResponse::Task(task.clone());
                 if store
                     .commit_delivery(&lease, task, result, &public_transcript, clock.now())
@@ -431,6 +444,7 @@ fn build_public_transcript(
     admitted_task: &a2a::Task,
     final_task: &a2a::Task,
     events: &[MeshEvent],
+    committed_progress: Option<StreamResponse>,
     now: i64,
 ) -> Vec<StreamResponse> {
     let progress = events
@@ -442,10 +456,9 @@ fn build_public_transcript(
             }
         })
         .unwrap_or_else(|| "SMESH swarm processed the durable dispatch".to_owned());
-    let mut transcript = vec![
-        StreamResponse::Task(admitted_task.clone()),
-        build_progress_frame(final_task, progress, now),
-    ];
+    let progress =
+        committed_progress.unwrap_or_else(|| build_progress_frame(final_task, progress, now));
+    let mut transcript = vec![StreamResponse::Task(admitted_task.clone()), progress];
     for artifact in final_task.artifacts.as_deref().unwrap_or_default() {
         transcript.push(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
             task_id: final_task.id.clone(),
@@ -463,4 +476,50 @@ fn build_public_transcript(
         metadata: None,
     }));
     transcript
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_transcript_reuses_the_exact_committed_progress_frame() {
+        let admitted = a2a::Task {
+            id: "task-prefix-fence".to_owned(),
+            context_id: "context-prefix-fence".to_owned(),
+            status: TaskStatus {
+                state: TaskState::Submitted,
+                message: None,
+                timestamp: chrono::DateTime::from_timestamp_millis(100),
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let committed = build_progress_frame(&admitted, "committed progress".to_owned(), 100);
+        let mut completed = admitted.clone();
+        let events = vec![
+            MeshEvent::Progress("committed progress".to_owned()),
+            MeshEvent::Completed {
+                summary: "completed".to_owned(),
+            },
+        ];
+        apply_terminal_events(
+            &mut completed,
+            "dispatch-prefix-fence",
+            &events,
+            &DurableReceiverTermination::Success,
+            101,
+        )
+        .expect("terminal task");
+
+        let transcript =
+            build_public_transcript(&admitted, &completed, &events, Some(committed.clone()), 101);
+
+        assert_eq!(transcript[1], committed);
+        assert_ne!(
+            transcript[1],
+            build_progress_frame(&completed, "committed progress".to_owned(), 101)
+        );
+    }
 }

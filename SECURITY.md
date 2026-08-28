@@ -58,14 +58,22 @@ The bundled runtime admission processor emits a private candidate receipt and co
 no review, test, contradiction, or ratification evidence. Runtime ingress therefore fails closed
 under the default completion policy and cannot masquerade as semantically completed work.
 The SQLite task ledger is Unix-only, owner-only, single-writer, crash-durable after transaction
-commit, and persists its cursor and completion-receipt keys. It is not a tenant boundary or a general
-key-management system: key rotation, revocation, identity binding, rollback-resistant freshness, and
-cross-host coordination remain production work. In-memory mode retains process-local keys and ledger
-state.
+commit, and persists its cursor and completion-receipt keys. Schema v5 enforces immutable tenant and
+owner identity across tasks and child records, exact live-DDL validation, versioned request-digest
+validation, scoped replay, and append-only durable authorization decisions. The binary permits
+authenticated task serving only through the authorized durable SQLite loopback gateway; policy-only,
+authentication-only, non-SQLite, and runtime combinations fail closed. Authentication-only
+compatibility builders are development-only. Key rotation, revocation, rollback-resistant freshness,
+and cross-host coordination remain production work. In-memory mode retains process-local keys and
+ledger state.
 
 ## Known dependency warning
 
 `cargo audit` reports `RUSTSEC-2025-0141`: `bincode 1.3.3` is unmaintained. It is pulled transitively by the pinned `smesh-core` revision. This is an unmaintained-package warning rather than a reported vulnerability. The gateway does not invoke bincode directly. It should be removed by upgrading SMESH serialization or narrowing the integration dependency when an upstream revision is available.
+
+The audit also reports that transitive `chacha20 0.10.1` is yanked through the pinned QUIC stack
+(`quinn-proto`/`quinn`). This is a registry-yank warning, not a RustSec vulnerability advisory in
+the locked tree. It must be removed through a reviewed upstream QUIC/runtime dependency update.
 
 Adding the pinned runtime initially resolved `time 0.3.45`, affected by
 `RUSTSEC-2026-0009`. The lockfile is upgraded to `time 0.3.47`; that security update raises the
@@ -75,8 +83,7 @@ gateway MSRV to Rust 1.88.
 
 Before internet or multi-tenant deployment, add:
 
-- tenant-scoped authorization using the authenticated principal on every task operation;
-- tenant-aware persistence and key management;
+- managed tenant-policy enrollment, revocation, rotation, and distributed policy coordination;
 - managed certificate issuance/revocation and external key custody for direct TLS deployments;
 - per-principal rate, concurrency, task-duration, history, and artifact quotas;
 - structured audit logs and distributed tracing;

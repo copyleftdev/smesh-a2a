@@ -38,6 +38,17 @@ impl Drop for ChildGuard {
     }
 }
 
+fn policy_json() -> &'static [u8] {
+    br#"{
+      "schemaVersion":"smesh-authz-policy/v1",
+      "policyId":"gateway-main",
+      "revision":1,
+      "tenants":[{"id":"tenant-a","enabled":true}],
+      "accounts":[{"id":"operator","kind":"human","memberships":[{"tenantId":"tenant-a","roles":["taskOperator"]}]}],
+      "principalBindings":[{"principal":{"issuer":"https://issuer.example","subject":"operator"},"accountId":"operator"}]
+    }"#
+}
+
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
     if let Some(status) = child.wait_timeout(timeout).unwrap() {
         return Some(status);
@@ -251,6 +262,74 @@ fn mismatched_tls_public_host_fails_before_listener_and_sqlite() {
     let rebound =
         std::net::TcpListener::bind(address).expect("hostname mismatch must precede listener bind");
     drop(rebound);
+}
+
+#[test]
+fn authentication_and_policy_startup_matrix_fails_closed_before_resources() {
+    for client_auth in ["required", "optional"] {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let child = Command::new(env!("CARGO_BIN_EXE_smesh-a2a-gateway"))
+            .env_clear()
+            .env("SMESH_A2A_AUTH_MODE", "disabled")
+            .env("SMESH_A2A_CLIENT_AUTH_MODE", client_auth)
+            .env("SMESH_A2A_MODE", "loopback")
+            .env("SMESH_A2A_BIND", address.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard(Some(child));
+        let status = wait_for_exit(child.0.as_mut().unwrap(), Duration::from_secs(2))
+            .expect("mTLS without policy must fail promptly");
+        assert!(!status.success());
+        drop(std::net::TcpListener::bind(address).expect("failure precedes listener bind"));
+    }
+
+    let root = TempDir::new("policy-without-auth");
+    let policy = root.0.join("policy.json");
+    let database = root.0.join("must-not-exist.sqlite");
+    std::fs::write(&policy, policy_json()).unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let child = Command::new(env!("CARGO_BIN_EXE_smesh-a2a-gateway"))
+        .env_clear()
+        .env("SMESH_A2A_AUTH_MODE", "disabled")
+        .env("SMESH_A2A_AUTHORIZATION_POLICY_PATH", &policy)
+        .env("SMESH_A2A_SQLITE_PATH", &database)
+        .env("SMESH_A2A_MODE", "loopback")
+        .env("SMESH_A2A_BIND", address.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = ChildGuard(Some(child));
+    let status = wait_for_exit(child.0.as_mut().unwrap(), Duration::from_secs(2))
+        .expect("policy without authentication must fail promptly");
+    assert!(!status.success());
+    assert!(!database.exists());
+    drop(std::net::TcpListener::bind(address).expect("failure precedes listener bind"));
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let child = Command::new(env!("CARGO_BIN_EXE_smesh-a2a-gateway"))
+        .env_clear()
+        .env("SMESH_A2A_AUTH_MODE", "oidc")
+        .env("SMESH_A2A_OIDC_ISSUER", "https://issuer.example")
+        .env("SMESH_A2A_MODE", "loopback")
+        .env("SMESH_A2A_BIND", address.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = ChildGuard(Some(child));
+    let status = wait_for_exit(child.0.as_mut().unwrap(), Duration::from_secs(2))
+        .expect("OIDC without policy must fail promptly");
+    assert!(!status.success());
+    drop(std::net::TcpListener::bind(address).expect("failure precedes listener bind"));
 }
 
 #[test]
