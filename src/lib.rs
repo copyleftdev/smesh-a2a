@@ -31,7 +31,8 @@ pub mod transport;
 
 pub use authorization::{
     AuthorizationContext, AuthorizationError, AuthorizationMiddlewareState, AuthorizationPolicy,
-    Operation, TENANT_SELECTOR_HEADER, TenantRole, VisibilityScope, current_authorization_context,
+    Operation, TENANT_SELECTOR_HEADER, TenantRole, VisibilityScope, authorize_request,
+    current_authorization_context, current_quota_reservation, scope_quota_reservation,
 };
 pub use bridge::{DispatchError, MeshDispatcher, MeshEvent, MeshRequest};
 pub use card::{
@@ -41,11 +42,12 @@ pub use card::{
 pub use channel::{ChannelDispatcher, DispatchCommand};
 pub use durable_authority::{
     AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition,
-    AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput,
-    AuthorizationAuditParts, AuthorizationAuditSink, AuthorizationDecisionEffect,
-    AuthorizedTaskRead, CancellationAuthority, CancellationOutcome, ChangeObservation,
-    ChangeObserver, DurableAuthority, IntoDurableAuthority, OutboxAuthority, OutboxLease,
-    OwnedTaskScope, PollInterval, ReceiverAdmission, ReceiverAuthority, ReceiverLease,
+    AuthorityCapabilities, AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown,
+    AuthorizationAuditInput, AuthorizationAuditParts, AuthorizationAuditSink,
+    AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead, CancellationAuthority,
+    CancellationOutcome, ChangeObservation, ChangeObserver, DurableAuthority, IntoDurableAuthority,
+    LeaseRenewalOutcome, OutboxAuthority, OutboxLease, OwnedTaskScope, PollInterval,
+    QuotaReservationInput, ReceiverAdmission, ReceiverAuthority, ReceiverLease,
     SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE,
     TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority, TransitionOutcome,
     authorized_message_identity, canonical_send_message_digest, canonical_send_message_digest_v2,

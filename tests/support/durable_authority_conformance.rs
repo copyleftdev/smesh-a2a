@@ -11,14 +11,16 @@ use a2a::{
 use async_trait::async_trait;
 use smesh_a2a::{
     AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition,
-    AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput,
-    AuthorizationAuditSink, AuthorizationDecisionEffect, AuthorizedTaskRead, CancellationAuthority,
-    CancellationOutcome, ChangeObservation, ChangeObserver, DurableAuthority,
-    DurableDispatchEnvelope, DurableReceiverResult, DurableReceiverTermination, InputLimits,
-    MeshEvent, MeshRequest, OutboxAuthority, OutboxLease, OwnedTaskScope, ReceiverAdmission,
-    ReceiverAuthority, ReceiverLease, SendMessageAdmission, StreamTranscriptBatch,
-    SubscriptionCursor, TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority,
-    TransitionOutcome, VisibilityScope, authorized_message_identity, content_digest,
+    AuthorityCapabilities, AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown,
+    AuthorizationAuditInput, AuthorizationAuditSink, AuthorizationDecisionEffect,
+    AuthorizedMutation, AuthorizedTaskRead, CancellationAuthority, CancellationOutcome,
+    ChangeObservation, ChangeObserver, DurableAuthority, DurableDispatchEnvelope,
+    DurableReceiverResult, DurableReceiverTermination, InputLimits, LeaseRenewalOutcome, MeshEvent,
+    MeshRequest, OutboxAuthority, OutboxLease, OwnedTaskScope, QuotaReservationInput,
+    ReceiverAdmission, ReceiverAuthority, ReceiverLease, SendMessageAdmission,
+    StreamTranscriptBatch, SubscriptionCursor, TaskAdmission, TaskEventBatch, TaskLifecycle,
+    TranscriptAuthority, TransitionOutcome, VisibilityScope, authorized_message_identity,
+    content_digest,
 };
 
 const NOW: i64 = 1_700_000_000_000;
@@ -184,8 +186,11 @@ fn outbox_lease() -> OutboxLease {
 fn receiver_lease() -> ReceiverLease {
     ReceiverLease {
         tenant_scope: TENANT.to_owned(),
+        task_id: TASK_ID.to_owned(),
         dispatch_id: DISPATCH_ID.to_owned(),
         payload_digest: "sha256:payload-conformance".to_owned(),
+        sender_attempt_no: 2,
+        sender_lease_token: "sender-fence-conformance".to_owned(),
         lease_owner: "receiver-conformance".to_owned(),
         lease_token: "receiver-fence-conformance".to_owned(),
         lease_epoch: 3,
@@ -578,23 +583,59 @@ struct FakeState {
 pub async fn run_continuation_cancellation_conformance(authority: Arc<dyn DurableAuthority>) {
     tokio::time::timeout(
         Duration::from_secs(5),
-        run_continuation_cancellation_conformance_inner(authority),
+        run_continuation_cancellation_conformance_inner(authority, false),
     )
     .await
     .expect("continuation cancellation conformance watchdog");
 }
 
-async fn run_continuation_cancellation_conformance_inner(authority: Arc<dyn DurableAuthority>) {
-    let scope = OwnedTaskScope::new(TENANT, OWNER, VisibilityScope::Own).unwrap();
-    let AdmissionOutcome::Admitted(_) = authority
-        .authorize_and_admit(
-            &scope,
-            command("interrupt-me"),
-            audit("cc-admit", "TaskCreate", AuthorizationDecisionEffect::Allow),
+pub async fn run_quota_continuation_cancellation_conformance(authority: Arc<dyn DurableAuthority>) {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run_continuation_cancellation_conformance_inner(authority, true),
+    )
+    .await
+    .expect("quota continuation cancellation conformance watchdog");
+}
+
+async fn run_continuation_cancellation_conformance_inner(
+    authority: Arc<dyn DurableAuthority>,
+    with_quota: bool,
+) {
+    let quota = |id: &str, operation: &str| {
+        QuotaReservationInput::new(
+            TENANT,
+            OWNER,
+            "principal-conformance",
+            operation,
+            "mutations",
+            1,
+            id,
+            NOW + 60_000,
+            None,
         )
-        .await
         .unwrap()
-    else {
+    };
+    let scope = OwnedTaskScope::new(TENANT, OWNER, VisibilityScope::Own).unwrap();
+    let initial = command("interrupt-me");
+    let admitted = if with_quota {
+        authority
+            .authorize_and_admit_mutation(
+                &scope,
+                AuthorizedMutation::with_quota(initial, quota("quota-admit", "TaskCreate")),
+                audit("cc-admit", "TaskCreate", AuthorizationDecisionEffect::Allow),
+            )
+            .await
+    } else {
+        authority
+            .authorize_and_admit(
+                &scope,
+                initial,
+                audit("cc-admit", "TaskCreate", AuthorizationDecisionEffect::Allow),
+            )
+            .await
+    };
+    let AdmissionOutcome::Admitted(_) = admitted.unwrap() else {
         panic!("initial admission must win")
     };
     let lease = authority
@@ -673,27 +714,72 @@ async fn run_continuation_cancellation_conformance_inner(authority: Arc<dyn Dura
         now: NOW + 3,
         max_attempts: 4,
     };
-    let AdmissionOutcome::Admitted(record) = authority
-        .authorize_and_continue(
-            &scope,
-            continuation.clone(),
-            audit(
-                "cc-continue",
-                "TaskContinue",
-                AuthorizationDecisionEffect::Allow,
-            ),
-        )
-        .await
-        .unwrap()
-    else {
+    let continued = if with_quota {
+        authority
+            .authorize_and_continue_mutation(
+                &scope,
+                AuthorizedMutation::with_quota(
+                    continuation.clone(),
+                    quota("quota-continue", "TaskContinue"),
+                ),
+                audit(
+                    "cc-continue",
+                    "TaskContinue",
+                    AuthorizationDecisionEffect::Allow,
+                ),
+            )
+            .await
+    } else {
+        authority
+            .authorize_and_continue(
+                &scope,
+                continuation.clone(),
+                audit(
+                    "cc-continue",
+                    "TaskContinue",
+                    AuthorizationDecisionEffect::Allow,
+                ),
+            )
+            .await
+    };
+    let AdmissionOutcome::Admitted(record) = continued.unwrap() else {
         panic!("continuation must admit")
     };
     assert_eq!(record.revision, 3);
     assert!(
-        matches!(authority.authorize_and_continue(&scope,continuation,audit("cc-replay","TaskContinue",AuthorizationDecisionEffect::Allow)).await.unwrap(),AdmissionOutcome::Replay(SendMessageResponse::Task(task)) if task.status.state==TaskState::Working)
+        matches!(if with_quota { authority.authorize_and_continue_mutation(&scope,AuthorizedMutation::with_quota(continuation,quota("quota-continue","TaskContinue")),audit("cc-replay","TaskContinue",AuthorizationDecisionEffect::Allow)).await } else { authority.authorize_and_continue(&scope,continuation,audit("cc-replay","TaskContinue",AuthorizationDecisionEffect::Allow)).await }.unwrap(),AdmissionOutcome::Replay(SendMessageResponse::Task(task)) if task.status.state==TaskState::Working)
     );
+    let canceled = if with_quota {
+        let reservation = quota("quota-cancel", "TaskCancel");
+        authority
+            .cancel_authorized_with_quota(
+                &scope,
+                TASK_ID,
+                NOW + 4,
+                audit(
+                    "cc-cancel",
+                    "TaskCancel",
+                    AuthorizationDecisionEffect::Allow,
+                ),
+                Some(&reservation),
+            )
+            .await
+    } else {
+        authority
+            .cancel_authorized(
+                &scope,
+                TASK_ID,
+                NOW + 4,
+                audit(
+                    "cc-cancel",
+                    "TaskCancel",
+                    AuthorizationDecisionEffect::Allow,
+                ),
+            )
+            .await
+    };
     assert!(
-        matches!(authority.cancel_authorized(&scope,TASK_ID,NOW+4,audit("cc-cancel","TaskCancel",AuthorizationDecisionEffect::Allow)).await.unwrap(),CancellationOutcome::Canceled(task) if task.status.state==TaskState::Canceled)
+        matches!(canceled.unwrap(),CancellationOutcome::Canceled(task) if task.status.state==TaskState::Canceled)
     );
     authority.shutdown().await.unwrap();
 }
@@ -759,6 +845,13 @@ impl RecordingAuthority {
 }
 
 impl AuthorityIdentity for RecordingAuthority {
+    fn capabilities(&self) -> AuthorityCapabilities {
+        self.record("identity:capabilities");
+        AuthorityCapabilities {
+            lease_renewal: true,
+            quota_reservations: true,
+        }
+    }
     fn completion_receipt_key(&self) -> Option<[u8; 32]> {
         self.record("identity:key");
         Some([0x61; 32])
@@ -939,6 +1032,16 @@ impl OutboxAuthority for RecordingAuthority {
         self.record(format!("claim:{owner}:{now}:{duration}"));
         Ok(Some(outbox_lease()))
     }
+    async fn renew_outbox_lease(
+        &self,
+        _: &OutboxLease,
+        _: i64,
+    ) -> Result<LeaseRenewalOutcome, A2AError> {
+        self.record("outbox:renew");
+        Ok(LeaseRenewalOutcome::Applied {
+            lease_until: NOW + 1_000,
+        })
+    }
     async fn task_for_outbox(&self, lease: &OutboxLease) -> Result<Option<Task>, A2AError> {
         assert_eq!(lease, &outbox_lease());
         self.record(format!("task_for_outbox:{}", lease.lease_token));
@@ -1026,6 +1129,16 @@ impl ReceiverAuthority for RecordingAuthority {
         );
         self.record(format!("receive:{owner}:{now}:{duration}"));
         Ok(ReceiverAdmission::Execute(receiver_lease()))
+    }
+    async fn renew_receiver_lease(
+        &self,
+        _: &ReceiverLease,
+        _: i64,
+    ) -> Result<LeaseRenewalOutcome, A2AError> {
+        self.record("receiver:renew");
+        Ok(LeaseRenewalOutcome::Applied {
+            lease_until: NOW + 1_000,
+        })
     }
     async fn complete_loopback_receive(
         &self,

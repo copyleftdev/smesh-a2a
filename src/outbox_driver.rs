@@ -19,9 +19,21 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AttemptDisposition, DurableAuthority, DurableDispatchEnvelope, DurableLoopbackEndpoint,
-    DurableReceiverTermination, InjectedClock, MeshEvent, TransitionOutcome, content_digest,
-    durable_dispatch::{DURABLE_CANCELED_SUMMARY, DurableDispatchOutcome},
+    DurableReceiverTermination, InjectedClock, LeaseRenewalOutcome, MeshEvent, TransitionOutcome,
+    content_digest,
+    durable_dispatch::{DURABLE_CANCELED_SUMMARY, DurableDispatchError, DurableDispatchOutcome},
 };
+
+fn driver_lease_millis() -> i64 {
+    if cfg!(debug_assertions)
+        && let Ok(value) = std::env::var("SMESH_TEST_DRIVER_LEASE_MILLIS")
+        && let Ok(value) = value.parse::<i64>()
+        && (300..=60_000).contains(&value)
+    {
+        return value;
+    }
+    60_000
+}
 
 thread_local! {
     static REDACT_DRIVER_PANIC: Cell<bool> = const { Cell::new(false) };
@@ -29,7 +41,7 @@ thread_local! {
 
 static INSTALL_DRIVER_PANIC_HOOK: Once = Once::new();
 
-fn install_driver_panic_hook() {
+pub(crate) fn install_driver_panic_hook() {
     INSTALL_DRIVER_PANIC_HOOK.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -56,12 +68,12 @@ impl Drop for DriverPanicScope {
     }
 }
 
-struct RedactedDriverPoll<F> {
+pub(crate) struct RedactedDriverPoll<F> {
     inner: Pin<Box<F>>,
 }
 
 impl<F> RedactedDriverPoll<F> {
-    fn new(inner: F) -> Self {
+    pub(crate) fn new(inner: F) -> Self {
         Self {
             inner: Box::pin(inner),
         }
@@ -74,6 +86,34 @@ impl<F: Future> Future for RedactedDriverPoll<F> {
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let _scope = DriverPanicScope::enter();
         self.inner.as_mut().poll(context)
+    }
+}
+
+pub(crate) struct AbortOnDropJoin<T> {
+    join: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropJoin<T> {
+    pub(crate) fn new(join: tokio::task::JoinHandle<T>) -> Self {
+        Self { join: Some(join) }
+    }
+
+    pub(crate) fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
+        self.join.as_mut().expect("owned join handle is present")
+    }
+
+    pub(crate) fn abort(&self) {
+        if let Some(join) = &self.join {
+            join.abort();
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDropJoin<T> {
+    fn drop(&mut self) {
+        if let Some(join) = &self.join {
+            join.abort();
+        }
     }
 }
 
@@ -95,7 +135,6 @@ impl Drop for WaiterGuard {
 pub(crate) struct DurableDriverControl {
     pub wake: Arc<Notify>,
     state: watch::Sender<DriverState>,
-    cancel: CancellationToken,
     endpoint: DurableLoopbackEndpoint,
 }
 
@@ -167,7 +206,8 @@ impl DurableDriverControl {
 
 pub(crate) struct DurableDriverHandle {
     control: Arc<DurableDriverControl>,
-    join: Option<tokio::task::JoinHandle<Result<(), a2a::A2AError>>>,
+    shutdown_requested: CancellationToken,
+    join: Option<AbortOnDropJoin<Result<(), a2a::A2AError>>>,
 }
 
 impl DurableDriverHandle {
@@ -175,38 +215,49 @@ impl DurableDriverHandle {
         Arc::clone(&self.control)
     }
 
-    pub(crate) fn abort_owned(&mut self) {
-        let Some(join) = self.join.take() else {
-            return;
-        };
-        self.control.state.send_modify(|state| {
-            state.generation = state.generation.wrapping_add(1);
-            state.failure = Some("durable gateway was dropped".to_owned());
-        });
-        self.control.cancel.cancel();
-        self.control.endpoint.cancel_all();
-        self.control.wake.notify_waiters();
-        join.abort();
-    }
-
-    pub(crate) async fn shutdown(mut self) -> Result<(), a2a::A2AError> {
+    fn request_shutdown(&self, failure: &str) {
         self.control.state.send_modify(|state| {
             state.generation = state.generation.wrapping_add(1);
             if state.failure.is_none() {
-                state.failure = Some("durable gateway is shutting down".to_owned());
+                state.failure = Some(failure.to_owned());
             }
         });
-        self.control.cancel.cancel();
+        self.shutdown_requested.cancel();
         self.control.endpoint.cancel_all();
         self.control.wake.notify_waiters();
+    }
+
+    pub(crate) fn reap_owned(&mut self) {
+        self.request_shutdown("durable gateway was dropped");
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            join.abort();
+            return;
+        };
+        runtime.spawn(async move {
+            let mut join = join;
+            if tokio::time::timeout(Duration::from_secs(5), join.handle_mut())
+                .await
+                .is_err()
+            {
+                join.abort();
+                let _ = join.handle_mut().await;
+            }
+        });
+    }
+
+    pub(crate) async fn shutdown(mut self) -> Result<(), a2a::A2AError> {
+        self.request_shutdown("durable gateway is shutting down");
         let Some(mut join) = self.join.take() else {
             return Ok(());
         };
-        if let Ok(joined) = tokio::time::timeout(Duration::from_secs(5), &mut join).await {
+        if let Ok(joined) = tokio::time::timeout(Duration::from_secs(5), join.handle_mut()).await {
             joined.map_err(|_| a2a::A2AError::internal("durable outbox driver panicked"))?
         } else {
             join.abort();
-            let _ = join.await;
+            let _ = join.handle_mut().await;
             Err(a2a::A2AError::internal(
                 "durable outbox driver shutdown timed out",
             ))
@@ -216,7 +267,7 @@ impl DurableDriverHandle {
 
 impl Drop for DurableDriverHandle {
     fn drop(&mut self) {
-        self.abort_owned();
+        self.reap_owned();
     }
 }
 
@@ -257,26 +308,44 @@ fn spawn_durable_driver_inner(
     let control = Arc::new(DurableDriverControl {
         wake: Arc::new(Notify::new()),
         state,
-        cancel: CancellationToken::new(),
         endpoint: endpoint.clone(),
     });
+    let shutdown_requested = CancellationToken::new();
+    let worker_shutdown = shutdown_requested.clone();
     let worker_control = Arc::clone(&control);
+    let replica_label =
+        std::env::var("SMESH_A2A_REPLICA_ID").unwrap_or_else(|_| "replica".to_owned());
+    let replica_id = format!(
+        "{replica_label}#boot-{}",
+        &content_digest(&rand::random::<[u8; 16]>())[..32]
+    );
     let poll_interval = authority.change_observation().poll_interval();
+    let lease_millis = driver_lease_millis();
+    let renewal_period = Duration::from_millis(u64::try_from(lease_millis / 3).unwrap_or(100));
     let mut clock_changed = clock.subscribe();
     let join = tokio::spawn(async move {
         let result = AssertUnwindSafe(RedactedDriverPoll::new(async {
             loop {
-                if worker_control.cancel.is_cancelled() {
+                if worker_shutdown.is_cancelled() {
                     return Ok(());
+                }
+                if cfg!(debug_assertions)
+                    && std::env::var("SMESH_TEST_DISABLE_DRIVER").as_deref() == Ok("1")
+                {
+                    tokio::select! {
+                        () = worker_shutdown.cancelled() => return Ok(()),
+                        () = tokio::time::sleep(poll_interval.as_duration()) => {},
+                    }
+                    continue;
                 }
                 #[cfg(test)]
                 if let Some(gate) = &hooks.before_claim
-                    && !gate.enter_once(&worker_control.cancel).await
+                    && !gate.enter_once(&worker_shutdown).await
                 {
                     return Ok(());
                 }
                 let Some(lease) = authority
-                    .claim_outbox("durable-loopback-driver", clock.now(), 60_000)
+                    .claim_outbox(&replica_id, clock.now(), lease_millis)
                     .await?
                 else {
                     #[cfg(test)]
@@ -284,7 +353,7 @@ fn spawn_durable_driver_inner(
                         idle.notify_one();
                     }
                     tokio::select! {
-                        () = worker_control.cancel.cancelled() => return Ok(()),
+                        () = worker_shutdown.cancelled() => return Ok(()),
                         () = worker_control.wake.notified() => {},
                         () = tokio::time::sleep(poll_interval.as_duration()) => {},
                         changed = clock_changed.changed() => {
@@ -323,19 +392,113 @@ fn spawn_durable_driver_inner(
                     } else {
                         None
                     };
-                let dispatch = tokio::select! {
-                    () = worker_control.cancel.cancelled() => {
-                        let _ = authority.finish_outbox_attempt(
-                            &lease,
-                            AttemptDisposition::Retry {
-                                available_at: clock.now(),
-                                error: "driver shutdown interrupted active dispatch".to_owned(),
-                            },
-                            clock.now(),
-                        ).await?;
-                        return Ok(());
+                let renewal_cancel = CancellationToken::new();
+                let (mut renewed_lease, renewal_join) = if authority.capabilities().lease_renewal {
+                    let (tx, rx) = watch::channel(lease.clone());
+                    let renewal_authority = Arc::clone(&authority);
+                    let renewal_cancel_task = renewal_cancel.clone();
+                    let mut current = lease.clone();
+                    let join = tokio::spawn(RedactedDriverPoll::new(async move {
+                        loop {
+                            tokio::select! {
+                                () = renewal_cancel_task.cancelled() => return Ok(()),
+                                () = tokio::time::sleep(renewal_period) => {}
+                            }
+                            let renewal = tokio::select! {
+                                () = renewal_cancel_task.cancelled() => return Ok(()),
+                                renewal = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    renewal_authority.renew_outbox_lease(&current, lease_millis),
+                                ) => renewal,
+                            };
+                            match renewal {
+                                Ok(Ok(LeaseRenewalOutcome::Applied { lease_until })) => {
+                                    current.lease_until = lease_until;
+                                    if tx.send(current.clone()).is_err() { return Ok(()); }
+                                }
+                                Ok(Ok(LeaseRenewalOutcome::Stale | LeaseRenewalOutcome::Unsupported)) => {
+                                    return Err(a2a::A2AError::internal("durable lease renewal became stale"));
+                                }
+                                Ok(Err(error)) => return Err(error),
+                                Err(_) => return Err(a2a::A2AError::internal("durable lease renewal timed out")),
+                            }
+                        }
+                    }));
+                    (Some(rx), Some(AbortOnDropJoin::new(join)))
+                } else {
+                    (None, None)
+                };
+                let dispatch_cancel = CancellationToken::new();
+                let dispatch_future = endpoint.dispatch_once(
+                    Arc::clone(&authority),
+                    envelope,
+                    &clock,
+                    &replica_id,
+                    &dispatch_cancel,
+                );
+                tokio::pin!(dispatch_future);
+                let mut shutdown_requested = false;
+                let mut sender_renewal_failed = false;
+                let dispatch_result = loop {
+                    tokio::select! {
+                        () = worker_shutdown.cancelled(), if !shutdown_requested && !sender_renewal_failed => {
+                            shutdown_requested = true;
+                            dispatch_cancel.cancel();
+                        }
+                        result = &mut dispatch_future => break result,
+                        changed = async {
+                            if let Some(rx) = renewed_lease.as_mut() {
+                                rx.changed().await.ok()
+                            } else {
+                                std::future::pending().await
+                            }
+                        }, if !shutdown_requested && !sender_renewal_failed => {
+                            if changed.is_none() {
+                                sender_renewal_failed = true;
+                                dispatch_cancel.cancel();
+                            }
+                        }
                     }
-                    result = endpoint.dispatch_once(authority.as_ref(), envelope, &clock) => result,
+                };
+                let dispatch = if shutdown_requested || sender_renewal_failed {
+                    None
+                } else {
+                    Some(dispatch_result)
+                };
+                renewal_cancel.cancel();
+                if let Some(mut join) = renewal_join {
+                    match tokio::time::timeout(Duration::from_secs(5), join.handle_mut()).await {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(error))) => return Err(error),
+                        Ok(Err(_)) => {
+                            return Err(a2a::A2AError::internal("outbox lease renewal task panicked"));
+                        }
+                        Err(_) => {
+                            join.abort();
+                            let _ = join.handle_mut().await;
+                            return Err(a2a::A2AError::internal("outbox lease renewal join timed out"));
+                        }
+                    }
+                }
+                let lease = renewed_lease
+                    .as_ref()
+                    .map_or_else(|| lease.clone(), |rx| rx.borrow().clone());
+                if shutdown_requested {
+                    let outcome = authority.finish_outbox_attempt(
+                        &lease,
+                        AttemptDisposition::Retry {
+                            available_at: clock.now(),
+                            error: "driver shutdown interrupted active dispatch".to_owned(),
+                        },
+                        clock.now(),
+                    ).await?;
+                    if outcome != TransitionOutcome::Applied {
+                        return Err(a2a::A2AError::internal("active dispatch shutdown requeue fence became stale"));
+                    }
+                    return Ok(());
+                }
+                let Some(dispatch) = dispatch else {
+                    return Err(a2a::A2AError::internal("durable lease renewal failed"));
                 };
                 let (events, termination) = match dispatch {
                     Ok(DurableDispatchOutcome::Delivered(events)) => {
@@ -364,7 +527,10 @@ fn spawn_durable_driver_inner(
                         }
                         continue;
                     }
-                    Err(error) => {
+                    Err(DurableDispatchError::FatalRenewal | DurableDispatchError::OwnerCancelled) => {
+                        return Err(a2a::A2AError::internal("durable lease renewal failed"));
+                    }
+                    Err(DurableDispatchError::Permanent(error)) => {
                         // Receiver validation/corruption errors are permanent. Busy is
                         // represented explicitly above and is the retryable class.
                         let outcome = authority
@@ -408,7 +574,7 @@ fn spawn_durable_driver_inner(
                 {
                     #[cfg(test)]
                     if let Some(gate) = &hooks.after_commit_before_publish
-                        && !gate.enter_once(&worker_control.cancel).await
+                        && !gate.enter_once(&worker_shutdown).await
                     {
                         return Ok(());
                     }
@@ -432,7 +598,8 @@ fn spawn_durable_driver_inner(
     control.wake.notify_one();
     DurableDriverHandle {
         control,
-        join: Some(join),
+        shutdown_requested,
+        join: Some(AbortOnDropJoin::new(join)),
     }
 }
 
@@ -554,12 +721,13 @@ fn build_public_transcript(
 mod tests {
     use super::*;
     use crate::{
-        AdmissionOutcome, AtomicRecordCounts, AuthorityDiagnostics, AuthorityIdentity,
-        AuthorityShutdown, AuthorizationAuditInput, AuthorizationAuditSink, AuthorizedTaskRead,
-        CancellationAuthority, CancellationOutcome, ChangeObservation, ChangeObserver,
-        OutboxAuthority, OutboxLease, OwnedTaskScope, ReceiverAdmission, ReceiverAuthority,
-        ReceiverLease, SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor,
-        TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority,
+        AdmissionOutcome, AtomicRecordCounts, AuthorityCapabilities, AuthorityDiagnostics,
+        AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput, AuthorizationAuditSink,
+        AuthorizedTaskRead, CancellationAuthority, CancellationOutcome, ChangeObservation,
+        ChangeObserver, LeaseRenewalOutcome, OutboxAuthority, OutboxLease, OwnedTaskScope,
+        ReceiverAdmission, ReceiverAuthority, ReceiverLease, SendMessageAdmission,
+        StreamTranscriptBatch, SubscriptionCursor, TaskAdmission, TaskEventBatch, TaskLifecycle,
+        TranscriptAuthority,
     };
     use async_trait::async_trait;
 
@@ -573,6 +741,13 @@ mod tests {
     }
 
     impl AuthorityIdentity for PanickingAuthority {
+        fn capabilities(&self) -> AuthorityCapabilities {
+            AuthorityCapabilities {
+                lease_renewal: false,
+                quota_reservations: false,
+            }
+        }
+
         fn completion_receipt_key(&self) -> Option<[u8; 32]> {
             None
         }
@@ -693,6 +868,13 @@ mod tests {
             self.release.notified().await;
             panic!("secret panic payload must not escape")
         }
+        async fn renew_outbox_lease(
+            &self,
+            _: &OutboxLease,
+            _: i64,
+        ) -> Result<LeaseRenewalOutcome, a2a::A2AError> {
+            Ok(LeaseRenewalOutcome::Unsupported)
+        }
         async fn task_for_outbox(
             &self,
             _: &OutboxLease,
@@ -738,6 +920,13 @@ mod tests {
             _: i64,
         ) -> Result<ReceiverAdmission, a2a::A2AError> {
             Err(unused())
+        }
+        async fn renew_receiver_lease(
+            &self,
+            _: &ReceiverLease,
+            _: i64,
+        ) -> Result<LeaseRenewalOutcome, a2a::A2AError> {
+            Ok(LeaseRenewalOutcome::Unsupported)
         }
         async fn complete_loopback_receive(
             &self,
@@ -817,6 +1006,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_driver_requests_cooperative_shutdown_before_reaping_root() {
+        struct ResourceGuard(Arc<Notify>);
+        impl Drop for ResourceGuard {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let (state, _) = watch::channel(DriverState::default());
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let control = Arc::new(DurableDriverControl {
+            wake: Arc::new(Notify::new()),
+            state,
+            endpoint: DurableLoopbackEndpoint::new(),
+        });
+        let started = Arc::new(Notify::new());
+        let task_started = Arc::clone(&started);
+        let released = Arc::new(Notify::new());
+        let task_released = Arc::clone(&released);
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let task_observed_cancel = Arc::clone(&observed_cancel);
+        let join = tokio::spawn(async move {
+            let _resource = ResourceGuard(task_released);
+            task_started.notify_one();
+            task_cancel.cancelled().await;
+            task_observed_cancel.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        started.notified().await;
+        let handle = DurableDriverHandle {
+            control,
+            shutdown_requested: cancel,
+            join: Some(AbortOnDropJoin::new(join)),
+        };
+
+        drop(handle);
+
+        tokio::time::timeout(Duration::from_secs(1), released.notified())
+            .await
+            .expect("drop reaper releases the root resource");
+        assert!(
+            observed_cancel.load(Ordering::SeqCst),
+            "drop must request cooperative cancellation before any fallback abort"
+        );
+    }
+
+    #[tokio::test]
     async fn driver_panic_publishes_one_generic_fatal_error_to_all_attached_observers() {
         let release = Arc::new(Notify::new());
         let recording = Arc::new(PanickingAuthority {
@@ -854,10 +1091,10 @@ mod tests {
                 .contains("durable outbox driver terminated unexpectedly")
         );
         assert!(!shutdown.to_string().contains("secret panic payload"));
-        assert_eq!(
-            recording.claims.lock().unwrap().as_slice(),
-            &[("durable-loopback-driver".to_owned(), 10, 60_000)]
-        );
+        let claims = recording.claims.lock().unwrap();
+        assert_eq!(claims.len(), 1);
+        assert!(claims[0].0.starts_with("replica#boot-sha256:"));
+        assert_eq!((claims[0].1, claims[0].2), (10, 60_000));
     }
 
     #[test]
@@ -916,6 +1153,47 @@ mod tests {
         eprintln!("{}", observer.borrow().failure.as_deref().expect("failure"));
         let shutdown = handle.shutdown().await.expect_err("panic shutdown error");
         eprintln!("{shutdown}");
+    }
+
+    #[test]
+    fn sender_renewal_panic_stderr_is_redacted_before_join_error_reporting() {
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "outbox_driver::tests::sender_renewal_panic_stderr_child",
+                    "--nocapture",
+                ])
+                .env("SMESH_SENDER_RENEWAL_PANIC_STDERR_CHILD", "1")
+                .output()
+                .expect("run sender renewal panic subprocess");
+        assert!(
+            output.status.success(),
+            "sender renewal child failed: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("durable outbox driver panic (details redacted)"));
+        assert!(stderr.contains("outbox lease renewal task panicked"));
+        assert!(!stderr.contains("sender-renewal-secret-payload"));
+        assert!(!stderr.contains("postgresql://secret-user:secret-password@secret-host"));
+    }
+
+    #[tokio::test]
+    async fn sender_renewal_panic_stderr_child() {
+        if std::env::var_os("SMESH_SENDER_RENEWAL_PANIC_STDERR_CHILD").is_none() {
+            return;
+        }
+        install_driver_panic_hook();
+        let join = tokio::spawn(RedactedDriverPoll::new(async {
+            panic!(
+                "sender-renewal-secret-payload at postgresql://secret-user:secret-password@secret-host"
+            )
+        }));
+        let error = join
+            .await
+            .expect_err("sender renewal panic must be a JoinError");
+        assert!(error.is_panic());
+        eprintln!("outbox lease renewal task panicked");
     }
 
     #[test]

@@ -6,10 +6,15 @@ use std::{env, fs, os::unix::fs::PermissionsExt as _, sync::Arc, time::Duration}
 
 use smesh_a2a::{
     AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput,
-    AuthorizationAuditSink, AuthorizationDecisionEffect, AuthorizedTaskRead, DurableAuthority,
-    OutboxAuthority, OwnedTaskScope, PostgresStoreConfig, PostgresTaskStore,
-    PostgresTransactionTestFault, ReceiverAuthority, SqliteTaskStore, TaskAdmission,
-    VisibilityScope,
+    AuthorizationAuditSink, AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead,
+    DurableAuthority, OutboxAuthority, OwnedTaskScope, PostgresStoreConfig, PostgresTaskStore,
+    PostgresTransactionTestFault, QuotaReservationInput, ReceiverAuthority, SqliteTaskStore,
+    TaskAdmission, TaskLifecycle, TranscriptAuthority, VisibilityScope,
+};
+#[cfg(debug_assertions)]
+use smesh_a2a::{
+    DurableLoopbackEndpoint, GatewayConfig, InjectedClock, SendMessageAdmission,
+    build_durable_loopback_gateway,
 };
 use support::authority_row_parity::{
     AUTHORITY_TABLES, assert_postgres_tables_match, assert_sqlite_tables_match, dump_postgres,
@@ -18,6 +23,7 @@ use support::authority_row_parity::{
 use support::durable_authority_conformance::{
     run_continuation_cancellation_conformance, run_durable_authority_command_conformance,
     run_durable_authority_command_conformance_open,
+    run_quota_continuation_cancellation_conformance,
 };
 use support::row_parity_scenario::populate_pagination_and_active_cancellation;
 use tokio_postgres::NoTls;
@@ -55,7 +61,7 @@ fn superuser_url() -> String {
 
 fn config(url: String, suffix: &str) -> PostgresStoreConfig {
     let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap_or_else(|_| {
-        "postgresql://smesh_test_runtime:smesh_test_runtime@127.0.0.1:55432/smesh_test".into()
+        "postgresql://smesh_test_runtime:smesh_runtime_password@127.0.0.1:55432/smesh_test".into()
     });
     PostgresStoreConfig::new(
         url,
@@ -120,6 +126,105 @@ fn denied_audit(id: &str) -> AuthorizationAuditInput {
         1,
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn sqlite_rejects_quota_before_any_schema_v6_mutation() {
+    let root =
+        std::env::temp_dir().join(format!("smesh-sqlite-quota-{:016x}", rand::random::<u64>()));
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = root.join("authority.sqlite3");
+    let store = SqliteTaskStore::open(&path, 16).await.unwrap();
+    assert!(!store.capabilities().quota_reservations);
+    let scope = OwnedTaskScope::new(
+        "tenant-sqlite-quota",
+        "owner-sqlite-quota",
+        VisibilityScope::Own,
+    )
+    .unwrap();
+    let mut message = a2a::Message::new(a2a::Role::User, vec![a2a::Part::text("quota")]);
+    message.message_id = "message-sqlite-quota".into();
+    let task = a2a::Task {
+        id: "task-sqlite-quota".into(),
+        context_id: "context-sqlite-quota".into(),
+        status: a2a::TaskStatus {
+            state: a2a::TaskState::Submitted,
+            message: None,
+            timestamp: None,
+        },
+        artifacts: None,
+        history: Some(vec![message.clone()]),
+        metadata: None,
+    };
+    let command = smesh_a2a::SendMessageAdmission {
+        request: a2a::SendMessageRequest {
+            message,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        },
+        streaming: false,
+        task: task.clone(),
+        original_result: a2a::SendMessageResponse::Task(task),
+        input_limits: smesh_a2a::InputLimits::default(),
+        now: 100,
+        max_attempts: 2,
+    };
+    let quota = QuotaReservationInput::new(
+        "tenant-sqlite-quota",
+        "owner-sqlite-quota",
+        "principal-sqlite-quota",
+        "TaskCreate",
+        "mutations",
+        1,
+        "reservation-sqlite-quota",
+        10_000,
+        None,
+    )
+    .unwrap();
+    let audit = AuthorizationAuditInput::new(
+        "audit-sqlite-quota",
+        "tenant-sqlite-quota",
+        "owner-sqlite-quota",
+        "policy",
+        1,
+        "sha256:policy",
+        "TaskCreate",
+        AuthorizationDecisionEffect::Allow,
+        "grant",
+        "task",
+        "sha256:resource",
+        None,
+        100,
+    )
+    .unwrap();
+    let before = store.atomic_record_counts().await.unwrap();
+    let error = store
+        .authorize_and_admit_mutation(
+            &scope,
+            AuthorizedMutation::with_quota(command, quota),
+            audit,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unsupported"));
+    assert_eq!(store.atomic_record_counts().await.unwrap(), before);
+    store.shutdown().await.unwrap();
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    let tables: i64 = sqlite
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='quota_reservations'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tables, 0,
+        "SQLite schema v6 must remain without a quota table"
+    );
+    drop(sqlite);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -407,6 +512,26 @@ postgres_test!(postgres_runs_continuation_and_cancellation_conformance, {
     PostgresTaskStore::drop_test_schema(&config).await.unwrap();
 });
 
+postgres_test!(postgres_quota_continuation_and_cancellation_are_atomic, {
+    let Some(url) = admin_url() else { return };
+    let config = config(url, "quota_cc");
+    let store = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
+    let authority: Arc<dyn DurableAuthority> = store;
+    run_quota_continuation_cancellation_conformance(authority).await;
+    let (client, driver) = admin_client(&superuser_url()).await;
+    let count: i64 = client.query_one(
+        &format!("SELECT count(*) FROM {}.quota_reservations WHERE tenant_scope='tenant-conformance'", config.schema_name()),
+        &[],
+    ).await.unwrap().get(0);
+    assert_eq!(
+        count, 3,
+        "admission, continuation replay, and cancellation reserve each key once"
+    );
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+});
+
 async fn admin_client(url: &str) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
     let (client, connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
     let driver = tokio::spawn(async move {
@@ -503,7 +628,7 @@ postgres_test!(startup_rejects_runtime_membership_in_migrator, {
     let Some(url) = admin_url() else { return };
     let migrator = Url::parse(&url).unwrap().username().to_owned();
     let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap_or_else(|_| {
-        "postgresql://smesh_test_runtime:***@127.0.0.1:55432/smesh_test".into()
+        "postgresql://smesh_test_runtime:smesh_runtime_password@127.0.0.1:55432/smesh_test".into()
     });
     let runtime = Url::parse(&runtime_url).unwrap().username().to_owned();
     let config = config(url, "runtime_member");
@@ -558,7 +683,7 @@ postgres_test!(non_superuser_migrator_opens_and_runtime_cannot_escalate, {
     let migrator_url =
         format!("postgresql://{migrator}:bounded-migrator@127.0.0.1:55432/smesh_test");
     let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap_or_else(|_| {
-        "postgresql://smesh_test_runtime:smesh_test_runtime@127.0.0.1:55432/smesh_test".into()
+        "postgresql://smesh_test_runtime:smesh_runtime_password@127.0.0.1:55432/smesh_test".into()
     });
     let config = PostgresStoreConfig::new(migrator_url, runtime_url.clone(), schema.clone())
         .unwrap()
@@ -681,7 +806,7 @@ postgres_test!(runtime_cannot_forge_internal_rls_operation_gucs, {
     }
 
     let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap_or_else(|_| {
-        "postgresql://smesh_test_runtime:***@127.0.0.1:55432/smesh_test".into()
+        "postgresql://smesh_test_runtime:smesh_runtime_password@127.0.0.1:55432/smesh_test".into()
     });
     let (mut runtime, runtime_driver) = admin_client(&runtime_url).await;
     for operation in ["diag-v1", "claim-v1", "cancel-v1"] {
@@ -940,14 +1065,357 @@ postgres_test!(populated_external_query_families_use_bounded_index_plans, {
     PostgresTaskStore::drop_test_schema(&config).await.unwrap();
 });
 
-postgres_test!(expired_final_attempt_is_atomically_dead_lettered, {
+postgres_test!(
+    expired_final_attempt_with_pending_cancellation_reconciles_to_canceled,
+    {
+        let Some(url) = admin_url() else { return };
+        let config = config(url.clone(), "final_expiry").with_test_only_trust_injected_time(true);
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let (client, driver) = admin_client(&superuser_url()).await;
+        let task = a2a::Task {
+            id: "expiry-task".into(),
+            context_id: "expiry-context".into(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let task_json = serde_json::to_string(&task).unwrap();
+        let state = serde_json::to_string(&task.status.state).unwrap();
+        let request = smesh_a2a::MeshRequest {
+            protocol: "a2a-v1".into(),
+            task_id: task.id.clone(),
+            context_id: task.context_id.clone(),
+            text: "expire".into(),
+        };
+        let payload = serde_json::to_string(&request).unwrap();
+        let digest = smesh_a2a::content_digest(payload.as_bytes());
+        let admission =
+            serde_json::to_string(&a2a::SendMessageResponse::Task(task.clone())).unwrap();
+        let initial = a2a::StreamResponse::Task(task.clone());
+        let initial_json = serde_json::to_string(&initial).unwrap();
+        let transcript_digest =
+            smesh_a2a::content_digest(&serde_json::to_vec(std::slice::from_ref(&initial)).unwrap());
+        let schema = config.schema_name();
+        client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES($1,$2,$3,$4,1,$5,$6)"), &[&"tenant-expiry",&task.id,&task.context_id,&state,&task_json,&"owner"]).await.unwrap();
+        client.execute(&format!("INSERT INTO {schema}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) VALUES($1,$2,1,1,'admitted',NULL,$3,$4,100)"), &[&"tenant-expiry",&task.id,&state,&task_json]).await.unwrap();
+        client.execute(&format!("INSERT INTO {schema}.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id) VALUES('tenant-expiry','message-expiry','sha256:request',$1,'in_progress',$2,100,100,2,'owner')"), &[&task.id,&admission]).await.unwrap();
+        client.execute(&format!("INSERT INTO {schema}.outbox(tenant_scope,dispatch_id,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) VALUES($1,$2,$3,$4,1,$5,$6,'pending',1,100,100,100,2)"), &[&"tenant-expiry",&"dispatch-expiry",&task.id,&"message-expiry",&payload,&digest]).await.unwrap();
+        client.execute(&format!("INSERT INTO {schema}.stream_transcripts(tenant_scope,message_id,dispatch_id,task_id,transcript_version,state,frame_count,transcript_digest,created_at,updated_at) VALUES('tenant-expiry','message-expiry','dispatch-expiry',$1,1,'open',1,$2,100,100)"), &[&task.id,&transcript_digest]).await.unwrap();
+        client.execute(&format!("INSERT INTO {schema}.stream_frames(tenant_scope,message_id,frame_seq,frame_version,frame_kind,frame_json,frame_digest,created_at) VALUES('tenant-expiry','message-expiry',1,1,'task',$1,$2,100)"), &[&initial_json,&smesh_a2a::content_digest(initial_json.as_bytes())]).await.unwrap();
+        let lease = store
+            .claim_outbox("expiry-owner", 100, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.attempt_no, 1);
+        for (suffix, disposition) in [
+            (
+                "retry",
+                smesh_a2a::AttemptDisposition::Retry {
+                    available_at: 105,
+                    error: "final live retry".into(),
+                },
+            ),
+            (
+                "permanent",
+                smesh_a2a::AttemptDisposition::Permanent {
+                    error: "final live permanent".into(),
+                },
+            ),
+        ] {
+            let mut live_task = task.clone();
+            live_task.id = format!("live-{suffix}-task");
+            live_task.context_id = format!("live-{suffix}-context");
+            let live_task_json = serde_json::to_string(&live_task).unwrap();
+            let mut live_request = request.clone();
+            live_request.task_id = live_task.id.clone();
+            live_request.context_id = live_task.context_id.clone();
+            let live_payload = serde_json::to_string(&live_request).unwrap();
+            let live_digest = smesh_a2a::content_digest(live_payload.as_bytes());
+            let live_admission =
+                serde_json::to_string(&a2a::SendMessageResponse::Task(live_task.clone())).unwrap();
+            let live_initial = a2a::StreamResponse::Task(live_task.clone());
+            let live_initial_json = serde_json::to_string(&live_initial).unwrap();
+            let live_transcript_digest =
+                smesh_a2a::content_digest(&serde_json::to_vec(&[live_initial]).unwrap());
+            let message_id = format!("live-{suffix}-message");
+            let dispatch_id = format!("live-{suffix}-dispatch");
+            client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES('tenant-expiry',$1,$2,$3,1,$4,'owner')"), &[&live_task.id,&live_task.context_id,&state,&live_task_json]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) VALUES('tenant-expiry',$1,1,1,'admitted',NULL,$2,$3,100)"), &[&live_task.id,&state,&live_task_json]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id) VALUES('tenant-expiry',$1,'sha256:request',$2,'in_progress',$3,100,100,2,'owner')"), &[&message_id,&live_task.id,&live_admission]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.outbox(tenant_scope,dispatch_id,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) VALUES('tenant-expiry',$1,$2,$3,1,$4,$5,'pending',1,100,100,100,2)"), &[&dispatch_id,&live_task.id,&message_id,&live_payload,&live_digest]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.stream_transcripts(tenant_scope,message_id,dispatch_id,task_id,transcript_version,state,frame_count,transcript_digest,created_at,updated_at) VALUES('tenant-expiry',$1,$2,$3,1,'open',1,$4,100,100)"), &[&message_id,&dispatch_id,&live_task.id,&live_transcript_digest]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.stream_frames(tenant_scope,message_id,frame_seq,frame_version,frame_kind,frame_json,frame_digest,created_at) VALUES('tenant-expiry',$1,1,1,'task',$2,$3,100)"), &[&message_id,&live_initial_json,&smesh_a2a::content_digest(live_initial_json.as_bytes())]).await.unwrap();
+            let live_owner = format!("live-{suffix}-owner");
+            let live_lease = store
+                .claim_outbox(&live_owner, 100, 10)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store
+                    .finish_outbox_attempt(&live_lease, disposition, 101)
+                    .await
+                    .unwrap(),
+                smesh_a2a::TransitionOutcome::DeadLettered
+            );
+            let live_state: String = client.query_one(&format!("SELECT state FROM {schema}.tasks WHERE tenant_scope='tenant-expiry' AND task_id=$1"), &[&live_task.id]).await.unwrap().get(0);
+            assert_eq!(
+                live_state,
+                serde_json::to_string(&a2a::TaskState::Failed).unwrap()
+            );
+        }
+        let envelope = smesh_a2a::DurableDispatchEnvelope {
+            tenant_scope: "tenant-expiry".into(),
+            dispatch_id: "dispatch-expiry".into(),
+            payload_digest: digest,
+            request: request.clone(),
+        };
+        let smesh_a2a::ReceiverAdmission::Execute(receiver) = store
+            .begin_receive(envelope, "incomplete-receiver", 100, 10)
+            .await
+            .unwrap()
+        else {
+            panic!("receiver execution lease expected")
+        };
+        assert_eq!(receiver.lease_until, 110);
+        client.execute(&format!("INSERT INTO {schema}.cancellation_intents(tenant_scope,dispatch_id,task_id,state,requested_at) VALUES('tenant-expiry','dispatch-expiry','expiry-task','requested',105)"), &[]).await.unwrap();
+
+        let (left, right) = tokio::join!(
+            store.claim_outbox("next-owner-a", 111, 10),
+            store.claim_outbox("next-owner-b", 111, 10),
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_ne!(
+            left.is_some(),
+            right.is_some(),
+            "exactly one final-attempt reconciler wins"
+        );
+        let reconciliation = left.or(right).unwrap();
+        assert_eq!(reconciliation.attempt_no, 1);
+        assert_ne!(reconciliation.lease_token, lease.lease_token);
+
+        let envelope = smesh_a2a::DurableDispatchEnvelope {
+            tenant_scope: "tenant-expiry".into(),
+            dispatch_id: "dispatch-expiry".into(),
+            payload_digest: smesh_a2a::content_digest(payload.as_bytes()),
+            request: request.clone(),
+        };
+        let smesh_a2a::ReceiverAdmission::Execute(reclaimed_receiver) = store
+            .begin_receive(envelope, "reclaimed-receiver", 111, 10)
+            .await
+            .unwrap()
+        else {
+            panic!("expired processing receiver must be reclaimable")
+        };
+        assert_eq!(reclaimed_receiver.lease_epoch, receiver.lease_epoch + 1);
+        assert_eq!(reclaimed_receiver.sender_attempt_no, 1);
+        assert_eq!(
+            reclaimed_receiver.sender_lease_token,
+            reconciliation.lease_token
+        );
+        assert_ne!(reclaimed_receiver.lease_token, receiver.lease_token);
+
+        let canceled_events = vec![
+            smesh_a2a::MeshEvent::Progress("SMESH swarm is processing the durable dispatch".into()),
+            smesh_a2a::MeshEvent::Completed {
+                summary: "SMESH durable receiver cooperatively canceled".into(),
+            },
+        ];
+        assert!(
+            store
+                .complete_canceled_receive(&receiver, &canceled_events, 112)
+                .await
+                .is_err(),
+            "the expired receiver fence must not complete after reclaim"
+        );
+        store
+            .complete_canceled_receive(&reclaimed_receiver, &canceled_events, 112)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .complete_canceled_receive(&reclaimed_receiver, &canceled_events, 112)
+                .await
+                .is_err(),
+            "receiver cancellation completion is single-effect"
+        );
+
+        let mut canceled = task.clone();
+        let mut cancel_message = a2a::Message::new(
+            a2a::Role::Agent,
+            vec![a2a::Part::text("SMESH task canceled")],
+        );
+        cancel_message.message_id = format!(
+            "cancel-{}",
+            &smesh_a2a::content_digest(b"dispatch-expiry")[..32]
+        );
+        cancel_message.task_id = Some(task.id.clone());
+        cancel_message.context_id = Some(task.context_id.clone());
+        canceled.status = a2a::TaskStatus {
+            state: a2a::TaskState::Canceled,
+            message: Some(cancel_message),
+            timestamp: chrono::DateTime::from_timestamp_millis(113),
+        };
+        let terminal = a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+            task_id: canceled.id.clone(),
+            context_id: canceled.context_id.clone(),
+            status: canceled.status.clone(),
+            metadata: None,
+        });
+        let public_transcript = vec![initial.clone(), terminal];
+        assert_eq!(
+            store
+                .commit_delivery(
+                    &reconciliation,
+                    canceled.clone(),
+                    a2a::SendMessageResponse::Task(canceled.clone()),
+                    &public_transcript,
+                    113,
+                )
+                .await
+                .unwrap(),
+            smesh_a2a::TransitionOutcome::Applied
+        );
+        assert_eq!(
+            store
+                .commit_delivery(
+                    &reconciliation,
+                    canceled.clone(),
+                    a2a::SendMessageResponse::Task(canceled.clone()),
+                    &public_transcript,
+                    113,
+                )
+                .await
+                .unwrap(),
+            smesh_a2a::TransitionOutcome::Stale
+        );
+
+        let canceled_state = serde_json::to_string(&a2a::TaskState::Canceled).unwrap();
+        let canceled_json = serde_json::to_string(&canceled).unwrap();
+        let final_json =
+            serde_json::to_string(&a2a::SendMessageResponse::Task(canceled.clone())).unwrap();
+        let public_digest =
+            smesh_a2a::content_digest(&serde_json::to_vec(&public_transcript).unwrap());
+        let row=client.query_one(&format!("SELECT o.state,o.lease_owner,o.lease_token,o.lease_until,o.last_error,o.updated_at,a.finished_at,a.outcome,a.error,t.state,t.revision,t.task_json,i.state,i.final_result_json,s.state,s.frame_count,s.transcript_digest,s.interruption_error FROM {schema}.outbox o JOIN {schema}.outbox_attempts a USING(tenant_scope,outbox_id) JOIN {schema}.tasks t USING(tenant_scope,task_id) JOIN {schema}.idempotency_records i USING(tenant_scope,task_id) JOIN {schema}.stream_transcripts s USING(tenant_scope,task_id) WHERE o.dispatch_id='dispatch-expiry'"),&[]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "delivered");
+        assert_eq!(row.get::<_, Option<String>>(1), None);
+        assert_eq!(row.get::<_, Option<String>>(2), None);
+        assert_eq!(row.get::<_, Option<i64>>(3), None);
+        assert_eq!(row.get::<_, Option<String>>(4), None);
+        assert_eq!(row.get::<_, i64>(5), 113);
+        assert_eq!(row.get::<_, Option<i64>>(6), Some(113));
+        assert_eq!(
+            row.get::<_, Option<String>>(7).as_deref(),
+            Some("delivered")
+        );
+        assert_eq!(row.get::<_, Option<String>>(8), None);
+        assert_eq!(row.get::<_, String>(9), canceled_state);
+        assert_eq!(row.get::<_, i64>(10), 2);
+        assert_eq!(row.get::<_, String>(11), canceled_json);
+        assert_eq!(row.get::<_, String>(12), "completed");
+        assert_eq!(
+            row.get::<_, Option<String>>(13).as_deref(),
+            Some(final_json.as_str())
+        );
+        assert_eq!(row.get::<_, String>(14), "terminal");
+        assert_eq!(row.get::<_, i64>(15), 2);
+        assert_eq!(row.get::<_, String>(16), public_digest);
+        assert_eq!(row.get::<_, Option<String>>(17), None);
+
+        let event=client.query_one(&format!("SELECT event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at FROM {schema}.task_events WHERE tenant_scope='tenant-expiry' AND task_id='expiry-task' ORDER BY event_seq DESC LIMIT 1"),&[]).await.unwrap();
+        assert_eq!(event.get::<_, i64>(0), 2);
+        assert_eq!(event.get::<_, i64>(1), 2);
+        assert_eq!(event.get::<_, String>(2), "durable_completed");
+        assert_eq!(
+            event.get::<_, Option<String>>(3).as_deref(),
+            Some(state.as_str())
+        );
+        assert_eq!(event.get::<_, String>(4), canceled_state);
+        assert_eq!(event.get::<_, String>(5), canceled_json);
+        assert_eq!(event.get::<_, i64>(6), 113);
+
+        let receiver_row = client.query_one(&format!("SELECT state,lease_epoch,lease_owner,lease_token,lease_until,sender_attempt_no,sender_lease_token,frame_count,completed_at FROM {schema}.receiver_inbox WHERE tenant_scope='tenant-expiry' AND dispatch_id='dispatch-expiry'"), &[]).await.unwrap();
+        assert_eq!(receiver_row.get::<_, String>(0), "completed");
+        assert_eq!(receiver_row.get::<_, i64>(1), 2);
+        assert_eq!(receiver_row.get::<_, Option<String>>(2), None);
+        assert_eq!(receiver_row.get::<_, Option<String>>(3), None);
+        assert_eq!(receiver_row.get::<_, Option<i64>>(4), None);
+        assert_eq!(receiver_row.get::<_, i64>(5), 1);
+        assert_eq!(receiver_row.get::<_, String>(6), reconciliation.lease_token);
+        assert_eq!(receiver_row.get::<_, Option<i64>>(7), Some(2));
+        assert_eq!(receiver_row.get::<_, Option<i64>>(8), Some(112));
+        let cancellation = client.query_one(&format!("SELECT state,requested_at,completed_at FROM {schema}.cancellation_intents WHERE tenant_scope='tenant-expiry' AND dispatch_id='dispatch-expiry'"), &[]).await.unwrap();
+        assert_eq!(cancellation.get::<_, String>(0), "receiver_canceled");
+        assert_eq!(cancellation.get::<_, i64>(1), 105);
+        assert_eq!(cancellation.get::<_, Option<i64>>(2), Some(112));
+        let effects: i64 = client.query_one(&format!("SELECT count(*) FROM {schema}.loopback_effects WHERE tenant_scope='tenant-expiry' AND dispatch_id='dispatch-expiry'"), &[]).await.unwrap().get(0);
+        assert_eq!(
+            effects, 0,
+            "cancellation containment must not commit the normal effect"
+        );
+        assert_eq!(
+            store
+                .final_result_scoped("tenant-expiry", "message-expiry")
+                .await
+                .unwrap(),
+            Some(a2a::SendMessageResponse::Task(canceled.clone()))
+        );
+        let batch = store
+            .stream_frames_after_scoped("tenant-expiry", "message-expiry", 0)
+            .await
+            .unwrap();
+        assert!(batch.closed);
+        assert_eq!(batch.frames, public_transcript);
+        assert_eq!(batch.interruption, None);
+        store.shutdown().await.unwrap();
+        let reopened = PostgresTaskStore::open(config.clone()).await.unwrap();
+        assert_eq!(
+            reopened
+                .final_result_scoped("tenant-expiry", "message-expiry")
+                .await
+                .unwrap(),
+            Some(a2a::SendMessageResponse::Task(canceled.clone()))
+        );
+        let replay = reopened
+            .stream_frames_after_scoped("tenant-expiry", "message-expiry", 0)
+            .await
+            .unwrap();
+        assert!(replay.closed);
+        assert_eq!(replay.frames, public_transcript);
+        let scope = OwnedTaskScope::new("tenant-expiry", "owner", VisibilityScope::Own).unwrap();
+        let events = reopened
+            .task_events_after_scoped(&scope, "expiry-task", 0)
+            .await
+            .unwrap();
+        assert!(events.closed);
+        assert!(matches!(
+            events.frames.last(),
+            Some(a2a::StreamResponse::StatusUpdate(update))
+                if update.status.state == a2a::TaskState::Canceled
+        ));
+        reopened.shutdown().await.unwrap();
+        drop(client);
+        driver.abort();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    }
+);
+
+postgres_test!(expired_final_attempt_without_receiver_is_dead_lettered, {
     let Some(url) = admin_url() else { return };
-    let config = config(url.clone(), "final_expiry");
+    let config = config(url, "final_unaccepted").with_test_only_trust_injected_time(true);
     let store = PostgresTaskStore::open(config.clone()).await.unwrap();
     let (client, driver) = admin_client(&superuser_url()).await;
+    let schema = config.schema_name();
     let task = a2a::Task {
-        id: "expiry-task".into(),
-        context_id: "expiry-context".into(),
+        id: "unaccepted-final-task".into(),
+        context_id: "unaccepted-final-context".into(),
         status: a2a::TaskStatus {
             state: a2a::TaskState::Submitted,
             message: None,
@@ -963,39 +1431,595 @@ postgres_test!(expired_final_attempt_is_atomically_dead_lettered, {
         protocol: "a2a-v1".into(),
         task_id: task.id.clone(),
         context_id: task.context_id.clone(),
-        text: "expire".into(),
+        text: "never accepted".into(),
     };
     let payload = serde_json::to_string(&request).unwrap();
-    let digest = smesh_a2a::content_digest(payload.as_bytes());
-    client.execute(&format!("INSERT INTO {}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES($1,$2,$3,$4,1,$5,$6)",config.schema_name()), &[&"tenant-expiry",&task.id,&task.context_id,&state,&task_json,&"owner"]).await.unwrap();
-    client.execute(&format!("INSERT INTO {}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) VALUES($1,$2,1,1,'admitted',NULL,$3,$4,1)",config.schema_name()), &[&"tenant-expiry",&task.id,&state,&task_json]).await.unwrap();
-    client.execute(&format!("INSERT INTO {}.outbox(tenant_scope,dispatch_id,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) VALUES($1,$2,$3,$4,1,$5,$6,'pending',1,100,100,100,2)",config.schema_name()), &[&"tenant-expiry",&"dispatch-expiry",&task.id,&"message-expiry",&payload,&digest]).await.unwrap();
+    let payload_digest = smesh_a2a::content_digest(payload.as_bytes());
+    let admission = serde_json::to_string(&a2a::SendMessageResponse::Task(task.clone())).unwrap();
+    client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES('tenant-unaccepted',$1,$2,$3,1,$4,'owner')"), &[&task.id,&task.context_id,&state,&task_json]).await.unwrap();
+    client.execute(&format!("INSERT INTO {schema}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) VALUES('tenant-unaccepted',$1,1,1,'admitted',NULL,$2,$3,100)"), &[&task.id,&state,&task_json]).await.unwrap();
+    client.execute(&format!("INSERT INTO {schema}.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id) VALUES('tenant-unaccepted','message-unaccepted','sha256:request',$1,'in_progress',$2,100,100,2,'owner')"), &[&task.id,&admission]).await.unwrap();
+    client.execute(&format!("INSERT INTO {schema}.outbox(tenant_scope,dispatch_id,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) VALUES('tenant-unaccepted','dispatch-unaccepted',$1,'message-unaccepted',1,$2,$3,'pending',1,100,100,100,2)"), &[&task.id,&payload,&payload_digest]).await.unwrap();
+    client.execute(&format!("INSERT INTO {schema}.stream_transcripts(tenant_scope,message_id,dispatch_id,task_id,transcript_version,state,frame_count,transcript_digest,created_at,updated_at) VALUES('tenant-unaccepted','message-unaccepted','dispatch-unaccepted',$1,1,'open',0,$2,100,100)"), &[&task.id,&smesh_a2a::content_digest(b"[]")]).await.unwrap();
     let lease = store
-        .claim_outbox("expiry-owner", 100, 10)
+        .claim_outbox("crashed", 100, 10)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(lease.attempt_no, 1);
     assert!(
         store
-            .claim_outbox("next-owner", 111, 10)
+            .claim_outbox("reaper", 111, 10)
             .await
             .unwrap()
             .is_none()
     );
-    let row=client.query_one(&format!("SELECT o.state,o.lease_token,a.finished_at,a.outcome FROM {0}.outbox o JOIN {0}.outbox_attempts a USING(tenant_scope,outbox_id) WHERE o.dispatch_id='dispatch-expiry'",config.schema_name()),&[]).await.unwrap();
+    let failed = store
+        .final_result_scoped("tenant-unaccepted", "message-unaccepted")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(failed, a2a::SendMessageResponse::Task(task) if task.status.state == a2a::TaskState::Failed)
+    );
+    let row = client.query_one(&format!("SELECT o.state,a.outcome,t.state FROM {schema}.outbox o JOIN {schema}.outbox_attempts a USING(tenant_scope,outbox_id) JOIN {schema}.tasks t USING(tenant_scope,task_id) WHERE o.dispatch_id='dispatch-unaccepted'"), &[]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), "dead");
-    assert!(row.get::<_, Option<String>>(1).is_none());
-    assert_eq!(row.get::<_, Option<i64>>(2), Some(111));
+    assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some("dead"));
     assert_eq!(
-        row.get::<_, Option<String>>(3).as_deref(),
-        Some("permanent")
+        row.get::<_, String>(2),
+        serde_json::to_string(&a2a::TaskState::Failed).unwrap()
     );
     store.shutdown().await.unwrap();
     drop(client);
     driver.abort();
     PostgresTaskStore::drop_test_schema(&config).await.unwrap();
 });
+
+postgres_test!(
+    dead_letter_fault_points_roll_back_the_entire_failed_lifecycle,
+    {
+        let Some(url) = admin_url() else { return };
+        for (index, (table, timing)) in [
+            ("tasks", "UPDATE"),
+            ("task_events", "INSERT"),
+            ("idempotency_records", "UPDATE"),
+            ("stream_transcripts", "UPDATE"),
+            ("outbox", "UPDATE"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let config = config(url.clone(), &format!("dead_fault_{index}"))
+                .with_test_only_trust_injected_time(true);
+            let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+            let (client, driver) = admin_client(&superuser_url()).await;
+            let schema = config.schema_name();
+            let task = a2a::Task {
+                id: "fault-task".into(),
+                context_id: "fault-context".into(),
+                status: a2a::TaskStatus {
+                    state: a2a::TaskState::Submitted,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            };
+            let task_json = serde_json::to_string(&task).unwrap();
+            let state = serde_json::to_string(&task.status.state).unwrap();
+            let request = smesh_a2a::MeshRequest {
+                protocol: "a2a-v1".into(),
+                task_id: task.id.clone(),
+                context_id: task.context_id.clone(),
+                text: "fault".into(),
+            };
+            let payload = serde_json::to_string(&request).unwrap();
+            let digest = smesh_a2a::content_digest(payload.as_bytes());
+            let admission =
+                serde_json::to_string(&a2a::SendMessageResponse::Task(task.clone())).unwrap();
+            let initial = a2a::StreamResponse::Task(task.clone());
+            let initial_json = serde_json::to_string(&initial).unwrap();
+            let transcript_digest =
+                smesh_a2a::content_digest(&serde_json::to_vec(&[initial]).unwrap());
+            client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES('tenant-fault',$1,$2,$3,1,$4,'owner')"), &[&task.id,&task.context_id,&state,&task_json]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) VALUES('tenant-fault',$1,1,1,'admitted',NULL,$2,$3,100)"), &[&task.id,&state,&task_json]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id) VALUES('tenant-fault','message-fault','sha256:request',$1,'in_progress',$2,100,100,2,'owner')"), &[&task.id,&admission]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.outbox(tenant_scope,dispatch_id,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) VALUES('tenant-fault','dispatch-fault',$1,'message-fault',1,$2,$3,'pending',1,100,100,100,2)"), &[&task.id,&payload,&digest]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.stream_transcripts(tenant_scope,message_id,dispatch_id,task_id,transcript_version,state,frame_count,transcript_digest,created_at,updated_at) VALUES('tenant-fault','message-fault','dispatch-fault',$1,1,'open',1,$2,100,100)"), &[&task.id,&transcript_digest]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.stream_frames(tenant_scope,message_id,frame_seq,frame_version,frame_kind,frame_json,frame_digest,created_at) VALUES('tenant-fault','message-fault',1,1,'task',$1,$2,100)"), &[&initial_json,&smesh_a2a::content_digest(initial_json.as_bytes())]).await.unwrap();
+            let lease = store
+                .claim_outbox("fault-owner", 100, 10)
+                .await
+                .unwrap()
+                .unwrap();
+            let trigger_when = if table == "outbox" {
+                " WHEN (NEW.state IN ('dead','superseded'))"
+            } else {
+                ""
+            };
+            client.batch_execute(&format!("CREATE FUNCTION {schema}.fail_dead_letter() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'dead-letter fault'; END $$; CREATE TRIGGER fail_dead_letter BEFORE {timing} ON {schema}.{table} FOR EACH ROW{trigger_when} EXECUTE FUNCTION {schema}.fail_dead_letter()" )).await.unwrap();
+            assert!(
+                store
+                    .claim_outbox("fault-reclaimer", 111, 10)
+                    .await
+                    .is_err(),
+                "fault at {table} must abort"
+            );
+            let unchanged = client.query_one(&format!("SELECT t.state,t.revision,(SELECT count(*) FROM {schema}.task_events WHERE task_id='fault-task'),i.state,i.final_result_json,s.state,s.interruption_error,o.state,o.lease_token,o.lease_until,a.finished_at,a.outcome FROM {schema}.tasks t JOIN {schema}.idempotency_records i USING(tenant_scope,task_id) JOIN {schema}.stream_transcripts s USING(tenant_scope,task_id) JOIN {schema}.outbox o USING(tenant_scope,task_id) JOIN {schema}.outbox_attempts a USING(tenant_scope,outbox_id) WHERE t.task_id='fault-task'"), &[]).await.unwrap();
+            assert_eq!(unchanged.get::<_, String>(0), state, "fault at {table}");
+            assert_eq!(unchanged.get::<_, i64>(1), 1, "fault at {table}");
+            assert_eq!(unchanged.get::<_, i64>(2), 1, "fault at {table}");
+            assert_eq!(
+                unchanged.get::<_, String>(3),
+                "in_progress",
+                "fault at {table}"
+            );
+            assert_eq!(
+                unchanged.get::<_, Option<String>>(4),
+                None,
+                "fault at {table}"
+            );
+            assert_eq!(unchanged.get::<_, String>(5), "open", "fault at {table}");
+            assert_eq!(
+                unchanged.get::<_, Option<String>>(6),
+                None,
+                "fault at {table}"
+            );
+            assert_eq!(unchanged.get::<_, String>(7), "leased", "fault at {table}");
+            assert_eq!(
+                unchanged.get::<_, Option<String>>(8).as_deref(),
+                Some(lease.lease_token.as_str()),
+                "fault at {table}"
+            );
+            assert_eq!(
+                unchanged.get::<_, Option<i64>>(9),
+                Some(110),
+                "fault at {table}"
+            );
+            assert_eq!(
+                unchanged.get::<_, Option<i64>>(10),
+                None,
+                "fault at {table}"
+            );
+            assert_eq!(
+                unchanged.get::<_, Option<String>>(11),
+                None,
+                "fault at {table}"
+            );
+            client.batch_execute(&format!("DROP TRIGGER fail_dead_letter ON {schema}.{table}; DROP FUNCTION {schema}.fail_dead_letter()" )).await.unwrap();
+            assert!(
+                store
+                    .claim_outbox("fault-reclaimer", 111, 10)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            store.shutdown().await.unwrap();
+            drop(client);
+            driver.abort();
+            PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+        }
+    }
+);
+
+postgres_test!(
+    completed_receiver_on_final_attempt_reconciles_after_sender_crash,
+    {
+        use smesh_a2a::{OutboxAuthority as _, ReceiverAdmission, ReceiverAuthority as _};
+        let Some(url) = admin_url() else { return };
+        let config = config(url, "final_reconcile").with_test_only_trust_injected_time(true);
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let (client, driver) = admin_client(&superuser_url()).await;
+        let mut task = a2a::Task {
+            id: "final-reconcile-task".into(),
+            context_id: "final-reconcile-context".into(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let submitted_json = serde_json::to_string(&task).unwrap();
+        let submitted_state = serde_json::to_string(&task.status.state).unwrap();
+        let request = smesh_a2a::MeshRequest {
+            protocol: "a2a-v1".into(),
+            task_id: task.id.clone(),
+            context_id: task.context_id.clone(),
+            text: "exactly once".into(),
+        };
+        let payload = serde_json::to_string(&request).unwrap();
+        let payload_digest = smesh_a2a::content_digest(payload.as_bytes());
+        let admission =
+            serde_json::to_string(&a2a::SendMessageResponse::Task(task.clone())).unwrap();
+        let schema = config.schema_name();
+        client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES('tenant-final',$1,$2,$3,1,$4,'owner')"), &[&task.id,&task.context_id,&submitted_state,&submitted_json]).await.unwrap();
+        client.execute(&format!("INSERT INTO {schema}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) VALUES('tenant-final',$1,1,1,'admitted',NULL,$2,$3,100)"), &[&task.id,&submitted_state,&submitted_json]).await.unwrap();
+        client.execute(&format!("INSERT INTO {schema}.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id) VALUES('tenant-final','message-final','sha256:request',$1,'in_progress',$2,100,100,2,'owner')"), &[&task.id,&admission]).await.unwrap();
+        client.execute(&format!("INSERT INTO {schema}.outbox(tenant_scope,dispatch_id,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) VALUES('tenant-final','dispatch-final',$1,'message-final',1,$2,$3,'pending',1,100,100,100,2)"), &[&task.id,&payload,&payload_digest]).await.unwrap();
+        client.execute(&format!("INSERT INTO {schema}.stream_transcripts(tenant_scope,message_id,dispatch_id,task_id,transcript_version,state,frame_count,transcript_digest,created_at,updated_at) VALUES('tenant-final','message-final','dispatch-final',$1,1,'open',0,$2,100,100)"), &[&task.id,&smesh_a2a::content_digest(b"[]")]).await.unwrap();
+        let crashed = store
+            .claim_outbox("crashed", 100, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        let envelope = smesh_a2a::DurableDispatchEnvelope {
+            tenant_scope: "tenant-final".into(),
+            dispatch_id: "dispatch-final".into(),
+            payload_digest,
+            request,
+        };
+        let ReceiverAdmission::Execute(receiver) = store
+            .begin_receive(envelope.clone(), "receiver", 100, 10)
+            .await
+            .unwrap()
+        else {
+            panic!("receiver execute expected")
+        };
+        let events = vec![smesh_a2a::MeshEvent::Completed {
+            summary: "exact result".into(),
+        }];
+        store
+            .complete_loopback_receive(&receiver, &events, 101)
+            .await
+            .unwrap();
+        drop(crashed);
+        let reconciliation = store
+            .claim_outbox("restart", 111, 10)
+            .await
+            .unwrap()
+            .expect("completed final receiver must reconcile");
+        assert_eq!(reconciliation.attempt_no, 1);
+        assert!(
+            matches!(store.begin_receive(envelope, "restart-receiver", 111, 10).await.unwrap(), ReceiverAdmission::Replay(replayed) if replayed == events)
+        );
+        task.status.state = a2a::TaskState::Completed;
+        task.status.timestamp = chrono::DateTime::from_timestamp_millis(112);
+        let result = a2a::SendMessageResponse::Task(task.clone());
+        let transcript = [
+            a2a::StreamResponse::Task(serde_json::from_str(&submitted_json).unwrap()),
+            a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+                task_id: task.id.clone(),
+                context_id: task.context_id.clone(),
+                status: task.status.clone(),
+                metadata: None,
+            }),
+        ];
+        assert_eq!(
+            store
+                .commit_delivery(&reconciliation, task, result, &transcript, 112)
+                .await
+                .unwrap(),
+            smesh_a2a::TransitionOutcome::Applied
+        );
+        let row = client.query_one(&format!("SELECT o.state,t.state,i.state,s.state,(SELECT count(*) FROM {schema}.loopback_effects WHERE dispatch_id='dispatch-final') FROM {schema}.outbox o JOIN {schema}.tasks t USING(tenant_scope,task_id) JOIN {schema}.idempotency_records i USING(tenant_scope,task_id) JOIN {schema}.stream_transcripts s USING(tenant_scope,task_id) WHERE o.dispatch_id='dispatch-final'"), &[]).await.unwrap();
+        assert_eq!(
+            (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, String>(3),
+                row.get::<_, i64>(4)
+            ),
+            (
+                "delivered".into(),
+                serde_json::to_string(&a2a::TaskState::Completed).unwrap(),
+                "completed".into(),
+                "terminal".into(),
+                1
+            )
+        );
+        store.shutdown().await.unwrap();
+        drop(client);
+        driver.abort();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    }
+);
+
+postgres_test!(postgres_renews_fenced_outbox_and_receiver_leases, {
+    use smesh_a2a::{AuthorityCapabilities, LeaseRenewalOutcome};
+    let Some(url) = admin_url() else { return };
+    let config = config(url, "lease_renewal");
+    let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+    assert_eq!(
+        store.capabilities(),
+        AuthorityCapabilities {
+            lease_renewal: true,
+            quota_reservations: true,
+        }
+    );
+    let stale_outbox = smesh_a2a::OutboxLease {
+        tenant_scope: "tenant".into(),
+        outbox_id: -1,
+        dispatch_id: "dispatch".into(),
+        task_id: "task".into(),
+        attempt_no: 1,
+        max_attempts: 1,
+        lease_owner: "replica".into(),
+        lease_token: "token".into(),
+        lease_until: 1,
+        request: smesh_a2a::MeshRequest {
+            protocol: "a2a-v1".into(),
+            task_id: "task".into(),
+            context_id: "context".into(),
+            text: "x".into(),
+        },
+    };
+    assert_eq!(
+        store
+            .renew_outbox_lease(&stale_outbox, 1_000)
+            .await
+            .unwrap(),
+        LeaseRenewalOutcome::Stale
+    );
+    let stale_receiver = smesh_a2a::ReceiverLease {
+        tenant_scope: "tenant".into(),
+        task_id: "task".into(),
+        dispatch_id: "dispatch".into(),
+        payload_digest: "digest".into(),
+        sender_attempt_no: 1,
+        sender_lease_token: "sender-token".into(),
+        lease_owner: "replica".into(),
+        lease_token: "token".into(),
+        lease_epoch: 1,
+        lease_until: 1,
+    };
+    assert_eq!(
+        store
+            .renew_receiver_lease(&stale_receiver, 1_000)
+            .await
+            .unwrap(),
+        LeaseRenewalOutcome::Stale
+    );
+    store.shutdown().await.unwrap();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+});
+
+postgres_test!(postgres_quota_reservation_seam_is_transactional, {
+    let Some(url) = admin_url() else { return };
+    let config = config(url, "quota_seam").with_test_only_trust_injected_time(true);
+    let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+    let scope = OwnedTaskScope::new("tenant-quota", "account-quota", VisibilityScope::Own).unwrap();
+    let command = |suffix: &str| {
+        let mut message = a2a::Message::new(a2a::Role::User, vec![a2a::Part::text("quota")]);
+        message.message_id = format!("message-quota-{suffix}");
+        let task = a2a::Task {
+            id: format!("task-quota-{suffix}"),
+            context_id: "context-quota".into(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: Some(vec![message.clone()]),
+            metadata: None,
+        };
+        smesh_a2a::SendMessageAdmission {
+            request: a2a::SendMessageRequest {
+                message,
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            },
+            streaming: false,
+            task: task.clone(),
+            original_result: a2a::SendMessageResponse::Task(task),
+            input_limits: smesh_a2a::InputLimits::default(),
+            now: 100,
+            max_attempts: 2,
+        }
+    };
+    let audit = |suffix: &str| {
+        AuthorizationAuditInput::new(
+            format!("audit-quota-{suffix}"),
+            "tenant-quota",
+            "account-quota",
+            "policy-quota",
+            1,
+            "sha256:policy-quota",
+            "TaskCreate",
+            AuthorizationDecisionEffect::Allow,
+            "grant",
+            "task",
+            format!("sha256:quota-{suffix}"),
+            None,
+            100,
+        )
+        .unwrap()
+    };
+    let quota = |reservation: &str, dimension: &str| {
+        QuotaReservationInput::new(
+            "tenant-quota",
+            "account-quota",
+            "principal-quota",
+            "sendMessage",
+            dimension,
+            1,
+            reservation,
+            10_000,
+            Some("{\"source\":\"server-policy\"}".into()),
+        )
+        .unwrap()
+    };
+
+    let admitted = command("one");
+    store
+        .authorize_and_admit_mutation(
+            &scope,
+            AuthorizedMutation::with_quota(admitted.clone(), quota("reservation-1", "requests")),
+            audit("one"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        admitted.task.metadata.is_none(),
+        "wire metadata never carries quota authority"
+    );
+    let (client, driver) = admin_client(&superuser_url()).await;
+    let count: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM {}.quota_reservations WHERE tenant_scope='tenant-quota'",
+                config.schema_name()
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 1);
+
+    store
+        .authorize_and_admit_mutation(
+            &scope,
+            AuthorizedMutation::with_quota(admitted.clone(), quota("reservation-1", "requests")),
+            audit("replay"),
+        )
+        .await
+        .unwrap();
+    let count_after_replay: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM {}.quota_reservations WHERE tenant_scope='tenant-quota'",
+                config.schema_name()
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count_after_replay, 1, "exact replay cannot double reserve");
+
+    let counts_before_replay_rejections = store.atomic_record_counts().await.unwrap();
+    assert!(
+        store
+            .authorize_and_admit_mutation(
+                &scope,
+                AuthorizedMutation::without_quota(admitted.clone()),
+                audit("missing-replay"),
+            )
+            .await
+            .is_err(),
+        "missing trusted task-local reservation must not replay"
+    );
+    assert!(
+        store
+            .authorize_and_admit_mutation(
+                &scope,
+                AuthorizedMutation::with_quota(
+                    admitted.clone(),
+                    quota("reservation-changed", "requests")
+                ),
+                audit("changed-replay"),
+            )
+            .await
+            .is_err(),
+        "changed trusted task-local reservation must not replay"
+    );
+    assert_eq!(
+        store.atomic_record_counts().await.unwrap(),
+        counts_before_replay_rejections
+    );
+    let mut after_expiry = admitted.clone();
+    after_expiry.now = 20_000;
+    store
+        .authorize_and_admit_mutation(
+            &scope,
+            AuthorizedMutation::with_quota(after_expiry, quota("reservation-1", "requests")),
+            audit("expired-exact-replay"),
+        )
+        .await
+        .expect("exact immutable replay remains valid after reservation expiry");
+
+    let counts_before_conflict = store.atomic_record_counts().await.unwrap();
+    assert!(
+        store
+            .authorize_and_admit_mutation(
+                &scope,
+                AuthorizedMutation::with_quota(command("two"), quota("reservation-1", "different")),
+                audit("conflict"),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.atomic_record_counts().await.unwrap(),
+        counts_before_conflict
+    );
+
+    client.batch_execute(&format!(
+        "CREATE FUNCTION {}.fail_quota_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'quota fault'; END $$; CREATE TRIGGER fail_quota BEFORE INSERT ON {}.quota_reservations FOR EACH ROW EXECUTE FUNCTION {}.fail_quota_insert()",
+        config.schema_name(), config.schema_name(), config.schema_name()
+    )).await.unwrap();
+    let counts_before_fault = store.atomic_record_counts().await.unwrap();
+    assert!(
+        store
+            .authorize_and_admit_mutation(
+                &scope,
+                AuthorizedMutation::with_quota(
+                    command("fault"),
+                    quota("reservation-fault", "requests")
+                ),
+                audit("fault"),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.atomic_record_counts().await.unwrap(),
+        counts_before_fault,
+        "quota trigger failure rolls back task/event/idempotency/outbox/audit"
+    );
+
+    store.shutdown().await.unwrap();
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+});
+
+postgres_test!(
+    startup_rejects_noncanonical_quota_row_with_intact_catalog,
+    {
+        let Some(url) = admin_url() else { return };
+        let config = config(url, "quota_corrupt");
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let (client, driver) = admin_client(&superuser_url()).await;
+        let task = a2a::Task {
+            id: "quota-corrupt-task".into(),
+            context_id: "quota-corrupt-context".into(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let state = serde_json::to_string(&task.status.state).unwrap();
+        let task_json = serde_json::to_string(&task).unwrap();
+        let schema = config.schema_name();
+        client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES('tenant-corrupt',$1,$2,$3,1,$4,'account-corrupt')"), &[&task.id,&task.context_id,&state,&task_json]).await.unwrap();
+        let now: i64 = client
+            .query_one(&format!("SELECT {schema}.db_millis()"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        client.execute(&format!("INSERT INTO {schema}.quota_reservations(tenant_scope,reservation_id,account_id,principal_scope,operation,dimension,units,task_id,expires_at,metadata_json,created_at) VALUES('tenant-corrupt','reservation-corrupt','account-corrupt','principal-corrupt','sendMessage','requests',1,$1,$2,'{{\"source\": \"noncanonical\"}}',$3)"), &[&task.id,&(now+60_000),&now]).await.unwrap();
+        store.shutdown().await.unwrap();
+        assert!(matches!(
+            PostgresTaskStore::open(config.clone()).await,
+            Err(smesh_a2a::PostgresStoreError::InvalidSchema)
+        ));
+        drop(client);
+        driver.abort();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    }
+);
 
 postgres_test!(concurrent_independent_pools_never_exceed_global_task_cap, {
     let Some(url) = admin_url() else { return };
@@ -1128,6 +2152,16 @@ postgres_test!(
                 .unwrap(),
             smesh_a2a::TransitionOutcome::Stale,
         );
+        admin.execute(
+            &format!("UPDATE {schema}.outbox SET state='dead',lease_owner=NULL,lease_token=NULL,lease_until=NULL WHERE dispatch_id='dispatch-expired'"),
+            &[],
+        ).await.unwrap();
+        let fresh = past_clock
+            .claim_outbox("fresh-worker", i64::MAX, 60_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.dispatch_id, "dispatch-fresh");
         let envelope = smesh_a2a::DurableDispatchEnvelope {
             tenant_scope: "tenant-clock".into(),
             dispatch_id: "dispatch-fresh".into(),
@@ -1345,3 +2379,215 @@ postgres_test!(startup_rejects_incompatible_schema_version_before_pool, {
     driver.abort();
     PostgresTaskStore::drop_test_schema(&config).await.unwrap();
 });
+
+postgres_test!(startup_rejects_unexpected_migration_revision, {
+    let Some(url) = admin_url() else { return };
+    let config = config(url, "unexpected_migration");
+    let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+    store.shutdown().await.unwrap();
+    let (client, driver) = admin_client(&superuser_url()).await;
+    let schema = config.schema_name();
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.schema_migrations DISABLE TRIGGER schema_migrations_immutable;
+             INSERT INTO {schema}.schema_migrations(revision,logical_schema_version,name,checksum,applied_at)
+             VALUES(999,6,'unexpected_revision','sha256:0000000000000000000000000000000000000000000000000000000000000000',0)"
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        PostgresTaskStore::open(config.clone()).await,
+        Err(smesh_a2a::PostgresStoreError::InvalidSchema)
+    ));
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+});
+
+#[cfg(debug_assertions)]
+postgres_test!(
+    drop_gateway_reaps_blocked_receiver_renewal_and_releases_postgres_pool,
+    {
+        if env::var_os("SMESH_DROP_REAPER_PG_CHILD").is_none() {
+            let output = tokio::time::timeout(
+                Duration::from_secs(25),
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "drop_gateway_reaps_blocked_receiver_renewal_and_releases_postgres_pool",
+                        "--nocapture",
+                    ])
+                    .env("SMESH_DROP_REAPER_PG_CHILD", "1")
+                    .env("SMESH_TEST_DRIVER_LEASE_MILLIS", "300")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("PostgreSQL drop-reaper subprocess watchdog")
+            .expect("launch PostgreSQL drop-reaper subprocess");
+            assert!(
+                output.status.success(),
+                "drop-reaper child failed: {output:?}"
+            );
+            return;
+        }
+        let Some(admin) = admin_url() else { return };
+        let runtime = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap();
+        let application_name = format!("smesh_drop_reaper_{:016x}", rand::random::<u64>());
+        let mut migrator_url = Url::parse(&admin).unwrap();
+        migrator_url
+            .query_pairs_mut()
+            .append_pair("application_name", &application_name);
+        let mut runtime_url = Url::parse(&runtime).unwrap();
+        runtime_url
+            .query_pairs_mut()
+            .append_pair("application_name", &application_name);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new(tokio::sync::Notify::new());
+        let config = PostgresStoreConfig::new(
+            migrator_url.to_string(),
+            runtime_url.to_string(),
+            format!("smesh_drop_reaper_{:016x}", rand::random::<u64>()),
+        )
+        .unwrap()
+        .with_test_only_insecure_loopback(true)
+        .with_test_only_parent_managed_cleanup()
+        .with_pool_size(1)
+        .unwrap()
+        .with_timeouts(Duration::from_secs(5), Duration::from_secs(5))
+        .unwrap()
+        .with_receiver_renewal_test_probe(Arc::clone(&entered), Arc::clone(&released));
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let now = 1_700_009_000_000;
+        let mut message =
+            a2a::Message::new(a2a::Role::User, vec![a2a::Part::text("blocked renewal")]);
+        message.message_id = "postgres-drop-renewal-message".into();
+        let request = a2a::SendMessageRequest {
+            message: message.clone(),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let task = a2a::Task {
+            id: "postgres-drop-renewal-task".into(),
+            context_id: "postgres-drop-renewal-context".into(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: chrono::DateTime::from_timestamp_millis(now),
+            },
+            artifacts: None,
+            history: Some(vec![message]),
+            metadata: None,
+        };
+        let scope = OwnedTaskScope::new(
+            "tenant-drop-renewal",
+            "owner-drop-renewal",
+            VisibilityScope::Own,
+        )
+        .unwrap();
+        let audit = AuthorizationAuditInput::new(
+            "audit-drop-renewal",
+            "tenant-drop-renewal",
+            "owner-drop-renewal",
+            "policy-drop-renewal",
+            1,
+            "sha256:policy-drop-renewal",
+            "TaskCreate",
+            AuthorizationDecisionEffect::Allow,
+            "grant",
+            "task",
+            "sha256:resource-drop-renewal",
+            None,
+            now,
+        )
+        .unwrap();
+        store
+            .authorize_and_admit(
+                &scope,
+                SendMessageAdmission {
+                    request,
+                    streaming: false,
+                    task: task.clone(),
+                    original_result: a2a::SendMessageResponse::Task(task),
+                    input_limits: smesh_a2a::InputLimits::default(),
+                    now,
+                    max_attempts: 2,
+                },
+                audit,
+            )
+            .await
+            .unwrap();
+
+        let receiver_started = Arc::new(tokio::sync::Notify::new());
+        let receiver_release = Arc::new(tokio::sync::Notify::new());
+        let gateway = build_durable_loopback_gateway(
+            GatewayConfig::new("http://127.0.0.1:1", "postgres-drop-reaper"),
+            store.clone(),
+            DurableLoopbackEndpoint::with_completion_barrier(
+                Arc::clone(&receiver_started),
+                receiver_release,
+            ),
+            InjectedClock::new(now),
+        )
+        .unwrap();
+        receiver_started.notified().await;
+
+        let acquired = Arc::new(tokio::sync::Barrier::new(2));
+        let holder_release = Arc::new(tokio::sync::Barrier::new(2));
+        let holder = {
+            let held_store = store.clone();
+            let acquired = Arc::clone(&acquired);
+            let holder_release = Arc::clone(&holder_release);
+            tokio::spawn(async move {
+                held_store
+                    .hold_test_pool_connection(acquired, holder_release)
+                    .await
+            })
+        };
+        acquired.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("receiver renewal entered its blocked PostgreSQL call");
+
+        drop(gateway);
+        tokio::time::timeout(Duration::from_secs(5), released.notified())
+            .await
+            .expect("gateway drop reaper released blocked receiver renewal");
+        holder_release.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), holder)
+            .await
+            .expect("pool holder join watchdog")
+            .expect("pool holder task")
+            .expect("pool holder result");
+        drop(store);
+
+        let second = PostgresTaskStore::open(config.clone())
+            .await
+            .expect("second store must remain usable after drop cleanup");
+        second
+            .atomic_record_counts()
+            .await
+            .expect("second store query after cleanup");
+        second.shutdown().await.unwrap();
+        drop(second);
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+        drop(config);
+
+        let (admin_client, admin_driver) = admin_client(&superuser_url()).await;
+        let sessions: i64 = admin_client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1",
+                &[&application_name],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            sessions, 0,
+            "gateway drop left PostgreSQL application sessions"
+        );
+        drop(admin_client);
+        admin_driver.abort();
+    }
+);

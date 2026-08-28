@@ -257,13 +257,10 @@ impl DurableGateway {
 
 impl Drop for DurableGateway {
     fn drop(&mut self) {
-        // Drop cannot async-join. It cancels and aborts the owned worker, closes
-        // admission for every router clone, then synchronously drops SQLite and
-        // the process ownership lock. Explicit shutdown remains authoritative and
-        // performs the bounded async join.
-        if let Some(driver) = self.driver.as_mut() {
-            driver.abort_owned();
-        }
+        // Drop cannot async-join. Dropping the driver requests cooperative
+        // cancellation and transfers its abort-on-drop root join into a bounded
+        // Tokio reaper. Closing the authority then rejects new work and closes
+        // durable pools; explicit shutdown remains authoritative and joins inline.
         self.driver.take();
         if let Some(authority) = self.authority.as_ref() {
             authority.close_owned_sync();

@@ -1,6 +1,7 @@
 //! Server-owned tenant authorization policy and immutable request context.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io::Read as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -11,17 +12,33 @@ use thiserror::Error;
 use crate::auth::Principal;
 use crate::{
     AuthorizationAuditInput, AuthorizationDecisionEffect, DurableAuthority, InjectedClock,
-    SqliteTaskStore, content_digest,
+    QuotaReservationInput, SqliteTaskStore, content_digest,
 };
 
 tokio::task_local! {
     static AUTHORIZATION_CONTEXT: AuthorizationContext;
+    static QUOTA_RESERVATION: QuotaReservationInput;
 }
 
 /// Return the immutable server-resolved context while authorized work runs.
 #[must_use]
 pub fn current_authorization_context() -> Option<AuthorizationContext> {
     AUTHORIZATION_CONTEXT.try_with(Clone::clone).ok()
+}
+
+/// Return the trusted server-resolved reservation for the current mutation.
+#[must_use]
+pub fn current_quota_reservation() -> Option<QuotaReservationInput> {
+    QUOTA_RESERVATION.try_with(Clone::clone).ok()
+}
+
+/// Run server work with an immutable quota reservation. Transport middleware
+/// never calls this from request fields; #14 policy resolution owns that step.
+pub async fn scope_quota_reservation<F: Future>(
+    reservation: QuotaReservationInput,
+    future: F,
+) -> F::Output {
+    QUOTA_RESERVATION.scope(reservation, future).await
 }
 
 /// Resolve and strip the sole transport tenant selector before protocol parsing.

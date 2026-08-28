@@ -119,6 +119,7 @@ SMESH_A2A_BIND=127.0.0.1:4000 \
 SMESH_A2A_PUBLIC_URL=http://127.0.0.1:4000 \
 SMESH_A2A_NODE_ID=gateway-west \
 SMESH_A2A_AUTH_MODE=disabled \
+SMESH_A2A_DURABLE_BACKEND=sqlite \
 SMESH_A2A_SQLITE_PATH="$HOME/.local/state/smesh-a2a/tasks.sqlite3" \
 cargo run --bin smesh-a2a-gateway
 ```
@@ -133,12 +134,28 @@ world permissions (normally mode `0700`). The database and SQLite sidecars are h
 On SIGINT, durable loopback stops HTTP admission gracefully, joins its outbox driver and real-time
 retry ticker within bounded deadlines, then closes shared SQLite state and releases the lock.
 
-When OIDC or optional/required mTLS is enabled, `SMESH_A2A_AUTHORIZATION_POLICY_PATH` and
-`SMESH_A2A_SQLITE_PATH` are mandatory. The production binary accepts authentication and tenant
+When OIDC or optional/required mTLS is enabled, `SMESH_A2A_AUTHORIZATION_POLICY_PATH` and an
+explicit durable backend are mandatory. The production binary accepts authentication and tenant
 authorization only as one combined boundary, validates policy before listener/SQLite/runtime/mesh
 acquisition where possible, and routes protected JSON-RPC/REST operations through the schema-v6
 tenant/owner predicates and durable authorization audit. A policy with authentication disabled,
-authentication without policy, or authenticated non-loopback/non-SQLite serving fails closed. See
+authentication without policy, or authenticated non-loopback serving fails closed.
+
+Production PostgreSQL replicas set `SMESH_A2A_DURABLE_BACKEND=postgres`, distinct TLS
+`SMESH_A2A_POSTGRES_MIGRATOR_URL` and `SMESH_A2A_POSTGRES_RUNTIME_URL`, and
+`SMESH_A2A_POSTGRES_SCHEMA`. `SMESH_A2A_REPLICA_ID` is optional; it must be a bounded ASCII
+identifier and otherwise a random boot identifier is generated. SQLite and PostgreSQL settings may
+not be mixed. PostgreSQL claims and renewals use database time and complete fences; durable polling
+is the cross-replica correctness path. PostgreSQL also advertises the server-owned atomic quota
+reservation seam for admission, continuation, and cancellation; SQLite rejects quota-bearing
+commands without mutation and remains schema v6. Quota policy and dimension selection remain #14
+and may populate the seam only through `scope_quota_reservation`, never caller-controlled A2A fields.
+Debug CI runs the plaintext local-fixture child-process PostgreSQL failover, durable SSE, renewal,
+crash reconciliation, restart replay, renewal-outage recovery, and full production-binary E2E. The
+plaintext and shortened-lease seams do not exist in release. Release CI instead runs the complete
+all-target/all-feature suite and proves the production binary rejects plaintext PostgreSQL with
+`TlsRequired` before listener/database acquisition; a trusted-CA release PostgreSQL E2E is not
+currently provisioned. See [`docs/POSTGRES_TENANT_SCHEMA.md`](docs/POSTGRES_TENANT_SCHEMA.md),
 [`docs/TENANT_AUTHORIZATION_RUNBOOK.md`](docs/TENANT_AUTHORIZATION_RUNBOOK.md) and
 [`evidence/m2/issue-13.md`](evidence/m2/issue-13.md). Authentication-only library builders remain
 explicit development compatibility APIs and are not multitenant-safe.

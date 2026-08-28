@@ -132,6 +132,7 @@ fn spawn_durable_gateway(address: std::net::SocketAddr, database: &Path) -> Chil
         .env("SMESH_A2A_MODE", "loopback")
         .env("SMESH_A2A_BIND", address.to_string())
         .env("SMESH_A2A_PUBLIC_URL", format!("http://{address}"))
+        .env("SMESH_A2A_DURABLE_BACKEND", "sqlite")
         .env("SMESH_A2A_SQLITE_PATH", database)
         .kill_on_drop(true)
         .stdin(Stdio::null())
@@ -588,6 +589,7 @@ async fn runtime_with_sqlite_fails_before_acquiring_any_resource() {
             .env("SMESH_A2A_AUTH_MODE", "disabled")
             .env("SMESH_A2A_MODE", "runtime")
             .env("SMESH_A2A_MESH_BIND", mesh_addr.to_string())
+            .env("SMESH_A2A_DURABLE_BACKEND", "sqlite")
             .env("SMESH_A2A_SQLITE_PATH", &database)
             .env("SMESH_RUNTIME_TRACE_PATH", &trace)
             .stdin(Stdio::null())
@@ -599,7 +601,7 @@ async fn runtime_with_sqlite_fails_before_acquiring_any_resource() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("durable runtime receiver/effect replay is unsupported"),
+        stderr.contains("durable authority routing is supported only in loopback mode"),
         "unexpected stderr: {stderr}"
     );
     assert!(!database.exists(), "rejection must not create SQLite");

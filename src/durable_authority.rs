@@ -27,6 +27,150 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Fixed compatibility scope used only by local, unauthenticated development mode.
 pub const TRUSTED_SINGLE_TENANT_SCOPE: &str = "smesh-dev-only-tenant";
 
+/// Bounded, backend-neutral quota reservation resolved by trusted server policy.
+///
+/// This value is not deserialized from A2A requests, headers, or request metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaReservationInput {
+    tenant_scope: String,
+    account_id: String,
+    principal_scope: String,
+    operation: String,
+    dimension: String,
+    units: u64,
+    reservation_id: String,
+    expires_at: i64,
+    metadata: Option<String>,
+}
+
+impl QuotaReservationInput {
+    #[allow(clippy::too_many_arguments, clippy::missing_errors_doc)]
+    pub fn new(
+        tenant_scope: impl Into<String>,
+        account_id: impl Into<String>,
+        principal_scope: impl Into<String>,
+        operation: impl Into<String>,
+        dimension: impl Into<String>,
+        units: u64,
+        reservation_id: impl Into<String>,
+        expires_at: i64,
+        metadata: Option<String>,
+    ) -> Result<Self, A2AError> {
+        let value = Self {
+            tenant_scope: tenant_scope.into(),
+            account_id: account_id.into(),
+            principal_scope: principal_scope.into(),
+            operation: operation.into(),
+            dimension: dimension.into(),
+            units,
+            reservation_id: reservation_id.into(),
+            expires_at,
+            metadata,
+        };
+        let bounded_ascii = |text: &str, max: usize| {
+            !text.is_empty()
+                && text.len() <= max
+                && text.bytes().all(|byte| byte.is_ascii_graphic())
+        };
+        if !bounded_ascii(&value.tenant_scope, 64)
+            || !bounded_ascii(&value.account_id, 64)
+            || !bounded_ascii(&value.principal_scope, 256)
+            || !bounded_ascii(&value.operation, 128)
+            || !bounded_ascii(&value.dimension, 128)
+            || !bounded_ascii(&value.reservation_id, 256)
+            || value.units == 0
+            || value.units > i64::MAX as u64
+            || !(1..=253_402_300_799_999).contains(&value.expires_at)
+            || value.metadata.as_ref().is_some_and(|metadata| {
+                metadata.len() > MAX_AUTHORIZATION_TEXT_BYTES
+                    || serde_json::from_str::<serde_json::Value>(metadata)
+                        .ok()
+                        .and_then(|value| serde_json::to_string(&value).ok())
+                        .as_deref()
+                        != Some(metadata)
+            })
+        {
+            return Err(A2AError::invalid_request("invalid quota reservation"));
+        }
+        Ok(value)
+    }
+
+    #[must_use]
+    pub fn tenant_scope(&self) -> &str {
+        &self.tenant_scope
+    }
+    #[must_use]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+    #[must_use]
+    pub fn principal_scope(&self) -> &str {
+        &self.principal_scope
+    }
+    #[must_use]
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+    #[must_use]
+    pub fn dimension(&self) -> &str {
+        &self.dimension
+    }
+    #[must_use]
+    pub const fn units(&self) -> u64 {
+        self.units
+    }
+    #[must_use]
+    pub fn reservation_id(&self) -> &str {
+        &self.reservation_id
+    }
+    #[must_use]
+    pub const fn expires_at(&self) -> i64 {
+        self.expires_at
+    }
+    #[must_use]
+    pub fn metadata(&self) -> Option<&str> {
+        self.metadata.as_deref()
+    }
+}
+
+/// A trusted authorized command and its optional server-resolved quota reservation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthorizedMutation<T> {
+    command: T,
+    quota_reservation: Option<QuotaReservationInput>,
+}
+
+impl<T> AuthorizedMutation<T> {
+    #[must_use]
+    pub fn without_quota(command: T) -> Self {
+        Self {
+            command,
+            quota_reservation: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_quota(command: T, quota_reservation: QuotaReservationInput) -> Self {
+        Self {
+            command,
+            quota_reservation: Some(quota_reservation),
+        }
+    }
+
+    #[must_use]
+    pub fn command(&self) -> &T {
+        &self.command
+    }
+    #[must_use]
+    pub fn quota_reservation(&self) -> Option<&QuotaReservationInput> {
+        self.quota_reservation.as_ref()
+    }
+    #[must_use]
+    pub fn into_parts(self) -> (T, Option<QuotaReservationInput>) {
+        (self.command, self.quota_reservation)
+    }
+}
+
 pub(crate) fn valid_bounded_identity(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && value.is_ascii()
 }
@@ -367,12 +511,28 @@ pub enum AttemptDisposition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverLease {
     pub tenant_scope: String,
+    pub task_id: String,
     pub dispatch_id: String,
     pub payload_digest: String,
+    pub sender_attempt_no: u32,
+    pub sender_lease_token: String,
     pub lease_owner: String,
     pub lease_token: String,
     pub lease_epoch: u64,
     pub lease_until: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityCapabilities {
+    pub lease_renewal: bool,
+    pub quota_reservations: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseRenewalOutcome {
+    Applied { lease_until: i64 },
+    Stale,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,6 +635,7 @@ pub struct TaskEventBatch {
 }
 
 pub trait AuthorityIdentity: Send + Sync {
+    fn capabilities(&self) -> AuthorityCapabilities;
     fn completion_receipt_key(&self) -> Option<[u8; 32]>;
     fn authorization_resource_digest(&self, resource: &str) -> Result<String, A2AError>;
 }
@@ -518,6 +679,34 @@ pub trait TaskAdmission: Send + Sync {
         command: SendMessageAdmission,
         audit: AuthorizationAuditInput,
     ) -> Result<AdmissionOutcome, A2AError>;
+    async fn authorize_and_admit_mutation(
+        &self,
+        scope: &OwnedTaskScope,
+        mutation: AuthorizedMutation<SendMessageAdmission>,
+        audit: AuthorizationAuditInput,
+    ) -> Result<AdmissionOutcome, A2AError> {
+        let (command, quota) = mutation.into_parts();
+        if quota.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "quota reservations are unsupported",
+            ));
+        }
+        self.authorize_and_admit(scope, command, audit).await
+    }
+    async fn authorize_and_continue_mutation(
+        &self,
+        scope: &OwnedTaskScope,
+        mutation: AuthorizedMutation<SendMessageAdmission>,
+        audit: AuthorizationAuditInput,
+    ) -> Result<AdmissionOutcome, A2AError> {
+        let (command, quota) = mutation.into_parts();
+        if quota.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "quota reservations are unsupported",
+            ));
+        }
+        self.authorize_and_continue(scope, command, audit).await
+    }
 }
 
 #[async_trait]
@@ -537,6 +726,11 @@ pub trait OutboxAuthority: Send + Sync {
         now: i64,
         lease_duration: i64,
     ) -> Result<Option<OutboxLease>, A2AError>;
+    async fn renew_outbox_lease(
+        &self,
+        lease: &OutboxLease,
+        lease_duration: i64,
+    ) -> Result<LeaseRenewalOutcome, A2AError>;
     async fn task_for_outbox(&self, lease: &OutboxLease) -> Result<Option<Task>, A2AError>;
     async fn finish_outbox_attempt(
         &self,
@@ -570,6 +764,11 @@ pub trait ReceiverAuthority: Send + Sync {
         now: i64,
         lease_duration: i64,
     ) -> Result<ReceiverAdmission, A2AError>;
+    async fn renew_receiver_lease(
+        &self,
+        lease: &ReceiverLease,
+        lease_duration: i64,
+    ) -> Result<LeaseRenewalOutcome, A2AError>;
     async fn complete_loopback_receive(
         &self,
         lease: &ReceiverLease,
@@ -621,6 +820,21 @@ pub trait CancellationAuthority: Send + Sync {
         now: i64,
         audit: AuthorizationAuditInput,
     ) -> Result<CancellationOutcome, A2AError>;
+    async fn cancel_authorized_with_quota(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        now: i64,
+        audit: AuthorizationAuditInput,
+        quota_reservation: Option<&QuotaReservationInput>,
+    ) -> Result<CancellationOutcome, A2AError> {
+        if quota_reservation.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "quota reservations are unsupported",
+            ));
+        }
+        self.cancel_authorized(scope, task_id, now, audit).await
+    }
 }
 
 #[async_trait]

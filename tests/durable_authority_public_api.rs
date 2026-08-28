@@ -3,8 +3,35 @@ use a2a::{
 };
 use smesh_a2a::{
     AuthorizationAuditInput, AuthorizationDecisionEffect, InputLimits, OwnedTaskScope,
-    SendMessageAdmission, VisibilityScope,
+    QuotaReservationInput, SendMessageAdmission, VisibilityScope,
 };
+
+#[test]
+fn external_backend_can_inspect_bounded_server_quota_reservation() {
+    let quota = QuotaReservationInput::new(
+        "tenant-public-api",
+        "owner-public-api",
+        "principal-public-api",
+        "sendMessage",
+        "task-concurrency",
+        1,
+        "reservation-public-api",
+        1_700_000_060_000,
+        None,
+    )
+    .expect("valid server quota reservation");
+    assert_eq!(quota.tenant_scope(), "tenant-public-api");
+    assert_eq!(quota.account_id(), "owner-public-api");
+    assert_eq!(quota.principal_scope(), "principal-public-api");
+    assert_eq!(quota.operation(), "sendMessage");
+    assert_eq!(quota.dimension(), "task-concurrency");
+    assert_eq!(quota.units(), 1);
+    assert_eq!(quota.reservation_id(), "reservation-public-api");
+    assert_eq!(quota.expires_at(), 1_700_000_060_000);
+    assert_eq!(quota.metadata(), None);
+    assert!(QuotaReservationInput::new("", "a", "p", "o", "d", 1, "r", 2, None).is_err());
+    assert!(QuotaReservationInput::new("t", "a", "p", "o", "d", 0, "r", 2, None).is_err());
+}
 
 fn task() -> Task {
     Task {

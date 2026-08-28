@@ -54,7 +54,7 @@ pub fn assert_sqlite_tables_match(path: &Path) {
 }
 
 pub async fn assert_postgres_tables_match(client: &Client, schema: &str) {
-    let actual = client
+    let mut actual = client
         .query(
             "SELECT table_name FROM information_schema.tables WHERE table_schema=$1 AND table_type='BASE TABLE' AND table_name<>'schema_migrations'",
             &[&schema],
@@ -64,10 +64,40 @@ pub async fn assert_postgres_tables_match(client: &Client, schema: &str) {
         .into_iter()
         .map(|row| row.get::<_, String>(0))
         .collect::<BTreeSet<_>>();
+    assert!(
+        actual.remove("quota_reservations"),
+        "PostgreSQL quota reservation seam table is missing"
+    );
     assert_eq!(
         actual,
         expected_tables(),
-        "PostgreSQL authority table set drifted"
+        "PostgreSQL core authority table set drifted"
+    );
+    let columns = client
+        .query(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='quota_reservations' ORDER BY ordinal_position",
+            &[&schema],
+        )
+        .await
+        .expect("query PostgreSQL quota seam columns")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        columns,
+        [
+            "tenant_scope",
+            "reservation_id",
+            "account_id",
+            "principal_scope",
+            "operation",
+            "dimension",
+            "units",
+            "task_id",
+            "expires_at",
+            "metadata_json",
+            "created_at",
+        ]
     );
 }
 
@@ -184,6 +214,27 @@ fn normalize(tables: &mut BTreeMap<String, Vec<Value>>) {
             ))
         })
         .collect();
+    let sender_by_dispatch: BTreeMap<String, (i64, String)> = tables
+        .get("outbox")
+        .into_iter()
+        .flatten()
+        .filter_map(|outbox| {
+            let dispatch = outbox.get("dispatch_id")?.as_str()?.to_owned();
+            let outbox_id = outbox.get("outbox_id")?.as_i64()?;
+            let attempt_no = outbox.get("attempt_count")?.as_i64()?;
+            let token = tables
+                .get("outbox_attempts")?
+                .iter()
+                .find(|attempt| {
+                    attempt.get("outbox_id").and_then(Value::as_i64) == Some(outbox_id)
+                        && attempt.get("attempt_no").and_then(Value::as_i64) == Some(attempt_no)
+                })?
+                .get("lease_token")?
+                .as_str()?
+                .to_owned();
+            Some((dispatch, (attempt_no, token)))
+        })
+        .collect();
     let snapshots: BTreeMap<String, String> = tables
         .get("list_snapshots")
         .into_iter()
@@ -230,12 +281,25 @@ fn normalize(tables: &mut BTreeMap<String, Vec<Value>>) {
             let Some(object) = row.as_object_mut() else {
                 continue;
             };
+            if table == "receiver_inbox"
+                && !object.contains_key("sender_attempt_no")
+                && let Some(dispatch) = object.get("dispatch_id").and_then(Value::as_str)
+                && let Some((attempt, token)) = sender_by_dispatch.get(dispatch)
+            {
+                object.insert("sender_attempt_no".into(), Value::from(*attempt));
+                object.insert("sender_lease_token".into(), Value::String(token.clone()));
+            }
             if let Some(Value::String(value)) = object.get_mut("snapshot_id")
                 && let Some(alias) = snapshots.get(value)
             {
                 *value = alias.clone();
             }
             if let Some(Value::String(value)) = object.get_mut("lease_token")
+                && let Some(alias) = lease_aliases.get(value)
+            {
+                *value = alias.clone();
+            }
+            if let Some(Value::String(value)) = object.get_mut("sender_lease_token")
                 && let Some(alias) = lease_aliases.get(value)
             {
                 *value = alias.clone();
