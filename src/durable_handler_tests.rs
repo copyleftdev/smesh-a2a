@@ -174,10 +174,7 @@ async fn unary_admission_has_an_atomic_subscription_revision_cursor() {
         .expect("subscription snapshot")
         .expect("task exists");
     assert_eq!(snapshot.status.state, TaskState::Submitted);
-    assert!(matches!(
-        cursor,
-        crate::sqlite_store::SubscriptionCursor::TaskRevision(1)
-    ));
+    assert!(matches!(cursor, crate::SubscriptionCursor::TaskRevision(1)));
     shutdown_store(&store).await.expect("close store");
     cleanup(&path);
 }

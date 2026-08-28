@@ -10,8 +10,8 @@ use thiserror::Error;
 
 use crate::auth::Principal;
 use crate::{
-    AuthorizationAuditInput, AuthorizationDecisionEffect, InjectedClock, SqliteTaskStore,
-    content_digest,
+    AuthorizationAuditInput, AuthorizationDecisionEffect, DurableAuthority, InjectedClock,
+    SqliteTaskStore, content_digest,
 };
 
 tokio::task_local! {
@@ -61,7 +61,7 @@ pub async fn authorize_request(
 #[derive(Clone)]
 pub struct AuthorizationMiddlewareState {
     policy: Arc<AuthorizationPolicy>,
-    audit_store: Option<SqliteTaskStore>,
+    audit_store: Option<Arc<dyn DurableAuthority>>,
     clock: InjectedClock,
 }
 
@@ -79,6 +79,15 @@ impl AuthorizationMiddlewareState {
     pub fn with_sqlite(
         policy: Arc<AuthorizationPolicy>,
         audit_store: SqliteTaskStore,
+        clock: InjectedClock,
+    ) -> Self {
+        Self::with_audit(policy, Arc::new(audit_store), clock)
+    }
+
+    #[must_use]
+    pub fn with_audit(
+        policy: Arc<AuthorizationPolicy>,
+        audit_store: Arc<dyn DurableAuthority>,
         clock: InjectedClock,
     ) -> Self {
         Self {

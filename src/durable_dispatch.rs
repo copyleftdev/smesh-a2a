@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::{MeshEvent, MeshRequest, SqliteTaskStore};
+use crate::{DurableAuthority, MeshEvent, MeshRequest};
 
 pub(crate) const DURABLE_CANCELED_SUMMARY: &str = "SMESH durable receiver cooperatively canceled";
 
@@ -257,11 +257,11 @@ impl DurableLoopbackEndpoint {
     #[allow(clippy::too_many_lines)] // Admission, cancellation, effect, and outcome form one receiver state machine.
     pub(crate) async fn dispatch_once(
         &self,
-        store: &SqliteTaskStore,
+        authority: &dyn DurableAuthority,
         envelope: DurableDispatchEnvelope,
         clock: &InjectedClock,
     ) -> Result<DurableDispatchOutcome, a2a::A2AError> {
-        let admission = store
+        let admission = authority
             .begin_receive(envelope.clone(), "durable-loopback", clock.now(), 60_000)
             .await?;
         match admission {
@@ -280,9 +280,12 @@ impl DurableLoopbackEndpoint {
                         a2a::A2AError::internal("durable endpoint cancellation lock failed")
                     })?
                     .insert(envelope.dispatch_id.clone(), cancellation.clone());
-                if store.cancellation_requested(&envelope.dispatch_id).await? {
+                if authority
+                    .cancellation_requested(&envelope.dispatch_id)
+                    .await?
+                {
                     let events = canceled_events();
-                    store
+                    authority
                         .complete_canceled_receive(&lease, &events, clock.now())
                         .await?;
                     if let Ok(mut active) = self.active.lock() {
@@ -298,10 +301,12 @@ impl DurableLoopbackEndpoint {
                     }
                 }
                 if cancellation.is_cancelled()
-                    || store.cancellation_requested(&envelope.dispatch_id).await?
+                    || authority
+                        .cancellation_requested(&envelope.dispatch_id)
+                        .await?
                 {
                     let events = canceled_events();
-                    store
+                    authority
                         .complete_canceled_receive(&lease, &events, clock.now())
                         .await?;
                     if let Ok(mut active) = self.active.lock() {
@@ -329,7 +334,7 @@ impl DurableLoopbackEndpoint {
                             }
                         },
                     };
-                    store
+                    authority
                         .complete_loopback_outcome(&lease, &outcome, clock.now())
                         .await?;
                     if let Ok(mut active) = self.active.lock() {
@@ -357,13 +362,16 @@ impl DurableLoopbackEndpoint {
                         summary: "SMESH swarm completed the task".to_owned(),
                     },
                 ];
-                if let Err(error) = store
+                if let Err(error) = authority
                     .complete_loopback_receive(&lease, &events, clock.now())
                     .await
                 {
-                    if store.cancellation_requested(&envelope.dispatch_id).await? {
+                    if authority
+                        .cancellation_requested(&envelope.dispatch_id)
+                        .await?
+                    {
                         let canceled = canceled_events();
-                        store
+                        authority
                             .complete_canceled_receive(&lease, &canceled, clock.now())
                             .await?;
                         if let Ok(mut active) = self.active.lock() {

@@ -20,8 +20,13 @@ use subtle::ConstantTimeEq as _;
 use thiserror::Error;
 
 use crate::{
+    AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition,
+    AuthorizationAuditInput, AuthorizationDecisionEffect, CancellationOutcome,
     DurableDispatchEnvelope, DurableReceiverResult, DurableReceiverTermination, InputLimits,
-    MeshEvent, MeshRequest, content_digest,
+    MeshEvent, MeshRequest, OutboxLease, OwnedTaskScope, ReceiverAdmission, ReceiverLease,
+    SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor, TaskEventBatch,
+    TransitionOutcome, VisibilityScope, authorized_message_identity, canonical_send_message_digest,
+    canonical_send_message_digest_v2, content_digest, durable_authority::valid_bounded_identity,
 };
 
 const SCHEMA_VERSION: i64 = 6;
@@ -39,7 +44,7 @@ const STREAM_TRANSCRIPT_VERSION: i64 = 1;
 const MAX_STREAM_FRAMES: usize = 1_024;
 const STREAM_INTERRUPTION_PREFIX: &str = "durable stream interrupted: ";
 /// Fixed compatibility scope used only by [`SqliteTaskStore::open`] for a new development DB.
-pub const TRUSTED_SINGLE_TENANT_SCOPE: &str = "smesh-dev-only-tenant";
+pub use crate::TRUSTED_SINGLE_TENANT_SCOPE;
 pub const DEV_ONLY_ACCOUNT_ID: &str = "smesh-dev-only-account";
 const LEGACY_V4_SENTINEL_SCOPE: &str = "smesh:trusted-single-tenant:v1";
 const MAX_AUTHORIZATION_DECISIONS: usize = 65_536;
@@ -98,214 +103,6 @@ impl LegacyTenantBinding {
         )
         .expect("fixed development binding is valid")
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnedTaskScope {
-    tenant_scope: String,
-    owner_account_id: String,
-    visibility: crate::authorization::VisibilityScope,
-}
-
-#[allow(clippy::missing_errors_doc)]
-impl OwnedTaskScope {
-    pub fn new(
-        tenant_scope: impl Into<String>,
-        owner_account_id: impl Into<String>,
-        visibility: crate::authorization::VisibilityScope,
-    ) -> Result<Self, A2AError> {
-        let value = Self {
-            tenant_scope: tenant_scope.into(),
-            owner_account_id: owner_account_id.into(),
-            visibility,
-        };
-        if !valid_bounded_identity(&value.tenant_scope)
-            || !valid_bounded_identity(&value.owner_account_id)
-        {
-            return Err(A2AError::invalid_request("invalid owned task scope"));
-        }
-        Ok(value)
-    }
-
-    #[must_use]
-    pub fn tenant_scope(&self) -> &str {
-        &self.tenant_scope
-    }
-
-    #[must_use]
-    pub fn owner_account_id(&self) -> &str {
-        &self.owner_account_id
-    }
-
-    #[must_use]
-    pub const fn visibility(&self) -> crate::authorization::VisibilityScope {
-        self.visibility
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthorizationDecisionEffect {
-    Allow,
-    Deny,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizationAuditInput {
-    decision_id: String,
-    tenant_scope: String,
-    actor_account_id: String,
-    policy_id: String,
-    policy_revision: u64,
-    policy_digest: String,
-    operation: String,
-    effect: AuthorizationDecisionEffect,
-    reason: String,
-    resource_kind: String,
-    resource_digest: String,
-    task_id: Option<String>,
-    decided_at: i64,
-}
-
-#[allow(clippy::missing_errors_doc)]
-impl AuthorizationAuditInput {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        decision_id: impl Into<String>,
-        tenant_scope: impl Into<String>,
-        actor_account_id: impl Into<String>,
-        policy_id: impl Into<String>,
-        policy_revision: u64,
-        policy_digest: impl Into<String>,
-        operation: impl Into<String>,
-        effect: AuthorizationDecisionEffect,
-        reason: impl Into<String>,
-        resource_kind: impl Into<String>,
-        resource_digest: impl Into<String>,
-        task_id: Option<String>,
-        decided_at: i64,
-    ) -> Result<Self, A2AError> {
-        let value = Self {
-            decision_id: decision_id.into(),
-            tenant_scope: tenant_scope.into(),
-            actor_account_id: actor_account_id.into(),
-            policy_id: policy_id.into(),
-            policy_revision,
-            policy_digest: policy_digest.into(),
-            operation: operation.into(),
-            effect,
-            reason: reason.into(),
-            resource_kind: resource_kind.into(),
-            resource_digest: resource_digest.into(),
-            task_id,
-            decided_at,
-        };
-        let short = [
-            &value.decision_id,
-            &value.tenant_scope,
-            &value.actor_account_id,
-            &value.policy_id,
-            &value.operation,
-            &value.reason,
-            &value.resource_kind,
-            &value.resource_digest,
-        ];
-        if short.iter().any(|v| v.is_empty() || v.len() > 256)
-            || value.policy_revision == 0
-            || value.policy_digest.is_empty()
-            || value.policy_digest.len() > 256
-            || value
-                .task_id
-                .as_ref()
-                .is_some_and(|v| v.is_empty() || v.len() > MAX_ATOMIC_TEXT_BYTES)
-        {
-            return Err(A2AError::invalid_request(
-                "invalid authorization audit input",
-            ));
-        }
-        Ok(value)
-    }
-
-    pub(crate) fn decided(
-        mut self,
-        effect: AuthorizationDecisionEffect,
-        reason: &str,
-        task_id: Option<String>,
-    ) -> Self {
-        self.effect = effect;
-        reason.clone_into(&mut self.reason);
-        self.task_id = task_id;
-        self
-    }
-}
-
-fn valid_bounded_identity(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 64 && value.is_ascii()
-}
-
-/// Canonical semantic identity for `SendMessage` admission. Transport IDs/bindings
-/// and caller-controlled tenant/header values are deliberately excluded.
-///
-/// # Errors
-///
-/// Returns an internal error if the semantic request cannot be encoded.
-pub fn canonical_send_message_digest(
-    request: &SendMessageRequest,
-    streaming: bool,
-) -> Result<String, A2AError> {
-    let semantic = serde_json::json!({
-        // The durable gateway accepts only application/json. Client spelling of
-        // omitted defaults, accepted-mode ordering/duplicates, and unary
-        // response controls (historyLength/returnImmediately) affect only the
-        // current response projection/wait, never business execution identity.
-        "executionConfiguration": { "outputMode": "application/json" },
-        "invocation": if streaming { "streaming" } else { "unary" },
-        "message": request.message,
-        "metadata": request.metadata,
-        "operation": "sendMessage",
-        "trustedScope": TRUSTED_SINGLE_TENANT_SCOPE,
-    });
-    let encoded = serde_json::to_vec(&semantic)
-        .map_err(|_| A2AError::internal("failed to canonicalize send-message request"))?;
-    Ok(content_digest(&encoded))
-}
-
-/// Version 2 semantic digest for authorized admissions. It binds server-resolved
-/// ownership and never consumes a caller tenant selector as authority.
-///
-/// # Errors
-/// Returns an invalid-request error for malformed authoritative identities.
-pub fn canonical_send_message_digest_v2(
-    tenant_scope: &str,
-    actor_account_id: &str,
-    request: &SendMessageRequest,
-    streaming: bool,
-) -> Result<String, A2AError> {
-    if !valid_bounded_identity(tenant_scope) || !valid_bounded_identity(actor_account_id) {
-        return Err(A2AError::invalid_request("invalid authorization identity"));
-    }
-    let semantic = serde_json::json!({
-        "digestVersion": 2,
-        "tenantScope": tenant_scope,
-        "actorAccountId": actor_account_id,
-        "invocation": if streaming { "streaming" } else { "unary" },
-        "operation": "sendMessage",
-        "executionConfiguration": { "outputMode": "application/json" },
-        "message": request.message,
-        "metadata": request.metadata,
-    });
-    serde_json::to_vec(&semantic)
-        .map(|encoded| content_digest(&encoded))
-        .map_err(|_| A2AError::internal("failed to canonicalize authorized request"))
-}
-
-pub(crate) fn authorized_message_identity(
-    tenant_scope: &str,
-    actor_account_id: &str,
-    message_id: &str,
-) -> String {
-    content_digest(
-        format!("message-v2\0{tenant_scope}\0{actor_account_id}\0{message_id}").as_bytes(),
-    )
 }
 
 const V1_SCHEMA_SQL: &str = "CREATE TABLE store_metadata (
@@ -743,117 +540,6 @@ pub enum SqliteStoreError {
     AlreadyOpen,
     #[error("persistent task store is unsupported on this platform")]
     UnsupportedPlatform,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SendMessageAdmission {
-    pub request: SendMessageRequest,
-    pub streaming: bool,
-    pub task: Task,
-    pub original_result: SendMessageResponse,
-    pub input_limits: InputLimits,
-    pub now: i64,
-    pub max_attempts: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmissionRecord {
-    pub task_id: String,
-    pub revision: u64,
-    pub dispatch_id: String,
-}
-
-// Keeping the typed replay inline makes the public API exact and allocation-free
-// for its dominant admitted case; response payload size is durably bounded.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq)]
-pub enum AdmissionOutcome {
-    Admitted(AdmissionRecord),
-    Replay(SendMessageResponse),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutboxLease {
-    pub tenant_scope: String,
-    pub outbox_id: i64,
-    pub dispatch_id: String,
-    pub task_id: String,
-    pub attempt_no: u32,
-    pub max_attempts: u32,
-    pub lease_owner: String,
-    pub lease_token: String,
-    pub lease_until: i64,
-    pub request: MeshRequest,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AttemptDisposition {
-    Retry { available_at: i64, error: String },
-    Permanent { error: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReceiverLease {
-    pub tenant_scope: String,
-    pub dispatch_id: String,
-    pub payload_digest: String,
-    pub lease_owner: String,
-    pub lease_token: String,
-    pub lease_epoch: u64,
-    pub lease_until: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReceiverAdmission {
-    Execute(ReceiverLease),
-    Replay(Vec<MeshEvent>),
-    ReplayOutcome(DurableReceiverResult),
-    Busy,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)]
-pub enum CancellationOutcome {
-    Canceled(Task),
-    AwaitReceiver {
-        dispatch_id: String,
-        message_id: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct StreamTranscriptBatch {
-    pub frames: Vec<StreamResponse>,
-    pub closed: bool,
-    pub interruption: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SubscriptionCursor {
-    Transcript { message_id: String, cursor: usize },
-    TaskRevision(u64),
-}
-
-pub(crate) struct TaskEventBatch {
-    pub frames: Vec<StreamResponse>,
-    pub closed: bool,
-    pub last_revision: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransitionOutcome {
-    Applied,
-    Idempotent,
-    Stale,
-    DeadLettered,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AtomicRecordCounts {
-    pub tasks: u64,
-    pub events: u64,
-    pub idempotency_records: u64,
-    pub outbox: u64,
 }
 
 #[derive(Clone)]
@@ -7528,6 +7214,344 @@ fn persisted_task_matches(
             .map(|value| value.to_rfc3339())
             .as_deref()
             == timestamp
+}
+
+impl crate::IntoDurableAuthority for SqliteTaskStore {
+    fn into_durable_authority(self) -> Arc<dyn crate::DurableAuthority> {
+        Arc::new(self)
+    }
+
+    fn into_durable_authority_parts(self) -> crate::durable_authority::DurableAuthorityParts {
+        let store = Arc::new(self);
+        crate::durable_authority::DurableAuthorityParts::local(store.clone(), store)
+    }
+}
+
+impl crate::AuthorityIdentity for SqliteTaskStore {
+    fn completion_receipt_key(&self) -> Option<[u8; 32]> {
+        Some(SqliteTaskStore::completion_receipt_key(self))
+    }
+
+    fn authorization_resource_digest(&self, resource: &str) -> Result<String, A2AError> {
+        SqliteTaskStore::authorization_resource_digest(self, resource)
+    }
+}
+
+impl crate::ChangeObserver for SqliteTaskStore {
+    fn change_observation(&self) -> crate::ChangeObservation {
+        crate::ChangeObservation::default()
+    }
+}
+
+#[async_trait]
+impl crate::AuthorizationAuditSink for SqliteTaskStore {
+    async fn append_denied_authorization_decision(
+        &self,
+        audit: AuthorizationAuditInput,
+    ) -> Result<(), A2AError> {
+        SqliteTaskStore::append_denied_authorization_decision(self, audit).await
+    }
+
+    async fn append_authorization_decision(
+        &self,
+        audit: AuthorizationAuditInput,
+    ) -> Result<(), A2AError> {
+        SqliteTaskStore::append_authorization_decision(self, audit).await
+    }
+}
+
+#[async_trait]
+impl crate::AuthorizedTaskRead for SqliteTaskStore {
+    async fn get_authorized(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        audit: AuthorizationAuditInput,
+    ) -> Result<Option<Task>, A2AError> {
+        SqliteTaskStore::get_authorized(self, scope, task_id, audit).await
+    }
+
+    async fn list_authorized(
+        &self,
+        scope: &OwnedTaskScope,
+        request: &ListTasksRequest,
+        audit: AuthorizationAuditInput,
+        cursor_scope_digest: &str,
+    ) -> Result<ListTasksResponse, A2AError> {
+        SqliteTaskStore::list_authorized(self, scope, request, audit, cursor_scope_digest).await
+    }
+}
+
+#[async_trait]
+impl crate::TaskAdmission for SqliteTaskStore {
+    async fn replay_authorized(
+        &self,
+        scope: &OwnedTaskScope,
+        actor_account_id: &str,
+        request: &SendMessageRequest,
+        streaming: bool,
+        audit: AuthorizationAuditInput,
+    ) -> Result<Option<SendMessageResponse>, A2AError> {
+        SqliteTaskStore::replay_authorized(self, scope, actor_account_id, request, streaming, audit)
+            .await
+    }
+
+    async fn authorize_and_admit(
+        &self,
+        scope: &OwnedTaskScope,
+        command: SendMessageAdmission,
+        audit: AuthorizationAuditInput,
+    ) -> Result<AdmissionOutcome, A2AError> {
+        SqliteTaskStore::authorize_and_admit(self, scope, command, audit).await
+    }
+
+    async fn authorize_and_continue(
+        &self,
+        scope: &OwnedTaskScope,
+        command: SendMessageAdmission,
+        audit: AuthorizationAuditInput,
+    ) -> Result<AdmissionOutcome, A2AError> {
+        SqliteTaskStore::authorize_and_continue(self, scope, command, audit).await
+    }
+}
+
+#[async_trait]
+impl crate::TaskLifecycle for SqliteTaskStore {
+    async fn final_result_scoped(
+        &self,
+        tenant_scope: &str,
+        message_id: &str,
+    ) -> Result<Option<SendMessageResponse>, A2AError> {
+        SqliteTaskStore::final_result_for_message_scoped(self, tenant_scope, message_id).await
+    }
+}
+
+#[async_trait]
+impl crate::CancellationAuthority for SqliteTaskStore {
+    async fn cancel_authorized(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        now: i64,
+        audit: AuthorizationAuditInput,
+    ) -> Result<CancellationOutcome, A2AError> {
+        SqliteTaskStore::cancel_authorized(self, scope, task_id, now, audit).await
+    }
+}
+
+#[async_trait]
+impl crate::OutboxAuthority for SqliteTaskStore {
+    async fn claim_outbox(
+        &self,
+        lease_owner: &str,
+        now: i64,
+        lease_duration: i64,
+    ) -> Result<Option<OutboxLease>, A2AError> {
+        SqliteTaskStore::claim_outbox(self, lease_owner.to_owned(), now, lease_duration).await
+    }
+
+    async fn task_for_outbox(&self, lease: &OutboxLease) -> Result<Option<Task>, A2AError> {
+        let scope = OwnedTaskScope::new(
+            &lease.tenant_scope,
+            "durable-outbox-driver",
+            VisibilityScope::Tenant,
+        )?;
+        SqliteTaskStore::get_scoped(self, &scope, &lease.task_id).await
+    }
+
+    async fn finish_outbox_attempt(
+        &self,
+        lease: &OutboxLease,
+        disposition: AttemptDisposition,
+        now: i64,
+    ) -> Result<TransitionOutcome, A2AError> {
+        SqliteTaskStore::finish_outbox_attempt(self, lease, disposition, now).await
+    }
+
+    async fn append_stream_progress(
+        &self,
+        tenant_scope: &str,
+        dispatch_id: &str,
+        frame: StreamResponse,
+        now: i64,
+    ) -> Result<Option<StreamResponse>, A2AError> {
+        SqliteTaskStore::append_stream_progress(self, tenant_scope, dispatch_id, frame, now).await
+    }
+
+    async fn commit_delivery(
+        &self,
+        lease: &OutboxLease,
+        task: Task,
+        result: SendMessageResponse,
+        public_transcript: &[StreamResponse],
+        now: i64,
+    ) -> Result<TransitionOutcome, A2AError> {
+        SqliteTaskStore::commit_delivery(self, lease, task, result, public_transcript, now).await
+    }
+}
+
+#[async_trait]
+impl crate::ReceiverAuthority for SqliteTaskStore {
+    async fn begin_receive(
+        &self,
+        envelope: DurableDispatchEnvelope,
+        lease_owner: &str,
+        now: i64,
+        lease_duration: i64,
+    ) -> Result<ReceiverAdmission, A2AError> {
+        SqliteTaskStore::begin_receive(self, envelope, lease_owner, now, lease_duration).await
+    }
+
+    async fn complete_loopback_receive(
+        &self,
+        lease: &ReceiverLease,
+        events: &[MeshEvent],
+        now: i64,
+    ) -> Result<(), A2AError> {
+        SqliteTaskStore::complete_loopback_receive(self, lease, events, now).await
+    }
+
+    async fn complete_loopback_outcome(
+        &self,
+        lease: &ReceiverLease,
+        outcome: &DurableReceiverResult,
+        now: i64,
+    ) -> Result<(), A2AError> {
+        SqliteTaskStore::complete_loopback_outcome(self, lease, outcome, now).await
+    }
+
+    async fn complete_canceled_receive(
+        &self,
+        lease: &ReceiverLease,
+        events: &[MeshEvent],
+        now: i64,
+    ) -> Result<(), A2AError> {
+        SqliteTaskStore::complete_canceled_receive(self, lease, events, now).await
+    }
+
+    async fn cancellation_requested(&self, dispatch_id: &str) -> Result<bool, A2AError> {
+        SqliteTaskStore::cancellation_requested(self, dispatch_id).await
+    }
+}
+
+#[async_trait]
+impl crate::TranscriptAuthority for SqliteTaskStore {
+    async fn stream_frames_after_scoped(
+        &self,
+        tenant_scope: &str,
+        message_id: &str,
+        last_sequence: usize,
+    ) -> Result<StreamTranscriptBatch, A2AError> {
+        SqliteTaskStore::stream_frames_after_scoped(self, tenant_scope, message_id, last_sequence)
+            .await
+    }
+
+    async fn subscription_snapshot_authorized(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+    ) -> Result<Option<(Task, SubscriptionCursor)>, A2AError> {
+        SqliteTaskStore::subscription_snapshot_authorized(self, scope, task_id).await
+    }
+
+    async fn task_events_after_scoped(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        last_revision: u64,
+    ) -> Result<TaskEventBatch, A2AError> {
+        SqliteTaskStore::task_events_after_scoped(self, scope, task_id, last_revision).await
+    }
+}
+
+#[async_trait]
+impl crate::AuthorityDiagnostics for SqliteTaskStore {
+    async fn authorization_decision_count(&self) -> Result<u64, A2AError> {
+        SqliteTaskStore::authorization_decision_count(self).await
+    }
+
+    async fn atomic_record_counts(&self) -> Result<AtomicRecordCounts, A2AError> {
+        SqliteTaskStore::atomic_record_counts(self).await
+    }
+
+    async fn durable_effect_count(&self) -> Result<u64, A2AError> {
+        SqliteTaskStore::durable_effect_count(self).await
+    }
+}
+
+#[async_trait]
+impl crate::AuthorityShutdown for SqliteTaskStore {
+    async fn shutdown(&self) -> Result<(), A2AError> {
+        SqliteTaskStore::shutdown_shared(self).await
+    }
+
+    fn close_owned_sync(&self) {
+        SqliteTaskStore::close_shared_sync(self);
+    }
+}
+
+#[async_trait]
+impl crate::durable_authority::LocalDevelopmentCompatibility for SqliteTaskStore {
+    async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
+        TaskStore::get(self, task_id).await
+    }
+
+    async fn list(&self, request: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+        TaskStore::list(self, request).await
+    }
+
+    async fn replay(
+        &self,
+        request: &SendMessageRequest,
+        streaming: bool,
+    ) -> Result<Option<SendMessageResponse>, A2AError> {
+        SqliteTaskStore::replay_send_message(self, request, streaming).await
+    }
+
+    async fn admit(&self, command: SendMessageAdmission) -> Result<AdmissionOutcome, A2AError> {
+        SqliteTaskStore::admit_send_message(self, command).await
+    }
+
+    async fn continue_task(
+        &self,
+        command: SendMessageAdmission,
+    ) -> Result<AdmissionOutcome, A2AError> {
+        SqliteTaskStore::admit_continuation(self, command).await
+    }
+
+    async fn final_result(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<SendMessageResponse>, A2AError> {
+        SqliteTaskStore::final_result_for_message(self, message_id).await
+    }
+
+    async fn cancel(&self, task_id: &str, now: i64) -> Result<CancellationOutcome, A2AError> {
+        SqliteTaskStore::request_cancellation(self, task_id, now).await
+    }
+
+    async fn stream_frames_after(
+        &self,
+        message_id: &str,
+        last_sequence: usize,
+    ) -> Result<StreamTranscriptBatch, A2AError> {
+        SqliteTaskStore::stream_frames_after(self, message_id, last_sequence).await
+    }
+
+    async fn subscription_snapshot(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(Task, SubscriptionCursor)>, A2AError> {
+        SqliteTaskStore::subscription_snapshot(self, task_id).await
+    }
+
+    async fn task_events_after(
+        &self,
+        task_id: &str,
+        last_revision: u64,
+    ) -> Result<TaskEventBatch, A2AError> {
+        SqliteTaskStore::task_events_after(self, task_id, last_revision).await
+    }
 }
 
 #[async_trait]

@@ -8,7 +8,7 @@ use a2a::{
     ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamResponse,
     SubscribeToTaskRequest, Task, TaskPushNotificationConfig, TaskState, TaskStatus,
 };
-use a2a_server::{RequestHandler, ServiceParams, TaskStore};
+use a2a_server::{RequestHandler, ServiceParams};
 use async_trait::async_trait;
 use futures::{
     StreamExt,
@@ -19,17 +19,19 @@ use tokio::sync::Notify;
 
 use crate::{
     AdmissionOutcome, AuthorizationAuditInput, AuthorizationContext, AuthorizationDecisionEffect,
-    CancellationOutcome, InjectedClock, InputLimits, OwnedTaskScope, SendMessageAdmission,
-    SqliteTaskStore,
+    CancellationOutcome, DurableAuthority, InjectedClock, InputLimits, OwnedTaskScope,
+    SendMessageAdmission, SubscriptionCursor,
     authorization::{Operation, current_authorization_context},
     content_digest,
+    durable_authority::LocalDevelopmentCompatibility,
     outbox_driver::{DurableDriverControl, WaiterGuard},
-    sqlite_store::SubscriptionCursor,
 };
 
 struct DurableStreamState {
-    store: SqliteTaskStore,
+    store: Arc<dyn DurableAuthority>,
+    local: Option<Arc<dyn LocalDevelopmentCompatibility>>,
     driver_state: tokio::sync::watch::Receiver<crate::outbox_driver::DriverState>,
+    poll_interval: crate::PollInterval,
     _waiter: WaiterGuard,
     message_id: String,
     last_sequence: usize,
@@ -44,8 +46,10 @@ struct DurableStreamState {
 }
 
 struct DurableTaskEventStreamState {
-    store: SqliteTaskStore,
+    store: Arc<dyn DurableAuthority>,
+    local: Option<Arc<dyn LocalDevelopmentCompatibility>>,
     driver_state: tokio::sync::watch::Receiver<crate::outbox_driver::DriverState>,
+    poll_interval: crate::PollInterval,
     _waiter: WaiterGuard,
     task_id: String,
     last_revision: u64,
@@ -57,7 +61,8 @@ struct DurableTaskEventStreamState {
 }
 
 pub(crate) struct DurableRequestHandler {
-    store: SqliteTaskStore,
+    store: Arc<dyn DurableAuthority>,
+    local: Option<Arc<dyn LocalDevelopmentCompatibility>>,
     driver: Arc<DurableDriverControl>,
     clock: InjectedClock,
     input_limits: InputLimits,
@@ -166,7 +171,7 @@ impl DurableRequestHandler {
                 )
                 .await?
         } else {
-            self.store.get(task_id).await?
+            self.local()?.get(task_id).await?
         }
         .ok_or_else(|| {
             A2AError::task_not_found(if authorization.is_some() {
@@ -185,14 +190,27 @@ impl DurableRequestHandler {
         Ok(Some(task))
     }
 
-    pub(crate) fn new(
-        store: SqliteTaskStore,
+    #[cfg(test)]
+    pub(crate) fn new<A: crate::IntoDurableAuthority>(
+        store: A,
+        driver: Arc<DurableDriverControl>,
+        clock: InjectedClock,
+        input_limits: InputLimits,
+    ) -> Self {
+        let parts = store.into_durable_authority_parts();
+        Self::new_with_local(parts.authority, parts.local, driver, clock, input_limits)
+    }
+
+    pub(crate) fn new_with_local(
+        store: Arc<dyn DurableAuthority>,
+        local: Option<Arc<dyn LocalDevelopmentCompatibility>>,
         driver: Arc<DurableDriverControl>,
         clock: InjectedClock,
         input_limits: InputLimits,
     ) -> Self {
         Self {
             store,
+            local,
             driver,
             clock,
             input_limits,
@@ -200,6 +218,12 @@ impl DurableRequestHandler {
             #[cfg(test)]
             after_empty_read: None,
         }
+    }
+
+    fn local(&self) -> Result<&Arc<dyn LocalDevelopmentCompatibility>, A2AError> {
+        self.local
+            .as_ref()
+            .ok_or_else(|| A2AError::internal("local development compatibility is unavailable"))
     }
 
     pub(crate) fn with_errors_before_stream(mut self) -> Self {
@@ -241,16 +265,17 @@ impl DurableRequestHandler {
         scope: Option<&OwnedTaskScope>,
     ) -> Result<SendMessageResponse, A2AError> {
         let _waiter = self.driver.waiter();
-        // Subscribe before the SQLite read: watch retains the generation/failure
-        // even when completion races this read.
+        // Subscribe before the durable read. Notifications are only hints; the
+        // bounded poll interval also observes commits made by another process.
         let mut state = self.driver.subscribe();
+        let poll_interval = self.store.change_observation().poll_interval();
         loop {
             let result = if let Some(scope) = scope {
                 self.store
-                    .final_result_for_message_scoped(scope.tenant_scope(), message_id)
+                    .final_result_scoped(scope.tenant_scope(), message_id)
                     .await?
             } else {
-                self.store.final_result_for_message(message_id).await?
+                self.local()?.final_result(message_id).await?
             };
             if let Some(result) = result {
                 return Ok(result);
@@ -263,10 +288,11 @@ impl DurableRequestHandler {
             if let Some(failure) = &state.borrow().failure {
                 return Err(A2AError::internal(failure.clone()));
             }
-            state
-                .changed()
-                .await
-                .map_err(|_| A2AError::internal("durable outbox driver stopped"))?;
+            tokio::select! {
+                changed = state.changed() => changed
+                    .map_err(|_| A2AError::internal("durable outbox driver stopped"))?,
+                () = tokio::time::sleep(poll_interval.as_duration()) => {},
+            }
         }
     }
 
@@ -354,6 +380,7 @@ impl DurableRequestHandler {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn stream_from_message(
         &self,
         message_id: String,
@@ -365,7 +392,9 @@ impl DurableRequestHandler {
         let (context, scope) = authorization.unzip();
         let state = DurableStreamState {
             store: self.store.clone(),
+            local: self.local.clone(),
             driver_state: self.driver.subscribe(),
+            poll_interval: self.store.change_observation().poll_interval(),
             _waiter: self.driver.waiter(),
             message_id,
             last_sequence,
@@ -406,11 +435,14 @@ impl DurableRequestHandler {
                             state.last_sequence,
                         )
                         .await
-                } else {
-                    state
-                        .store
+                } else if let Some(local) = state.local.as_ref() {
+                    local
                         .stream_frames_after(&state.message_id, state.last_sequence)
                         .await
+                } else {
+                    Err(A2AError::internal(
+                        "local development compatibility is unavailable",
+                    ))
                 } {
                     Ok(batch) => batch,
                     Err(error) => {
@@ -443,7 +475,11 @@ impl DurableRequestHandler {
                     }
                     return Some((Err(A2AError::internal(failure)), state));
                 }
-                if state.driver_state.changed().await.is_err() {
+                let change = tokio::select! {
+                    change = state.driver_state.changed() => change,
+                    () = tokio::time::sleep(state.poll_interval.as_duration()) => Ok(()),
+                };
+                if change.is_err() {
                     state.finished = true;
                     if !state.emit_stream_errors {
                         return None;
@@ -466,7 +502,9 @@ impl DurableRequestHandler {
         let (context, scope) = authorization.unzip();
         let state = DurableTaskEventStreamState {
             store: self.store.clone(),
+            local: self.local.clone(),
             driver_state: self.driver.subscribe(),
+            poll_interval: self.store.change_observation().poll_interval(),
             _waiter: self.driver.waiter(),
             task_id,
             last_revision,
@@ -489,11 +527,14 @@ impl DurableRequestHandler {
                         .store
                         .task_events_after_scoped(scope, &state.task_id, state.last_revision)
                         .await
-                } else {
-                    state
-                        .store
+                } else if let Some(local) = state.local.as_ref() {
+                    local
                         .task_events_after(&state.task_id, state.last_revision)
                         .await
+                } else {
+                    Err(A2AError::internal(
+                        "local development compatibility is unavailable",
+                    ))
                 };
                 match batch {
                     Ok(batch) => {
@@ -520,7 +561,11 @@ impl DurableRequestHandler {
                     }
                     return Some((Err(A2AError::internal(failure)), state));
                 }
-                if state.driver_state.changed().await.is_err() {
+                let change = tokio::select! {
+                    change = state.driver_state.changed() => change,
+                    () = tokio::time::sleep(state.poll_interval.as_duration()) => Ok(()),
+                };
+                if change.is_err() {
                     state.closed = true;
                     if !state.emit_stream_errors {
                         return None;
@@ -602,7 +647,7 @@ impl RequestHandler for DurableRequestHandler {
         let durable_message_id = authorization.as_ref().map_or_else(
             || request.message.message_id.clone(),
             |(context, _)| {
-                crate::sqlite_store::authorized_message_identity(
+                crate::authorized_message_identity(
                     context.tenant_id(),
                     context.account_id(),
                     &request.message.message_id,
@@ -620,7 +665,7 @@ impl RequestHandler for DurableRequestHandler {
                 )
                 .await?
         } else {
-            self.store.replay_send_message(&request, false).await?
+            self.local()?.replay(&request, false).await?
         };
         if let Some(replay) = replay {
             if matches!(&replay, SendMessageResponse::Task(task)
@@ -658,7 +703,7 @@ impl RequestHandler for DurableRequestHandler {
                     )
                     .await?
             } else {
-                self.store.admit_continuation(command).await?
+                self.local()?.continue_task(command).await?
             }
         } else {
             let task = self.admission_task(&request, authorization.as_ref())?;
@@ -685,7 +730,7 @@ impl RequestHandler for DurableRequestHandler {
                     )
                     .await?
             } else {
-                self.store.admit_send_message(command).await?
+                self.local()?.admit(command).await?
             }
         };
         match admission {
@@ -704,7 +749,7 @@ impl RequestHandler for DurableRequestHandler {
                         )
                         .await?
                 } else {
-                    self.store.replay_send_message(&request, false).await?
+                    self.local()?.replay(&request, false).await?
                 }
                 .ok_or_else(|| A2AError::internal("admitted result is missing"))?;
                 self.driver.wake.notify_one();
@@ -764,7 +809,7 @@ impl RequestHandler for DurableRequestHandler {
                     )
                     .await?
             } else {
-                self.store.replay_send_message(&request, true).await?
+                self.local()?.replay(&request, true).await?
             };
             if replay.is_some() {
                 return Ok::<_, A2AError>(request.message.message_id.clone());
@@ -793,7 +838,7 @@ impl RequestHandler for DurableRequestHandler {
                         )
                         .await?;
                 } else {
-                    self.store.admit_continuation(command).await?;
+                    self.local()?.continue_task(command).await?;
                 }
             } else if let Some((context, scope)) = authorization.as_ref() {
                 self.store
@@ -809,7 +854,7 @@ impl RequestHandler for DurableRequestHandler {
                     )
                     .await?;
             } else {
-                self.store.admit_send_message(command).await?;
+                self.local()?.admit(command).await?;
             }
             Ok::<_, A2AError>(request.message.message_id.clone())
         }
@@ -821,7 +866,7 @@ impl RequestHandler for DurableRequestHandler {
         let message_id = authorization
             .as_ref()
             .map_or(message_id.clone(), |(context, _)| {
-                crate::sqlite_store::authorized_message_identity(
+                crate::authorized_message_identity(
                     context.tenant_id(),
                     context.account_id(),
                     &message_id,
@@ -871,7 +916,7 @@ impl RequestHandler for DurableRequestHandler {
                 )
                 .await?
         } else {
-            self.store.get(&request.id).await?
+            self.local()?.get(&request.id).await?
         }
         .ok_or_else(|| {
             A2AError::task_not_found(if authorization.is_some() {
@@ -937,7 +982,7 @@ impl RequestHandler for DurableRequestHandler {
                 )
                 .await
         } else {
-            self.store.list(&request).await
+            self.local()?.list(&request).await
         }
     }
 
@@ -977,9 +1022,7 @@ impl RequestHandler for DurableRequestHandler {
                 )
                 .await?
         } else {
-            self.store
-                .request_cancellation(&request.id, self.clock.now())
-                .await?
+            self.local()?.cancel(&request.id, self.clock.now()).await?
         };
         match outcome {
             CancellationOutcome::Canceled(task) => {
@@ -1039,7 +1082,7 @@ impl RequestHandler for DurableRequestHandler {
                     .subscription_snapshot_authorized(scope, &request.id)
                     .await?
             } else {
-                self.store.subscription_snapshot(&request.id).await?
+                self.local()?.subscription_snapshot(&request.id).await?
             };
             let Some((snapshot, cursor)) = snapshot else {
                 return Err(A2AError::task_not_found(if authorization.is_some() {

@@ -361,8 +361,11 @@ async fn selector_denials_append_digest_only_durable_audits() {
     let db_path = dir.join("tasks.sqlite3");
     let store = SqliteTaskStore::open(&db_path, 8).await.unwrap();
     let policy = Arc::new(AuthorizationPolicy::from_json(&policy_json()).unwrap());
-    let state =
-        AuthorizationMiddlewareState::with_sqlite(policy, store.clone(), InjectedClock::new(100));
+    let state = AuthorizationMiddlewareState::with_audit(
+        policy,
+        Arc::new(store.clone()),
+        InjectedClock::new(100),
+    );
     let enrolled = Arc::new(
         Principal::bearer_for_verifier(
             "https://issuer.example".into(),
