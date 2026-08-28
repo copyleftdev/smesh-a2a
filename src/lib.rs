@@ -7,6 +7,7 @@ pub mod authorization;
 mod bridge;
 mod card;
 mod channel;
+mod durable_authority;
 mod durable_dispatch;
 mod durable_handler;
 #[cfg(test)]
@@ -37,6 +38,17 @@ pub use card::{
     build_secured_agent_card_with_policy,
 };
 pub use channel::{ChannelDispatcher, DispatchCommand};
+pub use durable_authority::{
+    AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition,
+    AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput,
+    AuthorizationAuditParts, AuthorizationAuditSink, AuthorizationDecisionEffect,
+    AuthorizedTaskRead, CancellationAuthority, CancellationOutcome, ChangeObservation,
+    ChangeObserver, DurableAuthority, IntoDurableAuthority, OutboxAuthority, OutboxLease,
+    OwnedTaskScope, PollInterval, ReceiverAdmission, ReceiverAuthority, ReceiverLease,
+    SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE,
+    TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority, TransitionOutcome,
+    authorized_message_identity, canonical_send_message_digest, canonical_send_message_digest_v2,
+};
 pub use durable_dispatch::{
     DurableDispatchEnvelope, DurableInterruptionKind, DurableLoopbackEndpoint,
     DurableReceiverResult, DurableReceiverTermination, InjectedClock, SystemClockTicker,
@@ -72,11 +84,5 @@ pub use server::{
     build_router_with_policy_and_trace, build_router_with_sqlite,
     build_router_with_sqlite_and_trace, build_router_with_trace,
 };
-pub use sqlite_store::{
-    AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition,
-    AuthorizationAuditInput, AuthorizationDecisionEffect, CancellationOutcome, LegacyTenantBinding,
-    OutboxLease, OwnedTaskScope, ReceiverAdmission, ReceiverLease, SendMessageAdmission,
-    SqliteStoreError, SqliteTaskStore, TRUSTED_SINGLE_TENANT_SCOPE, TransitionOutcome,
-    canonical_send_message_digest, canonical_send_message_digest_v2,
-};
+pub use sqlite_store::{LegacyTenantBinding, SqliteStoreError, SqliteTaskStore};
 pub use store::BoundedTaskStore;

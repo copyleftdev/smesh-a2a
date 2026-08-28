@@ -8,12 +8,13 @@ use axum::{Router, middleware};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
-    BoundedTaskStore, CompletionPolicySpec, DurableLoopbackEndpoint, ExecutionLimits,
-    InjectedClock, InputLimits, MeshDispatcher, PolicyError, RuntimeEventCapture, SmeshExecutor,
-    SqliteTaskStore, VersionedCompletionPolicy,
+    BoundedTaskStore, CompletionPolicySpec, DurableAuthority, DurableLoopbackEndpoint,
+    ExecutionLimits, InjectedClock, InputLimits, IntoDurableAuthority, MeshDispatcher, PolicyError,
+    RuntimeEventCapture, SmeshExecutor, SqliteTaskStore, VersionedCompletionPolicy,
     auth::{AuthState, authenticate_request},
     authorization::{AuthorizationMiddlewareState, AuthorizationPolicy, authorize_request},
     build_agent_card, build_secured_agent_card_with_policy,
+    durable_authority::DurableAuthorityParts,
     durable_handler::DurableRequestHandler,
     guard::GuardedRequestHandler,
     outbox_driver::{DurableDriverHandle, spawn_durable_driver},
@@ -181,7 +182,7 @@ impl GatewayConfig {
 pub struct DurableGateway {
     router: Option<Router>,
     driver: Option<DurableDriverHandle>,
-    store: Option<SqliteTaskStore>,
+    authority: Option<Arc<dyn DurableAuthority>>,
 }
 
 impl DurableGateway {
@@ -222,7 +223,7 @@ impl DurableGateway {
 
     #[doc(hidden)]
     pub async fn durable_effect_count(&self) -> Result<u64, A2AError> {
-        self.store
+        self.authority
             .as_ref()
             .ok_or_else(|| A2AError::internal("durable gateway is shut down"))?
             .durable_effect_count()
@@ -239,17 +240,17 @@ impl DurableGateway {
             .driver
             .take()
             .ok_or_else(|| A2AError::internal("durable gateway is already shut down"))?;
-        let store = self
-            .store
+        let authority = self
+            .authority
             .take()
             .ok_or_else(|| A2AError::internal("durable gateway is already shut down"))?;
         let driver_result = driver.shutdown().await;
         // Closing shared state invalidates handler/router clones and drops both
         // SQLite and the process ownership lock before shutdown returns.
-        let store_result = store.shutdown_shared().await;
+        let authority_result = authority.shutdown().await;
         self.router.take();
         driver_result?;
-        store_result?;
+        authority_result?;
         Ok(())
     }
 }
@@ -264,10 +265,10 @@ impl Drop for DurableGateway {
             driver.abort_owned();
         }
         self.driver.take();
-        if let Some(store) = self.store.as_ref() {
-            store.close_shared_sync();
+        if let Some(authority) = self.authority.as_ref() {
+            authority.close_owned_sync();
         }
-        self.store.take();
+        self.authority.take();
         self.router.take();
     }
 }
@@ -283,14 +284,15 @@ impl Drop for DurableGateway {
 /// # Errors
 ///
 /// Returns an error if durable gateway policy construction fails.
-pub fn build_durable_loopback_gateway(
+pub fn build_durable_loopback_gateway<A: IntoDurableAuthority>(
     config: GatewayConfig,
-    store: SqliteTaskStore,
+    store: A,
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
 ) -> Result<DurableGateway, PolicyError> {
+    let parts = store.into_durable_authority_parts();
     Ok(build_durable_gateway_inner(
-        config, store, endpoint, clock, None, None,
+        config, parts, endpoint, clock, None, None,
     ))
 }
 
@@ -303,16 +305,17 @@ pub fn build_durable_loopback_gateway(
 ///
 /// # Errors
 /// Returns an error if durable gateway policy construction fails.
-pub fn build_authenticated_durable_loopback_gateway(
+pub fn build_authenticated_durable_loopback_gateway<A: IntoDurableAuthority>(
     config: GatewayConfig,
-    store: SqliteTaskStore,
+    store: A,
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
     auth: AuthState,
 ) -> Result<DurableGateway, PolicyError> {
+    let parts = store.into_durable_authority_parts();
     Ok(build_durable_gateway_inner(
         config,
-        store,
+        parts,
         endpoint,
         clock,
         Some(auth),
@@ -325,17 +328,21 @@ pub fn build_authenticated_durable_loopback_gateway(
 ///
 /// # Errors
 /// Returns an error if durable gateway policy construction fails.
-pub fn build_authorized_durable_loopback_gateway(
+pub fn build_authorized_durable_loopback_gateway<A: IntoDurableAuthority>(
     config: GatewayConfig,
-    store: SqliteTaskStore,
+    store: A,
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
     auth: AuthState,
     policy: Arc<AuthorizationPolicy>,
 ) -> Result<DurableGateway, PolicyError> {
+    let authority = store.into_durable_authority();
     Ok(build_durable_gateway_inner(
         config,
-        store,
+        DurableAuthorityParts {
+            authority,
+            local: None,
+        },
         endpoint,
         clock,
         Some(auth),
@@ -345,28 +352,36 @@ pub fn build_authorized_durable_loopback_gateway(
 
 fn build_durable_gateway_inner(
     config: GatewayConfig,
-    store: SqliteTaskStore,
+    parts: DurableAuthorityParts,
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
     auth: Option<AuthState>,
     authorization: Option<Arc<AuthorizationPolicy>>,
 ) -> DurableGateway {
+    let DurableAuthorityParts { authority, local } = parts;
     let GatewayConfig {
         public_base_url,
         input_limits,
         max_body_bytes,
         ..
     } = config;
-    let driver = spawn_durable_driver(store.clone(), endpoint, clock.clone());
-    let jsonrpc_handler = Arc::new(DurableRequestHandler::new(
-        store.clone(),
+    let driver = spawn_durable_driver(Arc::clone(&authority), endpoint, clock.clone());
+    let jsonrpc_handler = Arc::new(DurableRequestHandler::new_with_local(
+        Arc::clone(&authority),
+        local.clone(),
         driver.control(),
         clock.clone(),
         input_limits,
     ));
     let rest_handler = Arc::new(
-        DurableRequestHandler::new(store.clone(), driver.control(), clock.clone(), input_limits)
-            .with_errors_before_stream(),
+        DurableRequestHandler::new_with_local(
+            Arc::clone(&authority),
+            local,
+            driver.control(),
+            clock.clone(),
+            input_limits,
+        )
+        .with_errors_before_stream(),
     );
     let mut durable_card = if let Some(auth) = auth.as_ref() {
         build_secured_agent_card_with_policy(
@@ -392,7 +407,8 @@ fn build_durable_gateway_inner(
             .nest("/rest", a2a_server::rest::rest_router(rest))
             .layer(RequestBodyLimitLayer::new(max_body_bytes));
         let protocol = if let Some(policy) = authorization {
-            let state = AuthorizationMiddlewareState::with_sqlite(policy, store.clone(), clock);
+            let state =
+                AuthorizationMiddlewareState::with_audit(policy, Arc::clone(&authority), clock);
             protocol.layer(middleware::from_fn_with_state(state, authorize_request))
         } else {
             protocol
@@ -411,7 +427,7 @@ fn build_durable_gateway_inner(
     DurableGateway {
         router: Some(router),
         driver: Some(driver),
-        store: Some(store),
+        authority: Some(authority),
     }
 }
 

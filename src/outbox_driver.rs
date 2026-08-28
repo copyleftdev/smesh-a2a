@@ -1,22 +1,81 @@
+use std::cell::Cell;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Once;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use a2a::{
     Artifact, Message, Part, Role, SendMessageResponse, StreamResponse, TaskArtifactUpdateEvent,
     TaskState, TaskStatus, TaskStatusUpdateEvent,
 };
-use a2a_server::TaskStore;
+use futures::FutureExt as _;
 use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AttemptDisposition, DurableDispatchEnvelope, DurableLoopbackEndpoint,
-    DurableReceiverTermination, InjectedClock, MeshEvent, SqliteTaskStore, TransitionOutcome,
-    content_digest,
+    AttemptDisposition, DurableAuthority, DurableDispatchEnvelope, DurableLoopbackEndpoint,
+    DurableReceiverTermination, InjectedClock, MeshEvent, TransitionOutcome, content_digest,
     durable_dispatch::{DURABLE_CANCELED_SUMMARY, DurableDispatchOutcome},
 };
+
+thread_local! {
+    static REDACT_DRIVER_PANIC: Cell<bool> = const { Cell::new(false) };
+}
+
+static INSTALL_DRIVER_PANIC_HOOK: Once = Once::new();
+
+fn install_driver_panic_hook() {
+    INSTALL_DRIVER_PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if REDACT_DRIVER_PANIC.with(Cell::get) {
+                eprintln!("durable outbox driver panic (details redacted)");
+            } else {
+                previous(info);
+            }
+        }));
+    });
+}
+
+struct DriverPanicScope(bool);
+
+impl DriverPanicScope {
+    fn enter() -> Self {
+        Self(REDACT_DRIVER_PANIC.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for DriverPanicScope {
+    fn drop(&mut self) {
+        REDACT_DRIVER_PANIC.with(|flag| flag.set(self.0));
+    }
+}
+
+struct RedactedDriverPoll<F> {
+    inner: Pin<Box<F>>,
+}
+
+impl<F> RedactedDriverPoll<F> {
+    fn new(inner: F) -> Self {
+        Self {
+            inner: Box::pin(inner),
+        }
+    }
+}
+
+impl<F: Future> Future for RedactedDriverPoll<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let _scope = DriverPanicScope::enter();
+        self.inner.as_mut().poll(context)
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DriverState {
@@ -133,7 +192,9 @@ impl DurableDriverHandle {
     pub(crate) async fn shutdown(mut self) -> Result<(), a2a::A2AError> {
         self.control.state.send_modify(|state| {
             state.generation = state.generation.wrapping_add(1);
-            state.failure = Some("durable gateway is shutting down".to_owned());
+            if state.failure.is_none() {
+                state.failure = Some("durable gateway is shutting down".to_owned());
+            }
         });
         self.control.cancel.cancel();
         self.control.endpoint.cancel_all();
@@ -161,12 +222,12 @@ impl Drop for DurableDriverHandle {
 
 #[allow(clippy::too_many_lines)] // The loop is one cohesive fenced-lease state machine.
 pub(crate) fn spawn_durable_driver(
-    store: SqliteTaskStore,
+    authority: Arc<dyn DurableAuthority>,
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
 ) -> DurableDriverHandle {
     spawn_durable_driver_inner(
-        store,
+        authority,
         endpoint,
         clock,
         #[cfg(test)]
@@ -175,22 +236,23 @@ pub(crate) fn spawn_durable_driver(
 }
 
 #[cfg(test)]
-pub(crate) fn spawn_durable_driver_with_test_hooks(
-    store: SqliteTaskStore,
+pub(crate) fn spawn_durable_driver_with_test_hooks<A: crate::IntoDurableAuthority>(
+    authority: A,
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
     hooks: DriverTestHooks,
 ) -> DurableDriverHandle {
-    spawn_durable_driver_inner(store, endpoint, clock, hooks)
+    spawn_durable_driver_inner(authority.into_durable_authority(), endpoint, clock, hooks)
 }
 
 #[allow(clippy::too_many_lines)] // The loop is one cohesive fenced-lease state machine.
 fn spawn_durable_driver_inner(
-    store: SqliteTaskStore,
+    authority: Arc<dyn DurableAuthority>,
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
     #[cfg(test)] hooks: DriverTestHooks,
 ) -> DurableDriverHandle {
+    install_driver_panic_hook();
     let (state, _) = watch::channel(DriverState::default());
     let control = Arc::new(DurableDriverControl {
         wake: Arc::new(Notify::new()),
@@ -199,9 +261,10 @@ fn spawn_durable_driver_inner(
         endpoint: endpoint.clone(),
     });
     let worker_control = Arc::clone(&control);
+    let poll_interval = authority.change_observation().poll_interval();
     let mut clock_changed = clock.subscribe();
     let join = tokio::spawn(async move {
-        let result = async {
+        let result = AssertUnwindSafe(RedactedDriverPoll::new(async {
             loop {
                 if worker_control.cancel.is_cancelled() {
                     return Ok(());
@@ -212,7 +275,7 @@ fn spawn_durable_driver_inner(
                 {
                     return Ok(());
                 }
-                let Some(lease) = store
+                let Some(lease) = authority
                     .claim_outbox("durable-loopback-driver", clock.now(), 60_000)
                     .await?
                 else {
@@ -223,6 +286,7 @@ fn spawn_durable_driver_inner(
                     tokio::select! {
                         () = worker_control.cancel.cancelled() => return Ok(()),
                         () = worker_control.wake.notified() => {},
+                        () = tokio::time::sleep(poll_interval.as_duration()) => {},
                         changed = clock_changed.changed() => {
                             if changed.is_err() { return Ok(()); }
                         }
@@ -237,30 +301,31 @@ fn spawn_durable_driver_inner(
                     payload_digest: content_digest(payload.as_bytes()),
                     request: lease.request.clone(),
                 };
-                let committed_progress = if let Some(task) = store.get(&lease.task_id).await? {
-                    let progress = build_progress_frame(
-                        &task,
-                        "SMESH swarm is processing the durable dispatch".to_owned(),
-                        clock.now(),
-                    );
-                    let committed = store
-                        .append_stream_progress(
-                            &lease.tenant_scope,
-                            &lease.dispatch_id,
-                            progress,
+                let committed_progress =
+                    if let Some(task) = authority.task_for_outbox(&lease).await? {
+                        let progress = build_progress_frame(
+                            &task,
+                            "SMESH swarm is processing the durable dispatch".to_owned(),
                             clock.now(),
-                        )
-                        .await?;
-                    if committed.is_some() {
-                        worker_control.changed();
-                    }
-                    committed
-                } else {
-                    None
-                };
+                        );
+                        let committed = authority
+                            .append_stream_progress(
+                                &lease.tenant_scope,
+                                &lease.dispatch_id,
+                                progress,
+                                clock.now(),
+                            )
+                            .await?;
+                        if committed.is_some() {
+                            worker_control.changed();
+                        }
+                        committed
+                    } else {
+                        None
+                    };
                 let dispatch = tokio::select! {
                     () = worker_control.cancel.cancelled() => {
-                        let _ = store.finish_outbox_attempt(
+                        let _ = authority.finish_outbox_attempt(
                             &lease,
                             AttemptDisposition::Retry {
                                 available_at: clock.now(),
@@ -270,7 +335,7 @@ fn spawn_durable_driver_inner(
                         ).await?;
                         return Ok(());
                     }
-                    result = endpoint.dispatch_once(&store, envelope, &clock) => result,
+                    result = endpoint.dispatch_once(authority.as_ref(), envelope, &clock) => result,
                 };
                 let (events, termination) = match dispatch {
                     Ok(DurableDispatchOutcome::Delivered(events)) => {
@@ -284,7 +349,7 @@ fn spawn_durable_driver_inner(
                             .now()
                             .checked_add(1_000)
                             .ok_or_else(|| a2a::A2AError::internal("retry time overflow"))?;
-                        let outcome = store
+                        let outcome = authority
                             .finish_outbox_attempt(
                                 &lease,
                                 AttemptDisposition::Retry {
@@ -302,7 +367,7 @@ fn spawn_durable_driver_inner(
                     Err(error) => {
                         // Receiver validation/corruption errors are permanent. Busy is
                         // represented explicitly above and is the retryable class.
-                        let outcome = store
+                        let outcome = authority
                             .finish_outbox_attempt(
                                 &lease,
                                 AttemptDisposition::Permanent {
@@ -317,7 +382,7 @@ fn spawn_durable_driver_inner(
                         continue;
                     }
                 };
-                let Some(mut task) = store.get(&lease.task_id).await? else {
+                let Some(mut task) = authority.task_for_outbox(&lease).await? else {
                     return Err(a2a::A2AError::task_not_found(&lease.task_id));
                 };
                 let admitted_task = task.clone();
@@ -336,7 +401,7 @@ fn spawn_durable_driver_inner(
                     clock.now(),
                 );
                 let result = SendMessageResponse::Task(task.clone());
-                if store
+                if authority
                     .commit_delivery(&lease, task, result, &public_transcript, clock.now())
                     .await?
                     == TransitionOutcome::Applied
@@ -350,10 +415,17 @@ fn spawn_durable_driver_inner(
                     worker_control.changed();
                 }
             }
-        }
-        .await;
+        }))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            Err(a2a::A2AError::internal(
+                "durable outbox driver terminated unexpectedly",
+            ))
+        });
         if let Err(error) = &result {
             worker_control.failed(error);
+            worker_control.wake.notify_waiters();
         }
         result
     });
@@ -481,6 +553,381 @@ fn build_public_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        AdmissionOutcome, AtomicRecordCounts, AuthorityDiagnostics, AuthorityIdentity,
+        AuthorityShutdown, AuthorizationAuditInput, AuthorizationAuditSink, AuthorizedTaskRead,
+        CancellationAuthority, CancellationOutcome, ChangeObservation, ChangeObserver,
+        OutboxAuthority, OutboxLease, OwnedTaskScope, ReceiverAdmission, ReceiverAuthority,
+        ReceiverLease, SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor,
+        TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority,
+    };
+    use async_trait::async_trait;
+
+    struct PanickingAuthority {
+        release: Arc<Notify>,
+        claims: std::sync::Mutex<Vec<(String, i64, i64)>>,
+    }
+
+    fn unused() -> a2a::A2AError {
+        a2a::A2AError::internal("unused panicking authority capability")
+    }
+
+    impl AuthorityIdentity for PanickingAuthority {
+        fn completion_receipt_key(&self) -> Option<[u8; 32]> {
+            None
+        }
+        fn authorization_resource_digest(&self, _: &str) -> Result<String, a2a::A2AError> {
+            Err(unused())
+        }
+    }
+
+    impl ChangeObserver for PanickingAuthority {
+        fn change_observation(&self) -> ChangeObservation {
+            ChangeObservation::default()
+        }
+    }
+
+    #[async_trait]
+    impl AuthorizationAuditSink for PanickingAuthority {
+        async fn append_denied_authorization_decision(
+            &self,
+            _: AuthorizationAuditInput,
+        ) -> Result<(), a2a::A2AError> {
+            Err(unused())
+        }
+        async fn append_authorization_decision(
+            &self,
+            _: AuthorizationAuditInput,
+        ) -> Result<(), a2a::A2AError> {
+            Err(unused())
+        }
+    }
+
+    #[async_trait]
+    impl AuthorizedTaskRead for PanickingAuthority {
+        async fn get_authorized(
+            &self,
+            _: &OwnedTaskScope,
+            _: &str,
+            _: AuthorizationAuditInput,
+        ) -> Result<Option<a2a::Task>, a2a::A2AError> {
+            Err(unused())
+        }
+        async fn list_authorized(
+            &self,
+            _: &OwnedTaskScope,
+            _: &a2a::ListTasksRequest,
+            _: AuthorizationAuditInput,
+            _: &str,
+        ) -> Result<a2a::ListTasksResponse, a2a::A2AError> {
+            Err(unused())
+        }
+    }
+
+    #[async_trait]
+    impl TaskAdmission for PanickingAuthority {
+        async fn replay_authorized(
+            &self,
+            _: &OwnedTaskScope,
+            _: &str,
+            _: &a2a::SendMessageRequest,
+            _: bool,
+            _: AuthorizationAuditInput,
+        ) -> Result<Option<a2a::SendMessageResponse>, a2a::A2AError> {
+            Err(unused())
+        }
+        async fn authorize_and_admit(
+            &self,
+            _: &OwnedTaskScope,
+            _: SendMessageAdmission,
+            _: AuthorizationAuditInput,
+        ) -> Result<AdmissionOutcome, a2a::A2AError> {
+            Err(unused())
+        }
+        async fn authorize_and_continue(
+            &self,
+            _: &OwnedTaskScope,
+            _: SendMessageAdmission,
+            _: AuthorizationAuditInput,
+        ) -> Result<AdmissionOutcome, a2a::A2AError> {
+            Err(unused())
+        }
+    }
+
+    #[async_trait]
+    impl TaskLifecycle for PanickingAuthority {
+        async fn final_result_scoped(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<a2a::SendMessageResponse>, a2a::A2AError> {
+            Err(unused())
+        }
+    }
+
+    #[async_trait]
+    impl CancellationAuthority for PanickingAuthority {
+        async fn cancel_authorized(
+            &self,
+            _: &OwnedTaskScope,
+            _: &str,
+            _: i64,
+            _: AuthorizationAuditInput,
+        ) -> Result<CancellationOutcome, a2a::A2AError> {
+            Err(unused())
+        }
+    }
+
+    #[async_trait]
+    impl OutboxAuthority for PanickingAuthority {
+        async fn claim_outbox(
+            &self,
+            owner: &str,
+            now: i64,
+            duration: i64,
+        ) -> Result<Option<OutboxLease>, a2a::A2AError> {
+            self.claims
+                .lock()
+                .unwrap()
+                .push((owner.to_owned(), now, duration));
+            self.release.notified().await;
+            panic!("secret panic payload must not escape")
+        }
+        async fn task_for_outbox(
+            &self,
+            _: &OutboxLease,
+        ) -> Result<Option<a2a::Task>, a2a::A2AError> {
+            Err(unused())
+        }
+        async fn finish_outbox_attempt(
+            &self,
+            _: &OutboxLease,
+            _: AttemptDisposition,
+            _: i64,
+        ) -> Result<TransitionOutcome, a2a::A2AError> {
+            Err(unused())
+        }
+        async fn append_stream_progress(
+            &self,
+            _: &str,
+            _: &str,
+            _: a2a::StreamResponse,
+            _: i64,
+        ) -> Result<Option<a2a::StreamResponse>, a2a::A2AError> {
+            Err(unused())
+        }
+        async fn commit_delivery(
+            &self,
+            _: &OutboxLease,
+            _: a2a::Task,
+            _: a2a::SendMessageResponse,
+            _: &[a2a::StreamResponse],
+            _: i64,
+        ) -> Result<TransitionOutcome, a2a::A2AError> {
+            Err(unused())
+        }
+    }
+
+    #[async_trait]
+    impl ReceiverAuthority for PanickingAuthority {
+        async fn begin_receive(
+            &self,
+            _: DurableDispatchEnvelope,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<ReceiverAdmission, a2a::A2AError> {
+            Err(unused())
+        }
+        async fn complete_loopback_receive(
+            &self,
+            _: &ReceiverLease,
+            _: &[MeshEvent],
+            _: i64,
+        ) -> Result<(), a2a::A2AError> {
+            Err(unused())
+        }
+        async fn complete_loopback_outcome(
+            &self,
+            _: &ReceiverLease,
+            _: &crate::DurableReceiverResult,
+            _: i64,
+        ) -> Result<(), a2a::A2AError> {
+            Err(unused())
+        }
+        async fn complete_canceled_receive(
+            &self,
+            _: &ReceiverLease,
+            _: &[MeshEvent],
+            _: i64,
+        ) -> Result<(), a2a::A2AError> {
+            Err(unused())
+        }
+        async fn cancellation_requested(&self, _: &str) -> Result<bool, a2a::A2AError> {
+            Err(unused())
+        }
+    }
+
+    #[async_trait]
+    impl TranscriptAuthority for PanickingAuthority {
+        async fn stream_frames_after_scoped(
+            &self,
+            _: &str,
+            _: &str,
+            _: usize,
+        ) -> Result<StreamTranscriptBatch, a2a::A2AError> {
+            Err(unused())
+        }
+        async fn subscription_snapshot_authorized(
+            &self,
+            _: &OwnedTaskScope,
+            _: &str,
+        ) -> Result<Option<(a2a::Task, SubscriptionCursor)>, a2a::A2AError> {
+            Err(unused())
+        }
+        async fn task_events_after_scoped(
+            &self,
+            _: &OwnedTaskScope,
+            _: &str,
+            _: u64,
+        ) -> Result<TaskEventBatch, a2a::A2AError> {
+            Err(unused())
+        }
+    }
+
+    #[async_trait]
+    impl AuthorityDiagnostics for PanickingAuthority {
+        async fn authorization_decision_count(&self) -> Result<u64, a2a::A2AError> {
+            Err(unused())
+        }
+        async fn atomic_record_counts(&self) -> Result<AtomicRecordCounts, a2a::A2AError> {
+            Err(unused())
+        }
+        async fn durable_effect_count(&self) -> Result<u64, a2a::A2AError> {
+            Err(unused())
+        }
+    }
+
+    #[async_trait]
+    impl AuthorityShutdown for PanickingAuthority {
+        async fn shutdown(&self) -> Result<(), a2a::A2AError> {
+            Ok(())
+        }
+        fn close_owned_sync(&self) {}
+    }
+
+    #[tokio::test]
+    async fn driver_panic_publishes_one_generic_fatal_error_to_all_attached_observers() {
+        let release = Arc::new(Notify::new());
+        let recording = Arc::new(PanickingAuthority {
+            release: release.clone(),
+            claims: std::sync::Mutex::new(Vec::new()),
+        });
+        let authority: Arc<dyn DurableAuthority> = recording.clone();
+        let handle = spawn_durable_driver(
+            authority,
+            DurableLoopbackEndpoint::new(),
+            InjectedClock::new(10),
+        );
+        let mut observers = [
+            handle.control().subscribe(),
+            handle.control().subscribe(),
+            handle.control().subscribe(),
+        ];
+        release.notify_one();
+        for observer in &mut observers {
+            tokio::time::timeout(Duration::from_secs(1), observer.changed())
+                .await
+                .expect("panic propagation watchdog")
+                .expect("driver state remains observable");
+            let failure = observer.borrow().failure.clone().expect("fatal failure");
+            assert!(failure.contains("durable outbox driver terminated unexpectedly"));
+            assert!(!failure.contains("secret panic payload"));
+        }
+        let shutdown = tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+            .await
+            .expect("panic shutdown watchdog")
+            .expect_err("panic remains the shutdown result");
+        assert!(
+            shutdown
+                .to_string()
+                .contains("durable outbox driver terminated unexpectedly")
+        );
+        assert!(!shutdown.to_string().contains("secret panic payload"));
+        assert_eq!(
+            recording.claims.lock().unwrap().as_slice(),
+            &[("durable-loopback-driver".to_owned(), 10, 60_000)]
+        );
+    }
+
+    #[test]
+    fn driver_panic_stderr_is_redacted_without_suppressing_unrelated_panics() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let driver = std::process::Command::new(&executable)
+            .args([
+                "--exact",
+                "outbox_driver::tests::driver_panic_stderr_child",
+                "--nocapture",
+            ])
+            .env("SMESH_DRIVER_PANIC_STDERR_CHILD", "1")
+            .output()
+            .expect("run driver panic subprocess");
+        assert!(driver.status.success(), "driver child failed: {driver:?}");
+        let driver_stderr = String::from_utf8_lossy(&driver.stderr);
+        assert!(!driver_stderr.contains("secret panic payload must not escape"));
+        assert!(driver_stderr.contains("durable outbox driver panic (details redacted)"));
+        assert!(driver_stderr.contains("durable outbox driver terminated unexpectedly"));
+
+        let unrelated = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "outbox_driver::tests::unrelated_panic_stderr_child",
+                "--nocapture",
+            ])
+            .env("SMESH_UNRELATED_PANIC_STDERR_CHILD", "1")
+            .output()
+            .expect("run unrelated panic subprocess");
+        assert!(!unrelated.status.success());
+        let unrelated_stderr = String::from_utf8_lossy(&unrelated.stderr);
+        assert!(unrelated_stderr.contains("unrelated panic canary must remain visible"));
+    }
+
+    #[tokio::test]
+    async fn driver_panic_stderr_child() {
+        if std::env::var_os("SMESH_DRIVER_PANIC_STDERR_CHILD").is_none() {
+            return;
+        }
+        let release = Arc::new(Notify::new());
+        let authority: Arc<dyn DurableAuthority> = Arc::new(PanickingAuthority {
+            release: release.clone(),
+            claims: std::sync::Mutex::new(Vec::new()),
+        });
+        let handle = spawn_durable_driver(
+            authority,
+            DurableLoopbackEndpoint::new(),
+            InjectedClock::new(10),
+        );
+        let mut observer = handle.control().subscribe();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), observer.changed())
+            .await
+            .expect("driver panic child watchdog")
+            .expect("driver state observable");
+        eprintln!("{}", observer.borrow().failure.as_deref().expect("failure"));
+        let shutdown = handle.shutdown().await.expect_err("panic shutdown error");
+        eprintln!("{shutdown}");
+    }
+
+    #[test]
+    fn unrelated_panic_stderr_child() {
+        if std::env::var_os("SMESH_UNRELATED_PANIC_STDERR_CHILD").is_some() {
+            std::panic::set_hook(Box::new(|info| {
+                eprintln!("delegated pre-existing hook: {info}");
+            }));
+            install_driver_panic_hook();
+            panic!("unrelated panic canary must remain visible");
+        }
+    }
 
     #[test]
     fn terminal_transcript_reuses_the_exact_committed_progress_frame() {

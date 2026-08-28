@@ -63,6 +63,47 @@ aborted after its bounded grace period.
 
 `BoundedTaskStore` gives the process-local ledger a hard capacity and makes terminal states absorbing. `GuardedRequestHandler` rejects caller-supplied tenants in the single-tenant MVP and blocks new messages for terminal task IDs before the official handler starts execution.
 
+### `durable_authority`, `sqlite_store`, and durable runtime
+
+`DurableAuthority` is an object-safe umbrella over required narrow capabilities:
+scoped reads/frozen pages, admission/replay/continuation, lifecycle and cancellation
+arbitration, outbox/receiver fencing, transcripts/subscriptions, authorization
+audit/key material, bounded change observation, diagnostics, and shutdown. Every
+production method is required; a blank backend cannot compile as a durable
+authority. Production durable handlers, the outbox driver, loopback receiver,
+authorization middleware, and the owned gateway hold `Arc<dyn DurableAuthority>`;
+SQLite construction, migration, schema administration, and test fault injection
+remain concrete.
+
+Authenticated routes receive only scoped capabilities. Global get/list/replay,
+cancel, and transcript operations are absent from `DurableAuthority`; a sealed,
+crate-private SQLite adapter preserves explicit local-development compatibility.
+
+Change notifications are hints. `ChangeObservation` contains a validated
+`PollInterval` in `10ms..=5s` and bounds periodic durable re-reads by drivers and
+streams, so correctness does not depend on an in-process `Notify` or `watch`
+reaching the consumer. A process-wide panic hook is installed once before the
+first driver spawn and preserves the previous hook. A poll wrapper sets a
+thread-local redaction flag only while synchronously polling the driver future,
+restoring it on return or unwind. Driver panic payloads and locations therefore
+do not reach process stderr, while unrelated panics still delegate to the prior
+hook. The worker publishes one generic fatal state and wakes attached consumers.
+Gateway shutdown first joins its owned driver and then calls the backend-neutral
+authority shutdown contract. The SQLite adapter intentionally retains its
+pre-existing shared-clone close behavior pending multi-replica work.
+
+Backend-neutral evidence is the reusable command-level harness in
+`tests/support/durable_authority_conformance.rs`. It accepts
+`Arc<dyn DurableAuthority>` through a watchdog-bounded fixture factory/cleanup
+runner, directly exercises every required scoped capability, and runs against
+both a fully recording fake and real SQLite state. The separate full JSON-RPC
+gateway lifecycle remains SQLite/local compatibility evidence; it is not
+described as backend-neutral conformance.
+
+Issue #61 intentionally exposes no lease-renewal API. Issue #63 will add renewal
+only as a negotiated capability together with runtime calls and atomic fencing;
+SQLite remains exclusive-open and reports no dormant renewal surface.
+
 ### `server`
 
 Composes the official JSON-RPC, REST, Agent Card, task store, and executor into one Axum router. It binds to loopback by default.
