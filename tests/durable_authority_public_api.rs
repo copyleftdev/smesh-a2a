@@ -7,6 +7,23 @@ use smesh_a2a::{
     SendMessageAdmission, VisibilityScope,
 };
 
+fn pre_artifact_exhaustive_match(event: &smesh_a2a::MeshEvent) -> &'static str {
+    match event {
+        smesh_a2a::MeshEvent::Progress(_) => "progress",
+        smesh_a2a::MeshEvent::Evidence(_) => "evidence",
+        smesh_a2a::MeshEvent::Artifact { .. } => "artifact",
+        smesh_a2a::MeshEvent::Completed { .. } => "completed",
+    }
+}
+
+#[test]
+fn pre_artifact_mesh_event_match_remains_exhaustive() {
+    assert_eq!(
+        pre_artifact_exhaustive_match(&smesh_a2a::MeshEvent::Progress(String::new())),
+        "progress"
+    );
+}
+
 #[test]
 fn external_backend_can_inspect_bounded_server_quota_reservation() {
     let quota = QuotaReservationInput::new(

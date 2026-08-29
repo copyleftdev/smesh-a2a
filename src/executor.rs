@@ -511,6 +511,77 @@ where
                         media_type,
                         content,
                     }) => {
+                        if let Some(internal) = crate::bridge::internal_artifact_payload(&content) {
+                            match internal {
+                                crate::bridge::InternalArtifactPayload::Binary { bytes } => {
+                                    use base64::Engine as _;
+                                    let Ok(bytes) =
+                                        base64::engine::general_purpose::STANDARD.decode(bytes)
+                                    else {
+                                        publish_invalid_internal_artifact_terminal(
+                                            control.as_ref(),
+                                            &tx,
+                                            runtime_trace.as_deref(),
+                                            &dispatcher,
+                                            &task_id,
+                                            &context_id,
+                                            &history,
+                                            execution_limits.cancel_timeout,
+                                        )
+                                        .await;
+                                        terminal_emitted = true;
+                                        break;
+                                    };
+                                    artifact_manifests.push(ArtifactManifest {
+                                        name: name.clone(),
+                                        media_type: media_type.clone(),
+                                        digest: content_digest(&bytes),
+                                    });
+                                    artifacts.push(Artifact {
+                                        artifact_id: new_artifact_id(),
+                                        name: Some(name),
+                                        description: Some(
+                                            "Unpublished SMESH candidate output".to_owned(),
+                                        ),
+                                        parts: vec![Part::raw(bytes).with_media_type(media_type)],
+                                        metadata: None,
+                                        extensions: None,
+                                    });
+                                }
+                                crate::bridge::InternalArtifactPayload::Published {
+                                    projection,
+                                } => {
+                                    let Ok(artifact): Result<Artifact, _> =
+                                        serde_json::from_str(&projection)
+                                    else {
+                                        publish_invalid_internal_artifact_terminal(
+                                            control.as_ref(),
+                                            &tx,
+                                            runtime_trace.as_deref(),
+                                            &dispatcher,
+                                            &task_id,
+                                            &context_id,
+                                            &history,
+                                            execution_limits.cancel_timeout,
+                                        )
+                                        .await;
+                                        terminal_emitted = true;
+                                        break;
+                                    };
+                                    artifact_manifests.push(ArtifactManifest {
+                                        name: artifact
+                                            .name
+                                            .clone()
+                                            .unwrap_or_else(|| "artifact".into()),
+                                        media_type: "application/vnd.smesh.artifact-manifest+json"
+                                            .into(),
+                                        digest: content_digest(projection.as_bytes()),
+                                    });
+                                    artifacts.push(artifact);
+                                }
+                            }
+                            continue;
+                        }
                         artifact_manifests.push(ArtifactManifest {
                             name: name.clone(),
                             media_type: media_type.clone(),
@@ -525,6 +596,7 @@ where
                             extensions: None,
                         });
                     }
+
                     Ok(MeshEvent::Completed { summary: _summary }) => {
                         if completion_proposed {
                             if control.claim_execution()
@@ -798,6 +870,37 @@ async fn publish_cancellation_terminal(
             .await;
     }
     control.terminal_published.notify_one();
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_invalid_internal_artifact_terminal(
+    control: &ExecutionControl,
+    tx: &tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
+    trace: Option<&RuntimeEventCapture>,
+    dispatcher: &Arc<dyn MeshDispatcher>,
+    task_id: &str,
+    context_id: &str,
+    history: &[Message],
+    cancel_timeout: Duration,
+) {
+    if control.claim_execution() {
+        if record_terminal_trace(trace, task_id, context_id, TaskState::Failed, Vec::new()).await {
+            let _ = tx
+                .send(Ok(task_response(
+                    task_id,
+                    context_id,
+                    TaskState::Failed,
+                    "SMESH worker emitted an undecodable artifact payload".to_owned(),
+                    None,
+                    history.to_vec(),
+                    None,
+                )))
+                .await;
+        }
+        request_dispatcher_cancel(dispatcher, task_id, cancel_timeout).await;
+    } else if control.terminal.load(Ordering::SeqCst) == TERMINAL_CANCEL {
+        publish_cancellation_terminal(control, tx, trace, task_id, context_id, history).await;
+    }
 }
 
 async fn record_cancellation_terminal_trace(
@@ -1172,5 +1275,102 @@ fn agent_message(task_id: &str, context_id: &str, text: String) -> Message {
         metadata: None,
         extensions: None,
         reference_task_ids: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use futures::stream::{self, BoxStream};
+    use tokio::sync::Barrier;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct CountingDispatcher {
+        cancel_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MeshDispatcher for CountingDispatcher {
+        fn dispatch(
+            &self,
+            _request: MeshRequest,
+        ) -> BoxStream<'static, Result<MeshEvent, crate::DispatchError>> {
+            Box::pin(stream::pending())
+        }
+
+        async fn cancel(&self, _task_id: &str) -> Result<(), crate::DispatchError> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_artifact_terminal_joins_the_cancellation_owner_before_publication() {
+        let control = Arc::new(ExecutionControl::new());
+        assert!(control.claim_cancel());
+        control.cancellation.cancel();
+        let cancellation_join = Arc::new(Barrier::new(2));
+        let owner_control = Arc::clone(&control);
+        let owner_join = Arc::clone(&cancellation_join);
+        let owner = tokio::spawn(async move {
+            owner_join.wait().await;
+            owner_control
+                .cancel_outcome
+                .store(CANCEL_OUTCOME_CANCELED, Ordering::SeqCst);
+            owner_control.cancel_done.notify_one();
+        });
+
+        let dispatcher = Arc::new(CountingDispatcher::default());
+        let dispatcher_trait: Arc<dyn MeshDispatcher> = dispatcher.clone();
+        let capture = Arc::new(RuntimeEventCapture::new(1, 1));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let helper_control = Arc::clone(&control);
+        let helper_capture = Arc::clone(&capture);
+        let helper = tokio::spawn(async move {
+            publish_invalid_internal_artifact_terminal(
+                helper_control.as_ref(),
+                &tx,
+                Some(helper_capture.as_ref()),
+                &dispatcher_trait,
+                "task-race",
+                "context-race",
+                &[],
+                Duration::from_secs(1),
+            )
+            .await;
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), rx.recv())
+                .await
+                .is_err()
+        );
+        cancellation_join.wait().await;
+        owner.await.unwrap();
+        helper.await.unwrap();
+        let response = rx.recv().await.unwrap().unwrap();
+        assert!(matches!(
+            response,
+            StreamResponse::Task(task) if task.status.state == TaskState::Canceled
+        ));
+        assert_eq!(dispatcher.cancel_calls.load(Ordering::SeqCst), 0);
+        assert!(rx.recv().await.is_none());
+        let trace = capture.snapshot().await;
+        assert!(matches!(
+            trace.events.as_slice(),
+            [event]
+                if matches!(
+                    event.details,
+                    crate::RuntimeTraceDetails::TerminalOutput {
+                        state: RuntimeTerminalState::Canceled,
+                        cancellation_outcome: Some(RuntimeCancellationOutcome::CooperativeStop),
+                        ..
+                    }
+                )
+        ));
     }
 }

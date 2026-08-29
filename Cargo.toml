@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 a2a = { package = "a2a-lf", version = "0.3.0" }
+aes-gcm = "0.10"
 a2a-server = { package = "a2a-server-lf", version = "0.4.1" }
 async-trait = "0.1"
 axum = "0.8"
@@ -51,6 +52,7 @@ tower-http = { version = "0.6", features = ["limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+mime = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 url = "2"
 # Direct dependency: reloads must inspect leaf DNS/IP SANs before atomic publish;

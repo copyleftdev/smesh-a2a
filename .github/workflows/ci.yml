@@ -75,7 +75,9 @@ jobs:
 
   postgres:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # Command watchdogs total 75 minutes; keep a bounded margin for builds and
+    # service setup without re-running postgres_store selections.
+    timeout-minutes: 90
     services:
       postgres:
         image: postgres:17
@@ -113,8 +115,17 @@ jobs:
           SQL
           PGPASSWORD=smesh-ci-migrator psql -h 127.0.0.1 -p 55432 -U smesh_migrator -d smesh_test -c 'SELECT current_user'
           PGPASSWORD=smesh-ci-runtime psql -h 127.0.0.1 -p 55432 -U smesh_test_runtime -d smesh_test -c 'SELECT current_user'
+      - name: Artifact Phase-A evidence and migration
+        run: |
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test artifact_migration -- --test-threads=1
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test artifact_operators -- --test-threads=1
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test artifact_storage -- --test-threads=1
       - name: PostgreSQL schema-v6 conformance, quota abuse matrix, and failover
         run: |
+          for run in 1 2 3; do
+            echo "artifact process crash matrix run ${run}/3"
+            timeout --signal=TERM --kill-after=15s 10m cargo test --locked --test postgres_artifact_process -- --test-threads=1
+          done
           timeout --signal=TERM --kill-after=15s 15m cargo test --locked --test postgres_store -- --test-threads=1
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test postgres_multi_replica -- --test-threads=1
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test authorized_gateway_process production_binary_selects_postgres_and_replays_after_graceful_restart -- --exact --test-threads=1

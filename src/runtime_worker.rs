@@ -62,6 +62,26 @@ impl RuntimeEventSink {
         .await
     }
 
+    /// Submit one binary-capable private candidate artifact through the
+    /// internal durable event envelope without extending [`MeshEvent`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when canceled, over budget, or the event channel closes.
+    pub async fn artifact_bytes(
+        &self,
+        name: impl Into<String>,
+        media_type: impl Into<String>,
+        content: &[u8],
+    ) -> Result<(), DispatchError> {
+        self.emit(crate::bridge::binary_artifact_event(
+            name.into(),
+            media_type.into(),
+            content,
+        ))
+        .await
+    }
+
     /// Submit an untrusted completion proposal. This cannot complete A2A work by itself.
     ///
     /// # Errors

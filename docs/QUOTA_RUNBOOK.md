@@ -6,11 +6,16 @@ Distributed enforcement is PostgreSQL-only. Configure authenticated authorized l
 
 ```text
 SMESH_A2A_DURABLE_BACKEND=postgres
-SMESH_A2A_POSTGRES_MIGRATOR_URL=postgresql://...
-SMESH_A2A_POSTGRES_RUNTIME_URL=postgresql://...
+SSL_CERT_FILE=/run/secrets/postgres-ca.pem
+SMESH_A2A_POSTGRES_MIGRATOR_URL=postgresql://db.example/smesh?sslmode=verify-full
+SMESH_A2A_POSTGRES_RUNTIME_URL=postgresql://db.example/smesh?sslmode=verify-full
 SMESH_A2A_POSTGRES_SCHEMA=smesh_authority
 SMESH_A2A_QUOTA_POLICY_PATH=/secure/path/quota-policy.json
 ```
+
+The connector uses rustls native roots plus `SSL_CERT_FILE` (and `SSL_CERT_DIR`,
+when set). The CA bundle must validate the PostgreSQL server certificate and
+hostname; do not weaken `sslmode=verify-full`.
 
 The quota file is opened with no-follow semantics, bounded to 256 KiB, parsed with unknown-field and duplicate rejection, canonicalized, and checked against compiled hard caps before PostgreSQL or gateway resources are acquired. A configured quota file with SQLite fails startup. A PostgreSQL production configuration without the file also fails startup.
 

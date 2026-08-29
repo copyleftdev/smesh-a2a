@@ -41,6 +41,46 @@ pub enum MeshEvent {
     },
 }
 
+const INTERNAL_ARTIFACT_PREFIX: &str = "smesh-internal-artifact/v1:";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub(crate) enum InternalArtifactPayload {
+    Binary { bytes: String },
+    Published { projection: String },
+}
+
+pub(crate) fn binary_artifact_event(name: String, media_type: String, content: &[u8]) -> MeshEvent {
+    use base64::Engine as _;
+    let payload = InternalArtifactPayload::Binary {
+        bytes: base64::engine::general_purpose::STANDARD.encode(content),
+    };
+    MeshEvent::Artifact {
+        name,
+        media_type,
+        content: format!(
+            "{INTERNAL_ARTIFACT_PREFIX}{}",
+            serde_json::to_string(&payload).expect("internal artifact envelope serializes")
+        ),
+    }
+}
+
+pub(crate) fn published_artifact_event(projection: String) -> MeshEvent {
+    let payload = InternalArtifactPayload::Published { projection };
+    MeshEvent::Artifact {
+        name: "artifact".to_owned(),
+        media_type: "application/vnd.smesh.artifact-manifest+json".to_owned(),
+        content: format!(
+            "{INTERNAL_ARTIFACT_PREFIX}{}",
+            serde_json::to_string(&payload).expect("internal artifact envelope serializes")
+        ),
+    }
+}
+
+pub(crate) fn internal_artifact_payload(content: &str) -> Option<InternalArtifactPayload> {
+    serde_json::from_str(content.strip_prefix(INTERNAL_ARTIFACT_PREFIX)?).ok()
+}
+
 #[async_trait]
 pub trait MeshDispatcher: Send + Sync + 'static {
     fn dispatch(

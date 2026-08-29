@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use smesh_a2a::{
     VersionedCompletionPolicy, artifact_set_digest, content_digest,
 };
 use smesh_core::NodeIdentity;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Barrier, Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Clone, Default)]
@@ -1051,6 +1052,148 @@ async fn accepted_cancel_request_suppresses_completion_while_ack_is_pending() {
             }
         )
     }));
+}
+
+#[derive(Clone)]
+struct InvalidArtifactCancelRaceDispatcher {
+    content: String,
+    invalid_release: Arc<Barrier>,
+    cancel_started: Arc<Barrier>,
+    cancel_ack_release: Arc<Barrier>,
+    cancel_calls: Arc<AtomicUsize>,
+    cancel_joined: Arc<AtomicBool>,
+}
+
+impl InvalidArtifactCancelRaceDispatcher {
+    fn new(content: &str) -> Self {
+        Self {
+            content: content.to_owned(),
+            invalid_release: Arc::new(Barrier::new(2)),
+            cancel_started: Arc::new(Barrier::new(2)),
+            cancel_ack_release: Arc::new(Barrier::new(2)),
+            cancel_calls: Arc::new(AtomicUsize::new(0)),
+            cancel_joined: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait]
+impl MeshDispatcher for InvalidArtifactCancelRaceDispatcher {
+    fn dispatch(
+        &self,
+        _request: MeshRequest,
+    ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
+        let invalid_release = Arc::clone(&self.invalid_release);
+        let content = self.content.clone();
+        let (tx, rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            invalid_release.wait().await;
+            let _ = tx
+                .send(Ok(MeshEvent::Artifact {
+                    name: "invalid.bin".to_owned(),
+                    media_type: "application/octet-stream".to_owned(),
+                    content,
+                }))
+                .await;
+        });
+        Box::pin(ReceiverStream::new(rx))
+    }
+
+    async fn cancel(&self, _task_id: &str) -> Result<(), DispatchError> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        self.cancel_started.wait().await;
+        self.cancel_ack_release.wait().await;
+        self.cancel_joined.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+async fn assert_cancel_wins_invalid_internal_artifact(content: &str) {
+    let dispatcher = InvalidArtifactCancelRaceDispatcher::new(content);
+    let invalid_release = Arc::clone(&dispatcher.invalid_release);
+    let cancel_started = Arc::clone(&dispatcher.cancel_started);
+    let cancel_ack_release = Arc::clone(&dispatcher.cancel_ack_release);
+    let cancel_calls = Arc::clone(&dispatcher.cancel_calls);
+    let cancel_joined = Arc::clone(&dispatcher.cancel_joined);
+    let capture = Arc::new(RuntimeEventCapture::new(4, 1));
+    let executor = SmeshExecutor::new(dispatcher, InputLimits::default(), "gateway-node")
+        .with_runtime_trace(Arc::clone(&capture));
+    let mut execution = executor.execute(context("cancel before invalid internal artifact"));
+    assert!(matches!(
+        execution.next().await,
+        Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Working
+    ));
+
+    let cancel = tokio::spawn(async move {
+        executor
+            .cancel(ExecutorContext {
+                message: None,
+                task_id: "task-1".to_owned(),
+                stored_task: None,
+                context_id: "context-1".to_owned(),
+                metadata: None,
+                user: None,
+                service_params: HashMap::new(),
+                tenant: None,
+            })
+            .collect::<Vec<_>>()
+            .await
+    });
+    cancel_started.wait().await;
+    invalid_release.wait().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), execution.next())
+            .await
+            .is_err()
+    );
+    assert!(!cancel.is_finished());
+    cancel_ack_release.wait().await;
+
+    assert!(cancel.await.unwrap().is_empty());
+    let remaining = tokio::time::timeout(Duration::from_secs(1), execution.collect::<Vec<_>>())
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(matches!(
+        remaining.as_slice(),
+        [StreamResponse::Task(task)] if task.status.state == TaskState::Canceled
+    ));
+    assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+    assert!(cancel_joined.load(Ordering::SeqCst));
+
+    let trace = capture.snapshot().await;
+    let terminals = trace
+        .events
+        .iter()
+        .filter(|event| event.kind == RuntimeTraceKind::TerminalOutput)
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert!(matches!(
+        terminals[0].details,
+        smesh_a2a::RuntimeTraceDetails::TerminalOutput {
+            state: RuntimeTerminalState::Canceled,
+            cancellation_outcome: Some(RuntimeCancellationOutcome::CooperativeStop),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn cancellation_owns_terminal_when_invalid_internal_base64_arrives() {
+    assert_cancel_wins_invalid_internal_artifact(
+        r#"smesh-internal-artifact/v1:{"kind":"binary","bytes":"***"}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cancellation_owns_terminal_when_invalid_published_projection_arrives() {
+    assert_cancel_wins_invalid_internal_artifact(
+        r#"smesh-internal-artifact/v1:{"kind":"published","projection":"not-json"}"#,
+    )
+    .await;
 }
 
 #[tokio::test]

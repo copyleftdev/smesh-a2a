@@ -5,9 +5,10 @@ mod support;
 use std::{env, fs, os::unix::fs::PermissionsExt as _, sync::Arc, time::Duration};
 
 use smesh_a2a::{
-    AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput,
-    AuthorizationAuditSink, AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead,
-    DurableAuthority, OutboxAuthority, OwnedTaskScope, PostgresStoreConfig, PostgresTaskStore,
+    ArtifactAuthority, ArtifactPublicationTestFault, ArtifactStoreConfig, AuthorityDiagnostics,
+    AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput, AuthorizationAuditSink,
+    AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead, DurableAuthority,
+    OutboxAuthority, OwnedTaskScope, PostgresStoreConfig, PostgresTaskStore,
     PostgresTransactionTestFault, QuotaReservationInput, ReceiverAuthority, SqliteTaskStore,
     TaskAdmission, TaskLifecycle, TranscriptAuthority, VisibilityScope,
 };
@@ -16,6 +17,7 @@ use smesh_a2a::{
     DurableLoopbackEndpoint, GatewayConfig, InjectedClock, SendMessageAdmission,
     build_durable_loopback_gateway,
 };
+use support::artifact_test_root::ArtifactTestRoot;
 use support::authority_row_parity::{
     AUTHORITY_TABLES, assert_postgres_tables_match, assert_sqlite_tables_match, dump_postgres,
     dump_sqlite,
@@ -30,6 +32,14 @@ use tokio_postgres::NoTls;
 use url::Url;
 
 macro_rules! postgres_test {
+    ($name:ident, $seconds:literal, $body:block) => {
+        #[tokio::test]
+        async fn $name() {
+            tokio::time::timeout(Duration::from_secs($seconds), async move $body)
+                .await
+                .unwrap_or_else(|_| panic!("PostgreSQL test {} exceeded {}s watchdog", stringify!($name), $seconds));
+        }
+    };
     ($name:ident, $body:block) => {
         #[tokio::test]
         async fn $name() {
@@ -40,10 +50,18 @@ macro_rules! postgres_test {
     };
 }
 
+fn required_postgres_url(name: &str) -> String {
+    env::var(name)
+        .unwrap_or_else(|_| panic!("{name} is required by the PostgreSQL evidence harness"))
+}
+
 fn admin_url() -> Option<String> {
     match env::var("SMESH_TEST_POSTGRES_ADMIN_URL") {
         Ok(url) => Some(url),
-        Err(_) if env::var("SMESH_POSTGRES_TEST_REQUIRED").as_deref() == Ok("1") => {
+        Err(_)
+            if env::var("SMESH_POSTGRES_TEST_REQUIRED").as_deref() == Ok("1")
+                || env::var("SMESH_TEST_POSTGRES_REQUIRED").as_deref() == Ok("1") =>
+        {
             panic!("SMESH_TEST_POSTGRES_ADMIN_URL is required")
         }
         Err(_) => {
@@ -54,9 +72,7 @@ fn admin_url() -> Option<String> {
 }
 
 fn superuser_url() -> String {
-    env::var("SMESH_TEST_POSTGRES_SUPERUSER_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:smesh_test_password@127.0.0.1:55432/smesh_test".into()
-    })
+    required_postgres_url("SMESH_TEST_POSTGRES_SUPERUSER_URL")
 }
 
 const RETAINED_AUTHORITY_TABLES: &[&str] = &[
@@ -135,9 +151,7 @@ async fn assert_retained_counter_table_parity(
 }
 
 fn config(url: String, suffix: &str) -> PostgresStoreConfig {
-    let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap_or_else(|_| {
-        "postgresql://smesh_test_runtime:smesh_runtime_password@127.0.0.1:55432/smesh_test".into()
-    });
+    let runtime_url = required_postgres_url("SMESH_TEST_POSTGRES_RUNTIME_URL");
     PostgresStoreConfig::new(
         url,
         runtime_url,
@@ -429,7 +443,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
     let source = include_str!("../src/postgres_store.rs");
     assert_eq!(
         source.matches(".transaction()").count(),
-        10,
+        13,
         "new direct transaction site must be routed through the bounded runner or explicitly reviewed"
     );
     for reason in [
@@ -443,6 +457,9 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
         "read-only tenant-scoped startup semantic validation",
         "read-only indexed quota diagnostics for deterministic evidence",
         "policy reconciliation is startup-only, advisory-fenced, and atomically audited",
+        "artifact orphan claim persists before unlink",
+        "artifact orphan finalize fences exact ownership",
+        "read-only tenant/key-generation snapshot before atomic reload",
     ] {
         assert!(
             source.contains(reason),
@@ -3078,3 +3095,2002 @@ postgres_test!(
         admin_driver.abort();
     }
 );
+
+postgres_test!(
+    artifact_promoter_workers_claim_disjoint_batches_and_reject_stale_tokens,
+    {
+        let Some(url) = admin_url() else { return };
+        let root = ArtifactTestRoot::new("artifact-pg-race");
+        let keyring = root.join("keys.json");
+        fs::write(&keyring, r#"{"activeGeneration":"key-a","generations":{"key-a":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}}"#).unwrap();
+        fs::set_permissions(&keyring, fs::Permissions::from_mode(0o600)).unwrap();
+        let artifact = ArtifactStoreConfig::new(&root, &keyring).unwrap();
+        let config = config(url, "artifact_race").with_artifact_store(artifact);
+        let store = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
+        let (client, driver) = admin_client(&superuser_url()).await;
+        let schema = config.schema_name();
+        client.batch_execute(&format!("INSERT INTO {schema}.retained_authority_usage VALUES('tenant-a','tenant','tenant-a',0,1),('tenant-a','account','owner',0,1),('tenant-a','principal','account:owner',0,1); INSERT INTO {schema}.artifact_key_generations VALUES('tenant-a','tenant-a/confidential','key-a','active',1,NULL);" )).await.unwrap();
+        for index in 0..4_i64 {
+            let object = format!("object-{index}");
+            let upload = format!("upload-{index}");
+            let artifact_id = format!("artifact-{index}");
+            let locator = format!("stage/{index:064x}.blob");
+            let final_locator = format!("objects/{index:064x}.blob");
+            let digest = format!("sha256:{index:064x}");
+            client.execute(&format!("INSERT INTO {schema}.content_objects(tenant_scope,owner_account_id,object_id,content_digest,classification,encryption_domain,key_generation,plaintext_length,ciphertext_length,ciphertext_digest,backend_locator,nonce,state,reference_count,retain_until,created_at) VALUES('tenant-a','owner',$1,$2,'confidential','tenant-a/confidential','key-a',1,16,$2,$3,$4,'staged',0,9999999999999,1)"), &[&object,&digest,&final_locator,&vec![0_u8;12]]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.upload_intents(tenant_scope,upload_id,artifact_id,object_id,state,stage_locator,final_locator,ciphertext_digest,ciphertext_length,lease_epoch,created_at,updated_at) VALUES('tenant-a',$1,$2,$3,'committed',$4,$5,$6,16,1,1,$7)"), &[&upload,&artifact_id,&object,&locator,&final_locator,&digest,&index]).await.unwrap();
+        }
+        let probe_sql =
+            format!("SELECT * FROM {schema}.claim_artifact_upload('probe','probe-token',30000,1)");
+        let probe = client
+            .query(&probe_sql, &[])
+            .await
+            .expect("direct promoter claim function");
+        assert_eq!(probe.len(), 1);
+        client.execute(&format!("UPDATE {schema}.upload_intents SET state='committed',lease_token=NULL,lease_until=NULL,lease_epoch=1,attempts=0"), &[]).await.unwrap();
+        let (runtime_client, runtime_driver) =
+            admin_client(&required_postgres_url("SMESH_TEST_POSTGRES_RUNTIME_URL")).await;
+        runtime_client
+            .batch_execute(&format!("SET ROLE {schema}_runtime"))
+            .await
+            .unwrap();
+        let runtime_probe = runtime_client
+            .query(&probe_sql, &[])
+            .await
+            .expect("runtime promoter claim function");
+        assert_eq!(runtime_probe.len(), 1);
+        drop(runtime_client);
+        runtime_driver.abort();
+        client.execute(&format!("UPDATE {schema}.upload_intents SET state='committed',lease_token=NULL,lease_until=NULL,lease_epoch=1,attempts=0"), &[]).await.unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let left = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .claim_artifact_promotion("promoter-left", 30_000, 2)
+                    .await
+                    .unwrap()
+            })
+        };
+        let right = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .claim_artifact_promotion("promoter-right", 30_000, 2)
+                    .await
+                    .unwrap()
+            })
+        };
+        barrier.wait().await;
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+        assert_eq!(left.len(), 2);
+        assert_eq!(right.len(), 2);
+        let left_ids = left
+            .iter()
+            .map(|claim| claim.upload_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let right_ids = right
+            .iter()
+            .map(|claim| claim.upload_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(left_ids.is_disjoint(&right_ids));
+        let mut stale = left[0].clone();
+        stale.lease_token =
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into();
+        assert!(
+            !store
+                .fail_artifact_promotion(
+                    &stale,
+                    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .fail_artifact_promotion(
+                    &left[0],
+                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                )
+                .await
+                .unwrap()
+        );
+
+        client.execute(&format!("UPDATE {schema}.content_objects SET state='available',available_at=1,retain_until=1"), &[]).await.unwrap();
+        let gc_barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let gc_left = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&gc_barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.claim_artifact_gc("gc-left", 30_000, 2).await.unwrap()
+            })
+        };
+        let gc_right = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&gc_barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .claim_artifact_gc("gc-right", 30_000, 2)
+                    .await
+                    .unwrap()
+            })
+        };
+        gc_barrier.wait().await;
+        let gc_left = gc_left.await.unwrap();
+        let gc_right = gc_right.await.unwrap();
+        assert_eq!(gc_left.len() + gc_right.len(), 4);
+        let gc_left_ids = gc_left
+            .iter()
+            .map(|claim| claim.object_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let gc_right_ids = gc_right
+            .iter()
+            .map(|claim| claim.object_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(gc_left_ids.is_disjoint(&gc_right_ids));
+        let winner = gc_left.first().or_else(|| gc_right.first()).unwrap();
+        let mut stale_generation = winner.clone();
+        stale_generation.tombstone_generation += 1;
+        assert!(
+            !store
+                .fail_artifact_gc(
+                    &stale_generation,
+                    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .fail_artifact_gc(
+                    winner,
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                )
+                .await
+                .unwrap()
+        );
+        drop(client);
+        driver.abort();
+        store.shutdown().await.unwrap();
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+);
+
+postgres_test!(
+    artifact_claim_terminalization_is_bounded_fair_and_eventual,
+    60,
+    {
+        let Some(url) = admin_url() else { return };
+        let config = config(url, "art_term");
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let schema = config.schema_name();
+        let (left, left_driver) = admin_client(&superuser_url()).await;
+        let (right, right_driver) = admin_client(&superuser_url()).await;
+        for tenant in ["terminal-a", "terminal-b"] {
+            let zeros = "0".repeat(64);
+            left.batch_execute(&format!("INSERT INTO {schema}.retained_authority_usage VALUES('{tenant}','tenant','{tenant}',0,1),('{tenant}','account','owner',0,1),('{tenant}','principal','account:owner',0,1); INSERT INTO {schema}.artifact_key_generations VALUES('{tenant}','{tenant}/confidential','old','active',1,NULL),('{tenant}','{tenant}/confidential','new','active',1,NULL); INSERT INTO {schema}.artifact_key_rotation_plans VALUES('{tenant}','rotation-terminal','{tenant}/confidential','old','new','sha256:{zeros}','sha256:{zeros}',2,'active',1,NULL);")).await.unwrap();
+            for index in 0..4_i32 {
+                for kind in ["upload", "gc", "reencrypt"] {
+                    let object_id = format!("{kind}-{tenant}-{index}");
+                    let digest = format!(
+                        "sha256:{:064x}",
+                        index
+                            + match kind {
+                                "upload" => 100,
+                                "gc" => 200,
+                                _ => 300,
+                            }
+                    );
+                    let (state, generation) = match (kind, index) {
+                        ("upload", _) => ("staged", 0_i64),
+                        ("gc", 0) => ("quarantined", 1),
+                        ("gc", _) => ("tombstoned", 1),
+                        _ => ("available", 0),
+                    };
+                    left.execute(&format!("INSERT INTO {schema}.content_objects(tenant_scope,owner_account_id,object_id,content_digest,classification,encryption_domain,key_generation,plaintext_length,ciphertext_length,ciphertext_digest,backend_locator,nonce,state,reference_count,retain_until,tombstone_generation,created_at,available_at) VALUES($1,'owner',$2,$3,'confidential',$4,'old',1,16,$3,$5,$6,$7,0,9999999999999,$8,1,1)"), &[&tenant,&object_id,&digest,&format!("{tenant}/confidential"),&format!("objects/{kind}-{tenant}-{index}.blob"),&vec![0_u8;12],&state,&generation]).await.unwrap();
+                    let attempts = if index < 3 { 1000_i32 } else { 0 };
+                    match kind {
+                        "upload" => {
+                            left.execute(&format!("INSERT INTO {schema}.upload_intents(tenant_scope,upload_id,artifact_id,object_id,state,stage_locator,final_locator,ciphertext_digest,ciphertext_length,lease_epoch,attempts,created_at,updated_at) VALUES($1,$2,$3,$4,'committed',$5,$6,$7,16,1,$8,1,$9)"), &[&tenant,&format!("upload-{tenant}-{index}"),&format!("artifact-{tenant}-{index}"),&object_id,&format!("stage/{tenant}-{index}.blob"),&format!("objects/upload-{tenant}-{index}.blob"),&digest,&attempts,&i64::from(index)]).await.unwrap();
+                        }
+                        "gc" => {
+                            left.execute(&format!("INSERT INTO {schema}.artifact_gc_jobs(tenant_scope,job_id,object_id,tombstone_generation,state,lease_epoch,available_at,attempts) VALUES($1,$2,$3,1,'pending',1,1,$4)"), &[&tenant,&format!("gc-{tenant}-{index}"),&object_id,&attempts]).await.unwrap();
+                        }
+                        _ => {
+                            left.execute(&format!("INSERT INTO {schema}.artifact_reencryption_jobs(tenant_scope,job_id,rotation_id,object_id,old_generation,new_generation,old_locator,state,lease_epoch,attempts,created_at,updated_at) VALUES($1,$2,'rotation-terminal',$3,'old','new',$4,'pending',1,$5,1,$6)"), &[&tenant,&format!("reencrypt-{tenant}-{index}"),&object_id,&format!("objects/reencrypt-{tenant}-{index}.blob"),&attempts,&i64::from(index)]).await.unwrap();
+                        }
+                    }
+                }
+            }
+        }
+        let cases = [
+            (
+                "upload_intents",
+                "failed",
+                format!(
+                    "SELECT * FROM {schema}.claim_artifact_upload('owner','token-left',30000,2)"
+                ),
+                format!(
+                    "UPDATE {schema}.upload_intents SET state='committed',lease_token=NULL,lease_until=NULL WHERE state IN ('failed','promoting')"
+                ),
+            ),
+            (
+                "artifact_gc_jobs",
+                "dead",
+                format!("SELECT * FROM {schema}.claim_artifact_gc('owner','token-left',30000,2)"),
+                format!(
+                    "UPDATE {schema}.artifact_gc_jobs SET state='pending',lease_owner=NULL,lease_token=NULL,lease_until=NULL WHERE state IN ('dead','leased'); UPDATE {schema}.content_objects SET state='tombstoned' WHERE object_id LIKE 'gc-%' AND state='deleting'"
+                ),
+            ),
+            (
+                "artifact_reencryption_jobs",
+                "failed",
+                format!(
+                    "SELECT * FROM {schema}.claim_artifact_reencryption('rotation-terminal','old','new','owner','token-left',30000,2)"
+                ),
+                format!(
+                    "UPDATE {schema}.artifact_reencryption_jobs SET state='pending',lease_owner=NULL,lease_token=NULL,lease_until=NULL WHERE state IN ('failed','leased')"
+                ),
+            ),
+        ];
+        for (table, terminal, sql, reset) in cases {
+            let right_sql = sql.replace("token-left", "token-right");
+            let (a, b) = tokio::join!(left.query(&sql, &[]), right.query(&right_sql, &[]));
+            a.unwrap();
+            b.unwrap();
+            let count: i64 = left
+                .query_one(
+                    &format!("SELECT count(*) FROM {schema}.{table} WHERE state='{terminal}'"),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(
+                (2..=4).contains(&count),
+                "concurrent {table} terminalizers made unbounded or zero progress: {count}"
+            );
+            left.batch_execute(&reset).await.unwrap();
+            for expected in [2_i64, 4, 6] {
+                left.query(&sql, &[]).await.unwrap();
+                let rows = left.query(&format!("SELECT tenant_scope,count(*) FROM {schema}.{table} WHERE state='{terminal}' GROUP BY tenant_scope ORDER BY tenant_scope"), &[]).await.unwrap();
+                let total: i64 = rows.iter().map(|row| row.get::<_, i64>(1)).sum();
+                assert_eq!(
+                    total, expected,
+                    "{table} exceeded its terminal batch or stalled"
+                );
+                assert!(
+                    rows.iter().all(|row| row.get::<_, i64>(1) == expected / 2),
+                    "{table} was not tenant-fair"
+                );
+            }
+        }
+        store.shutdown().await.unwrap();
+        drop(left);
+        drop(right);
+        left_driver.abort();
+        right_driver.abort();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    }
+);
+
+postgres_test!(
+    exhausted_artifact_claims_preserve_active_leases_until_db_time_expiry,
+    60,
+    {
+        let Some(url) = admin_url() else { return };
+        let config = config(url, "art_lease_term");
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let schema = config.schema_name();
+        let (client, driver) = admin_client(&superuser_url()).await;
+        let zeros = "0".repeat(64);
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {schema}.artifact_claim_test_clock(now_ms bigint NOT NULL); \
+                 INSERT INTO {schema}.artifact_claim_test_clock VALUES(100); \
+                 GRANT SELECT ON {schema}.artifact_claim_test_clock TO PUBLIC; \
+                 CREATE OR REPLACE FUNCTION {schema}.db_millis() RETURNS bigint \
+                 LANGUAGE sql VOLATILE SET search_path=pg_catalog AS \
+                 $clock$ SELECT now_ms FROM {schema}.artifact_claim_test_clock $clock$; \
+                 INSERT INTO {schema}.retained_authority_usage VALUES \
+                 ('lease-tenant','tenant','lease-tenant',0,1), \
+                 ('lease-tenant','account','owner',0,1), \
+                 ('lease-tenant','principal','account:owner',0,1); \
+                 INSERT INTO {schema}.artifact_key_generations VALUES \
+                 ('lease-tenant','lease-tenant/confidential','old','active',1,NULL), \
+                 ('lease-tenant','lease-tenant/confidential','new','active',1,NULL); \
+                 INSERT INTO {schema}.artifact_key_rotation_plans VALUES \
+                 ('lease-tenant','rotation-lease','lease-tenant/confidential','old','new', \
+                  'sha256:{zeros}','sha256:{zeros}',10,'active',1,NULL);"
+            ))
+            .await
+            .unwrap();
+
+        for (index, kind, object_state, generation) in [
+            (0_i32, "upload", "staged", 0_i64),
+            (1, "upload", "staged", 0),
+            (2, "upload", "staged", 0),
+            (3, "gc", "tombstoned", 1),
+            (4, "gc", "tombstoned", 1),
+            (5, "gc", "quarantined", 1),
+            (6, "gc", "tombstoned", 1),
+            (7, "reencrypt", "available", 0),
+            (8, "reencrypt", "available", 0),
+            (9, "reencrypt", "available", 0),
+            (10, "gc", "tombstoned", 1),
+        ] {
+            let object_id = format!("lease-object-{index}");
+            let digest = format!("sha256:{:064x}", index + 1);
+            client.execute(&format!("INSERT INTO {schema}.content_objects(tenant_scope,owner_account_id,object_id,content_digest,classification,encryption_domain,key_generation,plaintext_length,ciphertext_length,ciphertext_digest,backend_locator,nonce,state,reference_count,retain_until,tombstone_generation,created_at,available_at) VALUES('lease-tenant','owner',$1,$2,'confidential','lease-tenant/confidential','old',1,16,$2,$3,$4,$5,0,9999999999999,$6,1,1)"), &[&object_id,&digest,&format!("objects/{kind}-{index}.blob"),&vec![0_u8;12],&object_state,&generation]).await.unwrap();
+        }
+        client.batch_execute(&format!(
+            "INSERT INTO {schema}.upload_intents(tenant_scope,upload_id,artifact_id,object_id,state,stage_locator,final_locator,ciphertext_digest,ciphertext_length,lease_epoch,attempts,created_at,updated_at) VALUES \
+             ('lease-tenant','upload-fail','artifact-upload-fail','lease-object-0','committed','stage/upload-fail.tmp','objects/upload-0.blob','sha256:{:064x}',16,1,999,1,1), \
+             ('lease-tenant','upload-expire','artifact-upload-expire','lease-object-1','committed','stage/upload-expire.tmp','objects/upload-1.blob','sha256:{:064x}',16,1,999,1,2), \
+             ('lease-tenant','upload-healthy','artifact-upload-healthy','lease-object-2','committed','stage/upload-healthy.tmp','objects/upload-2.blob','sha256:{:064x}',16,1,0,1,3); \
+             INSERT INTO {schema}.artifact_gc_jobs(tenant_scope,job_id,object_id,tombstone_generation,state,lease_epoch,available_at,attempts) VALUES \
+             ('lease-tenant','gc-fail','lease-object-3',1,'pending',1,1,999), \
+             ('lease-tenant','gc-expire','lease-object-4',1,'pending',1,1,999), \
+             ('lease-tenant','gc-quarantined','lease-object-5',1,'leased',2,1,1000), \
+             ('lease-tenant','gc-healthy','lease-object-6',1,'pending',1,1,0), \
+             ('lease-tenant','gc-mixed-expired','lease-object-10',1,'leased',2,1,1000); \
+             UPDATE {schema}.artifact_gc_jobs SET lease_owner='current-gc',lease_token='gc-quarantine-token',lease_until=200 WHERE job_id='gc-quarantined'; \
+             UPDATE {schema}.artifact_gc_jobs SET lease_owner='expired-gc',lease_token='gc-expired-token',lease_until=100 WHERE job_id='gc-mixed-expired'; \
+             INSERT INTO {schema}.artifact_reencryption_jobs(tenant_scope,job_id,rotation_id,object_id,old_generation,new_generation,old_locator,state,lease_epoch,attempts,created_at,updated_at) VALUES \
+             ('lease-tenant','reencrypt-fail','rotation-lease','lease-object-7','old','new','objects/reencrypt-7.blob','pending',1,999,1,1), \
+             ('lease-tenant','reencrypt-expire','rotation-lease','lease-object-8','old','new','objects/reencrypt-8.blob','pending',1,999,1,2), \
+             ('lease-tenant','reencrypt-healthy','rotation-lease','lease-object-9','old','new','objects/reencrypt-9.blob','pending',1,0,1,3);",
+            1, 2, 3
+        )).await.unwrap();
+
+        let uploads = client.query(&format!("SELECT * FROM {schema}.claim_artifact_upload('current-upload','upload-token',100,10)"), &[]).await.unwrap();
+        assert_eq!(
+            uploads.len(),
+            3,
+            "exhaustion-boundary and healthy uploads claim"
+        );
+        let gc = client
+            .query(
+                &format!(
+                    "SELECT * FROM {schema}.claim_artifact_gc('current-gc','gc-token',100,10)"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(gc.len(), 3, "exhaustion-boundary and healthy GC jobs claim");
+        let reencryption = client.query(&format!("SELECT * FROM {schema}.claim_artifact_reencryption('rotation-lease','old','new','current-reencrypt','reencrypt-token',100,10)"), &[]).await.unwrap();
+        assert_eq!(
+            reencryption.len(),
+            3,
+            "exhaustion-boundary and healthy reencryption jobs claim"
+        );
+        let mixed_gc = client
+            .query_one(
+                &format!(
+                    "SELECT state,lease_owner,lease_token,lease_until FROM {schema}.artifact_gc_jobs WHERE job_id='gc-mixed-expired'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed_gc.get::<_, String>(0), "dead");
+        assert_eq!(mixed_gc.get::<_, Option<String>>(1), None);
+        assert_eq!(mixed_gc.get::<_, Option<String>>(2), None);
+        assert_eq!(mixed_gc.get::<_, Option<i64>>(3), None);
+
+        for sql in [
+            format!(
+                "SELECT * FROM {schema}.claim_artifact_upload('other-upload','other-upload-token',100,10)"
+            ),
+            format!("SELECT * FROM {schema}.claim_artifact_gc('other-gc','other-gc-token',100,10)"),
+            format!(
+                "SELECT * FROM {schema}.claim_artifact_reencryption('rotation-lease','old','new','other-reencrypt','other-reencrypt-token',100,10)"
+            ),
+        ] {
+            assert!(client.query(&sql, &[]).await.unwrap().is_empty());
+        }
+        let protected = client.query(&format!(
+            "SELECT 'upload',upload_id,state,NULL::text,lease_token,lease_epoch,lease_until FROM {schema}.upload_intents WHERE upload_id IN ('upload-fail','upload-expire') \
+             UNION ALL SELECT 'gc',job_id,state,lease_owner,lease_token,lease_epoch,lease_until FROM {schema}.artifact_gc_jobs WHERE job_id IN ('gc-fail','gc-expire','gc-quarantined') \
+             UNION ALL SELECT 'reencrypt',job_id,state,lease_owner,lease_token,lease_epoch,lease_until FROM {schema}.artifact_reencryption_jobs WHERE job_id IN ('reencrypt-fail','reencrypt-expire') ORDER BY 1,2"
+        ), &[]).await.unwrap();
+        assert_eq!(protected.len(), 7);
+        assert!(
+            protected.iter().all(|row| {
+                let state: String = row.get(2);
+                state != "failed" && state != "dead" && row.get::<_, i64>(6) == 200
+            }),
+            "a contender terminalized or mutated a future active lease"
+        );
+        let quarantine = protected
+            .iter()
+            .find(|row| row.get::<_, String>(1) == "gc-quarantined")
+            .unwrap();
+        assert_eq!(
+            quarantine.get::<_, Option<String>>(3).as_deref(),
+            Some("current-gc")
+        );
+        assert_eq!(
+            quarantine.get::<_, Option<String>>(4).as_deref(),
+            Some("gc-quarantine-token")
+        );
+        assert_eq!(quarantine.get::<_, i64>(5), 2);
+
+        for (table, id_column, id, terminal) in [
+            ("upload_intents", "upload_id", "upload-fail", "failed"),
+            ("artifact_gc_jobs", "job_id", "gc-fail", "dead"),
+            (
+                "artifact_reencryption_jobs",
+                "job_id",
+                "reencrypt-fail",
+                "failed",
+            ),
+        ] {
+            let owner_fence = if table == "upload_intents" {
+                "lease_token='upload-token' AND lease_epoch=2"
+            } else if table == "artifact_gc_jobs" {
+                "lease_owner='current-gc' AND lease_token='gc-token' AND lease_epoch=2"
+            } else {
+                "lease_owner='current-reencrypt' AND lease_token='reencrypt-token' AND lease_epoch=2"
+            };
+            let changed = client.execute(&format!("UPDATE {schema}.{table} SET state='{terminal}',lease_token=NULL,lease_until=NULL{} WHERE {id_column}='{id}' AND {owner_fence} AND lease_until>{schema}.db_millis()", if table == "upload_intents" { "" } else { ",lease_owner=NULL" }), &[]).await.unwrap();
+            assert_eq!(changed, 1, "the current worker lost its {table} fence");
+        }
+
+        client
+            .execute(
+                &format!("UPDATE {schema}.artifact_claim_test_clock SET now_ms=200"),
+                &[],
+            )
+            .await
+            .unwrap();
+        let upload_after_expiry = client.query(&format!("SELECT * FROM {schema}.claim_artifact_upload('after-expiry','after-upload',100,2)"), &[]).await.unwrap();
+        assert_eq!(upload_after_expiry.len(), 1);
+        assert_eq!(upload_after_expiry[0].get::<_, String>(1), "upload-healthy");
+        let gc_after_expiry = client
+            .query(
+                &format!(
+                    "SELECT * FROM {schema}.claim_artifact_gc('after-expiry','after-gc',100,2)"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(gc_after_expiry.len(), 1);
+        assert_eq!(gc_after_expiry[0].get::<_, String>(1), "gc-healthy");
+        let reencryption_after_expiry = client.query(&format!("SELECT * FROM {schema}.claim_artifact_reencryption('rotation-lease','old','new','after-expiry','after-reencrypt',100,2)"), &[]).await.unwrap();
+        assert_eq!(reencryption_after_expiry.len(), 1);
+        assert_eq!(
+            reencryption_after_expiry[0].get::<_, String>(1),
+            "reencrypt-healthy"
+        );
+
+        let terminal = client.query(&format!(
+            "SELECT 'upload',upload_id,state,lease_token,lease_until FROM {schema}.upload_intents WHERE upload_id='upload-expire' \
+             UNION ALL SELECT 'gc',job_id,state,lease_token,lease_until FROM {schema}.artifact_gc_jobs WHERE job_id IN ('gc-expire','gc-quarantined') \
+             UNION ALL SELECT 'reencrypt',job_id,state,lease_token,lease_until FROM {schema}.artifact_reencryption_jobs WHERE job_id='reencrypt-expire' ORDER BY 1,2"
+        ), &[]).await.unwrap();
+        assert_eq!(terminal.len(), 4);
+        assert!(
+            terminal.iter().all(|row| {
+                matches!(row.get::<_, String>(2).as_str(), "failed" | "dead")
+                    && row.get::<_, Option<String>>(3).is_none()
+                    && row.get::<_, Option<i64>>(4).is_none()
+            }),
+            "exact-expiry claim did not terminalize the bounded exhausted set"
+        );
+
+        let healthy = client.query_one(&format!(
+            "SELECT \
+             (SELECT state FROM {schema}.upload_intents WHERE upload_id='upload-healthy'), \
+             (SELECT state FROM {schema}.artifact_gc_jobs WHERE job_id='gc-healthy'), \
+             (SELECT state FROM {schema}.artifact_reencryption_jobs WHERE job_id='reencrypt-healthy')"
+        ), &[]).await.unwrap();
+        assert_eq!(healthy.get::<_, String>(0), "promoting");
+        assert_eq!(healthy.get::<_, String>(1), "leased");
+        assert_eq!(healthy.get::<_, String>(2), "leased");
+
+        store.shutdown().await.unwrap();
+        drop(client);
+        driver.abort();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    }
+);
+
+postgres_test!(
+    artifact_receiver_publication_faults_roll_back_and_retry_exactly_once,
+    {
+        use smesh_a2a::{ReceiverAdmission, ReceiverLease};
+        let Some(url) = admin_url() else { return };
+        let root = ArtifactTestRoot::new("artifact-pg-faults");
+        let keyring = root.join("keys.json");
+        fs::write(&keyring, r#"{"activeGeneration":"key-a","generations":{"key-a":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}}"#).unwrap();
+        fs::set_permissions(&keyring, fs::Permissions::from_mode(0o600)).unwrap();
+        let artifact = ArtifactStoreConfig::new(&root, &keyring).unwrap();
+        let config = config(url, "art_fault")
+            .with_test_only_trust_injected_time(true)
+            .with_artifact_store(artifact);
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let (client, driver) = admin_client(&superuser_url()).await;
+        let schema = config.schema_name();
+        let faults = [
+            ArtifactPublicationTestFault::BeforeContentObject,
+            ArtifactPublicationTestFault::AfterContentObject,
+            ArtifactPublicationTestFault::BeforeManifest,
+            ArtifactPublicationTestFault::AfterManifest,
+            ArtifactPublicationTestFault::BeforeChunkBatch,
+            ArtifactPublicationTestFault::AfterChunkBatch,
+            ArtifactPublicationTestFault::BeforeProvenanceBatch,
+            ArtifactPublicationTestFault::AfterProvenanceBatch,
+            ArtifactPublicationTestFault::BeforeReference,
+            ArtifactPublicationTestFault::AfterReference,
+            ArtifactPublicationTestFault::BeforeUploadIntent,
+            ArtifactPublicationTestFault::AfterUploadIntent,
+            ArtifactPublicationTestFault::BeforeReceiverEffect,
+            ArtifactPublicationTestFault::AfterReceiverEffect,
+            ArtifactPublicationTestFault::BeforeReceiverFrames,
+            ArtifactPublicationTestFault::AfterReceiverFrames,
+            ArtifactPublicationTestFault::BeforeReceiverCompletion,
+            ArtifactPublicationTestFault::AfterReceiverCompletion,
+        ];
+        assert_eq!(faults.len(), 18);
+        for (index, fault) in faults.into_iter().enumerate() {
+            let suffix = format!("{index:02}");
+            let tenant = format!("tenant-fault-{suffix}");
+            let task_id = format!("task-fault-{suffix}");
+            let context_id = format!("context-fault-{suffix}");
+            let message_id = format!("message-fault-{suffix}");
+            let dispatch_id = format!("dispatch-fault-{suffix}");
+            let submitted = a2a::Task {
+                id: task_id.clone(),
+                context_id: context_id.clone(),
+                status: a2a::TaskStatus {
+                    state: a2a::TaskState::Submitted,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            };
+            let request = smesh_a2a::MeshRequest {
+                protocol: "a2a-v1".into(),
+                task_id: task_id.clone(),
+                context_id: context_id.clone(),
+                text: format!("artifact publication fault {suffix}"),
+            };
+            let task_json = serde_json::to_string(&submitted).unwrap();
+            let task_state = serde_json::to_string(&submitted.status.state).unwrap();
+            let request_json = serde_json::to_string(&request).unwrap();
+            let payload_digest = smesh_a2a::content_digest(request_json.as_bytes());
+            let admission =
+                serde_json::to_string(&a2a::SendMessageResponse::Task(submitted)).unwrap();
+            let now = 10_000 + i64::try_from(index).unwrap() * 100;
+            client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES($1,$2,$3,$4,1,$5,'owner')"), &[&tenant,&task_id,&context_id,&task_state,&task_json]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) VALUES($1,$2,1,1,'admitted',NULL,$3,$4,$5)"), &[&tenant,&task_id,&task_state,&task_json,&now]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id) VALUES($1,$2,$3,$4,'in_progress',$5,$6,$6,2,'owner')"), &[&tenant,&message_id,&payload_digest,&task_id,&admission,&now]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.outbox(tenant_scope,dispatch_id,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) VALUES($1,$2,$3,$4,1,$5,$6,'pending',1,$7,$7,$7,2)"), &[&tenant,&dispatch_id,&task_id,&message_id,&request_json,&payload_digest,&now]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.stream_transcripts(tenant_scope,message_id,dispatch_id,task_id,transcript_version,state,frame_count,transcript_digest,created_at,updated_at) VALUES($1,$2,$3,$4,1,'open',0,$5,$6,$6)"), &[&tenant,&message_id,&dispatch_id,&task_id,&smesh_a2a::content_digest(b"[]"),&now]).await.unwrap();
+            let sender = store
+                .claim_outbox("fault-sender", now, 50)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sender.dispatch_id, dispatch_id);
+            let envelope = smesh_a2a::DurableDispatchEnvelope {
+                tenant_scope: tenant.clone(),
+                dispatch_id: dispatch_id.clone(),
+                payload_digest: payload_digest.clone(),
+                request,
+                execution_reservation: sender.execution_reservation.clone(),
+            };
+            let ReceiverAdmission::Execute(receiver): ReceiverAdmission = store
+                .begin_receive(envelope, "fault-receiver", now, 50)
+                .await
+                .unwrap()
+            else {
+                panic!("receiver lease expected")
+            };
+            let receiver: ReceiverLease = receiver;
+            let events = vec![
+                smesh_a2a::MeshEvent::Artifact {
+                    name: format!("result-{suffix}.bin"),
+                    media_type: "application/octet-stream".into(),
+                    content: format!("unique-fault-payload-{suffix}"),
+                },
+                smesh_a2a::MeshEvent::Completed {
+                    summary: "done".into(),
+                },
+            ];
+            let before = client.query_one(&format!("SELECT (SELECT count(*) FROM {schema}.content_objects),(SELECT count(*) FROM {schema}.artifact_manifests),(SELECT count(*) FROM {schema}.artifact_chunks),(SELECT count(*) FROM {schema}.provenance_edges),(SELECT count(*) FROM {schema}.artifact_references),(SELECT count(*) FROM {schema}.upload_intents)"), &[]).await.unwrap();
+            let before: Vec<i64> = (0..6).map(|column| before.get(column)).collect();
+            store.set_artifact_publication_test_fault(fault).unwrap();
+            let error = store
+                .complete_loopback_receive(&receiver, &events, now + 1)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("injected artifact publication fault")
+            );
+            let after = client.query_one(&format!("SELECT (SELECT count(*) FROM {schema}.content_objects),(SELECT count(*) FROM {schema}.artifact_manifests),(SELECT count(*) FROM {schema}.artifact_chunks),(SELECT count(*) FROM {schema}.provenance_edges),(SELECT count(*) FROM {schema}.artifact_references),(SELECT count(*) FROM {schema}.upload_intents),(SELECT count(*) FROM {schema}.loopback_effects WHERE dispatch_id=$1),(SELECT count(*) FROM {schema}.receiver_frames WHERE dispatch_id=$1),(SELECT state FROM {schema}.receiver_inbox WHERE dispatch_id=$1)"), &[&dispatch_id]).await.unwrap();
+            let after_counts: Vec<i64> = (0..6).map(|column| after.get(column)).collect();
+            assert_eq!(after_counts, before, "rollback failed at {fault:?}");
+            assert_eq!(after.get::<_, i64>(6), 0, "effect escaped at {fault:?}");
+            assert_eq!(after.get::<_, i64>(7), 0, "frames escaped at {fault:?}");
+            assert_eq!(after.get::<_, String>(8), "processing");
+            store
+                .complete_loopback_receive(&receiver, &events, now + 1)
+                .await
+                .unwrap();
+            let exact = client.query_one(&format!("SELECT (SELECT count(*) FROM {schema}.artifact_manifests WHERE dispatch_id=$1),(SELECT count(*) FROM {schema}.artifact_chunks c JOIN {schema}.artifact_manifests m USING(tenant_scope,artifact_id) WHERE m.dispatch_id=$1),(SELECT count(*) FROM {schema}.artifact_references r JOIN {schema}.artifact_manifests m USING(tenant_scope,artifact_id) WHERE m.dispatch_id=$1),(SELECT count(*) FROM {schema}.upload_intents u JOIN {schema}.artifact_manifests m USING(tenant_scope,artifact_id) WHERE m.dispatch_id=$1),(SELECT count(*) FROM {schema}.loopback_effects WHERE dispatch_id=$1),(SELECT count(*) FROM {schema}.receiver_frames WHERE dispatch_id=$1),(SELECT state FROM {schema}.receiver_inbox WHERE dispatch_id=$1)"), &[&dispatch_id]).await.unwrap();
+            assert_eq!(
+                (
+                    exact.get::<_, i64>(0),
+                    exact.get::<_, i64>(1),
+                    exact.get::<_, i64>(2),
+                    exact.get::<_, i64>(3),
+                    exact.get::<_, i64>(4),
+                    exact.get::<_, i64>(5),
+                    exact.get::<_, String>(6)
+                ),
+                (1, 1, 1, 1, 1, 2, "completed".into()),
+                "retry not exact at {fault:?}"
+            );
+            client.execute(&format!("UPDATE {schema}.outbox SET state='delivered',lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at=$1 WHERE tenant_scope=$2 AND dispatch_id=$3"), &[&(now+2),&tenant,&dispatch_id]).await.unwrap();
+            drop(sender);
+        }
+        store.shutdown().await.unwrap();
+        let reopened = PostgresTaskStore::open(config.clone()).await.unwrap();
+        reopened.shutdown().await.unwrap();
+        drop(client);
+        driver.abort();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+);
+
+// Baseline helper for isolated startup-tamper schemas.
+#[allow(clippy::too_many_lines)]
+async fn create_artifact_tamper_baseline(
+    url: &str,
+    prefix: &str,
+    with_quota_policy: bool,
+) -> (
+    PostgresStoreConfig,
+    ArtifactTestRoot,
+    smesh_a2a::ArtifactStageRegistration,
+) {
+    let root = ArtifactTestRoot::new(&format!("artifact-{prefix}"));
+    let keyring = root.join("keys.json");
+    fs::write(&keyring,r#"{"activeGeneration":"key-a","generations":{"key-a":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}}"#).unwrap();
+    fs::set_permissions(&keyring, fs::Permissions::from_mode(0o600)).unwrap();
+    let quota=Arc::new(smesh_a2a::QuotaPolicy::from_json(br#"{"schemaVersion":"smesh-quota-policy/v1","policyId":"tamper-quota","revision":1,"requestWindowMillis":60000,"reconnectWindowMillis":60000,"limits":{"requestCount":{"tenant":1000,"account":1000,"principal":1000},"concurrentActiveWork":{"tenant":100,"account":100,"principal":100},"inputBytes":{"tenant":67108864,"account":67108864,"principal":67108864},"outputBytes":{"tenant":67108864,"account":67108864,"principal":67108864},"eventCount":{"tenant":10000,"account":10000,"principal":10000},"concurrentStreams":{"tenant":100,"account":100,"principal":100},"concurrentSubscriptions":{"tenant":100,"account":100,"principal":100},"reconnectCount":{"tenant":100,"account":100,"principal":100},"retainedAuthorityBytes":{"tenant":67108864,"account":67108864,"principal":67108864}},"overrides":[]}"#).unwrap());
+    let mut cfg = config(url.to_owned(), prefix)
+        .with_artifact_store(ArtifactStoreConfig::new(&root, &keyring).unwrap());
+    if with_quota_policy {
+        cfg = cfg.with_quota_policy(quota);
+    }
+    let store = PostgresTaskStore::open(cfg.clone()).await.unwrap();
+    let (client, driver) = admin_client(&superuser_url()).await;
+    let schema = cfg.schema_name();
+    let tenant = "tenant-tamper";
+    let now = chrono::Utc::now().timestamp_millis();
+    let task = a2a::Task {
+        id: "task-tamper".into(),
+        context_id: "context-tamper".into(),
+        status: a2a::TaskStatus {
+            state: a2a::TaskState::Completed,
+            message: None,
+            timestamp: chrono::DateTime::from_timestamp_millis(now),
+        },
+        artifacts: None,
+        history: None,
+        metadata: None,
+    };
+    let task_json = serde_json::to_string(&task).unwrap();
+    let task_state = serde_json::to_string(&a2a::TaskState::Completed).unwrap();
+    let task_timestamp = task.status.timestamp.unwrap().to_rfc3339();
+    client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,status_timestamp,revision,task_json,owner_account_id) VALUES($1,'task-tamper','context-tamper',$2,$3,1,$4,'owner')"),&[&tenant,&task_state,&task_timestamp,&task_json]).await.unwrap();
+    client.execute(&format!("INSERT INTO {schema}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) VALUES($1,'task-tamper',1,1,'admitted',NULL,$2,$3,$4)"),&[&tenant,&task_state,&task_json,&now]).await.unwrap();
+    let bytes = b"tamper baseline bytes".to_vec();
+    let policy_digest = smesh_a2a::ContentDigestV1::of(b"tamper-policy");
+    let manifest = smesh_a2a::ArtifactManifestV1::new(
+        "artifact-tamper",
+        "tamper.bin",
+        None,
+        "application/octet-stream",
+        smesh_a2a::ArtifactClassification::Confidential,
+        smesh_a2a::EncryptionDomain::new("tenant-tamper/confidential").unwrap(),
+        "key-a",
+        smesh_a2a::ArtifactProducer::new(
+            tenant,
+            "owner",
+            "task-tamper",
+            "context-tamper",
+            "message-tamper",
+            "dispatch-tamper",
+        )
+        .unwrap(),
+        Vec::<smesh_a2a::DerivedFrom>::new(),
+        smesh_a2a::ArtifactPolicySnapshot::new(
+            "artifact-default",
+            1,
+            policy_digest,
+            now,
+            now + 60_000,
+        )
+        .unwrap(),
+        now,
+        &bytes,
+    )
+    .unwrap();
+    let registration = smesh_a2a::ArtifactStageRegistration {
+        tenant_scope: tenant.into(),
+        account_id: "owner".into(),
+        owner_account_id: "owner".into(),
+        task_id: "task-tamper".into(),
+        context_id: "context-tamper".into(),
+        message_id: "message-tamper".into(),
+        dispatch_id: "dispatch-tamper".into(),
+        upload_id: "upload-tamper".into(),
+        artifact_id: "artifact-tamper".into(),
+        object_id: smesh_a2a::content_digest(
+            format!(
+                "{tenant}\0confidential\0key-a\0{}",
+                manifest.content_digest()
+            )
+            .as_bytes(),
+        ),
+        content_digest: manifest.content_digest().to_string(),
+        manifest_digest: manifest.manifest_digest().to_string(),
+        ciphertext_digest: String::new(),
+        plaintext_length: manifest.plaintext_length(),
+        ciphertext_length: 0,
+        classification: "confidential".into(),
+        encryption_domain: "tenant-tamper/confidential".into(),
+        key_generation: "key-a".into(),
+        canonical_manifest_json: manifest.canonical_json().into(),
+        chunks: manifest
+            .chunks()
+            .iter()
+            .map(|c| smesh_a2a::ArtifactChunkRegistration {
+                ordinal: c.ordinal(),
+                byte_offset: c.offset(),
+                plaintext_length: c.length(),
+                content_digest: c.digest().to_string(),
+            })
+            .collect(),
+        provenance: Vec::new(),
+        media_type: "application/octet-stream".into(),
+        reference_id: "reference-tamper".into(),
+        task_revision: 1,
+        policy_id: "artifact-default".into(),
+        policy_revision: 1,
+        policy_digest: policy_digest.to_string(),
+        created_at: now,
+        stage_locator: String::new(),
+        final_locator: String::new(),
+        nonce: [0; 12],
+        retain_until: now + 60_000,
+        quota_binding_digest: None,
+        receiver_lease_epoch: 1,
+        receiver_lease_token: "receiver-token".into(),
+    };
+    let staged = store.stage_artifact(registration, bytes).await.unwrap();
+    store.register_artifact(&staged, now).await.unwrap();
+    let claim = store
+        .claim_artifact_promotion("tamper-promoter", 30_000, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(store.commit_artifact_promotion(&claim).await.unwrap());
+    store.shutdown().await.unwrap();
+    drop(client);
+    driver.abort();
+    (cfg, root, staged)
+}
+
+postgres_test!(
+    artifact_gc_blocker_row_lock_races_cover_both_orderings_on_two_stores,
+    90,
+    {
+        use smesh_a2a::ArtifactHold;
+        let Some(url) = admin_url() else { return };
+        for blocker in ["read", "backup", "hold"] {
+            for blocker_first in [true, false] {
+                let prefix = format!(
+                    "gc_{}_{}",
+                    blocker,
+                    if blocker_first { "first" } else { "second" }
+                );
+                let (cfg, root, staged) =
+                    create_artifact_tamper_baseline(&url, &prefix, false).await;
+                let left = PostgresTaskStore::open(cfg.clone()).await.unwrap();
+                let right = PostgresTaskStore::open(cfg.clone()).await.unwrap();
+                let (client, driver) = admin_client(&superuser_url()).await;
+                let scope = OwnedTaskScope::new(
+                    &staged.tenant_scope,
+                    &staged.owner_account_id,
+                    VisibilityScope::Own,
+                )
+                .unwrap();
+                let audit = || {
+                    AuthorizationAuditInput::new(
+                        format!("gc-race-{blocker}-{blocker_first}"),
+                        &staged.tenant_scope,
+                        &staged.owner_account_id,
+                        "gc-race-policy",
+                        1,
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "artifactResolve",
+                        AuthorizationDecisionEffect::Allow,
+                        "gc race",
+                        "artifact",
+                        smesh_a2a::content_digest(staged.artifact_id.as_bytes()),
+                        Some(staged.task_id.clone()),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .unwrap()
+                };
+                if blocker_first {
+                    let mut read = None;
+                    let mut backup = None;
+                    let mut hold = None;
+                    let mut reference_released = false;
+                    let mut retention_expired = false;
+                    match blocker {
+                        "read" => {
+                            read = left
+                                .begin_artifact_resolution(
+                                    &scope,
+                                    &staged.artifact_id,
+                                    Some(&staged.task_id),
+                                    &smesh_a2a::content_digest(b"owner"),
+                                    30_000,
+                                    None,
+                                    audit(),
+                                    chrono::Utc::now().timestamp_millis(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        "backup" => {
+                            assert!(
+                                left.release_artifact_reference(
+                                    &staged.tenant_scope,
+                                    &staged.reference_id,
+                                    &staged.owner_account_id,
+                                    &staged.task_id,
+                                    &staged.artifact_id,
+                                    chrono::Utc::now().timestamp_millis()
+                                )
+                                .await
+                                .unwrap()
+                            );
+                            reference_released = true;
+                            client.execute(&format!("UPDATE {}.content_objects SET retain_until={}.db_millis()+200 WHERE object_id=$1",cfg.schema_name(),cfg.schema_name()),&[&staged.object_id]).await.unwrap();
+                            backup = Some(
+                                left.acquire_artifact_backup_lease(
+                                    &staged.tenant_scope,
+                                    &staged.object_id,
+                                    "race-backup",
+                                    30_000,
+                                )
+                                .await
+                                .unwrap(),
+                            );
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            retention_expired = true;
+                        }
+                        "hold" => {
+                            let value = ArtifactHold {
+                                tenant_scope: staged.tenant_scope.clone(),
+                                artifact_id: staged.artifact_id.clone(),
+                                hold_id: "race-hold".into(),
+                                actor_digest: smesh_a2a::content_digest(b"actor"),
+                                reason_digest: smesh_a2a::content_digest(b"reason"),
+                                expires_at: None,
+                            };
+                            left.place_artifact_hold(&value, chrono::Utc::now().timestamp_millis())
+                                .await
+                                .unwrap();
+                            hold = Some(value);
+                        }
+                        _ => unreachable!(),
+                    }
+                    if !reference_released {
+                        assert!(
+                            left.release_artifact_reference(
+                                &staged.tenant_scope,
+                                &staged.reference_id,
+                                &staged.owner_account_id,
+                                &staged.task_id,
+                                &staged.artifact_id,
+                                chrono::Utc::now().timestamp_millis()
+                            )
+                            .await
+                            .unwrap()
+                        );
+                    }
+                    if !retention_expired {
+                        client
+                            .execute(
+                                &format!(
+                                    "UPDATE {}.content_objects SET retain_until=1 WHERE object_id=$1",
+                                    cfg.schema_name()
+                                ),
+                                &[&staged.object_id],
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    assert!(
+                        right
+                            .claim_artifact_gc("race-gc", 30_000, 1)
+                            .await
+                            .unwrap()
+                            .is_empty(),
+                        "{blocker} did not fence GC when acquired first"
+                    );
+                    if let Some(lease) = read {
+                        assert!(
+                            left.finish_artifact_resolution(&lease, 0, true)
+                                .await
+                                .unwrap()
+                        );
+                    }
+                    if let Some(lease) = backup {
+                        assert!(left.release_artifact_backup_lease(&lease).await.unwrap());
+                    }
+                    if let Some(value) = hold {
+                        assert!(
+                            left.release_artifact_hold(
+                                &value,
+                                chrono::Utc::now().timestamp_millis()
+                            )
+                            .await
+                            .unwrap()
+                        );
+                    }
+                    assert_eq!(
+                        right
+                            .claim_artifact_gc("race-gc-after", 30_000, 1)
+                            .await
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                } else {
+                    assert!(
+                        left.release_artifact_reference(
+                            &staged.tenant_scope,
+                            &staged.reference_id,
+                            &staged.owner_account_id,
+                            &staged.task_id,
+                            &staged.artifact_id,
+                            chrono::Utc::now().timestamp_millis()
+                        )
+                        .await
+                        .unwrap()
+                    );
+                    client
+                        .execute(
+                            &format!(
+                                "UPDATE {}.content_objects SET retain_until=1 WHERE object_id=$1",
+                                cfg.schema_name()
+                            ),
+                            &[&staged.object_id],
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        left.claim_artifact_gc("race-gc-first", 30_000, 1)
+                            .await
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                    match blocker {
+                        "read" => assert!(
+                            right
+                                .begin_artifact_resolution(
+                                    &scope,
+                                    &staged.artifact_id,
+                                    Some(&staged.task_id),
+                                    &smesh_a2a::content_digest(b"owner"),
+                                    30_000,
+                                    None,
+                                    audit(),
+                                    chrono::Utc::now().timestamp_millis()
+                                )
+                                .await
+                                .unwrap()
+                                .is_none()
+                        ),
+                        "backup" => assert!(
+                            right
+                                .acquire_artifact_backup_lease(
+                                    &staged.tenant_scope,
+                                    &staged.object_id,
+                                    "late-backup",
+                                    30_000
+                                )
+                                .await
+                                .is_err()
+                        ),
+                        "hold" => {
+                            let value = ArtifactHold {
+                                tenant_scope: staged.tenant_scope.clone(),
+                                artifact_id: staged.artifact_id.clone(),
+                                hold_id: "late-hold".into(),
+                                actor_digest: smesh_a2a::content_digest(b"actor"),
+                                reason_digest: smesh_a2a::content_digest(b"reason"),
+                                expires_at: None,
+                            };
+                            assert!(
+                                right
+                                    .place_artifact_hold(
+                                        &value,
+                                        chrono::Utc::now().timestamp_millis()
+                                    )
+                                    .await
+                                    .is_err()
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                left.shutdown().await.unwrap();
+                right.shutdown().await.unwrap();
+                drop(client);
+                driver.abort();
+                PostgresTaskStore::drop_test_schema(&cfg).await.unwrap();
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+);
+
+postgres_test!(artifact_authenticated_socket_wire_matrix, {
+    use smesh_a2a::auth::{
+        AuthenticationError, BearerVerifier, PresentedBearer, Principal, PrincipalLimits,
+    };
+    use smesh_a2a::{
+        ArtifactManifestV1, AuthorizationPolicy, ContentDigestV1, DurableLoopbackEndpoint,
+        GatewayConfig, InjectedClock, build_authorized_durable_loopback_gateway,
+    };
+    use tokio::io::AsyncWriteExt as _;
+    struct FixedVerifier;
+    #[async_trait::async_trait]
+    impl BearerVerifier for FixedVerifier {
+        async fn verify(
+            &self,
+            token: PresentedBearer<'_>,
+        ) -> Result<Principal, AuthenticationError> {
+            let subject = match token.as_str() {
+                "owner-token" => "owner",
+                "foreign-token" => "foreign",
+                _ => return Err(AuthenticationError::InvalidToken),
+            };
+            Principal::bearer_for_verifier(
+                "test:artifact".into(),
+                subject.into(),
+                PrincipalLimits::default(),
+            )
+            .map_err(|_| AuthenticationError::InvalidToken)
+        }
+    }
+    let Some(url) = admin_url() else { return };
+    let root = ArtifactTestRoot::new("artifact-wire");
+    let keyring = root.join("keys.json");
+    fs::write(&keyring, r#"{"activeGeneration":"key-a","generations":{"key-a":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}}"#).unwrap();
+    fs::set_permissions(&keyring, fs::Permissions::from_mode(0o600)).unwrap();
+    let bytes = b"authenticated artifact bytes\0with binary".to_vec();
+    let quota_json = format!(
+        r#"{{
+      "schemaVersion":"smesh-quota-policy/v1","policyId":"wire-quota","revision":1,
+      "requestWindowMillis":60000,"reconnectWindowMillis":60000,
+      "limits":{{
+        "requestCount":{{"tenant":100,"account":100,"principal":100}},
+        "concurrentActiveWork":{{"tenant":10,"account":10,"principal":10}},
+        "inputBytes":{{"tenant":1048576,"account":1048576,"principal":1048576}},
+        "outputBytes":{{"tenant":{0},"account":{0},"principal":{0}}},
+        "eventCount":{{"tenant":1024,"account":1024,"principal":1024}},
+        "concurrentStreams":{{"tenant":4,"account":4,"principal":4}},
+        "concurrentSubscriptions":{{"tenant":4,"account":4,"principal":4}},
+        "reconnectCount":{{"tenant":12,"account":12,"principal":12}},
+        "retainedAuthorityBytes":{{"tenant":67108864,"account":67108864,"principal":67108864}}
+      }},"overrides":[]
+    }}"#,
+        bytes.len() * 4
+    );
+    let quota = Arc::new(smesh_a2a::QuotaPolicy::from_json(quota_json.as_bytes()).unwrap());
+    let config = config(url, "art_wire")
+        .with_quota_policy(Arc::clone(&quota))
+        .with_artifact_store(ArtifactStoreConfig::new(&root, &keyring).unwrap());
+    let store = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
+    let (client, driver) = admin_client(&superuser_url()).await;
+    let schema = config.schema_name();
+    let tenant = "tenant-wire";
+    let artifact_id = "artifact-wire";
+    let now = chrono::Utc::now().timestamp_millis();
+    let task = a2a::Task {
+        id: "task-wire".into(),
+        context_id: "context-wire".into(),
+        status: a2a::TaskStatus {
+            state: a2a::TaskState::Completed,
+            message: None,
+            timestamp: chrono::DateTime::from_timestamp_millis(now),
+        },
+        artifacts: None,
+        history: None,
+        metadata: None,
+    };
+    client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES($1,'task-wire','context-wire',$2,1,$3,'owner')"), &[&tenant,&serde_json::to_string(&a2a::TaskState::Completed).unwrap(),&serde_json::to_string(&task).unwrap()]).await.unwrap();
+    let policy_digest = ContentDigestV1::of(b"wire-policy");
+    let manifest = ArtifactManifestV1::new(
+        artifact_id,
+        "wire.bin",
+        None,
+        "application/octet-stream",
+        smesh_a2a::ArtifactClassification::Confidential,
+        smesh_a2a::EncryptionDomain::new("tenant-wire/confidential").unwrap(),
+        "key-a",
+        smesh_a2a::ArtifactProducer::new(
+            tenant,
+            "owner",
+            "task-wire",
+            "context-wire",
+            "message-wire",
+            "dispatch-wire",
+        )
+        .unwrap(),
+        Vec::<smesh_a2a::DerivedFrom>::new(),
+        smesh_a2a::ArtifactPolicySnapshot::new(
+            "artifact-default",
+            1,
+            policy_digest,
+            now,
+            now + 60_000,
+        )
+        .unwrap(),
+        now,
+        &bytes,
+    )
+    .unwrap();
+    let registration = smesh_a2a::ArtifactStageRegistration {
+        tenant_scope: tenant.into(),
+        account_id: "owner".into(),
+        owner_account_id: "owner".into(),
+        task_id: "task-wire".into(),
+        context_id: "context-wire".into(),
+        message_id: "message-wire".into(),
+        dispatch_id: "dispatch-wire".into(),
+        upload_id: "upload-wire".into(),
+        artifact_id: artifact_id.into(),
+        object_id: smesh_a2a::content_digest(
+            format!(
+                "{tenant}\0confidential\0key-a\0{}",
+                manifest.content_digest()
+            )
+            .as_bytes(),
+        ),
+        content_digest: manifest.content_digest().to_string(),
+        manifest_digest: manifest.manifest_digest().to_string(),
+        ciphertext_digest: String::new(),
+        plaintext_length: manifest.plaintext_length(),
+        ciphertext_length: 0,
+        classification: "confidential".into(),
+        encryption_domain: "tenant-wire/confidential".into(),
+        key_generation: "key-a".into(),
+        canonical_manifest_json: manifest.canonical_json().into(),
+        chunks: manifest
+            .chunks()
+            .iter()
+            .map(|chunk| smesh_a2a::ArtifactChunkRegistration {
+                ordinal: chunk.ordinal(),
+                byte_offset: chunk.offset(),
+                plaintext_length: chunk.length(),
+                content_digest: chunk.digest().to_string(),
+            })
+            .collect(),
+        provenance: Vec::new(),
+        media_type: "application/octet-stream".into(),
+        reference_id: "reference-wire".into(),
+        task_revision: 1,
+        policy_id: "artifact-default".into(),
+        policy_revision: 1,
+        policy_digest: policy_digest.to_string(),
+        created_at: now,
+        stage_locator: String::new(),
+        final_locator: String::new(),
+        nonce: [0; 12],
+        retain_until: now + 60_000,
+        quota_binding_digest: None,
+        receiver_lease_epoch: 1,
+        receiver_lease_token: "receiver-token".into(),
+    };
+    let staged = store
+        .stage_artifact(registration, bytes.clone())
+        .await
+        .unwrap();
+    store.register_artifact(&staged, now).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let protected = store.scan_artifact_stage_orphans(1, 100).await.unwrap();
+    assert_eq!((protected.deleted, protected.refunded_bytes), (0, 0));
+    assert!(root.join(&staged.stage_locator).is_file());
+    let claim = store
+        .claim_artifact_promotion("wire-promoter", 30_000, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(store.commit_artifact_promotion(&claim).await.unwrap());
+    let scope = OwnedTaskScope::new(tenant, "owner", VisibilityScope::Own).unwrap();
+    let audit = AuthorizationAuditInput::new(
+        "audit-wire-direct",
+        tenant,
+        "owner",
+        "wire-policy",
+        1,
+        "wire-policy-digest",
+        "artifactResolve",
+        AuthorizationDecisionEffect::Allow,
+        "test",
+        "artifact",
+        smesh_a2a::content_digest(artifact_id.as_bytes()),
+        None,
+        now,
+    )
+    .unwrap();
+    let direct_quota = quota
+        .operation_intent(
+            &smesh_a2a::QuotaSubject::new(tenant, "owner", "direct-principal").unwrap(),
+            smesh_a2a::QuotaOperation::TaskGet,
+            "artifact-wire-direct",
+            0,
+        )
+        .unwrap();
+    let direct_lease = store
+        .begin_artifact_resolution(
+            &scope,
+            artifact_id,
+            None,
+            &smesh_a2a::content_digest(b"owner"),
+            30_000,
+            Some(&direct_quota),
+            audit,
+            now,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let direct = store.read_artifact_resolution(&direct_lease).await;
+    assert!(direct.is_ok(), "direct artifact read failed: {direct:?}");
+    assert!(
+        store
+            .finish_artifact_resolution(&direct_lease, bytes.len() as u64, true)
+            .await
+            .unwrap()
+    );
+    let policy = Arc::new(AuthorizationPolicy::from_json(br#"{"schemaVersion":"smesh-authz-policy/v1","policyId":"wire-policy","revision":1,"tenants":[{"id":"tenant-wire","enabled":true}],"accounts":[{"id":"owner","kind":"serviceAccount","memberships":[{"tenantId":"tenant-wire","roles":["taskAgent"]}]},{"id":"foreign","kind":"serviceAccount","memberships":[{"tenantId":"tenant-wire","roles":["taskAgent"]}]}],"principalBindings":[{"principal":{"issuer":"test:artifact","subject":"owner"},"accountId":"owner"},{"principal":{"issuer":"test:artifact","subject":"foreign"},"accountId":"foreign"}]}"#).unwrap());
+    let auth = smesh_a2a::auth::AuthState::new(Arc::new(FixedVerifier), [3; 32]);
+    let authority: Arc<dyn DurableAuthority> = store.clone();
+    let gateway = build_authorized_durable_loopback_gateway(
+        GatewayConfig::new("http://127.0.0.1", "wire"),
+        authority,
+        DurableLoopbackEndpoint::new(),
+        InjectedClock::new(now),
+        auth,
+        policy,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let server_cancel = cancel.clone();
+    let app = gateway.router();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(server_cancel.cancelled_owned())
+            .await
+            .unwrap();
+    });
+    let http = reqwest::Client::new();
+    let endpoint = format!("http://{address}/artifacts/v1/{artifact_id}");
+    assert_eq!(
+        http.get(&endpoint).send().await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        http.get(&endpoint)
+            .bearer_auth("foreign-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        http.get(format!("http://{address}/artifacts/v1/missing"))
+            .bearer_auth("owner-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let range = http
+        .get(&endpoint)
+        .bearer_auth("owner-token")
+        .header(reqwest::header::RANGE, "bytes=0-2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(range.status(), reqwest::StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        range.headers().get(reqwest::header::ACCEPT_RANGES).unwrap(),
+        "none"
+    );
+    let head = http
+        .head(&endpoint)
+        .bearer_auth("owner-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        head.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(),
+        bytes.len().to_string().as_str()
+    );
+    assert_eq!(head.bytes().await.unwrap().len(), 0);
+    let get = http
+        .get(&endpoint)
+        .bearer_auth("owner-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        get.headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .unwrap(),
+        "attachment"
+    );
+    assert_eq!(get.bytes().await.unwrap().as_ref(), bytes.as_slice());
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    socket.write_all(format!("GET /artifacts/v1/{artifact_id} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer owner-token\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    drop(socket);
+    tokio::task::yield_now().await;
+    assert_eq!(
+        client
+            .query_one(
+                &format!("SELECT count(*) FROM {schema}.artifact_read_leases WHERE state='active'"),
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    let blob = root.join(&staged.final_locator);
+    let mut corrupted = fs::read(&blob).unwrap();
+    corrupted[0] ^= 0xff;
+    fs::write(&blob, corrupted).unwrap();
+    assert_eq!(
+        http.get(&endpoint)
+            .bearer_auth("owner-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let blob_reads_at_boundary = store.artifact_blob_read_count();
+    let denied = http
+        .get(&endpoint)
+        .bearer_auth("owner-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        denied.headers().get(reqwest::header::RETRY_AFTER).unwrap(),
+        "1"
+    );
+    for forbidden in [
+        reqwest::header::ETAG,
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::CONTENT_DISPOSITION,
+    ] {
+        assert!(!denied.headers().contains_key(forbidden));
+    }
+    assert!(denied.bytes().await.unwrap().is_empty());
+    assert_eq!(store.artifact_blob_read_count(), blob_reads_at_boundary);
+    assert_eq!(
+        client
+            .query_one(
+                &format!("SELECT count(*) FROM {schema}.artifact_read_leases WHERE state='active'"),
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    let denial = client.query_one(&format!("SELECT count(*),COALESCE(bool_and(retry_after_seconds=1),false),COALESCE(string_agg(to_jsonb(d)::text,''),'') FROM {schema}.quota_denial_audits d WHERE tenant_scope=$1"), &[&tenant]).await.unwrap();
+    assert_eq!(denial.get::<_, i64>(0), 1);
+    assert!(denial.get::<_, bool>(1));
+    assert!(!denial.get::<_, String>(2).contains(artifact_id));
+    store.close_owned_sync();
+    assert_eq!(
+        http.get(&endpoint)
+            .bearer_auth("owner-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    cancel.cancel();
+    server.await.unwrap();
+    gateway.shutdown().await.unwrap();
+
+    // Startup semantic-seal tamper cases run in `artifact_tamper_reopen_matrix`,
+    // which mutates each authority row in an isolated schema.
+
+    drop(client);
+    driver.abort();
+    drop(store);
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    fs::remove_dir_all(root).unwrap();
+});
+
+postgres_test!(artifact_tamper_baseline_reopens, {
+    let Some(url) = admin_url() else { return };
+    let (config, root, _staged) =
+        create_artifact_tamper_baseline(&url, "art_tamper_control", true).await;
+    let reopened = PostgresTaskStore::open(config.clone()).await.unwrap();
+    reopened.shutdown().await.unwrap();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    fs::remove_dir_all(root).unwrap();
+});
+
+postgres_test!(artifact_tamper_reopen_matrix, 60, {
+    let Some(url) = admin_url() else { return };
+    let names = [
+        "object-content-digest",
+        "object-ciphertext-digest",
+        "object-plaintext-length",
+        "object-ciphertext-length",
+        "object-state",
+        "object-locator",
+        "object-key-generation",
+        "object-encryption-domain",
+        "object-classification",
+        "object-reference-count",
+        "manifest-canonical",
+        "manifest-digest",
+        "manifest-producer",
+        "manifest-task",
+        "manifest-context",
+        "manifest-policy",
+        "manifest-retention",
+        "chunk-order",
+        "chunk-digest",
+        "chunk-length",
+        "chunk-object-binding",
+        "provenance-self",
+        "provenance-cycle",
+        "provenance-cross-domain",
+        "upload-lease-fence",
+        "read-lease-fence",
+        "backup-lease-fence",
+        "retention-hold",
+        "tombstone",
+        "gc-job",
+    ];
+    for (index, name) in names.into_iter().enumerate() {
+        eprintln!("artifact isolated tamper case: {name}");
+        let prefix = format!("art_tm_{index:02}");
+        let (config, root, staged) = create_artifact_tamper_baseline(&url, &prefix, true).await;
+        let schema = config.schema_name();
+        let zero = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let (table, mutation) = match name {
+            "object-content-digest" => (
+                "content_objects",
+                format!("UPDATE {schema}.content_objects SET content_digest='{zero}'"),
+            ),
+            "object-ciphertext-digest" => (
+                "content_objects",
+                format!("UPDATE {schema}.content_objects SET ciphertext_digest='{zero}'"),
+            ),
+            "object-plaintext-length" => (
+                "content_objects",
+                format!("UPDATE {schema}.content_objects SET plaintext_length=plaintext_length+1"),
+            ),
+            "object-ciphertext-length" => (
+                "content_objects",
+                format!(
+                    "UPDATE {schema}.content_objects SET ciphertext_length=ciphertext_length+1"
+                ),
+            ),
+            "object-state" => (
+                "content_objects",
+                format!("UPDATE {schema}.content_objects SET state='staged'"),
+            ),
+            "object-locator" => (
+                "content_objects",
+                format!(
+                    "UPDATE {schema}.content_objects SET backend_locator='objects/tampered/locator'"
+                ),
+            ),
+            "object-key-generation" => (
+                "content_objects",
+                format!("UPDATE {schema}.content_objects SET key_generation='key-tampered'"),
+            ),
+            "object-encryption-domain" | "provenance-cross-domain" => (
+                "content_objects",
+                format!(
+                    "UPDATE {schema}.content_objects SET encryption_domain='tenant-tamper/cross-domain'"
+                ),
+            ),
+            "object-classification" => (
+                "content_objects",
+                format!("UPDATE {schema}.content_objects SET classification='public'"),
+            ),
+            "object-reference-count" => (
+                "content_objects",
+                format!("UPDATE {schema}.content_objects SET reference_count=2"),
+            ),
+            "manifest-canonical" => (
+                "artifact_manifests",
+                format!("UPDATE {schema}.artifact_manifests SET canonical_json='{{}}'"),
+            ),
+            "manifest-digest" => (
+                "artifact_manifests",
+                format!("UPDATE {schema}.artifact_manifests SET manifest_digest='{zero}'"),
+            ),
+            "manifest-producer" => (
+                "artifact_manifests",
+                format!("UPDATE {schema}.artifact_manifests SET owner_account_id='tampered'"),
+            ),
+            "manifest-task" => (
+                "artifact_manifests",
+                format!("UPDATE {schema}.artifact_manifests SET task_id='tampered'"),
+            ),
+            "manifest-context" => (
+                "artifact_manifests",
+                format!("UPDATE {schema}.artifact_manifests SET context_id='tampered'"),
+            ),
+            "manifest-policy" => (
+                "artifact_manifests",
+                format!("UPDATE {schema}.artifact_manifests SET policy_id='tampered'"),
+            ),
+            "manifest-retention" => (
+                "artifact_manifests",
+                format!("UPDATE {schema}.artifact_manifests SET retain_until=retain_until+1"),
+            ),
+            "chunk-order" => (
+                "artifact_chunks",
+                format!("UPDATE {schema}.artifact_chunks SET ordinal=1"),
+            ),
+            "chunk-digest" => (
+                "artifact_chunks",
+                format!("UPDATE {schema}.artifact_chunks SET content_digest='{zero}'"),
+            ),
+            "chunk-length" => (
+                "artifact_chunks",
+                format!("UPDATE {schema}.artifact_chunks SET plaintext_length=plaintext_length+1"),
+            ),
+            "chunk-object-binding" => (
+                "artifact_chunks",
+                format!("UPDATE {schema}.artifact_chunks SET artifact_id='tampered'"),
+            ),
+            "provenance-self" | "provenance-cycle" => (
+                "artifact_manifests",
+                format!(
+                    "UPDATE {schema}.artifact_manifests SET canonical_json=replace(canonical_json,'\"derivedFrom\":[]','\"derivedFrom\":[{{\"artifactId\":\"artifact-tamper\",\"relation\":\"summary\"}}]')"
+                ),
+            ),
+            "upload-lease-fence" => (
+                "upload_intents",
+                format!(
+                    "UPDATE {schema}.upload_intents SET state='promoting',lease_token=NULL,lease_until=NULL"
+                ),
+            ),
+            "read-lease-fence" => (
+                "artifact_read_leases",
+                format!(
+                    "INSERT INTO {schema}.artifact_read_leases VALUES('tenant-tamper','tamper-read','artifact-tamper',1,'','owner','active',1,1)"
+                ),
+            ),
+            "backup-lease-fence" => (
+                "artifact_backup_leases",
+                format!(
+                    "INSERT INTO {schema}.artifact_backup_leases VALUES('tenant-tamper','tamper-backup','{}','',1,'','active',1,1)",
+                    staged.object_id
+                ),
+            ),
+            "retention-hold" => (
+                "artifact_retention_holds",
+                format!(
+                    "INSERT INTO {schema}.artifact_retention_holds VALUES('tenant-tamper','tamper-hold','artifact-tamper','','','active',1,NULL,NULL)"
+                ),
+            ),
+            "tombstone" => (
+                "artifact_tombstones",
+                format!(
+                    "INSERT INTO {schema}.artifact_tombstones VALUES('tenant-tamper','{}',1,'reason','locator',NULL,1,NULL)",
+                    staged.object_id
+                ),
+            ),
+            "gc-job" => (
+                "artifact_gc_jobs",
+                format!(
+                    "INSERT INTO {schema}.artifact_gc_jobs VALUES('tenant-tamper','tamper-gc','{}',1,'leased',1,NULL,NULL,1,NULL,0,NULL)",
+                    staged.object_id
+                ),
+            ),
+            _ => unreachable!(),
+        };
+        let (client, driver) = admin_client(&superuser_url()).await;
+        client.batch_execute(&format!("ALTER TABLE {schema}.{table} DISABLE TRIGGER ALL; {mutation}; ALTER TABLE {schema}.{table} ENABLE TRIGGER ALL")).await.unwrap_or_else(|error|panic!("mutation failed {name}: {error}"));
+        assert!(
+            matches!(
+                PostgresTaskStore::open(config.clone()).await,
+                Err(smesh_a2a::PostgresStoreError::InvalidSchema)
+            ),
+            "tamper case reopened: {name}"
+        );
+        drop(client);
+        driver.abort();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+});
+
+postgres_test!(artifact_populated_default_plans_and_batch_bound, {
+    let Some(url) = admin_url() else { return };
+    let (config, root, staged) = create_artifact_tamper_baseline(&url, "art_plans", true).await;
+    let schema = config.schema_name();
+    let (client, driver) = admin_client(&superuser_url()).await;
+    for table in [
+        "content_objects",
+        "artifact_manifests",
+        "artifact_references",
+        "artifact_chunks",
+        "upload_intents",
+        "artifact_read_leases",
+        "artifact_backup_leases",
+        "artifact_retention_holds",
+        "provenance_edges",
+    ] {
+        client
+            .batch_execute(&format!("ALTER TABLE {schema}.{table} DISABLE TRIGGER ALL"))
+            .await
+            .unwrap();
+    }
+    let digest = "'sha256:'||encode(sha256(convert_to(g::text,'UTF8')),'hex')";
+    client.batch_execute(&format!(r"
+      INSERT INTO {schema}.content_objects SELECT 'tenant-plan','owner','obj-'||g,{digest},'confidential','tenant-plan/confidential','key-a',1,17,{digest},'objects/plan/obj-'||g,decode('000000000000000000000000','hex'),'available',0,0,1,1,0 FROM generate_series(1,2000) g;
+      INSERT INTO {schema}.artifact_manifests SELECT 'tenant-plan','artifact-'||g,{digest},'obj-'||g,1,'{{}}','owner','task-tamper','context-tamper','message','dispatch','application/octet-stream',1,'confidential','tenant-plan/confidential','policy',1,{digest},1,1 FROM generate_series(1,2000) g;
+      INSERT INTO {schema}.artifact_references SELECT 'tenant-plan','ref-'||g,'artifact-'||g,'task-tamper','context-tamper','owner',1,'active',1,1 FROM generate_series(1,2000) g;
+      INSERT INTO {schema}.artifact_chunks SELECT 'tenant-plan','artifact-'||g,0,0,1,{digest} FROM generate_series(1,2000) g;
+      INSERT INTO {schema}.upload_intents(tenant_scope,upload_id,artifact_id,object_id,state,stage_locator,final_locator,ciphertext_digest,ciphertext_length,lease_epoch,created_at,updated_at) SELECT 'tenant-plan','upload-'||g,'artifact-'||g,'obj-'||g,'committed','stage/0123456789abcdefghijklmnopqrstuv.tmp','objects/plan/obj-'||g,{digest},17,1,1,g FROM generate_series(1,2000) g;
+      INSERT INTO {schema}.artifact_read_leases SELECT 'tenant-plan','read-'||g,'artifact-'||g,1,'token','owner','active',10000,1 FROM generate_series(1,2000) g;
+      INSERT INTO {schema}.artifact_backup_leases SELECT 'tenant-plan','backup-'||g,'obj-'||g,'worker',1,'token','active',10000,1 FROM generate_series(1,2000) g;
+      INSERT INTO {schema}.artifact_retention_holds SELECT 'tenant-plan','hold-'||g,'artifact-'||g,'actor','reason','active',1,NULL,NULL FROM generate_series(1,2000) g;
+      INSERT INTO {schema}.provenance_edges SELECT 'tenant-plan','artifact-'||g,0,'artifact-tamper','summary' FROM generate_series(1,2000) g;
+      ANALYZE {schema}.content_objects; ANALYZE {schema}.artifact_manifests; ANALYZE {schema}.artifact_references; ANALYZE {schema}.artifact_chunks; ANALYZE {schema}.upload_intents; ANALYZE {schema}.artifact_read_leases; ANALYZE {schema}.artifact_backup_leases; ANALYZE {schema}.artifact_retention_holds; ANALYZE {schema}.provenance_edges;
+    ")).await.unwrap();
+    let plans = [
+        (
+            format!(
+                "SELECT r.reference_id FROM {schema}.artifact_references r WHERE r.tenant_scope='tenant-plan' AND r.task_id='task-tamper' AND r.artifact_id='artifact-1999' AND r.owner_account_id='owner' AND r.state='active'"
+            ),
+            "artifact_references_resolve",
+        ),
+        (
+            format!(
+                "SELECT upload_id FROM {schema}.upload_intents WHERE tenant_scope='tenant-plan' AND state IN ('committed','promoting') AND updated_at<=2 ORDER BY updated_at,tenant_scope,upload_id LIMIT 100"
+            ),
+            "upload_intents_due",
+        ),
+        (
+            format!(
+                "SELECT object_id FROM {schema}.content_objects WHERE state='available' AND reference_count=0 AND retain_until<=2 ORDER BY state,retain_until,tenant_scope,object_id LIMIT 100"
+            ),
+            "content_objects_gc_due",
+        ),
+        (
+            format!(
+                "SELECT lease_id FROM {schema}.artifact_read_leases WHERE tenant_scope='tenant-plan' AND artifact_id='artifact-1999' AND state='active' AND lease_until>2"
+            ),
+            "artifact_read_leases_active",
+        ),
+        (
+            format!(
+                "SELECT lease_id FROM {schema}.artifact_backup_leases WHERE tenant_scope='tenant-plan' AND object_id='obj-1999' AND state='active' AND lease_until>2"
+            ),
+            "artifact_backup_leases_active",
+        ),
+        (
+            format!(
+                "SELECT hold_id FROM {schema}.artifact_retention_holds WHERE tenant_scope='tenant-plan' AND artifact_id='artifact-1999' AND state='active' AND (expires_at IS NULL OR expires_at>2)"
+            ),
+            "artifact_retention_holds_active",
+        ),
+        (
+            format!(
+                "SELECT child_artifact_id FROM {schema}.provenance_edges WHERE tenant_scope='tenant-plan' AND parent_artifact_id='artifact-tamper' AND child_artifact_id='artifact-1999'"
+            ),
+            "provenance_edges_parent",
+        ),
+    ];
+    for (sql, index) in plans {
+        let plan = client
+            .query(&format!("EXPLAIN (COSTS OFF) {sql}"), &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!plan.contains("Seq Scan"), "{sql}\n{plan}");
+        assert!(!plan.contains("Sort"), "{sql}\n{plan}");
+        assert!(plan.contains(index), "expected {index}\n{sql}\n{plan}");
+    }
+    let functions=client.query(&format!("SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='{schema}' AND p.proname IN ('claim_artifact_upload','claim_artifact_gc','artifact_stage_locator_live') ORDER BY p.proname"),&[]).await.unwrap().into_iter().map(|r|r.get::<_,String>(0).replace(schema,"__SCHEMA__")).collect::<Vec<_>>().join("\n");
+    let function_hash = smesh_a2a::content_digest(functions.as_bytes());
+    eprintln!("artifact canonical function SQL hash: {function_hash}");
+    assert!(function_hash.starts_with("sha256:"));
+    assert!(
+        client
+            .query(
+                &format!(
+                    "SELECT * FROM {schema}.claim_artifact_upload('owner','token',30000,1001)"
+                ),
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    let claimed = client
+        .query(
+            &format!("SELECT * FROM {schema}.claim_artifact_upload('owner','token',30000,1000)"),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(claimed.len() <= 1000);
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    fs::remove_dir_all(root).unwrap();
+    let _ = staged;
+});
+
+postgres_test!(artifact_claims_are_fair_across_active_tenants, {
+    let Some(url) = admin_url() else { return };
+    let (config, root, staged) =
+        create_artifact_tamper_baseline(&url, "art_claim_fair", true).await;
+    let left = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
+    let right = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
+    let schema = config.schema_name();
+    let (client, driver) = admin_client(&superuser_url()).await;
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.upload_intents DISABLE TRIGGER ALL"
+        ))
+        .await
+        .unwrap();
+    for (tenant, count, updated) in [
+        ("tenant-a", 4, 0_i64),
+        ("tenant-b", 1, 1_i64),
+        ("tenant-c", 1, 1_i64),
+    ] {
+        for n in 0..count {
+            let id = format!("{tenant}-{n}");
+            client.execute(&format!("INSERT INTO {schema}.upload_intents(tenant_scope,upload_id,artifact_id,object_id,state,stage_locator,final_locator,ciphertext_digest,ciphertext_length,lease_epoch,created_at,updated_at) VALUES($1,$2,$2,$3,'committed',$4,$5,$6,$7,1,$8,$8)"),&[&tenant,&id,&staged.object_id,&staged.stage_locator,&staged.final_locator,&staged.ciphertext_digest,&i64::try_from(staged.ciphertext_length).unwrap(),&updated]).await.unwrap();
+        }
+    }
+    // Keep accounting disabled for these intentionally FK-free synthetic rows.
+    let (a, b) = tokio::join!(
+        left.claim_artifact_promotion("fair-left", 30_000, 3),
+        right.claim_artifact_promotion("fair-right", 30_000, 3)
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert!(a.len() <= 3 && b.len() <= 3);
+    let tenants: std::collections::BTreeSet<String> =
+        a.into_iter().chain(b).map(|r| r.tenant_scope).collect();
+    assert_eq!(
+        tenants,
+        std::collections::BTreeSet::from(["tenant-a".into(), "tenant-b".into(), "tenant-c".into()])
+    );
+    left.shutdown().await.unwrap();
+    right.shutdown().await.unwrap();
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    fs::remove_dir_all(root).unwrap();
+});
+
+postgres_test!(artifact_two_scanners_delete_and_refund_once, {
+    let Some(url) = admin_url() else { return };
+    let root = ArtifactTestRoot::new("artifact-scanners");
+    let keyring = root.join("keys.json");
+    fs::write(&keyring, r#"{"activeGeneration":"key-a","generations":{"key-a":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}}"#).unwrap();
+    fs::set_permissions(&keyring, fs::Permissions::from_mode(0o600)).unwrap();
+    let config = config(url, "art_scan")
+        .with_artifact_store(ArtifactStoreConfig::new(&root, &keyring).unwrap());
+    let store = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
+    let stage = root
+        .join("stage")
+        .join("0123456789abcdefghijklmnopqrstuv.tmp");
+    let bytes = vec![0x5a; 4096];
+    fs::write(&stage, &bytes).unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let left = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.scan_artifact_stage_orphans(1, 100).await.unwrap()
+        })
+    };
+    let right = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.scan_artifact_stage_orphans(1, 100).await.unwrap()
+        })
+    };
+    barrier.wait().await;
+    let left = left.await.unwrap();
+    let right = right.await.unwrap();
+    assert_eq!(left.deleted + right.deleted, 1);
+    assert_eq!(
+        left.refunded_bytes + right.refunded_bytes,
+        bytes.len() as u64
+    );
+    assert!(!stage.exists());
+    let (client, driver) = admin_client(&superuser_url()).await;
+    let rows: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM {}.artifact_orphan_audits",
+                config.schema_name()
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 1);
+    let candidate_rows: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM {}.artifact_orphan_candidates WHERE state='finalized' AND ciphertext_length=$1 AND finalized_at IS NOT NULL",
+                config.schema_name()
+            ),
+            &[&i64::try_from(bytes.len()).unwrap()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        candidate_rows, 1,
+        "unlink ownership must be durable before audit"
+    );
+
+    // Model SIGKILL after unlink but before database finalization.  The next
+    // scanner must take over the expired generation and emit one refund/audit.
+    let crashed_locator = "stage/abcdefghij0123456789ABCDEFGHIJKL.tmp";
+    let crashed_path = root.join(crashed_locator);
+    fs::write(&crashed_path, vec![0x33; 2048]).unwrap();
+    client
+        .execute(
+            &format!("INSERT INTO {}.artifact_orphan_candidates(stage_locator,locator_digest,ciphertext_length,state,claim_token,claim_generation,claim_until,claimed_at) VALUES($1,$2,2048,'claimed',$3,1,0,0)",
+                config.schema_name()),
+            &[&crashed_locator, &smesh_a2a::content_digest(crashed_locator.as_bytes()), &smesh_a2a::content_digest(b"dead-scanner")],
+        )
+        .await
+        .unwrap();
+    fs::remove_file(&crashed_path).unwrap();
+    let recovered = store.scan_artifact_stage_orphans(1, 100).await.unwrap();
+    assert_eq!((recovered.deleted, recovered.refunded_bytes), (1, 2048));
+    let replay = store.scan_artifact_stage_orphans(1, 100).await.unwrap();
+    assert_eq!((replay.deleted, replay.refunded_bytes), (0, 0));
+    let recovered_rows: i64 = client
+        .query_one(
+            &format!("SELECT count(*) FROM {}.artifact_orphan_candidates c JOIN {}.artifact_orphan_audits a USING(locator_digest) WHERE c.stage_locator=$1 AND c.state='finalized' AND c.claim_generation=2", config.schema_name(), config.schema_name()),
+            &[&crashed_locator],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(recovered_rows, 1);
+
+    // Scanner ownership wins the opposite ordering. Registration observes the
+    // durable claim under the same advisory fence, fails closed, and cannot
+    // publish metadata for a stage that cleanup may unlink.
+    let registration = smesh_a2a::ArtifactStageRegistration {
+        tenant_scope: "tenant-owned-stage".into(),
+        account_id: "owner".into(),
+        owner_account_id: "owner".into(),
+        task_id: "task".into(),
+        context_id: "context".into(),
+        message_id: "message".into(),
+        dispatch_id: "dispatch".into(),
+        upload_id: "upload-owned".into(),
+        artifact_id: "artifact-owned".into(),
+        object_id: smesh_a2a::content_digest(b"owned-object"),
+        content_digest: smesh_a2a::content_digest(b"owned"),
+        manifest_digest: smesh_a2a::content_digest(b"owned-manifest"),
+        ciphertext_digest: String::new(),
+        plaintext_length: 5,
+        ciphertext_length: 0,
+        classification: "confidential".into(),
+        encryption_domain: "tenant-owned-stage/confidential".into(),
+        key_generation: "key-a".into(),
+        canonical_manifest_json: "{}".into(),
+        chunks: Vec::new(),
+        provenance: Vec::new(),
+        media_type: "application/octet-stream".into(),
+        reference_id: "reference-owned".into(),
+        task_revision: 1,
+        policy_id: "artifact-default".into(),
+        policy_revision: 1,
+        policy_digest: smesh_a2a::content_digest(b"policy"),
+        created_at: 1,
+        stage_locator: String::new(),
+        final_locator: String::new(),
+        nonce: [0; 12],
+        retain_until: i64::MAX,
+        quota_binding_digest: None,
+        receiver_lease_epoch: 1,
+        receiver_lease_token: "receiver-token".into(),
+    };
+    let owned = store
+        .stage_artifact(registration, b"owned".to_vec())
+        .await
+        .unwrap();
+    client.execute(&format!("INSERT INTO {}.artifact_orphan_candidates(stage_locator,locator_digest,ciphertext_length,state,claim_token,claim_generation,claim_until,claimed_at) VALUES($1,$2,$3,'claimed',$4,1,9223372036854775807,0)", config.schema_name()), &[&owned.stage_locator,&smesh_a2a::content_digest(owned.stage_locator.as_bytes()),&i64::try_from(owned.ciphertext_length).unwrap(),&smesh_a2a::content_digest(b"scanner-owner")]).await.unwrap();
+    assert!(store.register_artifact(&owned, 1).await.is_err());
+    assert!(root.join(&owned.stage_locator).is_file());
+    let escaped: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM {}.upload_intents WHERE upload_id='upload-owned'",
+                config.schema_name()
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(escaped, 0);
+    store.shutdown().await.unwrap();
+    drop(client);
+    driver.abort();
+    drop(store);
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    fs::remove_dir_all(root).unwrap();
+});
