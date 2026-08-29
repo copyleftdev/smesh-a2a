@@ -7,7 +7,7 @@ use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header::RETRY_AFTER},
     response::IntoResponse,
 };
 use futures::{StreamExt, stream::BoxStream};
@@ -214,8 +214,26 @@ fn streaming_error_response(id: JsonRpcId, err: A2AError) -> axum::response::Res
         error_code::QUOTA_AUTHORITY_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::OK,
     };
+    let retry_after = (err.code == error_code::QUOTA_EXCEEDED).then(|| {
+        err.details
+            .as_ref()
+            .and_then(|details| {
+                details.iter().find_map(|detail| {
+                    detail.value.get("retryAfterSeconds").and_then(Value::as_u64)
+                })
+            })
+            .unwrap_or(1)
+            .clamp(1, 3_600)
+    });
     let resp = JsonRpcResponse::error(id, err.to_jsonrpc_error());
-    (status, Json(resp)).into_response()
+    let mut response = (status, Json(resp)).into_response();
+    if let Some(retry_after) = retry_after {
+        response.headers_mut().insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&retry_after.to_string()).expect("bounded retry-after"),
+        );
+    }
+    response
 }
 
 fn protojson_value<T: ProtoJsonPayload>(value: &T) -> Result<Value, A2AError> {
@@ -770,9 +788,11 @@ mod tests {
             error_response(JsonRpcId::Number(1), error.clone()).status(),
             StatusCode::OK
         );
+        let streaming = streaming_error_response(JsonRpcId::Number(1), error);
+        assert_eq!(streaming.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            streaming_error_response(JsonRpcId::Number(1), error).status(),
-            StatusCode::TOO_MANY_REQUESTS
+            streaming.headers().get(RETRY_AFTER).and_then(|value| value.to_str().ok()),
+            Some("1")
         );
         let unavailable = A2AError::new(
             -32_011,

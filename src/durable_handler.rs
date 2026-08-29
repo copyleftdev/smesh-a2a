@@ -663,12 +663,12 @@ impl DurableRequestHandler {
         };
         Box::pin(stream::unfold(state, |mut state| async move {
             loop {
+                if state.finished {
+                    return None;
+                }
                 if let Some(error) = state.quota_lease.as_ref().and_then(|lease| lease.failure()) {
                     state.finished = true;
                     return Some((Err(error), state));
-                }
-                if state.finished {
-                    return None;
                 }
                 if let Some(frame) = state.pending.pop_front() {
                     if let Err(error) = charge_public_egress(
@@ -791,6 +791,8 @@ impl DurableRequestHandler {
         Box::pin(stream::unfold(state, |mut state| async move {
             loop {
                 if let Some(error) = state.quota_lease.as_ref().and_then(|lease| lease.failure()) {
+                    state.quota_lease = None;
+                    state.pending.clear();
                     state.closed = true;
                     return Some((Err(error), state));
                 }

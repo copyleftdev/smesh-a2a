@@ -184,7 +184,11 @@ ALTER TABLE __SCHEMA__.receiver_inbox
 ALTER TABLE __SCHEMA__.receiver_inbox
  ADD CONSTRAINT receiver_execution_measurement_state CHECK(
    (state='processing' AND measured_output_bytes IS NULL AND measured_event_count IS NULL)
-   OR (state='completed' AND measured_output_bytes>=0 AND measured_event_count>=0)
+   OR (state='completed'
+       AND measured_output_bytes IS NOT NULL
+       AND measured_event_count IS NOT NULL
+       AND measured_output_bytes>=0
+       AND measured_event_count>=0)
  ) NOT VALID;
 UPDATE __SCHEMA__.receiver_inbox r
  SET measured_output_bytes=COALESCE((SELECT sum(octet_length(f.frame_json))::bigint FROM __SCHEMA__.receiver_frames f WHERE f.tenant_scope=r.tenant_scope AND f.dispatch_id=r.dispatch_id),0),
