@@ -162,6 +162,8 @@ async fn sqlite_authority_conforms_to_gateway_surface() {
 #[tokio::test]
 async fn recording_fake_conforms_to_every_backend_neutral_command() {
     let recording = RecordingAuthority::new();
+    let old_fake: &dyn smesh_a2a::DurableAuthority = recording.as_ref();
+    assert!(old_fake.artifact_authority().is_none());
     let factory_recording = recording.clone();
     run_durable_authority_fixture_conformance(
         move || async move {

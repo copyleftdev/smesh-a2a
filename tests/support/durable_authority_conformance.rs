@@ -1291,3 +1291,5 @@ impl AuthorityShutdown for RecordingAuthority {
         self.record("close");
     }
 }
+
+smesh_a2a::impl_unsupported_artifact_authority!(RecordingAuthority);

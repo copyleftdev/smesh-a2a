@@ -4,22 +4,27 @@ use std::time::Duration;
 use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task};
 use a2a_server::{DefaultRequestHandler, RequestHandler, StaticAgentCard, TaskStore};
 use async_trait::async_trait;
-use axum::http::{HeaderValue, StatusCode, header};
-use axum::response::Response;
+use axum::body::Body;
+use axum::extract::{Extension, Path};
+use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::response::{IntoResponse as _, Response};
+use axum::routing::get;
 use axum::{Router, middleware};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
-    BoundedTaskStore, CompletionPolicySpec, DurableAuthority, DurableLoopbackEndpoint,
-    ExecutionLimits, InjectedClock, InputLimits, IntoDurableAuthority, MeshDispatcher, PolicyError,
-    RuntimeEventCapture, SmeshExecutor, SqliteTaskStore, VersionedCompletionPolicy,
+    ArtifactGcHandle, ArtifactOrphanScannerHandle, ArtifactPromoterHandle, BoundedTaskStore,
+    CompletionPolicySpec, DurableAuthority, DurableLoopbackEndpoint, ExecutionLimits,
+    InjectedClock, InputLimits, IntoDurableAuthority, MeshDispatcher, Operation, OwnedTaskScope,
+    PolicyError, RuntimeEventCapture, SmeshExecutor, SqliteTaskStore, VersionedCompletionPolicy,
     auth::{AuthState, authenticate_request},
     authorization::{AuthorizationMiddlewareState, AuthorizationPolicy, authorize_request},
-    build_agent_card, build_secured_agent_card_with_policy,
+    build_agent_card, build_secured_agent_card_with_policy, content_digest,
     durable_authority::DurableAuthorityParts,
     durable_handler::DurableRequestHandler,
     guard::GuardedRequestHandler,
     outbox_driver::{DurableDriverHandle, spawn_durable_driver},
+    spawn_artifact_gc, spawn_artifact_orphan_scanner, spawn_artifact_promoter,
 };
 
 struct SharedTaskStore<S>(Arc<S>);
@@ -34,6 +39,165 @@ async fn quota_retry_after_header(
             .headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     }
+    response
+}
+
+#[allow(clippy::too_many_lines)]
+async fn artifact_resolver(
+    method: Method,
+    Path(artifact_id): Path<String>,
+    Extension(authority): Extension<Arc<dyn DurableAuthority>>,
+    Extension(context): Extension<Arc<crate::AuthorizationContext>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    const NOT_FOUND: &str = "artifact not found";
+    let Some(artifact_authority) = authority.artifact_authority() else {
+        return (StatusCode::NOT_FOUND, NOT_FOUND).into_response();
+    };
+    if headers.contains_key(header::RANGE) {
+        return (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::ACCEPT_RANGES, "none")],
+            "range requests are unsupported",
+        )
+            .into_response();
+    }
+    if !matches!(method, Method::GET | Method::HEAD)
+        || artifact_id.is_empty()
+        || artifact_id.len() > 256
+        || !artifact_id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'/')
+        || context.authorize(Operation::ArtifactResolve).is_err()
+    {
+        return (StatusCode::NOT_FOUND, NOT_FOUND).into_response();
+    }
+    let Ok(visibility) = context.visibility(Operation::ArtifactResolve) else {
+        return (StatusCode::NOT_FOUND, NOT_FOUND).into_response();
+    };
+    let Ok(scope) = OwnedTaskScope::new(context.tenant_id(), context.account_id(), visibility)
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(owner_digest) = authority.authorization_resource_digest(context.account_id()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(resource_digest) = authority.authorization_resource_digest(&artifact_id) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|value| i64::try_from(value.as_millis()).ok())
+        .unwrap_or(0);
+    let Ok(subject) = crate::QuotaSubject::new(
+        context.tenant_id(),
+        context.account_id(),
+        context.principal_scope(),
+    ) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let decision_id = content_digest(&rand::random::<[u8; 32]>());
+    let quota_intent = if let Some(policy) = authority.quota_policy_snapshot() {
+        match policy.operation_intent(&subject, crate::QuotaOperation::TaskGet, &decision_id, 0) {
+            Ok(intent) => Some(intent),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        None
+    };
+    let Ok(audit) = crate::AuthorizationAuditInput::new(
+        decision_id,
+        context.tenant_id(),
+        context.account_id(),
+        context.policy_id(),
+        context.policy_revision(),
+        context.policy_digest(),
+        "artifactResolve",
+        crate::AuthorizationDecisionEffect::Deny,
+        "preflight",
+        "artifact",
+        resource_digest,
+        None,
+        now,
+    ) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let resolution = match artifact_authority
+        .begin_artifact_resolution(
+            &scope,
+            &artifact_id,
+            None,
+            &owner_digest,
+            artifact_authority
+                .artifact_runtime_limits()
+                .read_lease_millis,
+            quota_intent.as_ref(),
+            audit,
+            now,
+        )
+        .await
+    {
+        Ok(Some(value)) => value,
+        Ok(None) => return (StatusCode::NOT_FOUND, NOT_FOUND).into_response(),
+        Err(error) => {
+            return if error.code == -32_010 {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            .into_response();
+        }
+    };
+    let metadata = resolution.metadata();
+    let Ok(bytes) = artifact_authority
+        .read_artifact_resolution(&resolution)
+        .await
+    else {
+        let _ = artifact_authority
+            .finish_artifact_resolution(&resolution, 0, false)
+            .await;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if !matches!(
+        artifact_authority
+            .finish_artifact_resolution(&resolution, bytes.len() as u64, true)
+            .await,
+        Ok(true)
+    ) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let Ok(etag) = HeaderValue::from_str(&format!("\"{}\"", metadata.content_digest)) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(media) = HeaderValue::from_str(&metadata.media_type) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(length) = HeaderValue::from_str(&metadata.plaintext_length.to_string()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let mut response = Response::new(if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from(bytes)
+    });
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(header::ETAG, etag);
+    response.headers_mut().insert(header::CONTENT_TYPE, media);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, length);
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-transform"),
+    );
     response
 }
 
@@ -197,6 +361,9 @@ impl GatewayConfig {
 pub struct DurableGateway {
     router: Option<Router>,
     driver: Option<DurableDriverHandle>,
+    promoter: Option<ArtifactPromoterHandle>,
+    gc: Option<ArtifactGcHandle>,
+    orphan_scanner: Option<ArtifactOrphanScannerHandle>,
     authority: Option<Arc<dyn DurableAuthority>>,
 }
 
@@ -260,11 +427,29 @@ impl DurableGateway {
             .take()
             .ok_or_else(|| A2AError::internal("durable gateway is already shut down"))?;
         let driver_result = driver.shutdown().await;
+        let promoter_result = if let Some(promoter) = self.promoter.take() {
+            promoter.shutdown().await
+        } else {
+            Ok(())
+        };
+        let gc_result = if let Some(gc) = self.gc.take() {
+            gc.shutdown().await
+        } else {
+            Ok(())
+        };
+        let orphan_result = if let Some(orphan_scanner) = self.orphan_scanner.take() {
+            orphan_scanner.shutdown().await
+        } else {
+            Ok(())
+        };
         // Closing shared state invalidates handler/router clones and drops both
         // SQLite and the process ownership lock before shutdown returns.
         let authority_result = authority.shutdown().await;
         self.router.take();
         driver_result?;
+        promoter_result?;
+        gc_result?;
+        orphan_result?;
         authority_result?;
         Ok(())
     }
@@ -277,6 +462,9 @@ impl Drop for DurableGateway {
         // Tokio reaper. Closing the authority then rejects new work and closes
         // durable pools; explicit shutdown remains authoritative and joins inline.
         self.driver.take();
+        self.promoter.take();
+        self.gc.take();
+        self.orphan_scanner.take();
         if let Some(authority) = self.authority.as_ref() {
             authority.close_owned_sync();
         }
@@ -414,9 +602,16 @@ fn build_durable_gateway_inner(
     let protocol = if let Some(auth) = auth {
         let jsonrpc = auth.wrap_handler(jsonrpc_handler);
         let rest = auth.wrap_handler(rest_handler);
+        let artifacts = Router::new()
+            .route(
+                "/artifacts/v1/{artifact_id}",
+                get(artifact_resolver).head(artifact_resolver),
+            )
+            .layer(Extension(Arc::clone(&authority)));
         let protocol = Router::new()
             .nest("/jsonrpc", a2a_server::jsonrpc::jsonrpc_router(jsonrpc))
             .nest("/rest", a2a_server::rest::rest_router(rest))
+            .merge(artifacts)
             .layer(RequestBodyLimitLayer::new(max_body_bytes));
         let protocol = if let Some(policy) = authorization {
             let state =
@@ -437,9 +632,15 @@ fn build_durable_gateway_inner(
     };
     let protocol = protocol.layer(middleware::from_fn(quota_retry_after_header));
     let router = protocol.merge(a2a_server::agent_card::agent_card_router(card));
+    let promoter = spawn_artifact_promoter(Arc::clone(&authority));
+    let gc = spawn_artifact_gc(Arc::clone(&authority));
+    let orphan_scanner = spawn_artifact_orphan_scanner(Arc::clone(&authority));
     DurableGateway {
         router: Some(router),
         driver: Some(driver),
+        promoter,
+        gc,
+        orphan_scanner,
         authority: Some(authority),
     }
 }

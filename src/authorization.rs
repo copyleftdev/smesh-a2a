@@ -192,6 +192,8 @@ pub enum Operation {
     TaskCancel,
     HistoryRead,
     ArtifactRead,
+    /// Resolve bytes through an opaque, task-bound artifact reference.
+    ArtifactResolve,
     AuditRead,
     AuthorizationAdmin,
     PushCreate,
@@ -280,35 +282,39 @@ impl AuthorizationContext {
 
 fn role_grant(role: TenantRole, operation: Operation) -> Option<VisibilityScope> {
     use Operation::{
-        ArtifactRead, AuditRead, AuthorizationAdmin, ExtendedCard, HistoryRead, PushCreate,
-        PushDelete, PushGet, PushList, TaskCancel, TaskContinue, TaskCreate, TaskGet, TaskList,
-        TaskSubscribe,
+        ArtifactRead, ArtifactResolve, AuditRead, AuthorizationAdmin, ExtendedCard, HistoryRead,
+        PushCreate, PushDelete, PushGet, PushList, TaskCancel, TaskContinue, TaskCreate, TaskGet,
+        TaskList, TaskSubscribe,
     };
     use TenantRole::{Auditor, ServiceReader, TaskAgent, TaskOperator, TaskViewer, TenantAdmin};
     match (role, operation) {
         (
             TenantAdmin,
             TaskCreate | TaskContinue | TaskGet | TaskList | TaskSubscribe | TaskCancel
-            | HistoryRead | ArtifactRead | AuditRead | AuthorizationAdmin | ExtendedCard,
+            | HistoryRead | ArtifactRead | ArtifactResolve | AuditRead | AuthorizationAdmin
+            | ExtendedCard,
         )
         | (
             TaskOperator,
             TaskCreate | TaskContinue | TaskGet | TaskList | TaskSubscribe | TaskCancel
-            | HistoryRead | ArtifactRead | ExtendedCard,
+            | HistoryRead | ArtifactRead | ArtifactResolve | ExtendedCard,
         )
         | (
             TaskViewer | ServiceReader,
-            TaskGet | TaskList | TaskSubscribe | HistoryRead | ArtifactRead | ExtendedCard,
+            TaskGet | TaskList | TaskSubscribe | HistoryRead | ArtifactRead | ArtifactResolve
+            | ExtendedCard,
         )
-        | (Auditor, TaskGet | TaskList | HistoryRead | ArtifactRead | AuditRead | ExtendedCard) => {
-            Some(VisibilityScope::Tenant)
-        }
+        | (
+            Auditor,
+            TaskGet | TaskList | HistoryRead | ArtifactRead | ArtifactResolve | AuditRead
+            | ExtendedCard,
+        )
+        | (TaskAgent, ExtendedCard) => Some(VisibilityScope::Tenant),
         (
             TaskAgent,
             TaskCreate | TaskContinue | TaskGet | TaskList | TaskSubscribe | TaskCancel
-            | HistoryRead | ArtifactRead,
+            | HistoryRead | ArtifactRead | ArtifactResolve,
         ) => Some(VisibilityScope::Own),
-        (TaskAgent, ExtendedCard) => Some(VisibilityScope::Tenant),
         (_, PushCreate | PushGet | PushList | PushDelete)
         | (
             TaskOperator | TaskViewer | Auditor | TaskAgent | ServiceReader,

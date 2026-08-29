@@ -23,6 +23,22 @@ SMESH remains the internal coordination substrate: signals diffuse, decay, reinf
   deterministic receipt claims, and optional signed human ratification
 - HMAC sealing and read-path validation for accepted completion receipts; SQLite mode persists the
   sealing key with the task ledger so receipts remain verifiable after restart
+- Versioned artifact manifests, exact plaintext SHA-256 digests, fixed 4 MiB chunks, manifest-only
+  A2A projections, envelope AES-256-GCM hooks, and a private immutable POSIX blob backend
+- PostgreSQL revision 5 catalog for task-bound opaque artifact references, provenance, promotion,
+  read leases, legal holds, key-generation audits, tombstones, and fenced GC jobs
+
+The production artifact path requires PostgreSQL metadata authority, an owner-private absolute POSIX
+root, and an explicit key generation selected by the runtime. With those settings, receiver output is
+staged, transactionally registered with the fenced receiver completion, promoted by bounded workers,
+and served only through authenticated GET/HEAD resolution. Startup fails closed for incomplete restore
+journals and invalid catalog/manifest/object relationships. SQLite remains the local task-ledger
+backend and does not claim external-artifact production parity. See
+[`docs/ARTIFACT_RUNBOOK.md`](docs/ARTIFACT_RUNBOOK.md).
+
+Physical backup/restore supports a sealed zero-object inventory, rejects every non-empty target
+authority table, authenticates all ciphertext before metadata import, and makes `clonePolicy` explicit.
+Sealed-backup key dependencies are enforced on live reload and restart until release/expiry.
 
 ## Architecture
 

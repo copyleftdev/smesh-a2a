@@ -6,8 +6,8 @@
 )]
 
 use std::{
-    collections::VecDeque,
-    fmt,
+    collections::{BTreeSet, VecDeque},
+    fmt::{self, Write as _},
     future::Future,
     pin::Pin,
     str::FromStr,
@@ -33,17 +33,19 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use url::Url;
 
 use crate::{
-    AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition,
+    AdmissionOutcome, AdmissionRecord, ArtifactKeyring, ArtifactMigrationPlan,
+    ArtifactMigrationPlanFile, ArtifactStoreConfig, AtomicRecordCounts, AttemptDisposition,
     AuthorityCapabilities, AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown,
     AuthorizationAuditInput, AuthorizationAuditParts, AuthorizationAuditSink,
     AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead, CancellationAuthority,
     CancellationOutcome, ChangeObservation, ChangeObserver, DurableDispatchEnvelope,
     DurableReceiverResult, DurableReceiverTermination, ExecutionReservation, LeaseRenewalOutcome,
-    MeshEvent, MeshRequest, OutboxAuthority, OutboxLease, OwnedTaskScope, QuotaLease,
-    QuotaLeaseAuthority, QuotaReservationInput, ReceiverAdmission, ReceiverAuthority,
-    ReceiverLease, SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor, TaskAdmission,
-    TaskEventBatch, TaskLifecycle, TranscriptAuthority, TransitionOutcome, VisibilityScope,
-    authorized_message_identity, canonical_send_message_digest_v2, content_digest,
+    MeshEvent, MeshRequest, OutboxAuthority, OutboxLease, OwnedTaskScope, PosixArtifactBlobStore,
+    QuotaLease, QuotaLeaseAuthority, QuotaReservationInput, ReceiverAdmission, ReceiverAuthority,
+    ReceiverLease, ReloadingArtifactKeyring, SendMessageAdmission, StreamTranscriptBatch,
+    SubscriptionCursor, TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority,
+    TransitionOutcome, VisibilityScope, authorized_message_identity,
+    canonical_send_message_digest_v2, content_digest,
 };
 
 const MIGRATION_SQL: &str = include_str!("../migrations/postgres/0001_authority_schema_v6.sql");
@@ -57,6 +59,9 @@ const RECEIVER_FENCE_MIGRATION_NAME: &str = "0003_receiver_sender_fence";
 const DISTRIBUTED_QUOTA_MIGRATION_SQL: &str =
     include_str!("../migrations/postgres/0004_distributed_quota_authority.sql");
 const DISTRIBUTED_QUOTA_MIGRATION_NAME: &str = "0004_distributed_quota_authority";
+const ARTIFACT_MIGRATION_SQL: &str =
+    include_str!("../migrations/postgres/0005_artifact_authority.sql");
+const ARTIFACT_MIGRATION_NAME: &str = "0005_artifact_authority";
 const LOGICAL_SCHEMA_VERSION: i64 = 6;
 const MAX_CONFIG_BYTES: usize = 4096;
 const PAGE_TOKEN_VERSION: i64 = 1;
@@ -79,9 +84,54 @@ pub enum PostgresTransactionTestFault {
     NonRetryable,
     AmbiguousCommit,
 }
-const EXPECTED_TABLES: &[&str] = &[
+
+/// One-shot, loopback-test-only failures inside receiver artifact publication.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactPublicationTestFault {
+    BeforeContentObject,
+    AfterContentObject,
+    BeforeChunkBatch,
+    AfterChunkBatch,
+    BeforeManifest,
+    AfterManifest,
+    BeforeProvenanceBatch,
+    AfterProvenanceBatch,
+    BeforeReference,
+    AfterReference,
+    BeforeUploadIntent,
+    AfterUploadIntent,
+    BeforeReceiverEffect,
+    AfterReceiverEffect,
+    BeforeReceiverFrames,
+    AfterReceiverFrames,
+    BeforeReceiverCompletion,
+    AfterReceiverCompletion,
+}
+pub(crate) const EXPECTED_TABLES: &[&str] = &[
+    "artifact_backup_inventory",
+    "artifact_backup_jobs",
+    "artifact_backup_key_dependencies",
+    "artifact_backup_leases",
+    "artifact_chunks",
+    "artifact_corruption_audits",
+    "artifact_gc_jobs",
+    "artifact_key_audits",
+    "artifact_key_generations",
+    "artifact_key_rotation_plans",
+    "artifact_manifests",
+    "artifact_migration_plans",
+    "artifact_orphan_audits",
+    "artifact_orphan_candidates",
+    "artifact_read_leases",
+    "artifact_reencryption_jobs",
+    "artifact_references",
+    "artifact_restore_jobs",
+    "artifact_retention_holds",
+    "artifact_tombstones",
     "authorization_decisions",
     "cancellation_intents",
+    "content_objects",
     "idempotency_records",
     "list_page_tokens",
     "list_snapshot_entries",
@@ -90,6 +140,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "outbox",
     "outbox_attempts",
     "outbox_tenant_scheduler",
+    "provenance_edges",
     "quota_allocations",
     "quota_buckets",
     "quota_denial_audits",
@@ -112,10 +163,30 @@ const EXPECTED_TABLES: &[&str] = &[
     "stream_transcripts",
     "task_events",
     "tasks",
+    "upload_intents",
 ];
 const TENANT_TABLES: &[&str] = &[
+    "artifact_backup_inventory",
+    "artifact_backup_jobs",
+    "artifact_backup_key_dependencies",
+    "artifact_backup_leases",
+    "artifact_chunks",
+    "artifact_corruption_audits",
+    "artifact_gc_jobs",
+    "artifact_key_audits",
+    "artifact_key_generations",
+    "artifact_key_rotation_plans",
+    "artifact_manifests",
+    "artifact_migration_plans",
+    "artifact_read_leases",
+    "artifact_reencryption_jobs",
+    "artifact_references",
+    "artifact_restore_jobs",
+    "artifact_retention_holds",
+    "artifact_tombstones",
     "authorization_decisions",
     "cancellation_intents",
+    "content_objects",
     "idempotency_records",
     "list_page_tokens",
     "list_snapshot_entries",
@@ -124,6 +195,7 @@ const TENANT_TABLES: &[&str] = &[
     "outbox",
     "outbox_attempts",
     "outbox_tenant_scheduler",
+    "provenance_edges",
     "quota_allocations",
     "quota_buckets",
     "quota_denial_audits",
@@ -143,13 +215,31 @@ const TENANT_TABLES: &[&str] = &[
     "stream_transcripts",
     "task_events",
     "tasks",
+    "upload_intents",
 ];
 const EXPECTED_CUSTOM_INDEXES: &[&str] = &[
+    "artifact_backup_jobs_active",
+    "artifact_backup_leases_active",
+    "artifact_gc_jobs_due",
+    "artifact_gc_jobs_one_active",
+    "artifact_manifests_object",
+    "artifact_manifests_resolve",
+    "artifact_migration_checkpoint",
+    "artifact_migration_one_active",
+    "artifact_orphan_candidates_due",
+    "artifact_read_leases_active",
+    "artifact_reencryption_due",
+    "artifact_references_gc",
+    "artifact_references_resolve",
+    "artifact_restore_one_enabled_identity",
+    "artifact_retention_holds_active",
     "authorization_decisions_actor_time",
     "authorization_decisions_resource_time",
     "authorization_decisions_tenant_time",
     "cancellation_intents_dispatch_requested",
     "cancellation_intents_task",
+    "content_objects_dedupe",
+    "content_objects_gc_due",
     "idempotency_records_task",
     "list_page_tokens_snapshot",
     "list_snapshots_expiry",
@@ -158,6 +248,7 @@ const EXPECTED_CUSTOM_INDEXES: &[&str] = &[
     "outbox_pending_tenant_due",
     "outbox_task_state",
     "outbox_tenant_scheduler_eligible",
+    "provenance_edges_parent",
     "quota_allocations_task_active",
     "quota_buckets_scope_lookup",
     "quota_denial_audits_expiry",
@@ -181,6 +272,7 @@ const EXPECTED_CUSTOM_INDEXES: &[&str] = &[
     "tasks_tenant_owner_time_v6",
     "tasks_tenant_state_time_v6",
     "tasks_tenant_time_v6",
+    "upload_intents_due",
 ];
 
 #[derive(Clone)]
@@ -197,7 +289,11 @@ pub struct PostgresStoreConfig {
     quota_policy: Option<Arc<crate::QuotaPolicy>>,
     quota_reconciliation_plan: Option<Arc<crate::QuotaReconciliationPlan>>,
     max_tasks: usize,
+    artifact_store: Option<Arc<ArtifactStoreConfig>>,
+    artifact_migration_plan: Option<Arc<ArtifactMigrationPlan>>,
+    artifact_migration_plan_file: Option<Arc<ArtifactMigrationPlanFile>>,
     transaction_test_faults: Arc<Mutex<VecDeque<PostgresTransactionTestFault>>>,
+    artifact_publication_test_fault: Arc<Mutex<Option<ArtifactPublicationTestFault>>>,
     receiver_renewal_test_probe: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     test_cleanup: Option<Arc<PostgresTestCleanup>>,
 }
@@ -239,6 +335,15 @@ impl fmt::Debug for PostgresStoreConfig {
             .field("connect_timeout", &self.connect_timeout)
             .field("acquire_timeout", &self.acquire_timeout)
             .field("max_tasks", &self.max_tasks)
+            .field("artifact_store_configured", &self.artifact_store.is_some())
+            .field(
+                "artifact_migration_plan_configured",
+                &self.artifact_migration_plan.is_some(),
+            )
+            .field(
+                "artifact_migration_plan_file_configured",
+                &self.artifact_migration_plan_file.is_some(),
+            )
             .field("trust_injected_time", &self.trust_injected_time)
             .field("quota_enforcement", &self.quota_enforcement)
             .field("quota_policy_configured", &self.quota_policy.is_some())
@@ -257,6 +362,13 @@ impl fmt::Debug for PostgresStoreConfig {
                     .transaction_test_faults
                     .lock()
                     .map_or(0, |faults| faults.len()),
+            )
+            .field(
+                "artifact_publication_test_fault_enabled",
+                &self
+                    .artifact_publication_test_fault
+                    .lock()
+                    .is_ok_and(|fault| fault.is_some()),
             )
             .field(
                 "receiver_renewal_test_probe_enabled",
@@ -306,7 +418,11 @@ impl PostgresStoreConfig {
             quota_policy: None,
             quota_reconciliation_plan: None,
             max_tasks: 1024,
+            artifact_store: None,
+            artifact_migration_plan: None,
+            artifact_migration_plan_file: None,
             transaction_test_faults: Arc::new(Mutex::new(VecDeque::new())),
+            artifact_publication_test_fault: Arc::new(Mutex::new(None)),
             receiver_renewal_test_probe: None,
             test_cleanup: None,
         })
@@ -363,6 +479,31 @@ impl PostgresStoreConfig {
         Ok(self)
     }
 
+    /// Bind strict artifact policy. Key material and the POSIX root are
+    /// preflighted before any PostgreSQL connection is acquired.
+    #[must_use]
+    pub fn with_artifact_store(mut self, config: ArtifactStoreConfig) -> Self {
+        self.artifact_store = Some(Arc::new(config));
+        self
+    }
+
+    /// Bind the exact operator-approved inline migration. Startup still fails
+    /// closed until this plan has been completed by the offline operator.
+    #[must_use]
+    pub fn with_artifact_migration_plan(mut self, plan: ArtifactMigrationPlan) -> Self {
+        self.artifact_migration_plan = Some(Arc::new(plan));
+        self
+    }
+
+    /// Bind the complete private plan file, including source schema and store
+    /// identity, so startup can verify the exact completed journal.
+    #[must_use]
+    pub fn with_artifact_migration_plan_file(mut self, plan: ArtifactMigrationPlanFile) -> Self {
+        self.artifact_migration_plan = Some(Arc::new(plan.plan().clone()));
+        self.artifact_migration_plan_file = Some(Arc::new(plan));
+        self
+    }
+
     /// Require server-owned quota intent on every authorized quota-bearing mutation.
     #[must_use]
     pub fn with_quota_enforcement(mut self, enabled: bool) -> Self {
@@ -410,6 +551,17 @@ impl PostgresStoreConfig {
         faults: impl IntoIterator<Item = PostgresTransactionTestFault>,
     ) -> Self {
         self.transaction_test_faults = Arc::new(Mutex::new(faults.into_iter().collect()));
+        self
+    }
+
+    /// Installs one receiver-publication checkpoint fault. It is consumed when hit.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_artifact_publication_test_fault(
+        mut self,
+        fault: ArtifactPublicationTestFault,
+    ) -> Self {
+        self.artifact_publication_test_fault = Arc::new(Mutex::new(Some(fault)));
         self
     }
 
@@ -463,6 +615,26 @@ pub enum PostgresStoreError {
     Unavailable,
     #[error("quota policy reconciliation is required")]
     ReconciliationRequired,
+    #[error("artifact restore is incomplete; gateway startup is refused")]
+    ArtifactRestoreIncomplete,
+    #[error("populated inline artifact migration is required")]
+    ArtifactMigrationRequired,
+    #[error("artifact migration plan does not match the source authority")]
+    ArtifactMigrationPlanMismatch,
+    #[error("artifact migration is fenced by another operator or active work")]
+    ArtifactMigrationBusy,
+    #[error("artifact migration source is corrupt or unsupported")]
+    ArtifactMigrationInvalidSource,
+    #[error("artifact restore target is not empty")]
+    ArtifactRestoreTargetNotEmpty,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArtifactMigrationOutcome {
+    pub migrated_artifacts: u64,
+    pub rewritten_rows: u64,
+    pub completed: bool,
+    pub completion_seal: Option<String>,
 }
 
 #[derive(Clone)]
@@ -478,21 +650,1050 @@ pub struct PostgresTaskStore {
     quota_enforcement: bool,
     quota_policy: Option<Arc<crate::QuotaPolicy>>,
     transaction_test_faults: Arc<Mutex<VecDeque<PostgresTransactionTestFault>>>,
+    artifact_publication_test_fault: Arc<Mutex<Option<ArtifactPublicationTestFault>>>,
     transaction_attempts: Arc<AtomicUsize>,
+    artifact_blob_reads: Arc<AtomicUsize>,
     receiver_renewal_test_probe: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    artifact_store: Option<Arc<PosixArtifactBlobStore>>,
+    artifact_keyring: Option<Arc<ReloadingArtifactKeyring>>,
+    artifact_runtime_limits: crate::ArtifactRuntimeLimits,
     _test_cleanup: Option<Arc<PostgresTestCleanup>>,
 }
 
+#[async_trait]
+impl crate::ArtifactAuthority for PostgresTaskStore {
+    fn artifact_capabilities(&self) -> crate::ArtifactCapabilities {
+        let enabled = self.artifact_store.is_some();
+        crate::ArtifactCapabilities {
+            publication: enabled,
+            promotion: enabled,
+            resolution: enabled,
+            retention_gc: enabled,
+        }
+    }
+
+    fn artifact_runtime_limits(&self) -> crate::ArtifactRuntimeLimits {
+        self.artifact_runtime_limits
+    }
+
+    async fn stage_artifact(
+        &self,
+        registration: crate::ArtifactStageRegistration,
+        plaintext: Vec<u8>,
+    ) -> Result<crate::ArtifactStageRegistration, A2AError> {
+        let store = self.artifact_store.clone().ok_or_else(|| {
+            A2AError::unsupported_operation("artifact publication is unsupported")
+        })?;
+        let staged =
+            tokio::task::spawn_blocking(move || store.stage_registration(registration, &plaintext))
+                .await
+                .map_err(|_| A2AError::internal("artifact staging worker failed"))?
+                .map_err(|_| A2AError::invalid_request("artifact staging failed"))?;
+        crate::artifact_production_checkpoint("publication_stage_before_receiver_transaction");
+        Ok(staged)
+    }
+
+    async fn register_artifact(
+        &self,
+        registration: &crate::ArtifactStageRegistration,
+        now: i64,
+    ) -> Result<(), A2AError> {
+        if self.artifact_store.is_none() {
+            return Err(A2AError::unsupported_operation(
+                "artifact publication is unsupported",
+            ));
+        }
+        let r = registration.clone();
+        self.run_retryable_transaction(&r.tenant_scope.clone(), None, |store, tx| {
+            let r = r.clone();
+            Box::pin(async move {
+                let fence = store.q("SELECT pg_advisory_xact_lock(hashtextextended($1,0))");
+                tx.execute(&fence, &[&r.stage_locator]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact stage fence failed")))?;
+                let claimed = store.q("SELECT EXISTS(SELECT 1 FROM __S__.artifact_orphan_candidates WHERE stage_locator=$1)");
+                if tx.query_one(&claimed,&[&r.stage_locator]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact stage ownership lookup failed")))?.get::<_,bool>(0) {
+                    return Err(A2AError::invalid_request("artifact stage is owned by orphan cleanup"));
+                }
+                let now = store.effective_now(tx, now).await?;
+                if r.task_revision == 0 || r.policy_revision == 0 || r.created_at > r.retain_until || r.ciphertext_length < 16 {
+                    return Err(A2AError::invalid_params("invalid artifact registration"));
+                }
+                let key = store.q("INSERT INTO __S__.artifact_key_generations(tenant_scope,encryption_domain,key_generation,state,created_at) VALUES($1,$2,$3,'active',$4) ON CONFLICT DO NOTHING");
+                tx.execute(&key, &[&r.tenant_scope,&r.encryption_domain,&r.key_generation,&now]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact key registration failed")))?;
+                let nonce = r.nonce.to_vec();
+                let object = store.q("INSERT INTO __S__.content_objects(tenant_scope,owner_account_id,object_id,content_digest,classification,encryption_domain,key_generation,plaintext_length,ciphertext_length,ciphertext_digest,backend_locator,nonce,state,reference_count,retain_until,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'staged',0,$13,$14) ON CONFLICT DO NOTHING");
+                let object_inserted=tx.execute(&object,&[&r.tenant_scope,&r.owner_account_id,&r.object_id,&r.content_digest,&r.classification,&r.encryption_domain,&r.key_generation,&i64::try_from(r.plaintext_length).unwrap_or(i64::MAX),&i64::try_from(r.ciphertext_length).unwrap_or(i64::MAX),&r.ciphertext_digest,&r.final_locator,&nonce,&r.retain_until,&r.created_at]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact object registration failed")))? == 1;
+                let verify = store.q("SELECT owner_account_id,content_digest,classification,encryption_domain,plaintext_length FROM __S__.content_objects WHERE tenant_scope=$1 AND object_id=$2");
+                let row=tx.query_one(&verify,&[&r.tenant_scope,&r.object_id]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact object verification failed")))?;
+                if row.get::<_,String>(0)!=r.owner_account_id || row.get::<_,String>(1)!=r.content_digest || row.get::<_,String>(2)!=r.classification || row.get::<_,String>(3)!=r.encryption_domain || row.get::<_,i64>(4)!=i64::try_from(r.plaintext_length).unwrap_or(i64::MAX) { return Err(A2AError::invalid_request("artifact registration conflicts with immutable state")); }
+                let manifest=store.q("INSERT INTO __S__.artifact_manifests(tenant_scope,artifact_id,manifest_digest,object_id,schema_version,canonical_json,owner_account_id,task_id,context_id,message_id,dispatch_id,media_type,plaintext_length,classification,encryption_domain,policy_id,policy_revision,policy_digest,created_at,retain_until) VALUES($1,$2,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) ON CONFLICT DO NOTHING");
+                tx.execute(&manifest,&[&r.tenant_scope,&r.artifact_id,&r.manifest_digest,&r.object_id,&r.canonical_manifest_json,&r.owner_account_id,&r.task_id,&r.context_id,&r.message_id,&r.dispatch_id,&r.media_type,&i64::try_from(r.plaintext_length).unwrap_or(i64::MAX),&r.classification,&r.encryption_domain,&r.policy_id,&i64::try_from(r.policy_revision).unwrap_or(i64::MAX),&r.policy_digest,&r.created_at,&r.retain_until]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact manifest registration failed")))?;
+                let chunk_sql=store.q("INSERT INTO __S__.artifact_chunks(tenant_scope,artifact_id,ordinal,byte_offset,plaintext_length,content_digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING");
+                for chunk in &r.chunks { tx.execute(&chunk_sql,&[&r.tenant_scope,&r.artifact_id,&i32::try_from(chunk.ordinal).unwrap_or(i32::MAX),&i64::try_from(chunk.byte_offset).unwrap_or(i64::MAX),&i64::try_from(chunk.plaintext_length).unwrap_or(i64::MAX),&chunk.content_digest]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact chunk registration failed")))?; }
+                let provenance_sql=store.q("INSERT INTO __S__.provenance_edges(tenant_scope,child_artifact_id,ordinal,parent_artifact_id,relation) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING");
+                for edge in &r.provenance { tx.execute(&provenance_sql,&[&r.tenant_scope,&r.artifact_id,&i32::try_from(edge.ordinal).unwrap_or(i32::MAX),&edge.parent_artifact_id,&edge.relation]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact provenance registration failed")))?; }
+                let reference=store.q("INSERT INTO __S__.artifact_references(tenant_scope,reference_id,artifact_id,task_id,context_id,owner_account_id,task_revision,state,retain_until,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,'active',$8,$9) ON CONFLICT DO NOTHING RETURNING reference_id");
+                let reference_inserted=tx.query_opt(&reference,&[&r.tenant_scope,&r.reference_id,&r.artifact_id,&r.task_id,&r.context_id,&r.owner_account_id,&i64::try_from(r.task_revision).unwrap_or(i64::MAX),&r.retain_until,&r.created_at]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact reference registration failed")))?.is_some();
+                if reference_inserted { let increment=store.q("UPDATE __S__.content_objects o SET reference_count=o.reference_count+1 WHERE o.tenant_scope=$1 AND o.object_id=$2"); tx.execute(&increment,&[&r.tenant_scope,&r.object_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact reference accounting failed")))?; }
+                if object_inserted { let upload=store.q("INSERT INTO __S__.upload_intents(tenant_scope,upload_id,artifact_id,object_id,state,stage_locator,final_locator,ciphertext_digest,ciphertext_length,lease_epoch,created_at,updated_at) VALUES($1,$2,$3,$4,'committed',$5,$6,$7,$8,1,$9,$9) ON CONFLICT DO NOTHING");
+                tx.execute(&upload,&[&r.tenant_scope,&r.upload_id,&r.artifact_id,&r.object_id,&r.stage_locator,&r.final_locator,&r.ciphertext_digest,&i64::try_from(r.ciphertext_length).unwrap_or(i64::MAX),&now]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact upload registration failed")))?; }
+                Ok(())
+            })
+        }).await?;
+        crate::artifact_production_checkpoint("receiver_commit_before_physical_promotion");
+        Ok(())
+    }
+
+    async fn claim_artifact_promotion(
+        &self,
+        lease_owner: &str,
+        lease_duration: i64,
+        batch: usize,
+    ) -> Result<Vec<crate::ArtifactPromotionClaim>, A2AError> {
+        if self.artifact_store.is_none() {
+            return Err(A2AError::unsupported_operation(
+                "artifact promotion is unsupported",
+            ));
+        }
+        if lease_owner.is_empty()
+            || !(10..=300_000).contains(&lease_duration)
+            || !(1..=1000).contains(&batch)
+        {
+            return Err(A2AError::invalid_params("invalid artifact promotion lease"));
+        }
+        let token = content_digest(&rand::random::<[u8; 24]>());
+        let batch = i32::try_from(batch)
+            .map_err(|_| A2AError::invalid_params("invalid artifact promotion batch"))?;
+        let client = self.connection().await?;
+        let sql = self.q("SELECT * FROM __S__.claim_artifact_upload($1,$2,$3,$4)");
+        client
+            .query(&sql, &[&lease_owner, &token, &lease_duration, &batch])
+            .await
+            .map_err(|_| A2AError::internal("artifact promotion claim failed"))?
+            .into_iter()
+            .map(|row| {
+                Ok(crate::ArtifactPromotionClaim {
+                    tenant_scope: row.get(0),
+                    upload_id: row.get(1),
+                    artifact_id: row.get(2),
+                    object_id: row.get(3),
+                    stage_locator: row.get(4),
+                    final_locator: row.get(5),
+                    ciphertext_digest: row.get(6),
+                    ciphertext_length: u64::try_from(row.get::<_, i64>(7))
+                        .map_err(|_| A2AError::internal("artifact promotion row corrupt"))?,
+                    lease_owner: lease_owner.to_owned(),
+                    lease_token: row.get(8),
+                    lease_epoch: u64::try_from(row.get::<_, i64>(9))
+                        .map_err(|_| A2AError::internal("artifact promotion row corrupt"))?,
+                    lease_until: row.get(10),
+                })
+            })
+            .collect()
+    }
+
+    async fn commit_artifact_promotion(
+        &self,
+        claim: &crate::ArtifactPromotionClaim,
+    ) -> Result<bool, A2AError> {
+        let blobs = self
+            .artifact_store
+            .clone()
+            .ok_or_else(|| A2AError::unsupported_operation("artifact promotion is unsupported"))?;
+        let copy = claim.clone();
+        tokio::task::spawn_blocking(move || blobs.promote_claim(&copy))
+            .await
+            .map_err(|_| A2AError::internal("artifact promoter worker failed"))?
+            .map_err(|_| A2AError::internal("artifact promotion integrity failed"))?;
+        crate::artifact_production_checkpoint("physical_promotion_before_upload_ack");
+        let tenant = claim.tenant_scope.clone();
+        let c = claim.clone();
+        self.run_retryable_transaction(&tenant,None,|store,tx| { let c=c.clone(); Box::pin(async move {
+            let epoch=i64::try_from(c.lease_epoch).unwrap_or(i64::MAX);
+            let q=store.q("UPDATE __S__.upload_intents SET state='available',lease_token=NULL,lease_until=NULL,updated_at=__S__.db_millis() WHERE tenant_scope=$1 AND upload_id=$2 AND state='promoting' AND lease_token=$3 AND lease_epoch=$4 AND lease_until>__S__.db_millis()");
+            if tx.execute(&q,&[&c.tenant_scope,&c.upload_id,&c.lease_token,&epoch]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact promotion commit failed")))? != 1 { return Ok(false); }
+            let o=store.q("UPDATE __S__.content_objects SET state='available',available_at=__S__.db_millis() WHERE tenant_scope=$1 AND object_id=$2 AND state='staged'");
+            tx.execute(&o,&[&c.tenant_scope,&c.object_id]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact availability commit failed")))?;
+            Ok(true)
+        })}).await
+    }
+
+    async fn fail_artifact_promotion(
+        &self,
+        claim: &crate::ArtifactPromotionClaim,
+        error_digest: &str,
+    ) -> Result<bool, A2AError> {
+        let tenant = claim.tenant_scope.clone();
+        let c = claim.clone();
+        let error = error_digest.to_owned();
+        self.run_retryable_transaction(&tenant,None,|store,tx| { let c=c.clone(); let error=error.clone(); Box::pin(async move {
+            let q=store.q("UPDATE __S__.upload_intents SET state='failed',last_error_digest=$1,lease_token=NULL,lease_until=NULL,updated_at=__S__.db_millis() WHERE tenant_scope=$2 AND upload_id=$3 AND state='promoting' AND lease_token=$4 AND lease_epoch=$5");
+            tx.execute(&q,&[&error,&c.tenant_scope,&c.upload_id,&c.lease_token,&i64::try_from(c.lease_epoch).unwrap_or(i64::MAX)]).await.map(|n|n==1).map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact promotion failure commit failed")))
+        })}).await
+    }
+
+    async fn begin_artifact_resolution(
+        &self,
+        scope: &OwnedTaskScope,
+        artifact_id: &str,
+        task_id: Option<&str>,
+        owner_digest: &str,
+        lease_duration: i64,
+        quota_intent: Option<&crate::QuotaIntent>,
+        audit: AuthorizationAuditInput,
+        requested_now: i64,
+    ) -> Result<Option<crate::ArtifactReadLease>, A2AError> {
+        if self.artifact_store.is_none() {
+            return Err(A2AError::unsupported_operation(
+                "artifact resolution is unsupported",
+            ));
+        }
+        if !(10..=300_000).contains(&lease_duration)
+            || audit.tenant_scope() != scope.tenant_scope()
+            || audit.actor_account_id() != scope.owner_account_id()
+        {
+            return Err(A2AError::invalid_params("invalid artifact read preflight"));
+        }
+        if self.quota_enforcement && quota_intent.is_none() {
+            return Err(crate::quota::quota_authority_unavailable());
+        }
+        let scope = scope.clone();
+        let tenant = scope.tenant_scope().to_owned();
+        let account = scope.owner_account_id().to_owned();
+        let artifact_id = artifact_id.to_owned();
+        let task_id = task_id.map(str::to_owned);
+        let owner_digest = owner_digest.to_owned();
+        let request_intent = quota_intent.cloned();
+        let denial_intent = request_intent.clone();
+        let egress_denial_intent = Arc::new(Mutex::new(None::<crate::QuotaIntent>));
+        let transaction_egress_intent = Arc::clone(&egress_denial_intent);
+        let result = self.run_retryable_transaction(&tenant,Some(&account),|store,tx|{
+            let scope=scope.clone();
+            let artifact_id=artifact_id.clone();
+            let task_id=task_id.clone();
+            let owner_digest=owner_digest.clone();
+            let request_intent=request_intent.clone();
+            let transaction_egress_intent=Arc::clone(&transaction_egress_intent);
+            let audit=audit.clone();
+            Box::pin(async move{
+                let now=store.effective_now(tx,requested_now).await?;
+                if let Some(intent)=request_intent.as_ref() {
+                    if intent.operation()!=crate::QuotaOperation::TaskGet {
+                        return Err(A2AError::invalid_params("artifact request quota intent mismatch"));
+                    }
+                    store.apply_quota_intent(tx,intent,scope.tenant_scope(),scope.owner_account_id(),None,now,true,None).await?;
+                }
+                let own=matches!(scope.visibility(),VisibilityScope::Own);
+                let q=store.q("SELECT m.owner_account_id,m.task_id,m.media_type,o.content_digest,m.manifest_digest,o.plaintext_length,o.classification,o.encryption_domain,o.ciphertext_digest,o.ciphertext_length,o.backend_locator,o.nonce,o.key_generation,m.canonical_json,o.state FROM __S__.artifact_references r JOIN __S__.artifact_manifests m USING(tenant_scope,artifact_id) JOIN __S__.content_objects o USING(tenant_scope,object_id) WHERE r.tenant_scope=$1 AND r.artifact_id=$2 AND r.state='active' AND o.state IN ('available','quarantined') AND o.retain_until>=$6 AND ($3::text IS NULL OR r.task_id=$3) AND (NOT $4 OR r.owner_account_id=$5) FOR UPDATE OF o");
+                let row=tx.query_opt(&q,&[&scope.tenant_scope(),&artifact_id,&task_id.as_deref(),&own,&scope.owner_account_id(),&now]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact resolution lookup failed")))?;
+                let Some(row)=row else {
+                    store.insert_audit(tx,audit.decided(AuthorizationDecisionEffect::Deny,"not_found_or_forbidden",None)).await?;
+                    return Ok(None);
+                };
+                let plaintext_i64:i64=row.get(5);
+                let plaintext_length=u64::try_from(plaintext_i64).map_err(|_|A2AError::internal("artifact metadata corrupt"))?;
+                if let (Some(policy),Some(intent))=(store.quota_policy.as_ref(),request_intent.as_ref()) {
+                    let subject=crate::QuotaSubject::new(scope.tenant_scope(),scope.owner_account_id(),intent.principal_scope.to_string()).map_err(|_|crate::quota::quota_authority_unavailable())?;
+                    let egress=policy.egress_intent(&subject,&intent.semantic_id,plaintext_length.max(1),1).map_err(|_|crate::quota::quota_authority_unavailable())?;
+                    *transaction_egress_intent.lock().map_err(|_|crate::quota::quota_authority_unavailable())?=Some(egress.clone());
+                    store.apply_quota_intent(tx,&egress,scope.tenant_scope(),scope.owner_account_id(),None,now,true,None).await?;
+                }
+                if row.get::<_, &str>(14) == "quarantined" {
+                    store.insert_audit(tx,audit.decided(AuthorizationDecisionEffect::Deny,"artifact_quarantined",Some(row.get(1)))).await?;
+                    return Err(A2AError::internal("artifact is quarantined"));
+                }
+                let lease_id=content_digest(&rand::random::<[u8;24]>());
+                let token=content_digest(&rand::random::<[u8;24]>());
+                let until=now.checked_add(lease_duration).ok_or_else(||A2AError::invalid_params("artifact lease overflow"))?;
+                let ins=store.q("INSERT INTO __S__.artifact_read_leases VALUES($1,$2,$3,1,$4,$5,'active',$6,$7)");
+                tx.execute(&ins,&[&scope.tenant_scope(),&lease_id,&artifact_id,&token,&owner_digest,&until,&now]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact read lease failed")))?;
+                store.insert_audit(tx,audit.decided(AuthorizationDecisionEffect::Allow,"authorized_task_reference",Some(row.get(1)))).await?;
+                let nonce:Vec<u8>=row.get(11);
+                let nonce:[u8;12]=nonce.try_into().map_err(|_|A2AError::internal("artifact metadata corrupt"))?;
+                Ok(Some(crate::ArtifactReadLease{tenant_scope:scope.tenant_scope().to_owned(),owner_account_id:row.get(0),task_id:row.get(1),artifact_id,media_type:row.get(2),content_digest:row.get(3),manifest_digest:row.get(4),plaintext_length,classification:row.get(6),encryption_domain:row.get(7),ciphertext_digest:row.get(8),ciphertext_length:u64::try_from(row.get::<_,i64>(9)).map_err(|_|A2AError::internal("artifact metadata corrupt"))?,backend_locator:row.get(10),nonce,key_generation:row.get(12),canonical_manifest_json:row.get(13),lease_id,lease_token:token,lease_epoch:1,lease_until:until}))
+            })
+        }).await;
+        let egress_denial_intent = egress_denial_intent
+            .lock()
+            .map_err(|_| crate::quota::quota_authority_unavailable())?
+            .clone();
+        let lease = self
+            .finalize_quota_result(
+                egress_denial_intent.as_ref().or(denial_intent.as_ref()),
+                requested_now,
+                result,
+            )
+            .await?;
+        if lease.is_some() {
+            crate::artifact_production_checkpoint("resolver_read_lease_before_blob_verify");
+        }
+        Ok(lease)
+    }
+
+    async fn read_artifact_resolution(
+        &self,
+        r: &crate::ArtifactReadLease,
+    ) -> Result<Vec<u8>, A2AError> {
+        self.artifact_blob_reads.fetch_add(1, Ordering::SeqCst);
+        let blobs = self
+            .artifact_store
+            .clone()
+            .ok_or_else(|| A2AError::unsupported_operation("artifact resolution is unsupported"))?;
+        let lease = r.clone();
+        let result = tokio::task::spawn_blocking(move || blobs.read_resolution(&lease))
+            .await
+            .map_err(|_| A2AError::internal("artifact resolver worker failed"))?;
+        if let Ok(bytes) = result {
+            Ok(bytes)
+        } else {
+            let tenant = r.tenant_scope.clone();
+            let artifact_id = r.artifact_id.clone();
+            let detection_digest = content_digest(
+                format!(
+                    "smesh-artifact-corruption/v1\0{}\0{}\0{}",
+                    tenant, artifact_id, r.ciphertext_digest
+                )
+                .as_bytes(),
+            );
+            let audit_id = format!("corruption-{}", &detection_digest[7..39]);
+            self.run_retryable_transaction(&tenant.clone(), None, |store, tx| {
+                    let tenant = tenant.clone();
+                    let artifact_id = artifact_id.clone();
+                    let detection_digest = detection_digest.clone();
+                    let audit_id = audit_id.clone();
+                    Box::pin(async move {
+                        let sql = store.q("WITH target AS (SELECT object_id FROM __S__.artifact_manifests WHERE tenant_scope=$1 AND artifact_id=$2), quarantined AS (UPDATE __S__.content_objects o SET state='quarantined' FROM target t WHERE o.tenant_scope=$1 AND o.object_id=t.object_id AND o.state<>'deleted' RETURNING o.object_id) INSERT INTO __S__.artifact_corruption_audits(tenant_scope,audit_id,object_id,artifact_id,detection_digest,detected_at) SELECT $1,$3,q.object_id,$2,$4,__S__.db_millis() FROM quarantined q ON CONFLICT DO NOTHING");
+                        tx.execute(&sql, &[&tenant, &artifact_id, &audit_id, &detection_digest])
+                            .await
+                            .map_err(|e| Self::transaction_body_error(&e, A2AError::internal("artifact corruption quarantine failed")))?;
+                        Ok(())
+                    })
+            }).await?;
+            Err(A2AError::internal("artifact integrity verification failed"))
+        }
+    }
+    async fn finish_artifact_resolution(
+        &self,
+        r: &crate::ArtifactReadLease,
+        _: u64,
+        _: bool,
+    ) -> Result<bool, A2AError> {
+        let tenant = r.tenant_scope.clone();
+        let r = r.clone();
+        self.run_retryable_transaction(&tenant,None,|store,tx|{let r=r.clone();Box::pin(async move{let q=store.q("UPDATE __S__.artifact_read_leases SET state='released' WHERE tenant_scope=$1 AND lease_id=$2 AND lease_token=$3 AND lease_epoch=$4 AND state IN ('active','released')");tx.execute(&q,&[&r.tenant_scope,&r.lease_id,&r.lease_token,&i64::try_from(r.lease_epoch).unwrap_or(i64::MAX)]).await.map(|n|n==1).map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact lease finish failed")))})}).await
+    }
+    async fn place_artifact_hold(
+        &self,
+        h: &crate::ArtifactHold,
+        _now: i64,
+    ) -> Result<(), A2AError> {
+        let tenant = h.tenant_scope.clone();
+        let h = h.clone();
+        self.run_retryable_transaction(&tenant,None,|store,tx|{let h=h.clone();Box::pin(async move{
+            let lock=store.q("SELECT o.tombstone_generation FROM __S__.artifact_manifests m JOIN __S__.content_objects o USING(tenant_scope,object_id) WHERE m.tenant_scope=$1 AND m.artifact_id=$2 AND o.state='available' AND o.retain_until>=__S__.db_millis() FOR UPDATE OF o");
+            if tx.query_opt(&lock,&[&h.tenant_scope,&h.artifact_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact hold fence failed")))?.is_none(){return Err(A2AError::invalid_params("artifact hold object unavailable"));}
+            let q=store.q("INSERT INTO __S__.artifact_retention_holds VALUES($1,$2,$3,$4,$5,'active',__S__.db_millis(),$6,NULL)");
+            tx.execute(&q,&[&h.tenant_scope,&h.hold_id,&h.artifact_id,&h.actor_digest,&h.reason_digest,&h.expires_at]).await.map(|_|()).map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact hold failed")))
+        })}).await
+    }
+    async fn release_artifact_hold(
+        &self,
+        h: &crate::ArtifactHold,
+        now: i64,
+    ) -> Result<bool, A2AError> {
+        let tenant = h.tenant_scope.clone();
+        let h = h.clone();
+        self.run_retryable_transaction(&tenant,None,|store,tx|{let h=h.clone();Box::pin(async move{let q=store.q("UPDATE __S__.artifact_retention_holds SET state='released',released_at=$1 WHERE tenant_scope=$2 AND hold_id=$3 AND artifact_id=$4 AND state='active'");tx.execute(&q,&[&now,&h.tenant_scope,&h.hold_id,&h.artifact_id]).await.map(|n|n==1).map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact hold release failed")))})}).await
+    }
+    async fn release_artifact_reference(
+        &self,
+        t: &str,
+        reference: &str,
+        owner: &str,
+        task: &str,
+        artifact: &str,
+        now: i64,
+    ) -> Result<bool, A2AError> {
+        let tenant = t.to_owned();
+        let reference = reference.to_owned();
+        let owner = owner.to_owned();
+        let task = task.to_owned();
+        let artifact = artifact.to_owned();
+        self.run_retryable_transaction(&tenant.clone(),None,|store,tx|{let tenant=tenant.clone();let reference=reference.clone();let owner=owner.clone();let task=task.clone();let artifact=artifact.clone();Box::pin(async move{let q=store.q("WITH released AS (UPDATE __S__.artifact_references SET state='released',released_at=$1 WHERE tenant_scope=$2 AND reference_id=$3 AND owner_account_id=$4 AND task_id=$5 AND artifact_id=$6 AND state='active' RETURNING tenant_scope,artifact_id), changed AS (UPDATE __S__.content_objects o SET reference_count=o.reference_count-1 FROM __S__.artifact_manifests m JOIN released r USING(tenant_scope,artifact_id) WHERE o.tenant_scope=m.tenant_scope AND o.object_id=m.object_id AND o.reference_count>0 RETURNING o.object_id) SELECT count(*)::bigint FROM released");let row=tx.query_one(&q,&[&now,&tenant,&reference,&owner,&task,&artifact]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact reference release failed")))?;Ok(row.get::<_,i64>(0)==1)})}).await
+    }
+    async fn claim_artifact_gc(
+        &self,
+        lease_owner: &str,
+        lease_duration: i64,
+        batch: usize,
+    ) -> Result<Vec<crate::ArtifactGcClaim>, A2AError> {
+        if self.artifact_store.is_none() {
+            return Err(A2AError::unsupported_operation(
+                "artifact gc is unsupported",
+            ));
+        }
+        if lease_owner.is_empty()
+            || !(10..=300_000).contains(&lease_duration)
+            || !(1..=1000).contains(&batch)
+        {
+            return Err(A2AError::invalid_params("invalid artifact gc lease"));
+        }
+        let token = content_digest(&rand::random::<[u8; 24]>());
+        let batch = i32::try_from(batch)
+            .map_err(|_| A2AError::invalid_params("invalid artifact gc batch"))?;
+        let client = self.connection().await?;
+        let sql = self.q("SELECT * FROM __S__.claim_artifact_gc($1,$2,$3,$4)");
+        client
+            .query(&sql, &[&lease_owner, &token, &lease_duration, &batch])
+            .await
+            .map_err(|_| A2AError::internal("artifact gc claim failed"))?
+            .into_iter()
+            .map(|row| {
+                Ok(crate::ArtifactGcClaim {
+                    tenant_scope: row.get(0),
+                    job_id: row.get(1),
+                    object_id: row.get(2),
+                    backend_locator: row.get(3),
+                    tombstone_generation: u64::try_from(row.get::<_, i64>(4))
+                        .map_err(|_| A2AError::internal("artifact gc row corrupt"))?,
+                    lease_owner: lease_owner.to_owned(),
+                    lease_token: row.get(5),
+                    lease_epoch: u64::try_from(row.get::<_, i64>(6))
+                        .map_err(|_| A2AError::internal("artifact gc row corrupt"))?,
+                })
+            })
+            .collect()
+    }
+    async fn commit_artifact_gc(
+        &self,
+        claim: &crate::ArtifactGcClaim,
+        deletion_receipt_digest: &str,
+    ) -> Result<bool, A2AError> {
+        if !deletion_receipt_digest.starts_with("sha256:") {
+            return Err(A2AError::invalid_params(
+                "invalid artifact deletion receipt",
+            ));
+        }
+        let blobs = self
+            .artifact_store
+            .clone()
+            .ok_or_else(|| A2AError::unsupported_operation("artifact gc is unsupported"))?;
+        let locator = claim.backend_locator.clone();
+        tokio::task::spawn_blocking(move || blobs.delete_locator(&locator))
+            .await
+            .map_err(|_| A2AError::internal("artifact gc worker failed"))?
+            .map_err(|_| A2AError::internal("artifact blob deletion failed"))?;
+        crate::artifact_production_checkpoint("gc_physical_unlink_before_finalize");
+        let tenant = claim.tenant_scope.clone();
+        let c = claim.clone();
+        let receipt = deletion_receipt_digest.to_owned();
+        let committed = self.run_retryable_transaction(&tenant,None,|store,tx| { let c=c.clone(); let receipt=receipt.clone(); Box::pin(async move {
+            let epoch=i64::try_from(c.lease_epoch).unwrap_or(i64::MAX); let generation=i64::try_from(c.tombstone_generation).unwrap_or(i64::MAX);
+            let job=store.q("UPDATE __S__.artifact_gc_jobs SET state='complete',lease_owner=NULL,lease_token=NULL,lease_until=NULL WHERE tenant_scope=$1 AND job_id=$2 AND object_id=$3 AND tombstone_generation=$4 AND state='leased' AND lease_owner=$5 AND lease_token=$6 AND lease_epoch=$7 AND lease_until>__S__.db_millis()");
+            if tx.execute(&job,&[&c.tenant_scope,&c.job_id,&c.object_id,&generation,&c.lease_owner,&c.lease_token,&epoch]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact gc finalize failed")))? != 1 { return Ok(false); }
+            let object=store.q("UPDATE __S__.content_objects SET state='deleted' WHERE tenant_scope=$1 AND object_id=$2 AND tombstone_generation=$3 AND state='deleting'");
+            if tx.execute(&object,&[&c.tenant_scope,&c.object_id,&generation]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact gc object finalize failed")))? != 1 { return Err(A2AError::internal("artifact gc fence lost")); }
+            let tombstone=store.q("INSERT INTO __S__.artifact_tombstones(tenant_scope,object_id,tombstone_generation,reason_digest,locator_digest,deletion_receipt_digest,tombstoned_at,deleted_at) VALUES($1,$2,$3,$4,$5,$6,__S__.db_millis(),__S__.db_millis())");
+            tx.execute(&tombstone,&[&c.tenant_scope,&c.object_id,&generation,&content_digest(b"retention-expired"),&content_digest(c.backend_locator.as_bytes()),&receipt]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact tombstone append failed")))?;
+            Ok(true)
+        })}).await?;
+        crate::artifact_production_checkpoint("gc_finalize_before_worker_ack");
+        Ok(committed)
+    }
+    async fn fail_artifact_gc(
+        &self,
+        claim: &crate::ArtifactGcClaim,
+        error_digest: &str,
+    ) -> Result<bool, A2AError> {
+        let tenant = claim.tenant_scope.clone();
+        let c = claim.clone();
+        let error = error_digest.to_owned();
+        self.run_retryable_transaction(&tenant,None,|store,tx| { let c=c.clone(); let error=error.clone(); Box::pin(async move {
+            let epoch=i64::try_from(c.lease_epoch).unwrap_or(i64::MAX); let generation=i64::try_from(c.tombstone_generation).unwrap_or(i64::MAX);
+            let job=store.q("UPDATE __S__.artifact_gc_jobs SET state='pending',available_at=__S__.db_millis(),lease_owner=NULL,lease_token=NULL,lease_until=NULL,last_error_digest=$1 WHERE tenant_scope=$2 AND job_id=$3 AND object_id=$4 AND tombstone_generation=$5 AND state='leased' AND lease_owner=$6 AND lease_token=$7 AND lease_epoch=$8");
+            if tx.execute(&job,&[&error,&c.tenant_scope,&c.job_id,&c.object_id,&generation,&c.lease_owner,&c.lease_token,&epoch]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact gc failure commit failed")))? != 1 { return Ok(false); }
+            let object=store.q("UPDATE __S__.content_objects SET state='tombstoned' WHERE tenant_scope=$1 AND object_id=$2 AND tombstone_generation=$3 AND state='deleting'");
+            tx.execute(&object,&[&c.tenant_scope,&c.object_id,&generation]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact gc retry failed")))?;
+            Ok(true)
+        })}).await
+    }
+
+    async fn acquire_artifact_backup_lease(
+        &self,
+        tenant_scope: &str,
+        object_id: &str,
+        lease_owner: &str,
+        lease_duration: i64,
+    ) -> Result<crate::ArtifactBackupLease, A2AError> {
+        if self.artifact_store.is_none()
+            || tenant_scope.is_empty()
+            || object_id.is_empty()
+            || lease_owner.is_empty()
+            || !(10..=86_400_000).contains(&lease_duration)
+        {
+            return Err(A2AError::invalid_params("invalid artifact backup lease"));
+        }
+        let tenant = tenant_scope.to_owned();
+        let object = object_id.to_owned();
+        let owner = lease_owner.to_owned();
+        let lease_id = format!("backup-{}", content_digest(&rand::random::<[u8; 24]>()));
+        let token = content_digest(&rand::random::<[u8; 24]>());
+        self.run_retryable_transaction(&tenant.clone(), None, |store, tx| {
+            let tenant = tenant.clone(); let object = object.clone(); let owner = owner.clone();
+            let lease_id = lease_id.clone(); let token = token.clone();
+            Box::pin(async move {
+                let lock = store.q("SELECT o.tombstone_generation FROM __S__.content_objects o WHERE o.tenant_scope=$1 AND o.object_id=$2 AND o.state='available' AND o.retain_until>=__S__.db_millis() FOR UPDATE OF o");
+                if tx.query_opt(&lock,&[&tenant,&object]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact backup fence failed")))?.is_none(){return Err(A2AError::invalid_params("artifact backup object unavailable"));}
+                let q = store.q("INSERT INTO __S__.artifact_backup_leases(tenant_scope,lease_id,object_id,lease_owner,lease_epoch,lease_token,state,lease_until,created_at) VALUES($1,$2,$3,$4,1,$5,'active',__S__.db_millis()+$6,__S__.db_millis()) RETURNING lease_until");
+                let row = tx.query_opt(&q, &[&tenant,&lease_id,&object,&owner,&token,&lease_duration]).await
+                    .map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact backup lease acquire failed")))?
+                    .ok_or_else(|| A2AError::invalid_params("artifact backup object unavailable"))?;
+                Ok(crate::ArtifactBackupLease { tenant_scope: tenant, object_id: object, lease_id, lease_owner: owner, lease_token: token, lease_epoch: 1, lease_until: row.get(0) })
+            })
+        }).await
+    }
+
+    async fn renew_artifact_backup_lease(
+        &self,
+        lease: &crate::ArtifactBackupLease,
+        lease_duration: i64,
+    ) -> Result<Option<crate::ArtifactBackupLease>, A2AError> {
+        if !(10..=86_400_000).contains(&lease_duration) {
+            return Err(A2AError::invalid_params("invalid artifact backup renewal"));
+        }
+        let tenant = lease.tenant_scope.clone();
+        let prior = lease.clone();
+        let next_token = content_digest(&rand::random::<[u8; 24]>());
+        self.run_retryable_transaction(&tenant, None, |store, tx| {
+            let prior=prior.clone(); let next_token=next_token.clone();
+            Box::pin(async move {
+                let q=store.q("UPDATE __S__.artifact_backup_leases SET lease_epoch=lease_epoch+1,lease_token=$1,lease_until=__S__.db_millis()+$2 WHERE tenant_scope=$3 AND lease_id=$4 AND object_id=$5 AND lease_owner=$6 AND lease_token=$7 AND lease_epoch=$8 AND state='active' AND lease_until>__S__.db_millis() RETURNING lease_epoch,lease_until");
+                let epoch=i64::try_from(prior.lease_epoch).unwrap_or(i64::MAX);
+                let row=tx.query_opt(&q,&[&next_token,&lease_duration,&prior.tenant_scope,&prior.lease_id,&prior.object_id,&prior.lease_owner,&prior.lease_token,&epoch]).await
+                    .map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact backup lease renew failed")))?;
+                row.map(|row| Ok(crate::ArtifactBackupLease { lease_token: next_token, lease_epoch:u64::try_from(row.get::<_,i64>(0)).map_err(|_|A2AError::internal("artifact backup lease corrupt"))?, lease_until:row.get(1), ..prior })).transpose()
+            })
+        }).await
+    }
+
+    async fn release_artifact_backup_lease(
+        &self,
+        lease: &crate::ArtifactBackupLease,
+    ) -> Result<bool, A2AError> {
+        let tenant = lease.tenant_scope.clone();
+        let lease = lease.clone();
+        self.run_retryable_transaction(&tenant,None,|store,tx| { let lease=lease.clone(); Box::pin(async move {
+            let q=store.q("UPDATE __S__.artifact_backup_leases SET state='released' WHERE tenant_scope=$1 AND lease_id=$2 AND object_id=$3 AND lease_owner=$4 AND lease_token=$5 AND lease_epoch=$6 AND state='active'");
+            tx.execute(&q,&[&lease.tenant_scope,&lease.lease_id,&lease.object_id,&lease.lease_owner,&lease.lease_token,&i64::try_from(lease.lease_epoch).unwrap_or(i64::MAX)]).await
+                .map(|n|n==1).map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact backup lease release failed")))
+        })}).await
+    }
+
+    async fn scan_artifact_stage_orphans(
+        &self,
+        horizon_millis: i64,
+        batch: usize,
+    ) -> Result<crate::StageOrphanCleanup, A2AError> {
+        if !(1..=86_400_000).contains(&horizon_millis) || !(1..=1000).contains(&batch) {
+            return Err(A2AError::invalid_params("invalid artifact orphan scan"));
+        }
+        let blobs = self.artifact_store.clone().ok_or_else(|| {
+            A2AError::unsupported_operation("artifact orphan scanning is unsupported")
+        })?;
+        let mut client = self.connection().await?;
+        let now: i64 = client
+            .query_one(&self.q("SELECT __S__.db_millis()"), &[])
+            .await
+            .map_err(|_| A2AError::internal("artifact orphan clock failed"))?
+            .get(0);
+        let cutoff = std::time::UNIX_EPOCH
+            .checked_add(Duration::from_millis(
+                u64::try_from(now.saturating_sub(horizon_millis)).unwrap_or(0),
+            ))
+            .ok_or_else(|| A2AError::internal("artifact orphan horizon failed"))?;
+        let mut candidates: Vec<(String, u64)> = client
+            .query(
+                &self.q("SELECT stage_locator,ciphertext_length FROM __S__.artifact_orphan_candidates WHERE state='claimed' AND claim_until<=__S__.db_millis() ORDER BY claim_until,stage_locator LIMIT $1"),
+                &[&i64::try_from(batch).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(|_| A2AError::internal("artifact orphan recovery failed"))?
+            .into_iter()
+            .filter_map(|row| {
+                u64::try_from(row.get::<_, i64>(1))
+                    .ok()
+                    .map(|bytes| (row.get(0), bytes))
+            })
+            .collect();
+        if candidates.len() < batch {
+            let remaining = batch - candidates.len();
+            candidates.extend(
+                blobs
+                    .stage_orphan_candidates(cutoff, remaining)
+                    .map_err(|_| A2AError::internal("artifact orphan enumeration failed"))?,
+            );
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        candidates.dedup_by(|left, right| left.0 == right.0);
+        let mut result = crate::StageOrphanCleanup::default();
+        for (locator, bytes) in candidates {
+            let token = content_digest(&rand::random::<[u8; 24]>());
+            // Claim ownership durably while holding the same locator fence used
+            // by registration.  The lease permits takeover after process death.
+            // ALLOWLIST: artifact orphan claim persists before unlink.
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|_| A2AError::internal("artifact orphan claim transaction failed"))?;
+            let fence = self.q("SELECT pg_advisory_xact_lock(hashtextextended($1,0)),__S__.artifact_stage_locator_live($1)");
+            let live: bool = tx
+                .query_one(&fence, &[&locator])
+                .await
+                .map_err(|_| A2AError::internal("artifact orphan fence failed"))?
+                .get(1);
+            if live {
+                tx.rollback()
+                    .await
+                    .map_err(|_| A2AError::internal("artifact orphan rollback failed"))?;
+                continue;
+            }
+            let claim = self.q("INSERT INTO __S__.artifact_orphan_candidates(stage_locator,locator_digest,ciphertext_length,state,claim_token,claim_generation,claim_until,claimed_at) VALUES($1,$2,$3,'claimed',$4,1,__S__.db_millis()+30000,__S__.db_millis()) ON CONFLICT(stage_locator) DO UPDATE SET claim_token=EXCLUDED.claim_token,claim_generation=__S__.artifact_orphan_candidates.claim_generation+1,claim_until=EXCLUDED.claim_until,claimed_at=EXCLUDED.claimed_at WHERE __S__.artifact_orphan_candidates.state='claimed' AND __S__.artifact_orphan_candidates.claim_until<=__S__.db_millis() RETURNING claim_generation");
+            let generation = tx
+                .query_opt(
+                    &claim,
+                    &[
+                        &locator,
+                        &content_digest(locator.as_bytes()),
+                        &i64::try_from(bytes).unwrap_or(i64::MAX),
+                        &token,
+                    ],
+                )
+                .await
+                .map_err(|_| A2AError::internal("artifact orphan claim failed"))?
+                .map(|row| row.get::<_, i64>(0));
+            let Some(generation) = generation else {
+                tx.rollback()
+                    .await
+                    .map_err(|_| A2AError::internal("artifact orphan rollback failed"))?;
+                continue;
+            };
+            tx.commit()
+                .await
+                .map_err(|_| A2AError::internal("artifact orphan claim commit failed"))?;
+
+            // Missing means a prior owner crashed after unlink.  It is still a
+            // successful cleanup and must be finalized/refunded exactly once.
+            let _ = blobs
+                .delete_stage_orphan(&locator)
+                .map_err(|_| A2AError::internal("artifact orphan deletion failed"))?;
+
+            // ALLOWLIST: artifact orphan finalize fences exact ownership.
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|_| A2AError::internal("artifact orphan finalize transaction failed"))?;
+            tx.execute(
+                &self.q("SELECT pg_advisory_xact_lock(hashtextextended($1,0))"),
+                &[&locator],
+            )
+            .await
+            .map_err(|_| A2AError::internal("artifact orphan finalize fence failed"))?;
+            let owned = self.q("SELECT ciphertext_length FROM __S__.artifact_orphan_candidates WHERE stage_locator=$1 AND state='claimed' AND claim_token=$2 AND claim_generation=$3 FOR UPDATE");
+            let Some(row) = tx
+                .query_opt(&owned, &[&locator, &token, &generation])
+                .await
+                .map_err(|_| A2AError::internal("artifact orphan ownership failed"))?
+            else {
+                tx.rollback()
+                    .await
+                    .map_err(|_| A2AError::internal("artifact orphan rollback failed"))?;
+                continue;
+            };
+            let durable_bytes: i64 = row.get(0);
+            let audit = self.q("INSERT INTO __S__.artifact_orphan_audits(locator_digest,refunded_bytes,deleted_at) VALUES($1,$2,__S__.db_millis()) ON CONFLICT DO NOTHING");
+            let inserted = tx
+                .execute(
+                    &audit,
+                    &[&content_digest(locator.as_bytes()), &durable_bytes],
+                )
+                .await
+                .map_err(|_| A2AError::internal("artifact orphan audit failed"))?
+                == 1;
+            let finalized = self.q("UPDATE __S__.artifact_orphan_candidates SET state='finalized',finalized_at=__S__.db_millis(),claim_until=__S__.db_millis() WHERE stage_locator=$1 AND state='claimed' AND claim_token=$2 AND claim_generation=$3");
+            if tx
+                .execute(&finalized, &[&locator, &token, &generation])
+                .await
+                .map_err(|_| A2AError::internal("artifact orphan finalize failed"))?
+                != 1
+            {
+                return Err(A2AError::internal("artifact orphan ownership lost"));
+            }
+            tx.commit()
+                .await
+                .map_err(|_| A2AError::internal("artifact orphan finalize commit failed"))?;
+            if inserted {
+                result.deleted += 1;
+                result.refunded_bytes = result
+                    .refunded_bytes
+                    .saturating_add(u64::try_from(durable_bytes).unwrap_or(0));
+            }
+        }
+        Ok(result)
+    }
+}
+
 impl PostgresTaskStore {
+    /// Verify and restore an encrypted artifact root against offline restored PostgreSQL metadata.
+    pub async fn restore_artifacts(
+        config: PostgresStoreConfig,
+        plan: &crate::ArtifactRestorePlanFile,
+    ) -> Result<crate::ArtifactRestoreOutcome, PostgresStoreError> {
+        if config.schema.as_ref() != plan.target_schema() {
+            return Err(PostgresStoreError::ArtifactMigrationPlanMismatch);
+        }
+        let artifact = config
+            .artifact_store
+            .as_ref()
+            .ok_or(PostgresStoreError::InvalidConfig)?;
+        if artifact.root() != plan.target_root() {
+            return Err(PostgresStoreError::ArtifactMigrationPlanMismatch);
+        }
+        let keyring = Arc::new(
+            ReloadingArtifactKeyring::open(artifact.keyring_path())
+                .map_err(|_| PostgresStoreError::InvalidConfig)?,
+        );
+        let target = Arc::new(
+            PosixArtifactBlobStore::open(artifact.root(), keyring.clone())
+                .map_err(|_| PostgresStoreError::InvalidConfig)?,
+        );
+        let source = Arc::new(
+            PosixArtifactBlobStore::open(plan.source_root(), keyring)
+                .map_err(|_| PostgresStoreError::InvalidConfig)?,
+        );
+        let insecure = validate_tls(&config)?;
+        let pg = tokio_postgres::Config::from_str(&config.migrator_url)
+            .map_err(|_| PostgresStoreError::InvalidConfig)?;
+        if insecure {
+            let (mut client, connection) =
+                tokio::time::timeout(config.connect_timeout, pg.connect(NoTls))
+                    .await
+                    .map_err(|_| PostgresStoreError::Unavailable)?
+                    .map_err(|_| PostgresStoreError::Unavailable)?;
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            validate_catalog(&client, &config.schema).await?;
+            let result = crate::artifact_restore_executor::execute(
+                &mut client,
+                &config.schema,
+                source,
+                target,
+                plan,
+            )
+            .await;
+            let _ = client
+                .query_one(
+                    "SELECT pg_advisory_unlock(hashtextextended($1,0))",
+                    &[&format!(
+                        "smesh-artifact-restore:{}:{}",
+                        config.schema,
+                        plan.restore_id()
+                    )],
+                )
+                .await;
+            drop(client);
+            driver.abort();
+            result
+        } else {
+            let connector = native_tls_connector()?;
+            let (mut client, connection) =
+                tokio::time::timeout(config.connect_timeout, pg.connect(connector))
+                    .await
+                    .map_err(|_| PostgresStoreError::Unavailable)?
+                    .map_err(|_| PostgresStoreError::Unavailable)?;
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            validate_catalog(&client, &config.schema).await?;
+            let result = crate::artifact_restore_executor::execute(
+                &mut client,
+                &config.schema,
+                source,
+                target,
+                plan,
+            )
+            .await;
+            let _ = client
+                .query_one(
+                    "SELECT pg_advisory_unlock(hashtextextended($1,0))",
+                    &[&format!(
+                        "smesh-artifact-restore:{}:{}",
+                        config.schema,
+                        plan.restore_id()
+                    )],
+                )
+                .await;
+            drop(client);
+            driver.abort();
+            result
+        }
+    }
+
+    /// Atomically activate a validated keyring generation and join its fenced re-encryption work.
+    pub async fn rotate_artifact_key(
+        config: PostgresStoreConfig,
+        plan: &crate::ArtifactKeyRotationPlanFile,
+        lease_owner: &str,
+    ) -> Result<crate::ArtifactKeyRotationOutcome, PostgresStoreError> {
+        if config.schema.as_ref() != plan.source_schema() {
+            return Err(PostgresStoreError::ArtifactMigrationPlanMismatch);
+        }
+        let artifact = config
+            .artifact_store
+            .as_ref()
+            .ok_or(PostgresStoreError::InvalidConfig)?;
+        let keyring = Arc::new(
+            ReloadingArtifactKeyring::open(artifact.keyring_path())
+                .map_err(|_| PostgresStoreError::InvalidConfig)?,
+        );
+        if keyring.active_generation() != plan.plan().new_generation()
+            || keyring.key(plan.plan().old_generation()).is_err()
+        {
+            return Err(PostgresStoreError::InvalidConfig);
+        }
+        let blobs = Arc::new(
+            PosixArtifactBlobStore::open(artifact.root(), keyring.clone())
+                .map_err(|_| PostgresStoreError::InvalidConfig)?,
+        );
+        let insecure = validate_tls(&config)?;
+        let pg = tokio_postgres::Config::from_str(&config.migrator_url)
+            .map_err(|_| PostgresStoreError::InvalidConfig)?;
+        if insecure {
+            let (mut client, connection) =
+                tokio::time::timeout(config.connect_timeout, pg.connect(NoTls))
+                    .await
+                    .map_err(|_| PostgresStoreError::Unavailable)?
+                    .map_err(|_| PostgresStoreError::Unavailable)?;
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            validate_catalog(&client, &config.schema).await?;
+            let result = crate::artifact_reencryption_executor::execute(
+                &mut client,
+                &config.schema,
+                blobs,
+                keyring,
+                plan,
+                lease_owner,
+            )
+            .await;
+            drop(client);
+            driver.abort();
+            result
+        } else {
+            let connector = native_tls_connector()?;
+            let (mut client, connection) =
+                tokio::time::timeout(config.connect_timeout, pg.connect(connector))
+                    .await
+                    .map_err(|_| PostgresStoreError::Unavailable)?
+                    .map_err(|_| PostgresStoreError::Unavailable)?;
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            validate_catalog(&client, &config.schema).await?;
+            let result = crate::artifact_reencryption_executor::execute(
+                &mut client,
+                &config.schema,
+                blobs,
+                keyring,
+                plan,
+                lease_owner,
+            )
+            .await;
+            drop(client);
+            driver.abort();
+            result
+        }
+    }
+
+    /// Execute a coherent verified physical artifact backup without starting a runtime.
+    pub async fn backup_artifacts(
+        config: PostgresStoreConfig,
+        plan: &crate::ArtifactBackupPlanFile,
+        lease_owner: &str,
+    ) -> Result<crate::ArtifactBackupOutcome, PostgresStoreError> {
+        if config.schema.as_ref() != plan.source_schema() {
+            return Err(PostgresStoreError::ArtifactMigrationPlanMismatch);
+        }
+        let artifact = config
+            .artifact_store
+            .as_ref()
+            .ok_or(PostgresStoreError::InvalidConfig)?;
+        let keyring = Arc::new(
+            ReloadingArtifactKeyring::open(artifact.keyring_path())
+                .map_err(|_| PostgresStoreError::InvalidConfig)?,
+        );
+        let blobs = Arc::new(
+            PosixArtifactBlobStore::open(artifact.root(), keyring)
+                .map_err(|_| PostgresStoreError::InvalidConfig)?,
+        );
+        let insecure = validate_tls(&config)?;
+        let pg = tokio_postgres::Config::from_str(&config.migrator_url)
+            .map_err(|_| PostgresStoreError::InvalidConfig)?;
+        if insecure {
+            let (mut client, connection) =
+                tokio::time::timeout(config.connect_timeout, pg.connect(NoTls))
+                    .await
+                    .map_err(|_| PostgresStoreError::Unavailable)?
+                    .map_err(|_| PostgresStoreError::Unavailable)?;
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            validate_catalog(&client, &config.schema).await?;
+            let result = crate::artifact_backup_executor::execute(
+                &mut client,
+                &config.schema,
+                blobs,
+                plan,
+                lease_owner,
+            )
+            .await;
+            drop(client);
+            driver.abort();
+            result
+        } else {
+            let connector = native_tls_connector()?;
+            let (mut client, connection) =
+                tokio::time::timeout(config.connect_timeout, pg.connect(connector))
+                    .await
+                    .map_err(|_| PostgresStoreError::Unavailable)?
+                    .map_err(|_| PostgresStoreError::Unavailable)?;
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            validate_catalog(&client, &config.schema).await?;
+            let result = crate::artifact_backup_executor::execute(
+                &mut client,
+                &config.schema,
+                blobs,
+                plan,
+                lease_owner,
+            )
+            .await;
+            drop(client);
+            driver.abort();
+            result
+        }
+    }
+
+    /// Execute the explicit populated inline-artifact migration without starting
+    /// a gateway runtime. The plan and artifact keyring are preflighted before
+    /// the database connection; the executor owns only a fenced operator lease.
+    pub async fn migrate_inline_artifacts(
+        config: PostgresStoreConfig,
+        plan: &crate::ArtifactMigrationPlanFile,
+        lease_owner: &str,
+    ) -> Result<ArtifactMigrationOutcome, PostgresStoreError> {
+        if config.schema.as_ref() != plan.source_schema() {
+            return Err(PostgresStoreError::ArtifactMigrationPlanMismatch);
+        }
+        let artifact = config
+            .artifact_store
+            .as_ref()
+            .ok_or(PostgresStoreError::InvalidConfig)?;
+        let keyring = Arc::new(
+            ReloadingArtifactKeyring::open(artifact.keyring_path())
+                .map_err(|_| PostgresStoreError::InvalidConfig)?,
+        );
+        let blobs = Arc::new(
+            PosixArtifactBlobStore::open(artifact.root(), keyring)
+                .map_err(|_| PostgresStoreError::InvalidConfig)?,
+        );
+        let insecure = validate_tls(&config)?;
+        let pg = tokio_postgres::Config::from_str(&config.migrator_url)
+            .map_err(|_| PostgresStoreError::InvalidConfig)?;
+        if insecure {
+            let (mut client, connection) =
+                tokio::time::timeout(config.connect_timeout, pg.connect(NoTls))
+                    .await
+                    .map_err(|_| PostgresStoreError::Unavailable)?
+                    .map_err(|_| PostgresStoreError::Unavailable)?;
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let (cursor_key, _) = validate_catalog(&client, &config.schema).await?;
+            let result = crate::artifact_migration_executor::execute(
+                &mut client,
+                &config.schema,
+                blobs,
+                plan,
+                lease_owner,
+                &cursor_key,
+            )
+            .await;
+            drop(client);
+            driver.abort();
+            result
+        } else {
+            let connector = native_tls_connector()?;
+            let (mut client, connection) =
+                tokio::time::timeout(config.connect_timeout, pg.connect(connector))
+                    .await
+                    .map_err(|_| PostgresStoreError::Unavailable)?
+                    .map_err(|_| PostgresStoreError::Unavailable)?;
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let (cursor_key, _) = validate_catalog(&client, &config.schema).await?;
+            let result = crate::artifact_migration_executor::execute(
+                &mut client,
+                &config.schema,
+                blobs,
+                plan,
+                lease_owner,
+                &cursor_key,
+            )
+            .await;
+            drop(client);
+            driver.abort();
+            result
+        }
+    }
+
     pub async fn open(config: PostgresStoreConfig) -> Result<Self, PostgresStoreError> {
         if config.trust_injected_time && !config.test_only_insecure_loopback {
             return Err(PostgresStoreError::InvalidConfig);
         }
+        let artifact_runtime_limits = config.artifact_store.as_ref().map_or_else(
+            crate::ArtifactRuntimeLimits::default,
+            |artifact| crate::ArtifactRuntimeLimits {
+                max_artifact_bytes: artifact.max_artifact_bytes(),
+                retention_millis: artifact.retention_millis(),
+                read_lease_millis: artifact.read_lease_millis(),
+                worker_batch: artifact.worker_batch() as usize,
+            },
+        );
+        let (artifact_store, artifact_keyring) =
+            if let Some(artifact) = config.artifact_store.as_ref() {
+                let keyring = Arc::new(
+                    ReloadingArtifactKeyring::open(artifact.keyring_path())
+                        .map_err(|_| PostgresStoreError::InvalidConfig)?,
+                );
+                let store = Arc::new(
+                    PosixArtifactBlobStore::open_config(artifact, keyring.clone())
+                        .map_err(|_| PostgresStoreError::InvalidConfig)?,
+                );
+                (Some(store), Some(keyring))
+            } else {
+                (None, None)
+            };
         let insecure = validate_tls(&config)?;
         let pg = tokio_postgres::Config::from_str(&config.migrator_url)
             .map_err(|_| PostgresStoreError::InvalidConfig)?;
-        let runtime_pg = tokio_postgres::Config::from_str(&config.runtime_url)
+        let mut runtime_pg = tokio_postgres::Config::from_str(&config.runtime_url)
             .map_err(|_| PostgresStoreError::InvalidConfig)?;
+        // Runtime login is NOINHERIT by policy. Every pooled connection must enter
+        // the schema-scoped generated role before issuing any authority query.
+        runtime_pg.options(format!("-c role={}_runtime", config.schema));
         let runtime_user = Url::parse(&config.runtime_url)
             .map_err(|_| PostgresStoreError::InvalidConfig)?
             .username()
@@ -538,8 +1739,106 @@ impl PostgresTaskStore {
         };
         validate_runtime_login(&migration, &config.schema, &runtime_user).await?;
         migrate(&mut migration, &config.schema, &runtime_user).await?;
+
         validate_runtime_login(&migration, &config.schema, &runtime_user).await?;
+
         let (cursor_key, receipt_key) = validate_catalog(&migration, &config.schema).await?;
+
+        if let Some(keyring) = artifact_keyring.as_ref() {
+            migration
+                .batch_execute("SELECT set_config('smesh.internal_global','claim-v1',false)")
+                .await
+                .map_err(|_| PostgresStoreError::InvalidSchema)?;
+            let generations = migration
+                .query(
+                    &format!(
+                        "SELECT DISTINCT key_generation FROM {}.content_objects WHERE state<>'deleted' UNION SELECT DISTINCT d.key_generation FROM {}.artifact_backup_key_dependencies d JOIN {}.artifact_backup_jobs b USING(tenant_scope,backup_id) WHERE b.state='sealed' AND d.released_at IS NULL AND d.required_until>{}.db_millis() ORDER BY key_generation",
+                        config.schema, config.schema, config.schema, config.schema
+                    ),
+                    &[],
+                )
+                .await
+                .map_err(|_| PostgresStoreError::InvalidSchema)?;
+            migration
+                .batch_execute("SELECT set_config('smesh.internal_global','',false)")
+                .await
+                .map_err(|_| PostgresStoreError::InvalidSchema)?;
+            if generations
+                .iter()
+                .any(|row| keyring.key(row.get::<_, &str>(0)).is_err())
+            {
+                return Err(PostgresStoreError::InvalidSchema);
+            }
+        }
+        if config.artifact_store.is_some() {
+            let plan_id = config
+                .artifact_migration_plan
+                .as_ref()
+                .map_or("", |plan| plan.plan_id());
+            let required: bool = migration
+                .query_one(
+                    &format!(
+                        "SELECT {}.artifact_inline_migration_required($1)",
+                        config.schema
+                    ),
+                    &[&plan_id],
+                )
+                .await
+                .map_err(|_| PostgresStoreError::InvalidSchema)?
+                .get(0);
+            if required {
+                return Err(PostgresStoreError::ArtifactMigrationRequired);
+            }
+            migration
+                .batch_execute("SELECT set_config('smesh.internal_global','claim-v1',false)")
+                .await
+                .map_err(|_| PostgresStoreError::InvalidSchema)?;
+            let store_id: Vec<u8> = migration
+                .query_one(
+                    &format!(
+                        "SELECT store_id FROM {}.store_identity WHERE singleton=1",
+                        config.schema
+                    ),
+                    &[],
+                )
+                .await
+                .map_err(|_| PostgresStoreError::InvalidSchema)?
+                .get(0);
+            let store_identity =
+                store_id
+                    .iter()
+                    .fold(String::from("sha256:"), |mut identity, byte| {
+                        write!(&mut identity, "{byte:02x}").expect("writing to String cannot fail");
+                        identity
+                    });
+            if let Some(plan) = config.artifact_migration_plan.as_ref() {
+                crate::artifact_migration_executor::verify_completed_plan(
+                    &migration,
+                    &config.schema,
+                    &store_identity,
+                    plan,
+                )
+                .await?;
+            }
+            if let Some(file) = config.artifact_migration_plan_file.as_ref() {
+                if file.source_schema() != config.schema.as_ref()
+                    || file.source_store_id().to_string() != store_identity
+                {
+                    return Err(PostgresStoreError::ArtifactMigrationRequired);
+                }
+                crate::artifact_migration_executor::verify_completed_plan(
+                    &migration,
+                    &config.schema,
+                    &store_identity,
+                    file.plan(),
+                )
+                .await?;
+            }
+            migration
+                .batch_execute("SELECT set_config('smesh.internal_global','',false)")
+                .await
+                .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        }
         reconcile_quota_policy(
             &mut migration,
             &config.schema,
@@ -547,6 +1846,7 @@ impl PostgresTaskStore {
             config.quota_reconciliation_plan.as_deref(),
         )
         .await?;
+
         drop(migration);
         driver.abort();
         let pool = Pool::builder(manager)
@@ -577,6 +1877,18 @@ impl PostgresTaskStore {
             ))
             .await
             .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        let restore_incomplete: bool = validation
+            .query_one(
+                &format!("SELECT {}.artifact_restore_incomplete()", config.schema),
+                &[],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?
+            .get(0);
+        if restore_incomplete {
+            return Err(PostgresStoreError::ArtifactRestoreIncomplete);
+        }
+
         let task_count: i64 = validation
             .query_one(
                 &format!(
@@ -611,9 +1923,20 @@ impl PostgresTaskStore {
                 )
                 .await
                 .map_err(|_| PostgresStoreError::InvalidSchema)?;
+            let restore_incomplete: bool = validation
+                .query_one(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {}.artifact_restore_jobs WHERE tenant_scope=$1 AND state IN ('restoring','verified'))", config.schema),
+                    &[&tenant],
+                )
+                .await
+                .map_err(|_| PostgresStoreError::InvalidSchema)?
+                .get(0);
+            if restore_incomplete {
+                return Err(PostgresStoreError::ArtifactRestoreIncomplete);
+            }
             let retained = validation
                 .query_one(
-                    &format!("SELECT COALESCE((SELECT retained_bytes FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='tenant' AND scope_id=$1),-1),{}.retained_authority_oracle($1,NULL)", config.schema, config.schema),
+                    &format!("SELECT COALESCE((SELECT retained_bytes FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='tenant' AND scope_id=$1),-1),{}.retained_authority_oracle($1,NULL)+{}.artifact_retained_oracle($1,NULL)", config.schema, config.schema, config.schema),
                     &[&tenant],
                 )
                 .await
@@ -626,7 +1949,7 @@ impl PostgresTaskStore {
             }
             let account_rows = validation
                 .query(
-                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_account_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'account') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='account') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='account' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema),
+                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_account_oracle($1,scopes.scope_id)+{}.artifact_retained_account_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'account') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='account') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='account' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema, config.schema),
                     &[&tenant],
                 )
                 .await
@@ -640,7 +1963,7 @@ impl PostgresTaskStore {
             }
             let principal_rows = validation
                 .query(
-                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'principal') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='principal') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='principal' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema),
+                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_oracle($1,scopes.scope_id)+{}.artifact_retained_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'principal') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='principal') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='principal' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema, config.schema),
                     &[&tenant],
                 )
                 .await
@@ -698,10 +2021,78 @@ impl PostgresTaskStore {
             quota_enforcement: config.quota_enforcement,
             quota_policy: config.quota_policy,
             transaction_test_faults: config.transaction_test_faults,
+            artifact_publication_test_fault: config.artifact_publication_test_fault,
             transaction_attempts: Arc::new(AtomicUsize::new(0)),
+            artifact_blob_reads: Arc::new(AtomicUsize::new(0)),
             receiver_renewal_test_probe: config.receiver_renewal_test_probe,
+            artifact_store,
+            artifact_keyring,
+            artifact_runtime_limits,
             _test_cleanup: config.test_cleanup,
         })
+    }
+
+    /// Atomically reload the no-follow keyring only after the replacement can
+    /// decrypt every generation referenced by any live production object.
+    pub async fn reload_artifact_keyring(&self) -> Result<(), PostgresStoreError> {
+        let keyring = self
+            .artifact_keyring
+            .as_ref()
+            .ok_or(PostgresStoreError::InvalidConfig)?;
+        let mut object = tokio::time::timeout(self.acquire_timeout, self.pool.get())
+            .await
+            .map_err(|_| PostgresStoreError::Unavailable)?
+            .map_err(|_| PostgresStoreError::Unavailable)?;
+        // ALLOWLIST: read-only tenant/key-generation snapshot before atomic reload.
+        let tx = object
+            .transaction()
+            .await
+            .map_err(|_| PostgresStoreError::Unavailable)?;
+        tx.batch_execute("SET LOCAL statement_timeout='15s'; SET LOCAL lock_timeout='5s'")
+            .await
+            .map_err(|_| PostgresStoreError::Unavailable)?;
+        let tenants = tx
+            .query(
+                &format!("SELECT * FROM {}.authority_tenants_bounded()", self.schema),
+                &[],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        let mut generations = BTreeSet::new();
+        for row in tenants {
+            let tenant: String = row.get(0);
+            tx.query_one(
+                "SELECT set_config('smesh.tenant_scope',$1,true),set_config('smesh.account_id','',true)",
+                &[&tenant],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::Unavailable)?;
+            for generation in tx
+                .query(
+                    &self.q("SELECT DISTINCT key_generation FROM __S__.content_objects WHERE state<>'deleted' UNION SELECT DISTINCT d.key_generation FROM __S__.artifact_backup_key_dependencies d JOIN __S__.artifact_backup_jobs b USING(tenant_scope,backup_id) WHERE b.state='sealed' AND d.released_at IS NULL AND d.required_until>__S__.db_millis() ORDER BY key_generation"),
+                    &[],
+                )
+                .await
+                .map_err(|_| PostgresStoreError::InvalidSchema)?
+            {
+                generations.insert(generation.get::<_, String>(0));
+            }
+        }
+        tx.rollback()
+            .await
+            .map_err(|_| PostgresStoreError::Unavailable)?;
+        keyring
+            .reload_if(|candidate| {
+                if generations
+                    .iter()
+                    .any(|generation| candidate.key(generation).is_err())
+                {
+                    Err(crate::ArtifactStoreError::Unavailable)
+                } else {
+                    Ok(())
+                }
+            })
+            .map_err(|_| PostgresStoreError::InvalidConfig)
     }
 
     pub async fn drop_test_schema(config: &PostgresStoreConfig) -> Result<(), PostgresStoreError> {
@@ -866,6 +2257,13 @@ impl PostgresTaskStore {
         self.transaction_attempts.load(Ordering::SeqCst)
     }
 
+    /// Number of artifact blob reads attempted by this store instance.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn artifact_blob_read_count(&self) -> usize {
+        self.artifact_blob_reads.load(Ordering::SeqCst)
+    }
+
     /// Holds one pooled runtime connection behind deterministic test barriers.
     #[doc(hidden)]
     pub async fn hold_test_pool_connection(
@@ -920,6 +2318,40 @@ impl PostgresTaskStore {
             .lock()
             .ok()
             .and_then(|mut faults| faults.pop_front())
+    }
+
+    /// Arms one loopback-only receiver publication fault for exhaustive integration evidence.
+    #[doc(hidden)]
+    pub fn set_artifact_publication_test_fault(
+        &self,
+        fault: ArtifactPublicationTestFault,
+    ) -> Result<(), A2AError> {
+        if !self.trust_injected_time {
+            return Err(A2AError::invalid_request(
+                "artifact publication fault injection is disabled",
+            ));
+        }
+        let mut configured = self
+            .artifact_publication_test_fault
+            .lock()
+            .map_err(|_| A2AError::internal("artifact publication fault lock failed"))?;
+        *configured = Some(fault);
+        Ok(())
+    }
+
+    fn publication_fault(&self, point: ArtifactPublicationTestFault) -> Result<(), A2AError> {
+        if !self.trust_injected_time {
+            return Ok(());
+        }
+        let mut configured = self
+            .artifact_publication_test_fault
+            .lock()
+            .map_err(|_| A2AError::internal("artifact publication fault lock failed"))?;
+        if configured.as_ref() == Some(&point) {
+            configured.take();
+            return Err(A2AError::internal("injected artifact publication fault"));
+        }
+        Ok(())
     }
 
     async fn run_retryable_transaction<T, F>(
@@ -1357,7 +2789,7 @@ impl PostgresTaskStore {
         if &expected != intent {
             return Err(A2AError::invalid_request("quota intent binding mismatch"));
         }
-        let lookup = self.q("SELECT i.binding_digest,i.account_id,i.principal_scope,i.operation,i.semantic_id,i.task_id,i.policy_id,i.policy_revision,i.policy_digest,p.canonical_json FROM __S__.quota_intents i JOIN __S__.quota_policy_versions p ON p.tenant_scope=i.tenant_scope AND p.policy_id=i.policy_id AND p.policy_revision=i.policy_revision WHERE i.tenant_scope=$1 AND (i.binding_digest=$2 OR (i.operation=$3 AND i.semantic_id=$4)) ORDER BY (i.binding_digest=$2) DESC LIMIT 1");
+        let lookup = self.q("SELECT i.binding_digest,i.account_id,i.principal_scope,i.operation,i.semantic_id,i.task_id,i.policy_id,i.policy_revision,i.policy_digest,p.canonical_json FROM __S__.quota_intents i JOIN __S__.quota_policy_versions p ON p.tenant_scope=i.tenant_scope AND p.policy_id=i.policy_id AND p.policy_revision=i.policy_revision WHERE i.tenant_scope=$1 AND (i.binding_digest=$2 OR (i.operation=$3 AND i.semantic_id=$4 AND i.account_id=$5 AND i.principal_scope=$6)) ORDER BY (i.binding_digest=$2) DESC LIMIT 1");
         if let Some(row) = tx
             .query_opt(
                 &lookup,
@@ -1366,6 +2798,8 @@ impl PostgresTaskStore {
                     &intent.binding_digest(),
                     &intent.operation().as_str(),
                     &intent.semantic_id.as_ref(),
+                    &account,
+                    &intent.principal_scope.as_ref(),
                 ],
             )
             .await
@@ -2460,9 +3894,9 @@ async fn validate_runtime_login(
              FROM pg_auth_members am
              JOIN pg_roles member ON member.oid=am.member
              JOIN pg_roles parent ON parent.oid=am.roleid
-             WHERE member.rolname IN ($1,$2) OR parent.rolname IN ($1,$2)
+             WHERE member.rolname=$1 OR parent.rolname=$1
              ORDER BY member.rolname,parent.rolname",
-            &[&runtime_user, &generated_role],
+            &[&generated_role],
         )
         .await
         .map_err(|_| PostgresStoreError::Initialization)?;
@@ -2490,10 +3924,49 @@ async fn validate_runtime_login(
     {
         return Err(PostgresStoreError::InvalidSchema);
     }
+    let sibling_memberships = client
+        .query(
+            "SELECT parent.rolname,am.admin_option,am.inherit_option,am.set_option,
+                    parent.rolsuper,parent.rolinherit,parent.rolcreaterole,parent.rolcreatedb,
+                    parent.rolcanlogin,parent.rolreplication,parent.rolbypassrls,
+                    EXISTS(SELECT 1 FROM pg_namespace n WHERE n.nspname=left(parent.rolname,length(parent.rolname)-8)),
+                    EXISTS(SELECT 1 FROM pg_namespace n
+                           JOIN pg_auth_members owner_edge ON owner_edge.member=n.nspowner
+                           WHERE n.nspname=left(parent.rolname,length(parent.rolname)-8)
+                             AND owner_edge.roleid=parent.oid
+                             AND owner_edge.admin_option AND NOT owner_edge.inherit_option
+                             AND NOT owner_edge.set_option)
+             FROM pg_auth_members am
+             JOIN pg_roles member ON member.oid=am.member
+             JOIN pg_roles parent ON parent.oid=am.roleid
+             WHERE member.rolname=$1 AND parent.rolname<>$2
+             ORDER BY parent.rolname",
+            &[&runtime_user, &generated_role],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    if sibling_memberships.iter().any(|membership| {
+        let role = membership.get::<_, &str>(0);
+        !role.ends_with("_runtime")
+            || membership.get::<_, bool>(1)
+            || membership.get::<_, bool>(2)
+            || !membership.get::<_, bool>(3)
+            || membership.get::<_, bool>(4)
+            || membership.get::<_, bool>(5)
+            || membership.get::<_, bool>(6)
+            || membership.get::<_, bool>(7)
+            || membership.get::<_, bool>(8)
+            || membership.get::<_, bool>(9)
+            || membership.get::<_, bool>(10)
+            || !membership.get::<_, bool>(11)
+            || !membership.get::<_, bool>(12)
+    }) {
+        return Err(PostgresStoreError::InvalidSchema);
+    }
     let walk = client
         .query(
             "WITH RECURSIVE membership_walk(root_oid,role_oid,path,cycle,depth) AS (
-               SELECT r.oid,r.oid,ARRAY[r.oid],false,0 FROM pg_roles r WHERE r.rolname IN ($1,$2)
+               SELECT r.oid,r.oid,ARRAY[r.oid],false,0 FROM pg_roles r WHERE r.rolname=$1
                UNION ALL
                SELECT w.root_oid,am.roleid,w.path||am.roleid,am.roleid=ANY(w.path),w.depth+1
                  FROM membership_walk w JOIN pg_auth_members am ON am.member=w.role_oid
@@ -2504,16 +3977,15 @@ async fn validate_runtime_login(
                     role.rolcanlogin,role.rolreplication,role.rolbypassrls
                FROM membership_walk w JOIN pg_roles root ON root.oid=w.root_oid
                JOIN pg_roles role ON role.oid=w.role_oid ORDER BY root.rolname,w.depth,role.rolname",
-            &[&runtime_user, &generated_role],
+            &[&generated_role],
         )
         .await
         .map_err(|_| PostgresStoreError::Initialization)?;
     for entry in walk {
-        let root: &str = entry.get(0);
         let role: &str = entry.get(1);
         let cycle: bool = entry.get(2);
         let depth: i32 = entry.get(3);
-        if cycle || depth > 1 || (depth == 1 && (root != runtime_user || role != generated_role)) {
+        if cycle || depth > 0 {
             return Err(PostgresStoreError::InvalidSchema);
         }
         let privileged = entry.get::<_, bool>(4)
@@ -2800,6 +4272,54 @@ async fn migrate(
         .await
         .map_err(|_| PostgresStoreError::Initialization)?;
     }
+    let artifact_checksum = content_digest(ARTIFACT_MIGRATION_SQL.as_bytes());
+    let artifact_row = tx
+        .query_opt(
+            &format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=5"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if let Some(row) = artifact_row {
+        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+            || row.get::<_, String>(1) != artifact_checksum
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    } else {
+        let sql = ARTIFACT_MIGRATION_SQL
+            .replace("__SCHEMA__", schema)
+            .replace("__ROLE__", &format!("{schema}_runtime"))
+            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        tx.batch_execute(&sql)
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {schema}.schema_migrations VALUES(5,6,$1,$2,{schema}.db_millis())"
+            ),
+            &[&ARTIFACT_MIGRATION_NAME, &artifact_checksum],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        let catalog = catalog_digest(&tx, schema).await?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata DISABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!("UPDATE {schema}.store_metadata SET catalog_hash=$1 WHERE singleton=1"),
+            &[&catalog],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    }
     tx.commit()
         .await
         .map_err(|_| PostgresStoreError::Initialization)
@@ -2835,6 +4355,167 @@ where
     Ok(content_digest(normalized.as_bytes()))
 }
 
+async fn validate_artifact_semantics<C>(client: &C, schema: &str) -> Result<(), PostgresStoreError>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    // manifest canonical seal: canonical bytes, digest, producer, classification and policy binding.
+    let manifests = client
+        .query(
+            &format!("SELECT m.artifact_id,m.manifest_digest,m.canonical_json,m.owner_account_id,m.task_id,m.context_id,m.message_id,m.dispatch_id,m.media_type,m.plaintext_length,m.classification,m.encryption_domain,m.policy_id,m.policy_revision,m.policy_digest,m.created_at,m.retain_until,o.content_digest,o.key_generation,m.tenant_scope FROM {schema}.artifact_manifests m JOIN {schema}.content_objects o USING(tenant_scope,object_id)"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    for row in manifests {
+        let canonical: String = row.get(2);
+        let value: serde_json::Value =
+            serde_json::from_str(&canonical).map_err(|_| PostgresStoreError::InvalidSchema)?;
+        let producer = value
+            .get("producer")
+            .ok_or(PostgresStoreError::InvalidSchema)?;
+        let policy = value
+            .get("policy")
+            .ok_or(PostgresStoreError::InvalidSchema)?;
+        let mut sealed = b"smesh-artifact-manifest/v1\0".to_vec();
+        sealed.extend_from_slice(canonical.as_bytes());
+        if content_digest(&sealed) != row.get::<_, String>(1)
+            || value.get("schema").and_then(serde_json::Value::as_str)
+                != Some("smesh-artifact-manifest/v1")
+            || value.get("artifactId").and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(0))
+            || value.get("mediaType").and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(8))
+            || value
+                .get("plaintextLength")
+                .and_then(serde_json::Value::as_i64)
+                != Some(row.get(9))
+            || value
+                .get("classification")
+                .and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(10))
+            || value
+                .get("encryptionDomain")
+                .and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(11))
+            || value
+                .get("contentDigest")
+                .and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(17))
+            || producer.get("owner").and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(3))
+            || producer.get("tenant").and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(19))
+            || producer.get("task").and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(4))
+            || producer.get("context").and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(5))
+            || producer.get("message").and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(6))
+            || producer.get("dispatch").and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(7))
+            || policy.get("policyId").and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(12))
+            || policy.get("revision").and_then(serde_json::Value::as_i64) != Some(row.get(13))
+            || policy.get("digest").and_then(serde_json::Value::as_str)
+                != Some(row.get::<_, &str>(14))
+            || policy.get("createdAt").and_then(serde_json::Value::as_i64) != Some(row.get(15))
+            || policy
+                .get("retainUntil")
+                .and_then(serde_json::Value::as_i64)
+                != Some(row.get(16))
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+        let chunks = value
+            .get("chunks")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(PostgresStoreError::InvalidSchema)?;
+        let artifact_id: &str = row.get(0);
+        let tenant_scope: &str = row.get(19);
+        let chunk_rows = client
+            .query(
+                &format!("SELECT ordinal,byte_offset,plaintext_length,content_digest FROM {schema}.artifact_chunks WHERE tenant_scope=$1 AND artifact_id=$2 ORDER BY ordinal"),
+                &[&tenant_scope, &artifact_id],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        if chunks.len() != chunk_rows.len()
+            || chunks.iter().zip(&chunk_rows).any(|(chunk, stored)| {
+                chunk.get("ordinal").and_then(serde_json::Value::as_i64)
+                    != Some(i64::from(stored.get::<_, i32>(0)))
+                    || chunk.get("offset").and_then(serde_json::Value::as_i64)
+                        != Some(stored.get(1))
+                    || chunk.get("length").and_then(serde_json::Value::as_i64)
+                        != Some(stored.get(2))
+                    || chunk.get("digest").and_then(serde_json::Value::as_str)
+                        != Some(stored.get::<_, &str>(3))
+            })
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+        let provenance = value
+            .get("derivedFrom")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(PostgresStoreError::InvalidSchema)?;
+        let provenance_rows = client
+            .query(
+                &format!("SELECT parent_artifact_id,relation FROM {schema}.provenance_edges WHERE tenant_scope=$1 AND child_artifact_id=$2 ORDER BY ordinal"),
+                &[&tenant_scope, &artifact_id],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        if provenance.len() != provenance_rows.len()
+            || provenance
+                .iter()
+                .zip(&provenance_rows)
+                .any(|(edge, stored)| {
+                    edge.get("artifactId").and_then(serde_json::Value::as_str)
+                        != Some(stored.get::<_, &str>(0))
+                        || edge.get("relation").and_then(serde_json::Value::as_str)
+                            != Some(stored.get::<_, &str>(1))
+                })
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    }
+    // chunk topology; reference count; locator grammar; object lifecycle; upload lease;
+    // read lease; backup lease; retention hold; tombstone generation.
+    let invalid: i64 = client.query_one(&format!(r"SELECT
+      (SELECT count(*) FROM (
+        SELECT m.tenant_scope,m.artifact_id,m.plaintext_length,
+          count(c.*) chunks,COALESCE(sum(c.plaintext_length),0) bytes,
+          bool_and(c.ordinal=row_number_placeholder.expected_ordinal AND c.byte_offset=row_number_placeholder.expected_offset AND c.plaintext_length BETWEEN 1 AND 4194304) topology
+        FROM {schema}.artifact_manifests m
+        LEFT JOIN {schema}.artifact_chunks c USING(tenant_scope,artifact_id)
+        LEFT JOIN LATERAL (SELECT count(*)::integer AS expected_ordinal,COALESCE(sum(p.plaintext_length),0) AS expected_offset FROM {schema}.artifact_chunks p WHERE p.tenant_scope=c.tenant_scope AND p.artifact_id=c.artifact_id AND p.ordinal<c.ordinal) row_number_placeholder ON true
+        GROUP BY m.tenant_scope,m.artifact_id,m.plaintext_length
+      ) x WHERE bytes<>plaintext_length OR (plaintext_length=0 AND chunks<>0) OR (plaintext_length>0 AND (chunks=0 OR topology IS NOT TRUE)))
+      +(SELECT count(*) FROM {schema}.content_objects o WHERE o.reference_count<>(SELECT count(*) FROM {schema}.artifact_references r JOIN {schema}.artifact_manifests m USING(tenant_scope,artifact_id) WHERE m.tenant_scope=o.tenant_scope AND m.object_id=o.object_id AND r.state='active'))
+      +(SELECT count(*) FROM {schema}.content_objects o WHERE backend_locator!~'^objects/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$' OR encryption_domain NOT LIKE tenant_scope||'/%' OR (state='available' AND available_at IS NULL) OR (state='staged' AND available_at IS NOT NULL) OR (state IN ('tombstoned','deleting','deleted') AND tombstone_generation=0))
+      +(SELECT count(*) FROM {schema}.content_objects o JOIN {schema}.artifact_manifests m USING(tenant_scope,object_id) WHERE o.plaintext_length<>m.plaintext_length OR o.classification<>m.classification OR o.encryption_domain<>m.encryption_domain)
+      +(SELECT count(*) FROM {schema}.upload_intents u JOIN {schema}.content_objects o USING(tenant_scope,object_id) WHERE u.artifact_id NOT IN (SELECT artifact_id FROM {schema}.artifact_manifests m WHERE m.tenant_scope=u.tenant_scope AND m.object_id=u.object_id) OR u.stage_locator!~'^stage/[A-Za-z0-9_-]{{32}}[.]tmp$' OR u.final_locator<>o.backend_locator OR u.ciphertext_digest<>o.ciphertext_digest OR u.ciphertext_length<>o.ciphertext_length OR (u.state='promoting')<>(u.lease_token IS NOT NULL AND u.lease_until IS NOT NULL))
+      +(SELECT count(*) FROM {schema}.artifact_read_leases WHERE lease_token='' OR lease_epoch<=0 OR lease_until<=created_at)
+      +(SELECT count(*) FROM {schema}.artifact_backup_leases WHERE lease_owner='' OR lease_token='' OR lease_epoch<=0 OR lease_until<=created_at)
+      +(SELECT count(*) FROM {schema}.artifact_retention_holds WHERE actor_digest='' OR reason_digest='' OR (expires_at IS NOT NULL AND expires_at<=created_at) OR (state='released')<>(released_at IS NOT NULL))
+      +(SELECT count(*) FROM {schema}.artifact_tombstones t LEFT JOIN {schema}.content_objects o USING(tenant_scope,object_id) WHERE o.object_id IS NULL OR t.tombstone_generation<=0 OR t.tombstone_generation>o.tombstone_generation)
+      +(SELECT count(*) FROM {schema}.artifact_gc_jobs j JOIN {schema}.content_objects o USING(tenant_scope,object_id) WHERE j.tombstone_generation<>o.tombstone_generation OR (j.state='leased')<>(j.lease_owner IS NOT NULL AND j.lease_token IS NOT NULL AND j.lease_until IS NOT NULL))"),&[]).await.map_err(|_|PostgresStoreError::InvalidSchema)?.get(0);
+    if invalid != 0 {
+        return Err(PostgresStoreError::InvalidSchema);
+    }
+    // provenance acyclic and cross-domain/classification monotonicity.
+    let invalid_provenance: i64 = client.query_one(&format!(r"WITH RECURSIVE walk(tenant_scope,start_id,node,path,cycle) AS (
+      SELECT p.tenant_scope,p.child_artifact_id,p.parent_artifact_id,ARRAY[p.child_artifact_id,p.parent_artifact_id],false FROM {schema}.provenance_edges p
+      UNION ALL SELECT w.tenant_scope,w.start_id,p.parent_artifact_id,w.path||p.parent_artifact_id,p.parent_artifact_id=ANY(w.path)
+      FROM walk w JOIN {schema}.provenance_edges p ON p.tenant_scope=w.tenant_scope AND p.child_artifact_id=w.node WHERE NOT w.cycle AND cardinality(w.path)<=33)
+      SELECT (SELECT count(*) FROM walk WHERE cycle)
+       +(SELECT count(*) FROM {schema}.provenance_edges p JOIN {schema}.artifact_manifests c ON c.tenant_scope=p.tenant_scope AND c.artifact_id=p.child_artifact_id JOIN {schema}.artifact_manifests a ON a.tenant_scope=p.tenant_scope AND a.artifact_id=p.parent_artifact_id WHERE c.encryption_domain<>a.encryption_domain OR CASE c.classification WHEN 'public' THEN 0 WHEN 'internal' THEN 1 WHEN 'confidential' THEN 2 ELSE 3 END < CASE a.classification WHEN 'public' THEN 0 WHEN 'internal' THEN 1 WHEN 'confidential' THEN 2 ELSE 3 END)"),&[]).await.map_err(|_|PostgresStoreError::InvalidSchema)?.get(0);
+    if invalid_provenance != 0 {
+        return Err(PostgresStoreError::InvalidSchema);
+    }
+    Ok(())
+}
+
 async fn validate_semantics<C>(
     client: &C,
     schema: &str,
@@ -2843,6 +4524,7 @@ async fn validate_semantics<C>(
 where
     C: tokio_postgres::GenericClient + Sync,
 {
+    validate_artifact_semantics(client, schema).await?;
     let evidence_gaps: i64 = client.query_one(
         &format!("SELECT (SELECT count(*) FROM {schema}.quota_intents i LEFT JOIN {schema}.quota_policy_versions p ON p.tenant_scope=i.tenant_scope AND p.policy_id=i.policy_id AND p.policy_revision=i.policy_revision WHERE p.policy_id IS NULL OR p.policy_digest<>i.policy_digest) + (SELECT count(*) FROM {schema}.quota_receipts r LEFT JOIN {schema}.quota_intents i USING(tenant_scope,binding_digest) WHERE i.binding_digest IS NULL) + (SELECT count(*) FROM {schema}.quota_allocations a LEFT JOIN {schema}.quota_intents i USING(tenant_scope,binding_digest) WHERE i.binding_digest IS NULL) + (SELECT count(*) FROM {schema}.quota_leases l LEFT JOIN {schema}.quota_intents i USING(tenant_scope,binding_digest) WHERE i.binding_digest IS NULL)"),
         &[],
@@ -3158,23 +4840,45 @@ async fn validate_catalog(
         .collect::<Vec<_>>();
     if definer_names
         != [
+            "artifact_inline_migration_required",
+            "artifact_restore_incomplete",
+            "artifact_stage_locator_live",
             "authority_diagnostics_bounded",
             "authority_retained_scopes_bounded",
             "authority_tenants_bounded",
             "cancellation_requested_bounded",
+            "claim_artifact_gc",
+            "claim_artifact_reencryption",
+            "claim_artifact_upload",
             "claim_outbox_bounded",
             "ensure_outbox_tenant_scheduler",
             "gc_quota_authority_bounded",
         ]
         || definer_rows.iter().any(|row| {
-            row.get::<_, &str>(1) != expected_owner
-                || row.get::<_, Option<Vec<String>>>(2).is_none_or(|settings| {
-                    settings.len() != 1 || settings[0] != "search_path=pg_catalog"
-                })
+            if row.get::<_, &str>(1) != expected_owner {
+                return true;
+            }
+            let name: &str = row.get(0);
+            row.get::<_, Option<Vec<String>>>(2).is_none_or(|settings| {
+                if matches!(
+                    name,
+                    "claim_artifact_upload"
+                        | "claim_artifact_gc"
+                        | "claim_artifact_reencryption"
+                        | "artifact_stage_locator_live"
+                        | "artifact_inline_migration_required"
+                        | "artifact_restore_incomplete"
+                ) {
+                    settings != ["search_path=pg_catalog", "row_security=on"]
+                } else {
+                    settings != ["search_path=pg_catalog"]
+                }
+            })
         })
     {
         return Err(PostgresStoreError::InvalidSchema);
     }
+
     let rows = client.query("SELECT c.relname,c.relrowsecurity,c.relforcerowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p') ORDER BY c.relname", &[&schema]).await.map_err(|_| PostgresStoreError::InvalidSchema)?;
     let actual: Vec<&str> = rows.iter().map(|r| r.get(0)).collect();
     if actual != EXPECTED_TABLES {
@@ -3187,6 +4891,7 @@ async fn validate_catalog(
             return Err(PostgresStoreError::InvalidSchema);
         }
     }
+
     let policy_count: i64 = client.query_one("SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND p.polname='tenant_isolation'", &[&schema]).await.map_err(|_| PostgresStoreError::InvalidSchema)?.get(0);
     if policy_count != i64::try_from(TENANT_TABLES.len()).unwrap_or(-1) {
         return Err(PostgresStoreError::InvalidSchema);
@@ -3199,11 +4904,13 @@ async fn validate_catalog(
     }) {
         return Err(PostgresStoreError::InvalidSchema);
     }
+
     let index_rows=client.query("SELECT i.relname FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class t ON t.oid=x.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace LEFT JOIN pg_constraint c ON c.conindid=i.oid WHERE n.nspname=$1 AND c.oid IS NULL ORDER BY i.relname", &[&schema]).await.map_err(|_|PostgresStoreError::InvalidSchema)?;
     let indexes: Vec<&str> = index_rows.iter().map(|r| r.get(0)).collect();
     if indexes != EXPECTED_CUSTOM_INDEXES {
         return Err(PostgresStoreError::InvalidSchema);
     }
+
     let migration_rows = client
         .query(
             &format!(
@@ -3234,6 +4941,11 @@ async fn validate_catalog(
             DISTRIBUTED_QUOTA_MIGRATION_NAME,
             content_digest(DISTRIBUTED_QUOTA_MIGRATION_SQL.as_bytes()),
         ),
+        (
+            5_i64,
+            ARTIFACT_MIGRATION_NAME,
+            content_digest(ARTIFACT_MIGRATION_SQL.as_bytes()),
+        ),
     ];
     if migration_rows.len() != expected_migrations.len()
         || migration_rows
@@ -3248,6 +4960,7 @@ async fn validate_catalog(
     {
         return Err(PostgresStoreError::InvalidSchema);
     }
+
     let query = format!(
         "SELECT schema_version,migration_hash,catalog_hash,cursor_key,receipt_key FROM {schema}.store_metadata WHERE singleton=1"
     );
@@ -3675,7 +5388,7 @@ fn mac_field(mac: &mut Hmac<Sha256>, bytes: &[u8]) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn snapshot_metadata_digest(
+pub(crate) fn snapshot_metadata_digest(
     key: &[u8; 32],
     snapshot_id: &[u8],
     scope: &str,
@@ -3752,6 +5465,10 @@ impl crate::IntoDurableAuthority for PostgresTaskStore {
 }
 
 impl AuthorityIdentity for PostgresTaskStore {
+    fn artifact_authority(&self) -> Option<&dyn crate::ArtifactAuthority> {
+        Some(self)
+    }
+
     fn capabilities(&self) -> AuthorityCapabilities {
         AuthorityCapabilities {
             lease_renewal: true,
@@ -6181,6 +7898,190 @@ impl ReceiverAuthority for PostgresTaskStore {
 }
 
 impl PostgresTaskStore {
+    #[allow(clippy::single_match_else)]
+    async fn prepare_receiver_artifacts(
+        &self,
+        lease: &ReceiverLease,
+        events: &[MeshEvent],
+        _now: i64,
+    ) -> Result<(Vec<MeshEvent>, Vec<crate::ArtifactStageRegistration>), A2AError> {
+        if !events
+            .iter()
+            .any(|event| matches!(event, MeshEvent::Artifact { .. }))
+        {
+            return Ok((events.to_vec(), Vec::new()));
+        }
+        let Some(blobs) = self.artifact_store.as_ref() else {
+            return Ok((events.to_vec(), Vec::new()));
+        };
+        let key_generation = blobs.active_key_generation();
+        let tenant = lease.tenant_scope.clone();
+        let task = lease.task_id.clone();
+        let dispatch = lease.dispatch_id.clone();
+        let (owner, context, revision, message, db_now) = self.run_retryable_transaction(&tenant, None, |store, tx| {
+            let tenant=tenant.clone(); let task=task.clone(); let dispatch=dispatch.clone();
+            Box::pin(async move {
+                let q=store.q("SELECT t.owner_account_id,t.context_id,t.revision,o.message_id,__S__.db_millis() FROM __S__.tasks t JOIN __S__.outbox o ON o.tenant_scope=t.tenant_scope AND o.task_id=t.task_id AND o.dispatch_id=$3 WHERE t.tenant_scope=$1 AND t.task_id=$2");
+                let row=tx.query_one(&q,&[&tenant,&task,&dispatch]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact producer lookup failed")))?;
+                Ok((row.get::<_,String>(0),row.get::<_,String>(1),row.get::<_,i64>(2),row.get::<_,String>(3),row.get::<_,i64>(4)))
+            })
+        }).await?;
+        let mut prepared = Vec::with_capacity(events.len());
+        let mut staged_artifacts = Vec::new();
+        for (ordinal, event) in events.iter().enumerate() {
+            let (name, media_type, bytes) = match event {
+                MeshEvent::Artifact {
+                    name,
+                    media_type,
+                    content,
+                } => match crate::bridge::internal_artifact_payload(content) {
+                    Some(crate::bridge::InternalArtifactPayload::Binary { bytes }) => {
+                        use base64::Engine as _;
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(bytes)
+                            .map_err(|_| A2AError::internal("artifact payload is corrupt"))?;
+                        (name.clone(), media_type.clone(), bytes)
+                    }
+                    Some(crate::bridge::InternalArtifactPayload::Published { .. }) => {
+                        prepared.push(event.clone());
+                        continue;
+                    }
+                    None => (
+                        name.clone(),
+                        media_type.clone(),
+                        content.as_bytes().to_vec(),
+                    ),
+                },
+                _ => {
+                    prepared.push(event.clone());
+                    continue;
+                }
+            };
+            if bytes.len() as u64 > self.artifact_runtime_limits.max_artifact_bytes {
+                return Err(A2AError::invalid_request(
+                    "artifact payload exceeds configured limit",
+                ));
+            }
+            let semantic = content_digest(
+                format!(
+                    "{}\0{}\0{}",
+                    lease.dispatch_id,
+                    ordinal,
+                    content_digest(&bytes)
+                )
+                .as_bytes(),
+            );
+            let artifact_id = format!("artifact-{}", &semantic[7..39]);
+            let upload_id = format!("upload-{}", &semantic[39..71]);
+            let object_id = content_digest(
+                format!(
+                    "{}\0{}\0confidential\0{}",
+                    lease.tenant_scope,
+                    owner,
+                    content_digest(&bytes)
+                )
+                .as_bytes(),
+            );
+            let domain =
+                crate::EncryptionDomain::new(format!("{}/confidential", lease.tenant_scope))
+                    .map_err(|_| A2AError::invalid_params("invalid artifact encryption domain"))?;
+            let producer = crate::ArtifactProducer::new(
+                &lease.tenant_scope,
+                &owner,
+                &lease.task_id,
+                &context,
+                &message,
+                &lease.dispatch_id,
+            )
+            .map_err(|_| A2AError::invalid_params("invalid artifact producer"))?;
+            let retain_until = db_now
+                .checked_add(self.artifact_runtime_limits.retention_millis)
+                .ok_or_else(|| A2AError::invalid_params("artifact retention overflow"))?;
+            let policy_digest = crate::ContentDigestV1::of(b"smesh-artifact-default/v1");
+            let policy = crate::ArtifactPolicySnapshot::new(
+                "artifact-default",
+                1,
+                policy_digest,
+                db_now,
+                retain_until,
+            )
+            .map_err(|_| A2AError::invalid_params("invalid artifact policy"))?;
+            let manifest = crate::ArtifactManifestV1::new(
+                &artifact_id,
+                name,
+                Some("Durably replayable SMESH output".to_owned()),
+                media_type.clone(),
+                crate::ArtifactClassification::Confidential,
+                domain,
+                key_generation.clone(),
+                producer,
+                vec![],
+                policy,
+                db_now,
+                &bytes,
+            )
+            .map_err(|_| A2AError::invalid_params("invalid artifact payload"))?;
+            let registration = crate::ArtifactStageRegistration {
+                tenant_scope: lease.tenant_scope.clone(),
+                account_id: owner.clone(),
+                owner_account_id: owner.clone(),
+                task_id: lease.task_id.clone(),
+                context_id: context.clone(),
+                message_id: message.clone(),
+                dispatch_id: lease.dispatch_id.clone(),
+                upload_id,
+                artifact_id: artifact_id.clone(),
+                object_id,
+                content_digest: manifest.content_digest().to_string(),
+                manifest_digest: manifest.manifest_digest().to_string(),
+                ciphertext_digest: String::new(),
+                plaintext_length: manifest.plaintext_length(),
+                ciphertext_length: 0,
+                classification: "confidential".to_owned(),
+                encryption_domain: format!("{}/confidential", lease.tenant_scope),
+                key_generation: key_generation.clone(),
+                canonical_manifest_json: manifest.canonical_json().to_owned(),
+                chunks: manifest
+                    .chunks()
+                    .iter()
+                    .map(|chunk| crate::ArtifactChunkRegistration {
+                        ordinal: chunk.ordinal(),
+                        byte_offset: chunk.offset(),
+                        plaintext_length: chunk.length(),
+                        content_digest: chunk.digest().to_string(),
+                    })
+                    .collect(),
+                provenance: Vec::new(),
+                media_type,
+                reference_id: format!("reference-{}", &semantic[7..39]),
+                task_revision: u64::try_from(revision)
+                    .map_err(|_| A2AError::internal("task revision corrupt"))?,
+                policy_id: "artifact-default".to_owned(),
+                policy_revision: 1,
+                policy_digest: policy_digest.to_string(),
+                created_at: db_now,
+                stage_locator: String::new(),
+                final_locator: String::new(),
+                nonce: [0; 12],
+                retain_until,
+                quota_binding_digest: lease
+                    .execution_reservation
+                    .as_ref()
+                    .map(|value| value.binding_digest.clone()),
+                receiver_lease_epoch: lease.lease_epoch,
+                receiver_lease_token: lease.lease_token.clone(),
+            };
+            let staged =
+                crate::ArtifactAuthority::stage_artifact(self, registration, bytes).await?;
+            staged_artifacts.push(staged);
+            prepared.push(crate::bridge::published_artifact_event(
+                serde_json::to_string(&manifest.to_a2a_projection())
+                    .map_err(|_| A2AError::internal("artifact projection failed"))?,
+            ));
+        }
+        Ok((prepared, staged_artifacts))
+    }
+
     async fn complete_receiver(
         &self,
         lease: &ReceiverLease,
@@ -6195,6 +8096,9 @@ impl PostgresTaskStore {
                 "receiver transcript exceeds limit",
             ));
         }
+        let (prepared_events, staged_artifacts) =
+            self.prepare_receiver_artifacts(lease, events, now).await?;
+        let events = prepared_events.as_slice();
         let (kind, termination_json) = match &termination {
             DurableReceiverTermination::Success => ("success", None),
             DurableReceiverTermination::InputRequired { message } => {
@@ -6265,6 +8169,7 @@ impl PostgresTaskStore {
             let encoded = encoded.clone();
             let transcript = transcript.clone();
             let termination_json = termination_json.clone();
+            let staged_artifacts = staged_artifacts.clone();
             Box::pin(async move {
         let now = store.effective_now(tx, now).await?;
         let reservation_id = lease.execution_reservation.as_ref().map(|value| value.reservation_id.as_str());
@@ -6302,6 +8207,60 @@ impl PostgresTaskStore {
         {
             return Err(A2AError::invalid_request("receiver lease is stale"));
         }
+        // Artifact metadata becomes authoritative only inside the fenced receiver
+        // completion transaction. Staging is the sole pre-transaction side effect.
+        for r in &staged_artifacts {
+            if r.tenant_scope != lease.tenant_scope
+                || r.task_id != lease.task_id
+                || r.dispatch_id != lease.dispatch_id
+                || r.receiver_lease_epoch != lease.lease_epoch
+                || r.receiver_lease_token != lease.lease_token
+                || r.quota_binding_digest.as_deref() != binding
+                || r.task_revision == 0
+                || r.policy_revision == 0
+                || r.created_at > r.retain_until
+                || r.ciphertext_length < 16
+            {
+                return Err(A2AError::invalid_request("artifact receiver binding is stale"));
+            }
+            let locator_fence = store.q("SELECT pg_advisory_xact_lock(hashtextextended($1,0))");
+            tx.execute(&locator_fence,&[&r.stage_locator]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact stage fence failed")))?;
+            let claimed = store.q("SELECT EXISTS(SELECT 1 FROM __S__.artifact_orphan_candidates WHERE stage_locator=$1)");
+            if tx.query_one(&claimed,&[&r.stage_locator]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact stage ownership lookup failed")))?.get::<_,bool>(0) {
+                return Err(A2AError::invalid_request("artifact stage is owned by orphan cleanup"));
+            }
+            let key = store.q("INSERT INTO __S__.artifact_key_generations(tenant_scope,encryption_domain,key_generation,state,created_at) VALUES($1,$2,$3,'active',$4) ON CONFLICT DO NOTHING");
+            tx.execute(&key, &[&r.tenant_scope,&r.encryption_domain,&r.key_generation,&now]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact key registration failed")))?;
+            let nonce = r.nonce.to_vec();
+            store.publication_fault(ArtifactPublicationTestFault::BeforeContentObject)?;
+            let object = store.q("INSERT INTO __S__.content_objects(tenant_scope,owner_account_id,object_id,content_digest,classification,encryption_domain,key_generation,plaintext_length,ciphertext_length,ciphertext_digest,backend_locator,nonce,state,reference_count,retain_until,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'staged',0,$13,$14) ON CONFLICT DO NOTHING");
+            let object_inserted=tx.execute(&object,&[&r.tenant_scope,&r.owner_account_id,&r.object_id,&r.content_digest,&r.classification,&r.encryption_domain,&r.key_generation,&i64::try_from(r.plaintext_length).unwrap_or(i64::MAX),&i64::try_from(r.ciphertext_length).unwrap_or(i64::MAX),&r.ciphertext_digest,&r.final_locator,&nonce,&r.retain_until,&r.created_at]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact object registration failed")))? == 1;
+            store.publication_fault(ArtifactPublicationTestFault::AfterContentObject)?;
+            let verify = store.q("SELECT owner_account_id,content_digest,classification,encryption_domain,plaintext_length FROM __S__.content_objects WHERE tenant_scope=$1 AND object_id=$2");
+            let row=tx.query_one(&verify,&[&r.tenant_scope,&r.object_id]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact object verification failed")))?;
+            if row.get::<_,String>(0)!=r.owner_account_id || row.get::<_,String>(1)!=r.content_digest || row.get::<_,String>(2)!=r.classification || row.get::<_,String>(3)!=r.encryption_domain || row.get::<_,i64>(4)!=i64::try_from(r.plaintext_length).unwrap_or(i64::MAX) { return Err(A2AError::invalid_request("artifact registration conflicts with immutable state")); }
+            store.publication_fault(ArtifactPublicationTestFault::BeforeManifest)?;
+            let manifest=store.q("INSERT INTO __S__.artifact_manifests(tenant_scope,artifact_id,manifest_digest,object_id,schema_version,canonical_json,owner_account_id,task_id,context_id,message_id,dispatch_id,media_type,plaintext_length,classification,encryption_domain,policy_id,policy_revision,policy_digest,created_at,retain_until) VALUES($1,$2,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) ON CONFLICT DO NOTHING");
+            tx.execute(&manifest,&[&r.tenant_scope,&r.artifact_id,&r.manifest_digest,&r.object_id,&r.canonical_manifest_json,&r.owner_account_id,&r.task_id,&r.context_id,&r.message_id,&r.dispatch_id,&r.media_type,&i64::try_from(r.plaintext_length).unwrap_or(i64::MAX),&r.classification,&r.encryption_domain,&r.policy_id,&i64::try_from(r.policy_revision).unwrap_or(i64::MAX),&r.policy_digest,&r.created_at,&r.retain_until]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact manifest registration failed")))?;
+            store.publication_fault(ArtifactPublicationTestFault::AfterManifest)?;
+            store.publication_fault(ArtifactPublicationTestFault::BeforeChunkBatch)?;
+            let chunk_sql=store.q("INSERT INTO __S__.artifact_chunks(tenant_scope,artifact_id,ordinal,byte_offset,plaintext_length,content_digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING");
+            for chunk in &r.chunks { tx.execute(&chunk_sql,&[&r.tenant_scope,&r.artifact_id,&i32::try_from(chunk.ordinal).unwrap_or(i32::MAX),&i64::try_from(chunk.byte_offset).unwrap_or(i64::MAX),&i64::try_from(chunk.plaintext_length).unwrap_or(i64::MAX),&chunk.content_digest]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact chunk registration failed")))?; }
+            store.publication_fault(ArtifactPublicationTestFault::AfterChunkBatch)?;
+            store.publication_fault(ArtifactPublicationTestFault::BeforeProvenanceBatch)?;
+            let provenance_sql=store.q("INSERT INTO __S__.provenance_edges(tenant_scope,child_artifact_id,ordinal,parent_artifact_id,relation) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING");
+            for edge in &r.provenance { tx.execute(&provenance_sql,&[&r.tenant_scope,&r.artifact_id,&i32::try_from(edge.ordinal).unwrap_or(i32::MAX),&edge.parent_artifact_id,&edge.relation]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact provenance registration failed")))?; }
+            store.publication_fault(ArtifactPublicationTestFault::AfterProvenanceBatch)?;
+            store.publication_fault(ArtifactPublicationTestFault::BeforeReference)?;
+            let reference=store.q("INSERT INTO __S__.artifact_references(tenant_scope,reference_id,artifact_id,task_id,context_id,owner_account_id,task_revision,state,retain_until,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,'active',$8,$9) ON CONFLICT DO NOTHING RETURNING reference_id");
+            let reference_inserted=tx.query_opt(&reference,&[&r.tenant_scope,&r.reference_id,&r.artifact_id,&r.task_id,&r.context_id,&r.owner_account_id,&i64::try_from(r.task_revision).unwrap_or(i64::MAX),&r.retain_until,&r.created_at]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact reference registration failed")))?.is_some();
+            if reference_inserted { let increment=store.q("UPDATE __S__.content_objects o SET reference_count=o.reference_count+1 WHERE o.tenant_scope=$1 AND o.object_id=$2"); tx.execute(&increment,&[&r.tenant_scope,&r.object_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact reference accounting failed")))?; }
+            store.publication_fault(ArtifactPublicationTestFault::AfterReference)?;
+            store.publication_fault(ArtifactPublicationTestFault::BeforeUploadIntent)?;
+            if object_inserted { let upload=store.q("INSERT INTO __S__.upload_intents(tenant_scope,upload_id,artifact_id,object_id,state,stage_locator,final_locator,ciphertext_digest,ciphertext_length,lease_epoch,created_at,updated_at) VALUES($1,$2,$3,$4,'committed',$5,$6,$7,$8,1,$9,$9) ON CONFLICT DO NOTHING");
+            tx.execute(&upload,&[&r.tenant_scope,&r.upload_id,&r.artifact_id,&r.object_id,&r.stage_locator,&r.final_locator,&r.ciphertext_digest,&i64::try_from(r.ciphertext_length).unwrap_or(i64::MAX),&now]).await.map_err(|e| Self::transaction_body_error(&e,A2AError::internal("artifact upload registration failed")))?; }
+            store.publication_fault(ArtifactPublicationTestFault::AfterUploadIntent)?;
+        }
         if completion_canceled {
             let cancel=store.q("UPDATE __S__.cancellation_intents SET state='receiver_canceled',completed_at=$1 WHERE tenant_scope=$2 AND dispatch_id=$3 AND state='requested'");
             if tx
@@ -6320,12 +8279,15 @@ impl PostgresTaskStore {
                 return Err(A2AError::invalid_request("receiver lease is stale"));
             }
         }
+        store.publication_fault(ArtifactPublicationTestFault::BeforeReceiverEffect)?;
         if loopback_effect {
             let effect = store.q("INSERT INTO __S__.loopback_effects VALUES($1,$2,'accepted',$3)");
             tx.execute(&effect, &[&lease.tenant_scope, &lease.dispatch_id, &now])
                 .await
                 .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("receiver effect commit failed")))?;
         }
+        store.publication_fault(ArtifactPublicationTestFault::AfterReceiverEffect)?;
+        store.publication_fault(ArtifactPublicationTestFault::BeforeReceiverFrames)?;
         let insert =
             store.q("INSERT INTO __S__.receiver_frames VALUES($1,$2,$3,1,'mesh_event',$4,$5,$6)");
         for (seq, json) in encoded.iter().enumerate() {
@@ -6345,9 +8307,11 @@ impl PostgresTaskStore {
             .await
             .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("receiver frame append failed")))?;
         }
+        store.publication_fault(ArtifactPublicationTestFault::AfterReceiverFrames)?;
         let count = i64::try_from(encoded.len())
             .map_err(|_| A2AError::internal("too many receiver frames"))?;
         let digest = content_digest(&transcript);
+        store.publication_fault(ArtifactPublicationTestFault::BeforeReceiverCompletion)?;
         let update=store.q("UPDATE __S__.receiver_inbox SET state='completed',completion_kind=$1,termination_json=$2,frame_count=$3,transcript_digest=$4,measured_output_bytes=$5,measured_event_count=$6,completed_at=$7,updated_at=$7,lease_owner=NULL,lease_token=NULL,lease_until=NULL WHERE tenant_scope=$8 AND dispatch_id=$9 AND state='processing' AND lease_token=$10 AND lease_epoch=$11");
         if tx
             .execute(
@@ -6372,10 +8336,13 @@ impl PostgresTaskStore {
         {
             return Err(A2AError::invalid_request("receiver lease is stale"));
         }
+        store.publication_fault(ArtifactPublicationTestFault::AfterReceiverCompletion)?;
                 Ok(())
             })
         })
-        .await
+        .await?;
+        crate::artifact_production_checkpoint("receiver_complete_before_sender_delivery_commit");
+        Ok(())
     }
 }
 

@@ -9,13 +9,14 @@ use smesh_a2a::transport::{
     TlsSnapshotManager, TransportMode, load_tls_snapshot,
 };
 use smesh_a2a::{
-    AuthorizationPolicy, CorrelatingRuntimeProcessor, DurableLoopbackEndpoint, GatewayConfig,
-    GatewayMode, InjectedClock, LegacyTenantBinding, LoopbackDispatcher, PostgresStoreConfig,
-    PostgresTaskStore, QuotaPolicy, RuntimeAdmissionProcessor, RuntimeEventCapture,
-    RuntimeModeConfig, RuntimeWorker, SqliteTaskStore, SystemClockTicker,
-    build_authenticated_router, build_authenticated_router_with_trace,
-    build_authorized_durable_loopback_gateway, build_durable_loopback_gateway, build_router,
-    build_router_with_trace,
+    ArtifactAuthority, ArtifactBackupPlanFile, ArtifactKeyRotationPlanFile,
+    ArtifactMigrationPlanFile, ArtifactRestorePlanFile, ArtifactStoreConfig, AuthorizationPolicy,
+    CorrelatingRuntimeProcessor, DurableLoopbackEndpoint, GatewayConfig, GatewayMode,
+    InjectedClock, LegacyTenantBinding, LoopbackDispatcher, PostgresStoreConfig, PostgresTaskStore,
+    QuotaPolicy, RuntimeAdmissionProcessor, RuntimeEventCapture, RuntimeModeConfig, RuntimeWorker,
+    SqliteTaskStore, SystemClockTicker, build_authenticated_router,
+    build_authenticated_router_with_trace, build_authorized_durable_loopback_gateway,
+    build_durable_loopback_gateway, build_router, build_router_with_trace,
 };
 use smesh_core::{Network, Node};
 use smesh_runtime::{MeshConfig, RuntimeConfig, SmeshRuntime};
@@ -317,9 +318,154 @@ async fn serve_router(
     }
 }
 
+async fn run_artifact_restore_command() -> Result<(), Box<dyn std::error::Error>> {
+    let p = std::env::args_os()
+        .nth(2)
+        .ok_or("usage: smesh-a2a-gateway artifact-restore /absolute/private/plan.json")?;
+    if std::env::args_os().nth(3).is_some() {
+        return Err("artifact-restore accepts exactly one plan file".into());
+    }
+    let plan = ArtifactRestorePlanFile::open(p)?;
+    let migrator = std::env::var("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
+    let runtime = std::env::var("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
+    let schema = std::env::var("SMESH_A2A_POSTGRES_SCHEMA")?;
+    let keys = std::env::var_os("SMESH_A2A_ARTIFACT_KEYRING_PATH")
+        .ok_or("SMESH_A2A_ARTIFACT_KEYRING_PATH is required")?;
+    let config = PostgresStoreConfig::new(&migrator, &runtime, &schema)?
+        .with_artifact_store(ArtifactStoreConfig::new(plan.target_root(), keys)?);
+    #[cfg(debug_assertions)]
+    let config = if std::env::var("SMESH_TEST_POSTGRES_INSECURE_LOOPBACK").as_deref() == Ok("1") {
+        config.with_test_only_insecure_loopback(true)
+    } else {
+        config
+    };
+    let out = PostgresTaskStore::restore_artifacts(config, &plan).await?;
+    println!(
+        "artifact restore objects={} enabled={}",
+        out.objects, out.enabled
+    );
+    Ok(())
+}
+
+async fn run_artifact_key_rotate_command() -> Result<(), Box<dyn std::error::Error>> {
+    let plan_path = std::env::args_os()
+        .nth(2)
+        .ok_or("usage: smesh-a2a-gateway artifact-key-rotate /absolute/private/plan.json")?;
+    if std::env::args_os().nth(3).is_some() {
+        return Err("artifact-key-rotate accepts exactly one plan file".into());
+    }
+    let plan = ArtifactKeyRotationPlanFile::open(plan_path)?;
+    let migrator = std::env::var("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
+    let runtime = std::env::var("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
+    let schema = std::env::var("SMESH_A2A_POSTGRES_SCHEMA")?;
+    let root =
+        std::env::var_os("SMESH_A2A_ARTIFACT_ROOT").ok_or("SMESH_A2A_ARTIFACT_ROOT is required")?;
+    let keys = std::env::var_os("SMESH_A2A_ARTIFACT_KEYRING_PATH")
+        .ok_or("SMESH_A2A_ARTIFACT_KEYRING_PATH is required")?;
+    let owner = std::env::var("SMESH_A2A_ARTIFACT_ROTATION_OWNER")
+        .map_err(|_| "SMESH_A2A_ARTIFACT_ROTATION_OWNER is required")?;
+    let config = PostgresStoreConfig::new(&migrator, &runtime, &schema)?
+        .with_artifact_store(ArtifactStoreConfig::new(root, keys)?);
+    #[cfg(debug_assertions)]
+    let config = if std::env::var("SMESH_TEST_POSTGRES_INSECURE_LOOPBACK").as_deref() == Ok("1") {
+        config.with_test_only_insecure_loopback(true)
+    } else {
+        config
+    };
+    let out = PostgresTaskStore::rotate_artifact_key(config, &plan, &owner).await?;
+    println!(
+        "artifact key rotation reencrypted={} cleaned={} completed={}",
+        out.reencrypted, out.cleaned, out.completed
+    );
+    Ok(())
+}
+
+async fn run_artifact_backup_command() -> Result<(), Box<dyn std::error::Error>> {
+    let plan_path = std::env::args_os()
+        .nth(2)
+        .ok_or("usage: smesh-a2a-gateway artifact-backup /absolute/private/plan.json")?;
+    if std::env::args_os().nth(3).is_some() {
+        return Err("artifact-backup accepts exactly one plan file".into());
+    }
+    let plan = ArtifactBackupPlanFile::open(&plan_path)?;
+    let migrator = std::env::var("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
+    let runtime = std::env::var("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
+    let schema = std::env::var("SMESH_A2A_POSTGRES_SCHEMA")?;
+    let root =
+        std::env::var_os("SMESH_A2A_ARTIFACT_ROOT").ok_or("SMESH_A2A_ARTIFACT_ROOT is required")?;
+    let keyring = std::env::var_os("SMESH_A2A_ARTIFACT_KEYRING_PATH")
+        .ok_or("SMESH_A2A_ARTIFACT_KEYRING_PATH is required")?;
+    let owner = std::env::var("SMESH_A2A_ARTIFACT_BACKUP_OWNER")
+        .map_err(|_| "SMESH_A2A_ARTIFACT_BACKUP_OWNER is required")?;
+    let config = PostgresStoreConfig::new(&migrator, &runtime, &schema)?
+        .with_artifact_store(ArtifactStoreConfig::new(root, keyring)?);
+    #[cfg(debug_assertions)]
+    let config = if std::env::var("SMESH_TEST_POSTGRES_INSECURE_LOOPBACK").as_deref() == Ok("1") {
+        config.with_test_only_insecure_loopback(true)
+    } else {
+        config
+    };
+    let result = PostgresTaskStore::backup_artifacts(config, &plan, &owner).await?;
+    println!(
+        "artifact backup objects={} inventory_digest={} signed={}",
+        result.objects,
+        result.inventory_digest,
+        result.signature.is_some()
+    );
+    Ok(())
+}
+
+async fn run_artifact_migrate_command() -> Result<(), Box<dyn std::error::Error>> {
+    let plan_path = std::env::args_os()
+        .nth(2)
+        .ok_or("usage: smesh-a2a-gateway artifact-migrate /absolute/private/plan.json")?;
+    if std::env::args_os().nth(3).is_some() {
+        return Err("artifact-migrate accepts exactly one plan file".into());
+    }
+    let plan = ArtifactMigrationPlanFile::open(&plan_path)?;
+    let migrator = std::env::var("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
+    let runtime = std::env::var("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
+    let schema = std::env::var("SMESH_A2A_POSTGRES_SCHEMA")?;
+    let root =
+        std::env::var_os("SMESH_A2A_ARTIFACT_ROOT").ok_or("SMESH_A2A_ARTIFACT_ROOT is required")?;
+    let keyring = std::env::var_os("SMESH_A2A_ARTIFACT_KEYRING_PATH")
+        .ok_or("SMESH_A2A_ARTIFACT_KEYRING_PATH is required")?;
+    let owner = std::env::var("SMESH_A2A_ARTIFACT_MIGRATION_OWNER")
+        .map_err(|_| "SMESH_A2A_ARTIFACT_MIGRATION_OWNER is required")?;
+    let config = PostgresStoreConfig::new(&migrator, &runtime, &schema)?
+        .with_artifact_store(ArtifactStoreConfig::new(root, keyring)?);
+    #[cfg(debug_assertions)]
+    let config = if std::env::var("SMESH_TEST_POSTGRES_INSECURE_LOOPBACK").as_deref() == Ok("1") {
+        config.with_test_only_insecure_loopback(true)
+    } else {
+        config
+    };
+    let result = PostgresTaskStore::migrate_inline_artifacts(config, &plan, &owner).await?;
+    println!(
+        "artifact migration completed={} migrated_artifacts={} rewritten_rows={} completion_seal={}",
+        result.completed,
+        result.migrated_artifacts,
+        result.rewritten_rows,
+        result.completion_seal.as_deref().unwrap_or("none")
+    );
+    Ok(())
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("artifact-restore")) {
+        return run_artifact_restore_command().await;
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("artifact-key-rotate")) {
+        return run_artifact_key_rotate_command().await;
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("artifact-backup")) {
+        return run_artifact_backup_command().await;
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("artifact-migrate")) {
+        return run_artifact_migrate_command().await;
+    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -407,11 +553,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quota_policy = std::env::var_os("SMESH_A2A_QUOTA_POLICY_PATH")
         .map(|path| QuotaPolicy::load(std::path::PathBuf::from(path)).map(Arc::new))
         .transpose()?;
+    let artifact_root = std::env::var_os("SMESH_A2A_ARTIFACT_ROOT");
+    let artifact_keyring = std::env::var_os("SMESH_A2A_ARTIFACT_KEYRING_PATH");
+    let artifact_store = match (artifact_root, artifact_keyring) {
+        (None, None) => None,
+        (Some(root), Some(keyring)) => Some(ArtifactStoreConfig::new(root, keyring)?),
+        _ => {
+            return Err(
+                "SMESH_A2A_ARTIFACT_ROOT and SMESH_A2A_ARTIFACT_KEYRING_PATH must be set together"
+                    .into(),
+            );
+        }
+    };
     let backend = std::env::var("SMESH_A2A_DURABLE_BACKEND").ok();
     if quota_policy.is_some() && backend.as_deref() != Some("postgres") {
         return Err(
             "distributed quota enforcement requires the PostgreSQL durable authority".into(),
         );
+    }
+    if artifact_store.is_some() && backend.as_deref() != Some("postgres") {
+        return Err("artifact storage requires the PostgreSQL durable authority".into());
     }
     if let Ok(replica_id) = std::env::var("SMESH_A2A_REPLICA_ID")
         && (replica_id.is_empty()
@@ -433,7 +594,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !authentication_enabled || !matches!(mode, GatewayMode::Loopback) {
                 return Err("PostgreSQL durable authority requires authenticated authorized loopback mode".into());
             }
-            let config = PostgresStoreConfig::new(
+            let mut config = PostgresStoreConfig::new(
                 pg_migrator.ok_or("SMESH_A2A_POSTGRES_MIGRATOR_URL is required")?,
                 pg_runtime.ok_or("SMESH_A2A_POSTGRES_RUNTIME_URL is required")?,
                 pg_schema.ok_or("SMESH_A2A_POSTGRES_SCHEMA is required")?,
@@ -441,6 +602,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_quota_policy(quota_policy.clone().ok_or(
                 "SMESH_A2A_QUOTA_POLICY_PATH is required for PostgreSQL production authority",
             )?);
+            if let Some(artifact_store) = artifact_store.clone() {
+                config = config.with_artifact_store(artifact_store);
+                if let Some(path) = std::env::var_os("SMESH_A2A_ARTIFACT_MIGRATION_PLAN_PATH") {
+                    config = config.with_artifact_migration_plan_file(
+                        ArtifactMigrationPlanFile::open(std::path::PathBuf::from(path))?,
+                    );
+                }
+            }
             #[cfg(debug_assertions)]
             let config = {
                 let mut config = config;
@@ -617,6 +786,10 @@ async fn run_postgres_durable_loopback_gateway(
     let policy =
         authorization.ok_or("PostgreSQL durable authority requires authorization policy")?;
     let store = PostgresTaskStore::open(postgres_config).await?;
+    tracing::info!(
+        artifact_storage = store.artifact_capabilities().publication,
+        "PostgreSQL durable authority opened"
+    );
     let clock = InjectedClock::new(chrono::Utc::now().timestamp_millis());
     let gateway = build_authorized_durable_loopback_gateway(
         config,

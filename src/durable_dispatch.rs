@@ -539,7 +539,23 @@ impl DurableLoopbackEndpoint {
                                         () = publish_release.notified() => {}
                                     }
                                 }
-                                Ok(DurableDispatchOutcome::Delivered(events))
+                                match authority
+                                    .begin_receive(
+                                        envelope.clone(),
+                                        replica_id,
+                                        clock.now(),
+                                        receiver_lease_millis(),
+                                    )
+                                    .await?
+                                {
+                                    crate::ReceiverAdmission::Replay(published) => {
+                                        Ok(DurableDispatchOutcome::Delivered(published))
+                                    }
+                                    _ => Err(a2a::A2AError::internal(
+                                        "completed receiver did not replay authoritative frames",
+                                    )
+                                    .into()),
+                                }
                             }
                         },
                     }

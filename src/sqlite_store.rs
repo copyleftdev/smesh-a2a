@@ -7869,6 +7869,8 @@ impl TaskStore for SqliteTaskStore {
     }
 }
 
+crate::impl_unsupported_artifact_authority!(SqliteTaskStore);
+
 #[cfg(test)]
 mod tests {
     use super::*;

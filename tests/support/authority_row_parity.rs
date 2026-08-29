@@ -65,6 +65,31 @@ pub async fn assert_postgres_tables_match(client: &Client, schema: &str) {
         .map(|row| row.get::<_, String>(0))
         .collect::<BTreeSet<_>>();
     for table in [
+        // PostgreSQL-only artifact authority. SQLite intentionally remains a
+        // development compatibility backend and must not claim artifact parity.
+        "artifact_backup_inventory",
+        "artifact_backup_jobs",
+        "artifact_backup_key_dependencies",
+        "artifact_backup_leases",
+        "artifact_corruption_audits",
+        "artifact_orphan_audits",
+        "artifact_orphan_candidates",
+        "artifact_chunks",
+        "artifact_gc_jobs",
+        "artifact_key_audits",
+        "artifact_key_generations",
+        "artifact_key_rotation_plans",
+        "artifact_manifests",
+        "artifact_migration_plans",
+        "artifact_read_leases",
+        "artifact_reencryption_jobs",
+        "artifact_references",
+        "artifact_restore_jobs",
+        "artifact_retention_holds",
+        "artifact_tombstones",
+        "content_objects",
+        "provenance_edges",
+        "upload_intents",
         "outbox_tenant_scheduler",
         "quota_reservations",
         "quota_allocations",

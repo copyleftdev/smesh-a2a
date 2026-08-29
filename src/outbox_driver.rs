@@ -619,17 +619,45 @@ fn apply_terminal_events(
                 name,
                 media_type,
                 content,
-            } => artifacts.push(Artifact {
-                artifact_id: format!(
-                    "artifact-{}",
-                    &content_digest(format!("{dispatch_id}\0{index}").as_bytes())[..32]
-                ),
-                name: Some(name.clone()),
-                description: Some("Durably replayable SMESH output".to_owned()),
-                parts: vec![Part::text(content.clone()).with_media_type(media_type.clone())],
-                metadata: None,
-                extensions: None,
-            }),
+            } => match crate::bridge::internal_artifact_payload(content) {
+                Some(crate::bridge::InternalArtifactPayload::Published { projection }) => {
+                    artifacts.push(
+                        serde_json::from_str(&projection)
+                            .map_err(|_| a2a::A2AError::invalid_agent_response())?,
+                    );
+                }
+                Some(crate::bridge::InternalArtifactPayload::Binary { bytes }) => {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(bytes)
+                        .map_err(|_| a2a::A2AError::invalid_agent_response())?;
+                    artifacts.push(Artifact {
+                        artifact_id: format!(
+                            "artifact-{}",
+                            &content_digest(format!("{dispatch_id}\0{index}").as_bytes())[..32]
+                        ),
+                        name: Some(name.clone()),
+                        description: Some("Durably replayable SMESH output".to_owned()),
+                        parts: vec![
+                            Part::data(serde_json::json!({"bytes": bytes}))
+                                .with_media_type(media_type.clone()),
+                        ],
+                        metadata: None,
+                        extensions: None,
+                    });
+                }
+                None => artifacts.push(Artifact {
+                    artifact_id: format!(
+                        "artifact-{}",
+                        &content_digest(format!("{dispatch_id}\0{index}").as_bytes())[..32]
+                    ),
+                    name: Some(name.clone()),
+                    description: Some("Durably replayable SMESH output".to_owned()),
+                    parts: vec![Part::text(content.clone()).with_media_type(media_type.clone())],
+                    metadata: None,
+                    extensions: None,
+                }),
+            },
             MeshEvent::Completed { summary } => completed_summary = Some(summary.clone()),
             MeshEvent::Progress(_) | MeshEvent::Evidence(_) => {}
         }
@@ -1007,6 +1035,8 @@ mod tests {
         }
         fn close_owned_sync(&self) {}
     }
+
+    crate::impl_unsupported_artifact_authority!(PanickingAuthority);
 
     #[tokio::test]
     async fn dropping_driver_requests_cooperative_shutdown_before_reaping_root() {

@@ -1,5 +1,17 @@
 //! A2A v1 interoperability gateway for SMESH swarms.
 
+/// Backend-neutral artifact contracts, encrypted POSIX CAS, authorization, and lifecycle.
+pub mod artifact;
+mod artifact_backup_executor;
+mod artifact_checkpoint;
+mod artifact_gc;
+mod artifact_migration;
+mod artifact_migration_executor;
+mod artifact_operator_plan;
+mod artifact_orphan_scanner;
+mod artifact_promoter;
+mod artifact_reencryption_executor;
+mod artifact_restore_executor;
 /// Bearer and mTLS principal verification and request-scoping boundaries.
 pub mod auth;
 /// Server-owned tenant authorization policy and immutable request context.
@@ -30,6 +42,34 @@ mod store;
 /// Production exposure policy, TLS material loading, reload, and bounded acceptor.
 pub mod transport;
 
+pub use artifact::{
+    ARTIFACT_CHUNK_BYTES, ArtifactBackupInventory, ArtifactBackupObject, ArtifactCatalog,
+    ArtifactChunkV1, ArtifactClassification, ArtifactKeyRotationPlan, ArtifactKeyring,
+    ArtifactManifestV1, ArtifactMigrationPlan, ArtifactPolicySnapshot, ArtifactProducer,
+    ArtifactStoreConfig, ArtifactStoreError, ContentDigestV1, DerivedFrom, DerivedRelation,
+    EncryptionDomain, InMemoryKeyring, JsonArtifactKeyring, PosixArtifactBlobStore,
+    ReloadingArtifactKeyring, RetentionDecision, StageOrphanCleanup, StagedArtifact,
+    StoredArtifact,
+};
+pub use artifact_backup_executor::ArtifactBackupOutcome;
+#[doc(hidden)]
+pub use artifact_checkpoint::artifact_production_checkpoint;
+pub use artifact_gc::{ArtifactGcHandle, ArtifactGcState, spawn_artifact_gc};
+pub use artifact_migration::{
+    ArtifactMigrationPlanFile, InlineArtifact, InlineArtifactKind, InlineArtifactPart,
+    extract_inline_artifacts,
+};
+pub use artifact_operator_plan::{
+    ArtifactBackupPlanFile, ArtifactKeyRotationPlanFile, ArtifactRestorePlanFile, SignatureHook,
+};
+pub use artifact_orphan_scanner::{
+    ArtifactOrphanScannerHandle, ArtifactOrphanScannerState, spawn_artifact_orphan_scanner,
+};
+pub use artifact_promoter::{
+    ArtifactPromoterHandle, ArtifactPromoterState, spawn_artifact_promoter,
+};
+pub use artifact_reencryption_executor::ArtifactKeyRotationOutcome;
+pub use artifact_restore_executor::ArtifactRestoreOutcome;
 pub use authorization::{
     AuthorizationContext, AuthorizationError, AuthorizationMiddlewareState, AuthorizationPolicy,
     Operation, TENANT_SELECTOR_HEADER, TenantRole, VisibilityScope, authorize_request,
@@ -42,17 +82,20 @@ pub use card::{
 };
 pub use channel::{ChannelDispatcher, DispatchCommand};
 pub use durable_authority::{
-    AdmissionOutcome, AdmissionRecord, AtomicRecordCounts, AttemptDisposition,
-    AuthorityCapabilities, AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown,
-    AuthorizationAuditInput, AuthorizationAuditParts, AuthorizationAuditSink,
-    AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead, CancellationAuthority,
-    CancellationOutcome, ChangeObservation, ChangeObserver, DurableAuthority, ExecutionReservation,
-    IntoDurableAuthority, LeaseRenewalOutcome, OutboxAuthority, OutboxLease, OwnedTaskScope,
-    PollInterval, QuotaLease, QuotaLeaseAuthority, QuotaReservationInput, ReceiverAdmission,
-    ReceiverAuthority, ReceiverLease, SendMessageAdmission, StreamTranscriptBatch,
-    SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE, TaskAdmission, TaskEventBatch, TaskLifecycle,
-    TranscriptAuthority, TransitionOutcome, authorized_message_identity,
-    canonical_send_message_digest, canonical_send_message_digest_v2,
+    AdmissionOutcome, AdmissionRecord, ArtifactAuthority, ArtifactBackupLease,
+    ArtifactCapabilities, ArtifactChunkRegistration, ArtifactGcClaim, ArtifactHold,
+    ArtifactPromotionClaim, ArtifactProvenanceRegistration, ArtifactReadLease,
+    ArtifactReadMetadata, ArtifactRuntimeLimits, ArtifactStageReference, ArtifactStageRegistration,
+    AtomicRecordCounts, AttemptDisposition, AuthorityCapabilities, AuthorityDiagnostics,
+    AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput, AuthorizationAuditParts,
+    AuthorizationAuditSink, AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead,
+    CancellationAuthority, CancellationOutcome, ChangeObservation, ChangeObserver,
+    DurableAuthority, ExecutionReservation, IntoDurableAuthority, LeaseRenewalOutcome,
+    OutboxAuthority, OutboxLease, OwnedTaskScope, PollInterval, QuotaLease, QuotaLeaseAuthority,
+    QuotaReservationInput, ReceiverAdmission, ReceiverAuthority, ReceiverLease,
+    SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE,
+    TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority, TransitionOutcome,
+    authorized_message_identity, canonical_send_message_digest, canonical_send_message_digest_v2,
 };
 pub use durable_dispatch::{
     DurableDispatchEnvelope, DurableInterruptionKind, DurableLoopbackEndpoint,
@@ -72,7 +115,8 @@ pub use policy::{
     content_digest,
 };
 pub use postgres_store::{
-    PostgresStoreConfig, PostgresStoreError, PostgresTaskStore, PostgresTransactionTestFault,
+    ArtifactMigrationOutcome, ArtifactPublicationTestFault, PostgresStoreConfig,
+    PostgresStoreError, PostgresTaskStore, PostgresTransactionTestFault,
 };
 pub use quota::{
     ExecutionBudget, QuotaAlgorithm, QuotaCharge, QuotaDimension, QuotaExceeded, QuotaIntent,

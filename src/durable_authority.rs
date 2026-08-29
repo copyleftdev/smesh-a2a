@@ -574,6 +574,512 @@ pub struct AuthorityCapabilities {
     pub quota_reservations: bool,
 }
 
+/// Artifact capability declaration used to fail production startup closed.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactCapabilities {
+    pub publication: bool,
+    pub promotion: bool,
+    pub resolution: bool,
+    pub retention_gc: bool,
+}
+
+/// Validated runtime limits consumed by the resolver and background workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactRuntimeLimits {
+    pub max_artifact_bytes: u64,
+    pub retention_millis: i64,
+    pub read_lease_millis: i64,
+    pub worker_batch: usize,
+}
+
+impl Default for ArtifactRuntimeLimits {
+    fn default() -> Self {
+        Self {
+            max_artifact_bytes: 64 * 1024 * 1024,
+            retention_millis: 30 * 24 * 60 * 60 * 1_000,
+            read_lease_millis: 60_000,
+            worker_batch: 100,
+        }
+    }
+}
+
+/// Exact plaintext chunk registration carried across backend boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactChunkRegistration {
+    pub ordinal: u32,
+    pub byte_offset: u64,
+    pub plaintext_length: u64,
+    pub content_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactProvenanceRegistration {
+    pub ordinal: u32,
+    pub parent_artifact_id: String,
+    pub relation: String,
+}
+
+/// Complete immutable registration produced after encrypted POSIX staging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactStageRegistration {
+    pub tenant_scope: String,
+    pub account_id: String,
+    pub owner_account_id: String,
+    pub task_id: String,
+    pub context_id: String,
+    pub message_id: String,
+    pub dispatch_id: String,
+    pub upload_id: String,
+    pub artifact_id: String,
+    pub object_id: String,
+    pub content_digest: String,
+    pub manifest_digest: String,
+    pub ciphertext_digest: String,
+    pub plaintext_length: u64,
+    pub ciphertext_length: u64,
+    pub classification: String,
+    pub encryption_domain: String,
+    pub key_generation: String,
+    pub canonical_manifest_json: String,
+    pub chunks: Vec<ArtifactChunkRegistration>,
+    pub provenance: Vec<ArtifactProvenanceRegistration>,
+    pub media_type: String,
+    pub reference_id: String,
+    pub task_revision: u64,
+    pub policy_id: String,
+    pub policy_revision: u64,
+    pub policy_digest: String,
+    pub created_at: i64,
+    pub stage_locator: String,
+    pub final_locator: String,
+    pub nonce: [u8; 12],
+    pub retain_until: i64,
+    pub quota_binding_digest: Option<String>,
+    pub receiver_lease_epoch: u64,
+    pub receiver_lease_token: String,
+}
+
+pub type ArtifactStageReference = ArtifactStageRegistration;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactPromotionClaim {
+    pub tenant_scope: String,
+    pub upload_id: String,
+    pub artifact_id: String,
+    pub object_id: String,
+    pub stage_locator: String,
+    pub final_locator: String,
+    pub ciphertext_digest: String,
+    pub ciphertext_length: u64,
+    pub lease_owner: String,
+    pub lease_token: String,
+    pub lease_epoch: u64,
+    pub lease_until: i64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ArtifactReadLease {
+    pub(crate) tenant_scope: String,
+    pub(crate) owner_account_id: String,
+    pub(crate) task_id: String,
+    pub(crate) artifact_id: String,
+    pub(crate) media_type: String,
+    pub(crate) content_digest: String,
+    pub(crate) manifest_digest: String,
+    pub(crate) plaintext_length: u64,
+    pub(crate) classification: String,
+    pub(crate) encryption_domain: String,
+    pub(crate) ciphertext_digest: String,
+    pub(crate) ciphertext_length: u64,
+    pub(crate) backend_locator: String,
+    pub(crate) nonce: [u8; 12],
+    pub(crate) key_generation: String,
+    pub(crate) canonical_manifest_json: String,
+    pub(crate) lease_id: String,
+    pub(crate) lease_token: String,
+    pub(crate) lease_epoch: u64,
+    pub(crate) lease_until: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactReadMetadata {
+    pub artifact_id: String,
+    pub media_type: String,
+    pub content_digest: String,
+    pub plaintext_length: u64,
+}
+
+impl ArtifactReadLease {
+    #[must_use]
+    pub fn metadata(&self) -> ArtifactReadMetadata {
+        ArtifactReadMetadata {
+            artifact_id: self.artifact_id.clone(),
+            media_type: self.media_type.clone(),
+            content_digest: self.content_digest.clone(),
+            plaintext_length: self.plaintext_length,
+        }
+    }
+}
+
+impl std::fmt::Debug for ArtifactReadLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArtifactReadLease")
+            .field("artifact_id", &self.artifact_id)
+            .field("metadata", &self.metadata())
+            .field("private_authority", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactHold {
+    pub tenant_scope: String,
+    pub artifact_id: String,
+    pub hold_id: String,
+    pub actor_digest: String,
+    pub reason_digest: String,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactGcClaim {
+    pub tenant_scope: String,
+    pub job_id: String,
+    pub object_id: String,
+    pub backend_locator: String,
+    pub tombstone_generation: u64,
+    pub lease_owner: String,
+    pub lease_token: String,
+    pub lease_epoch: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ArtifactBackupLease {
+    pub tenant_scope: String,
+    pub object_id: String,
+    pub lease_id: String,
+    pub lease_owner: String,
+    pub lease_token: String,
+    pub lease_epoch: u64,
+    pub lease_until: i64,
+}
+
+impl std::fmt::Debug for ArtifactBackupLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArtifactBackupLease")
+            .field("tenant_scope", &self.tenant_scope)
+            .field("object_id", &self.object_id)
+            .field("lease_id", &self.lease_id)
+            .field("lease_owner", &self.lease_owner)
+            .field("lease_token", &"<redacted>")
+            .field("lease_epoch", &self.lease_epoch)
+            .field("lease_until", &self.lease_until)
+            .finish()
+    }
+}
+
+/// Narrow object-safe artifact authority. Every method is required: adapters
+/// must either implement production semantics or explicitly return Unsupported.
+#[async_trait]
+pub trait ArtifactAuthority: Send + Sync {
+    fn artifact_capabilities(&self) -> ArtifactCapabilities;
+    fn artifact_runtime_limits(&self) -> ArtifactRuntimeLimits {
+        ArtifactRuntimeLimits::default()
+    }
+    async fn stage_artifact(
+        &self,
+        registration: ArtifactStageRegistration,
+        plaintext: Vec<u8>,
+    ) -> Result<ArtifactStageRegistration, A2AError>;
+    async fn register_artifact(
+        &self,
+        registration: &ArtifactStageRegistration,
+        now: i64,
+    ) -> Result<(), A2AError>;
+    async fn claim_artifact_promotion(
+        &self,
+        lease_owner: &str,
+        lease_duration: i64,
+        batch: usize,
+    ) -> Result<Vec<ArtifactPromotionClaim>, A2AError>;
+    async fn commit_artifact_promotion(
+        &self,
+        claim: &ArtifactPromotionClaim,
+    ) -> Result<bool, A2AError>;
+    async fn fail_artifact_promotion(
+        &self,
+        claim: &ArtifactPromotionClaim,
+        error_digest: &str,
+    ) -> Result<bool, A2AError>;
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_artifact_resolution(
+        &self,
+        scope: &OwnedTaskScope,
+        artifact_id: &str,
+        task_id: Option<&str>,
+        owner_digest: &str,
+        lease_duration: i64,
+        quota_intent: Option<&crate::QuotaIntent>,
+        audit: AuthorizationAuditInput,
+        now: i64,
+    ) -> Result<Option<ArtifactReadLease>, A2AError>;
+    async fn read_artifact_resolution(
+        &self,
+        resolution: &ArtifactReadLease,
+    ) -> Result<Vec<u8>, A2AError>;
+    async fn finish_artifact_resolution(
+        &self,
+        resolution: &ArtifactReadLease,
+        bytes_served: u64,
+        success: bool,
+    ) -> Result<bool, A2AError>;
+    async fn place_artifact_hold(&self, hold: &ArtifactHold, now: i64) -> Result<(), A2AError>;
+    async fn release_artifact_hold(&self, hold: &ArtifactHold, now: i64) -> Result<bool, A2AError>;
+    async fn release_artifact_reference(
+        &self,
+        tenant_scope: &str,
+        reference_id: &str,
+        owner_account_id: &str,
+        task_id: &str,
+        artifact_id: &str,
+        now: i64,
+    ) -> Result<bool, A2AError>;
+    async fn claim_artifact_gc(
+        &self,
+        lease_owner: &str,
+        lease_duration: i64,
+        batch: usize,
+    ) -> Result<Vec<ArtifactGcClaim>, A2AError>;
+    async fn commit_artifact_gc(
+        &self,
+        claim: &ArtifactGcClaim,
+        deletion_receipt_digest: &str,
+    ) -> Result<bool, A2AError>;
+    async fn fail_artifact_gc(
+        &self,
+        claim: &ArtifactGcClaim,
+        error_digest: &str,
+    ) -> Result<bool, A2AError>;
+    async fn acquire_artifact_backup_lease(
+        &self,
+        tenant_scope: &str,
+        object_id: &str,
+        lease_owner: &str,
+        lease_duration: i64,
+    ) -> Result<ArtifactBackupLease, A2AError>;
+    async fn renew_artifact_backup_lease(
+        &self,
+        lease: &ArtifactBackupLease,
+        lease_duration: i64,
+    ) -> Result<Option<ArtifactBackupLease>, A2AError>;
+    async fn release_artifact_backup_lease(
+        &self,
+        lease: &ArtifactBackupLease,
+    ) -> Result<bool, A2AError>;
+    async fn scan_artifact_stage_orphans(
+        &self,
+        horizon_millis: i64,
+        batch: usize,
+    ) -> Result<crate::StageOrphanCleanup, A2AError>;
+}
+
+/// Explicit non-production artifact implementation for development adapters and
+/// scripted test doubles. The production contract itself has no defaults.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! impl_unsupported_artifact_authority {
+    ($ty:ty) => {
+        #[async_trait::async_trait]
+        impl $crate::ArtifactAuthority for $ty {
+            fn artifact_capabilities(&self) -> $crate::ArtifactCapabilities {
+                $crate::ArtifactCapabilities {
+                    publication: false,
+                    promotion: false,
+                    resolution: false,
+                    retention_gc: false,
+                }
+            }
+            async fn stage_artifact(
+                &self,
+                _: $crate::ArtifactStageRegistration,
+                _: Vec<u8>,
+            ) -> Result<$crate::ArtifactStageRegistration, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact publication is unsupported",
+                ))
+            }
+            async fn register_artifact(
+                &self,
+                _: &$crate::ArtifactStageRegistration,
+                _: i64,
+            ) -> Result<(), a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact publication is unsupported",
+                ))
+            }
+            async fn claim_artifact_promotion(
+                &self,
+                _: &str,
+                _: i64,
+                _: usize,
+            ) -> Result<Vec<$crate::ArtifactPromotionClaim>, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact promotion is unsupported",
+                ))
+            }
+            async fn commit_artifact_promotion(
+                &self,
+                _: &$crate::ArtifactPromotionClaim,
+            ) -> Result<bool, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact promotion is unsupported",
+                ))
+            }
+            async fn fail_artifact_promotion(
+                &self,
+                _: &$crate::ArtifactPromotionClaim,
+                _: &str,
+            ) -> Result<bool, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact promotion is unsupported",
+                ))
+            }
+            async fn begin_artifact_resolution(
+                &self,
+                _: &$crate::OwnedTaskScope,
+                _: &str,
+                _: Option<&str>,
+                _: &str,
+                _: i64,
+                _: Option<&$crate::QuotaIntent>,
+                _: $crate::AuthorizationAuditInput,
+                _: i64,
+            ) -> Result<Option<$crate::ArtifactReadLease>, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact resolution is unsupported",
+                ))
+            }
+            async fn read_artifact_resolution(
+                &self,
+                _: &$crate::ArtifactReadLease,
+            ) -> Result<Vec<u8>, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact resolution is unsupported",
+                ))
+            }
+            async fn finish_artifact_resolution(
+                &self,
+                _: &$crate::ArtifactReadLease,
+                _: u64,
+                _: bool,
+            ) -> Result<bool, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact resolution is unsupported",
+                ))
+            }
+            async fn place_artifact_hold(
+                &self,
+                _: &$crate::ArtifactHold,
+                _: i64,
+            ) -> Result<(), a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact retention is unsupported",
+                ))
+            }
+            async fn release_artifact_hold(
+                &self,
+                _: &$crate::ArtifactHold,
+                _: i64,
+            ) -> Result<bool, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact retention is unsupported",
+                ))
+            }
+            async fn release_artifact_reference(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: i64,
+            ) -> Result<bool, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact retention is unsupported",
+                ))
+            }
+            async fn claim_artifact_gc(
+                &self,
+                _: &str,
+                _: i64,
+                _: usize,
+            ) -> Result<Vec<$crate::ArtifactGcClaim>, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact gc is unsupported",
+                ))
+            }
+            async fn commit_artifact_gc(
+                &self,
+                _: &$crate::ArtifactGcClaim,
+                _: &str,
+            ) -> Result<bool, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact gc is unsupported",
+                ))
+            }
+            async fn fail_artifact_gc(
+                &self,
+                _: &$crate::ArtifactGcClaim,
+                _: &str,
+            ) -> Result<bool, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact gc is unsupported",
+                ))
+            }
+            async fn acquire_artifact_backup_lease(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: i64,
+            ) -> Result<$crate::ArtifactBackupLease, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact backup is unsupported",
+                ))
+            }
+            async fn renew_artifact_backup_lease(
+                &self,
+                _: &$crate::ArtifactBackupLease,
+                _: i64,
+            ) -> Result<Option<$crate::ArtifactBackupLease>, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact backup is unsupported",
+                ))
+            }
+            async fn release_artifact_backup_lease(
+                &self,
+                _: &$crate::ArtifactBackupLease,
+            ) -> Result<bool, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact backup is unsupported",
+                ))
+            }
+            async fn scan_artifact_stage_orphans(
+                &self,
+                _: i64,
+                _: usize,
+            ) -> Result<$crate::StageOrphanCleanup, a2a::A2AError> {
+                Err(a2a::A2AError::unsupported_operation(
+                    "artifact orphan scanning is unsupported",
+                ))
+            }
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseRenewalOutcome {
     Applied { lease_until: i64 },
@@ -750,6 +1256,11 @@ pub trait AuthorityIdentity: Send + Sync {
     fn completion_receipt_key(&self) -> Option<[u8; 32]>;
     fn authorization_resource_digest(&self, resource: &str) -> Result<String, A2AError>;
     fn quota_policy_snapshot(&self) -> Option<Arc<crate::QuotaPolicy>> {
+        None
+    }
+    /// Optional artifact-storage capability. Existing authority implementations
+    /// remain source compatible and artifact-disabled by default.
+    fn artifact_authority(&self) -> Option<&dyn ArtifactAuthority> {
         None
     }
 }

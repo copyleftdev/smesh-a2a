@@ -59,6 +59,28 @@ runtime ingress, an artifact, or a worker completion proposal cannot directly pu
 that separately. Cancellation acknowledgement is sent only after the processor task exits or is
 aborted after its bounded grace period.
 
+### `artifact`
+
+Defines the closed `ContentDigestV1`, `ArtifactManifestV1`, classification, encryption-domain,
+producer, policy, chunk, and sorted provenance-edge contracts. Content identity is SHA-256 of exact
+logical plaintext. Manifest identity is domain-separated SHA-256 of deterministic canonical JSON.
+Opaque artifact IDs—not digests—are the authorization keys.
+
+`PosixArtifactBlobStore` accepts only an absolute, owner-private, non-symlink root. It writes 0600
+same-filesystem staging files, syncs file and directories, atomically promotes immutable random
+object generations, and never derives a path from caller input. AES-256-GCM AAD binds tenant,
+encryption domain, classification, content digest, plaintext length, and key generation. Reads spool
+and verify ciphertext digest, AEAD, plaintext length, and plaintext digest before returning bytes.
+
+PostgreSQL revision 5 is the production metadata/reference/retention authority. The filesystem is
+bytes-only and cannot grant visibility. Resolver admission must use the scoped
+`(tenant, owner/task visibility, opaque artifact ID)` join before any blob lookup. Read leases and
+legal holds fence the live → tombstoned → deleting → deleted lifecycle; GC batches are bounded to
+1..=1000 and generation-fenced. URL parts remain inert metadata and are never fetched.
+
+SQLite intentionally does not claim external-artifact production parity. Existing inline history
+remains replay-compatible pending the explicit, restartable PostgreSQL backfill/cutover operation.
+
 ### `store` and `guard`
 
 `BoundedTaskStore` gives the process-local ledger a hard capacity and makes terminal states absorbing. `GuardedRequestHandler` rejects caller-supplied tenants in the single-tenant MVP and blocks new messages for terminal task IDs before the official handler starts execution.

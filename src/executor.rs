@@ -511,6 +511,58 @@ where
                         media_type,
                         content,
                     }) => {
+                        if let Some(internal) = crate::bridge::internal_artifact_payload(&content) {
+                            match internal {
+                                crate::bridge::InternalArtifactPayload::Binary { bytes } => {
+                                    use base64::Engine as _;
+                                    let Ok(bytes) =
+                                        base64::engine::general_purpose::STANDARD.decode(bytes)
+                                    else {
+                                        terminal_emitted = true;
+                                        break;
+                                    };
+                                    artifact_manifests.push(ArtifactManifest {
+                                        name: name.clone(),
+                                        media_type: media_type.clone(),
+                                        digest: content_digest(&bytes),
+                                    });
+                                    artifacts.push(Artifact {
+                                        artifact_id: new_artifact_id(),
+                                        name: Some(name),
+                                        description: Some(
+                                            "Unpublished SMESH candidate output".to_owned(),
+                                        ),
+                                        parts: vec![
+                                            Part::data(serde_json::json!({"bytes": bytes}))
+                                                .with_media_type(media_type),
+                                        ],
+                                        metadata: None,
+                                        extensions: None,
+                                    });
+                                }
+                                crate::bridge::InternalArtifactPayload::Published {
+                                    projection,
+                                } => {
+                                    let Ok(artifact): Result<Artifact, _> =
+                                        serde_json::from_str(&projection)
+                                    else {
+                                        terminal_emitted = true;
+                                        break;
+                                    };
+                                    artifact_manifests.push(ArtifactManifest {
+                                        name: artifact
+                                            .name
+                                            .clone()
+                                            .unwrap_or_else(|| "artifact".into()),
+                                        media_type: "application/vnd.smesh.artifact-manifest+json"
+                                            .into(),
+                                        digest: content_digest(projection.as_bytes()),
+                                    });
+                                    artifacts.push(artifact);
+                                }
+                            }
+                            continue;
+                        }
                         artifact_manifests.push(ArtifactManifest {
                             name: name.clone(),
                             media_type: media_type.clone(),
@@ -525,6 +577,7 @@ where
                             extensions: None,
                         });
                     }
+
                     Ok(MeshEvent::Completed { summary: _summary }) => {
                         if completion_proposed {
                             if control.claim_execution()
