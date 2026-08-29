@@ -153,6 +153,9 @@ pub(crate) async fn execute(
         .await
         .map_err(|_| PostgresStoreError::Unavailable)?;
 
+    // Keep external blob I/O outside a SQL transaction while still ensuring
+    // the session-scoped domain lock is released for every body result.
+    let rotation_result: Result<ArtifactKeyRotationOutcome, PostgresStoreError> = async {
     let tenants=client.query(&format!("SELECT DISTINCT tenant_scope FROM {schema}.content_objects WHERE encryption_domain=$1 AND key_generation=$2 AND state<>'deleted' ORDER BY tenant_scope"),&[&plan.plan().encryption_domain(),&plan.plan().old_generation()]).await.map_err(|_|PostgresStoreError::InvalidSchema)?;
     for row in tenants {
         let tenant: String = row.get(0);
@@ -390,7 +393,14 @@ pub(crate) async fn execute(
         client.execute(&format!("UPDATE {schema}.artifact_key_rotation_plans SET state='completed',completed_at={schema}.db_millis() WHERE rotation_id=$1 AND state<>'completed'"),&[&plan.plan().plan_id()]).await.map_err(|_|PostgresStoreError::Unavailable)?;
         client.execute(&format!("UPDATE {schema}.artifact_key_generations k SET state='retired',retired_at={schema}.db_millis() WHERE k.encryption_domain=$1 AND k.key_generation=$2 AND k.state='retiring' AND NOT EXISTS(SELECT 1 FROM {schema}.artifact_backup_key_dependencies d JOIN {schema}.artifact_backup_jobs b USING(tenant_scope,backup_id) WHERE d.tenant_scope=k.tenant_scope AND d.encryption_domain=k.encryption_domain AND d.key_generation=k.key_generation AND d.released_at IS NULL AND d.required_until>{schema}.db_millis() AND b.state='sealed')"),&[&plan.plan().encryption_domain(),&plan.plan().old_generation()]).await.map_err(|_|PostgresStoreError::Unavailable)?;
     }
-    client
+    Ok(ArtifactKeyRotationOutcome {
+        reencrypted: done,
+        cleaned,
+        completed: remaining == 0,
+    })
+    }
+    .await;
+    let unlock_result = client
         .query_one(
             "SELECT pg_advisory_unlock(hashtextextended($1,0))",
             &[&format!(
@@ -398,11 +408,10 @@ pub(crate) async fn execute(
                 plan.plan().encryption_domain()
             )],
         )
-        .await
-        .map_err(|_| PostgresStoreError::Unavailable)?;
-    Ok(ArtifactKeyRotationOutcome {
-        reencrypted: done,
-        cleaned,
-        completed: remaining == 0,
-    })
+        .await;
+    match (rotation_result, unlock_result) {
+        (Err(error), _) => Err(error),
+        (Ok(outcome), Ok(_)) => Ok(outcome),
+        (Ok(_), Err(_)) => Err(PostgresStoreError::Unavailable),
+    }
 }

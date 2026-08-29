@@ -84,6 +84,20 @@ fn write_inventory_and_digest(root: &std::path::Path, value: &serde_json::Value)
     .unwrap();
 }
 
+fn regular_file_count(root: &std::path::Path) -> usize {
+    fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .map(|path| {
+            if path.is_dir() {
+                regular_file_count(&path)
+            } else {
+                usize::from(path.is_file())
+            }
+        })
+        .sum()
+}
+
 #[test]
 fn canonical_extractor_handles_text_raw_data_and_never_url() {
     let canary = "https://127.0.0.1:9/must-never-be-fetched";
@@ -492,11 +506,17 @@ async fn populated_postgres_migration_rewrites_causal_copies_and_exact_rerun_is_
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let ready = BufReader::new(crashed.stdout.take().unwrap())
+        let ready = if let Some(line) = BufReader::new(crashed.stdout.take().unwrap())
             .lines()
             .next()
-            .unwrap()
-            .unwrap();
+        {
+            line.unwrap()
+        } else {
+            let mut stderr = String::new();
+            std::io::Read::read_to_string(&mut crashed.stderr.take().unwrap(), &mut stderr)
+                .unwrap();
+            panic!("rotation child exited before checkpoint: {stderr}");
+        };
         assert_eq!(
             ready,
             "SMESH_ARTIFACT_CHECKPOINT READY reencryption_promoted_before_metadata_swap"
@@ -845,6 +865,9 @@ async fn populated_postgres_migration_rewrites_causal_copies_and_exact_rerun_is_
         "manifest-digest",
         "manifest-canonical-json",
         "forged-provenance",
+        "cross-bound-hold",
+        "malformed-tombstone",
+        "duplicate-hold-pk",
     ] {
         let mut inventory = clean_inventory.clone();
         match name {
@@ -872,6 +895,31 @@ async fn populated_postgres_migration_rewrites_causal_copies_and_exact_rerun_is_
             "forged-provenance" => {
                 inventory["entries"][0]["provenance"] = serde_json::json!([{"tenant_scope":"tenant-a","child_artifact_id":"artifact-inline","ordinal":0,"parent_artifact_id":"artifact-forged","relation":"derived"}]);
             }
+            "cross-bound-hold" => {
+                inventory["entries"][0]["holds"] = serde_json::json!([{
+                    "tenant_scope":"tenant-forged","hold_id":"hold-1","artifact_id":"artifact-inline",
+                    "actor_digest":format!("sha256:{}", "44".repeat(32)),
+                    "reason_digest":format!("sha256:{}", "55".repeat(32)),
+                    "state":"active","created_at":1,"expires_at":null,"released_at":null
+                }]);
+            }
+            "malformed-tombstone" => {
+                inventory["entries"][0]["tombstones"] = serde_json::json!([{
+                    "tenant_scope":"tenant-a","object_id":inventory["entries"][0]["object"]["object_id"],
+                    "tombstone_generation":0,"reason_digest":"not-a-digest",
+                    "locator_digest":format!("sha256:{}", "66".repeat(32)),
+                    "deletion_receipt_digest":null,"tombstoned_at":1,"deleted_at":null
+                }]);
+            }
+            "duplicate-hold-pk" => {
+                let hold = serde_json::json!({
+                    "tenant_scope":"tenant-a","hold_id":"hold-duplicate","artifact_id":"artifact-inline",
+                    "actor_digest":format!("sha256:{}", "44".repeat(32)),
+                    "reason_digest":format!("sha256:{}", "55".repeat(32)),
+                    "state":"active","created_at":1,"expires_at":null,"released_at":null
+                });
+                inventory["entries"][0]["holds"] = serde_json::json!([hold.clone(), hold]);
+            }
             "inventory-digest" => {}
             _ => unreachable!(),
         }
@@ -883,25 +931,29 @@ async fn populated_postgres_migration_rewrites_causal_copies_and_exact_rerun_is_
             )
             .unwrap();
         }
+        let target_files_before = regular_file_count(&restored_root);
         assert!(
             PostgresTaskStore::restore_artifacts(restored_config.clone(), &restore)
                 .await
                 .is_err(),
             "restore accepted corrupt backup component {name}"
         );
+        let unchanged = client.query_one(&format!("SELECT (SELECT count(*) FROM {target_schema}.artifact_restore_jobs),(SELECT count(*) FROM {target_schema}.content_objects),(SELECT count(*) FROM {target_schema}.artifact_manifests),(SELECT count(*) FROM {target_schema}.artifact_retention_holds),(SELECT count(*) FROM {target_schema}.artifact_tombstones)"), &[]).await.unwrap();
         assert_eq!(
-            client
-                .query_one(
-                    &format!(
-                        "SELECT count(*) FROM {target_schema}.artifact_restore_jobs WHERE state='enabled'"
-                    ),
-                    &[]
-                )
-                .await
-                .unwrap()
-                .get::<_, i64>(0),
-            0,
-            "corrupt restore enabled metadata for {name}"
+            (
+                unchanged.get::<_, i64>(0),
+                unchanged.get::<_, i64>(1),
+                unchanged.get::<_, i64>(2),
+                unchanged.get::<_, i64>(3),
+                unchanged.get::<_, i64>(4)
+            ),
+            (0, 0, 0, 0, 0),
+            "corrupt restore mutated target metadata for {name}"
+        );
+        assert_eq!(
+            regular_file_count(&restored_root),
+            target_files_before,
+            "corrupt restore copied target files for {name}"
         );
         client
             .execute(

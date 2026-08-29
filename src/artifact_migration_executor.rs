@@ -121,10 +121,10 @@ pub(crate) async fn execute(
             let (lease_token, lease_epoch) = if let Some(fence) = completion_fence.as_ref() {
                 fence.clone()
             } else {
-                let tenant = existing
-                    .as_ref()
-                    .map(|row| row.get::<_, String>(0))
-                    .ok_or(PostgresStoreError::ArtifactMigrationPlanMismatch)?;
+                let tenant = existing.as_ref().map_or_else(
+                    || "smesh-artifact-empty-tenant/v1".to_owned(),
+                    |row| row.get::<_, String>(0),
+                );
                 acquire_lease(client, schema, plan_file, lease_owner, &tenant).await?
             };
             let completion_seal = complete_plan(

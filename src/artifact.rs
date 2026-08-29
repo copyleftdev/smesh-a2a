@@ -2523,6 +2523,7 @@ impl ArtifactCatalog {
     }
     pub fn gc(
         &self,
+        tenant: &str,
         artifact_id: &str,
         now: i64,
         batch: usize,
@@ -2535,10 +2536,10 @@ impl ArtifactCatalog {
                 .state
                 .lock()
                 .map_err(|_| ArtifactStoreError::Unavailable)?;
-            let (key, entry) = state
+            let key = (tenant.to_owned(), artifact_id.to_owned());
+            let entry = state
                 .entries
-                .iter_mut()
-                .find(|((_, id), _)| id == artifact_id)
+                .get_mut(&key)
                 .ok_or(ArtifactStoreError::Denied)?;
             entry.leases.retain(|_, expiry| *expiry > now);
             if !entry.holds.is_empty() {
@@ -2555,7 +2556,7 @@ impl ArtifactCatalog {
                 .deletion_fence
                 .checked_add(1)
                 .ok_or(ArtifactStoreError::Unavailable)?;
-            (key.clone(), entry.object.clone(), entry.deletion_fence)
+            (key, entry.object.clone(), entry.deletion_fence)
         };
         let shared = {
             let state = self

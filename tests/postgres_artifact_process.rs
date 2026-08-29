@@ -214,6 +214,7 @@ impl Gateway {
                 for line in BufReader::new(stdout).lines() {
                     if line.is_ok_and(|line| line == expected) {
                         let _ = tx.send(());
+                        break;
                     }
                 }
             });
@@ -356,7 +357,9 @@ async fn promoted_artifact(client: &reqwest::Client, resolver: &str) -> reqwest:
             tokio::time::Instant::now() < deadline,
             "artifact promotion watchdog"
         );
-        tokio::task::yield_now().await;
+        // This is polling only; checkpoint channels remain the synchronization
+        // mechanism for deterministic crash cuts.
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 

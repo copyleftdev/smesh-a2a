@@ -318,6 +318,10 @@ async fn serve_router(
     }
 }
 
+fn required_operator_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    std::env::var(name).map_err(|_| format!("{name} is required").into())
+}
+
 async fn run_artifact_restore_command() -> Result<(), Box<dyn std::error::Error>> {
     let p = std::env::args_os()
         .nth(2)
@@ -326,9 +330,9 @@ async fn run_artifact_restore_command() -> Result<(), Box<dyn std::error::Error>
         return Err("artifact-restore accepts exactly one plan file".into());
     }
     let plan = ArtifactRestorePlanFile::open(p)?;
-    let migrator = std::env::var("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
-    let runtime = std::env::var("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
-    let schema = std::env::var("SMESH_A2A_POSTGRES_SCHEMA")?;
+    let migrator = required_operator_env("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
+    let runtime = required_operator_env("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
+    let schema = required_operator_env("SMESH_A2A_POSTGRES_SCHEMA")?;
     let keys = std::env::var_os("SMESH_A2A_ARTIFACT_KEYRING_PATH")
         .ok_or("SMESH_A2A_ARTIFACT_KEYRING_PATH is required")?;
     let config = PostgresStoreConfig::new(&migrator, &runtime, &schema)?
@@ -355,9 +359,9 @@ async fn run_artifact_key_rotate_command() -> Result<(), Box<dyn std::error::Err
         return Err("artifact-key-rotate accepts exactly one plan file".into());
     }
     let plan = ArtifactKeyRotationPlanFile::open(plan_path)?;
-    let migrator = std::env::var("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
-    let runtime = std::env::var("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
-    let schema = std::env::var("SMESH_A2A_POSTGRES_SCHEMA")?;
+    let migrator = required_operator_env("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
+    let runtime = required_operator_env("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
+    let schema = required_operator_env("SMESH_A2A_POSTGRES_SCHEMA")?;
     let root =
         std::env::var_os("SMESH_A2A_ARTIFACT_ROOT").ok_or("SMESH_A2A_ARTIFACT_ROOT is required")?;
     let keys = std::env::var_os("SMESH_A2A_ARTIFACT_KEYRING_PATH")
@@ -388,9 +392,9 @@ async fn run_artifact_backup_command() -> Result<(), Box<dyn std::error::Error>>
         return Err("artifact-backup accepts exactly one plan file".into());
     }
     let plan = ArtifactBackupPlanFile::open(&plan_path)?;
-    let migrator = std::env::var("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
-    let runtime = std::env::var("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
-    let schema = std::env::var("SMESH_A2A_POSTGRES_SCHEMA")?;
+    let migrator = required_operator_env("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
+    let runtime = required_operator_env("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
+    let schema = required_operator_env("SMESH_A2A_POSTGRES_SCHEMA")?;
     let root =
         std::env::var_os("SMESH_A2A_ARTIFACT_ROOT").ok_or("SMESH_A2A_ARTIFACT_ROOT is required")?;
     let keyring = std::env::var_os("SMESH_A2A_ARTIFACT_KEYRING_PATH")
@@ -423,9 +427,9 @@ async fn run_artifact_migrate_command() -> Result<(), Box<dyn std::error::Error>
         return Err("artifact-migrate accepts exactly one plan file".into());
     }
     let plan = ArtifactMigrationPlanFile::open(&plan_path)?;
-    let migrator = std::env::var("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
-    let runtime = std::env::var("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
-    let schema = std::env::var("SMESH_A2A_POSTGRES_SCHEMA")?;
+    let migrator = required_operator_env("SMESH_A2A_POSTGRES_MIGRATOR_URL")?;
+    let runtime = required_operator_env("SMESH_A2A_POSTGRES_RUNTIME_URL")?;
+    let schema = required_operator_env("SMESH_A2A_POSTGRES_SCHEMA")?;
     let root =
         std::env::var_os("SMESH_A2A_ARTIFACT_ROOT").ok_or("SMESH_A2A_ARTIFACT_ROOT is required")?;
     let keyring = std::env::var_os("SMESH_A2A_ARTIFACT_KEYRING_PATH")

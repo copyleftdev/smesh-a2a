@@ -638,10 +638,7 @@ fn apply_terminal_events(
                         ),
                         name: Some(name.clone()),
                         description: Some("Durably replayable SMESH output".to_owned()),
-                        parts: vec![
-                            Part::data(serde_json::json!({"bytes": bytes}))
-                                .with_media_type(media_type.clone()),
-                        ],
+                        parts: vec![Part::raw(bytes).with_media_type(media_type.clone())],
                         metadata: None,
                         extensions: None,
                     });

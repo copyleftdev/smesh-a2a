@@ -3265,6 +3265,348 @@ postgres_test!(
 );
 
 postgres_test!(
+    artifact_claim_terminalization_is_bounded_fair_and_eventual,
+    60,
+    {
+        let Some(url) = admin_url() else { return };
+        let config = config(url, "art_term");
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let schema = config.schema_name();
+        let (left, left_driver) = admin_client(&superuser_url()).await;
+        let (right, right_driver) = admin_client(&superuser_url()).await;
+        for tenant in ["terminal-a", "terminal-b"] {
+            let zeros = "0".repeat(64);
+            left.batch_execute(&format!("INSERT INTO {schema}.retained_authority_usage VALUES('{tenant}','tenant','{tenant}',0,1),('{tenant}','account','owner',0,1),('{tenant}','principal','account:owner',0,1); INSERT INTO {schema}.artifact_key_generations VALUES('{tenant}','{tenant}/confidential','old','active',1,NULL),('{tenant}','{tenant}/confidential','new','active',1,NULL); INSERT INTO {schema}.artifact_key_rotation_plans VALUES('{tenant}','rotation-terminal','{tenant}/confidential','old','new','sha256:{zeros}','sha256:{zeros}',2,'active',1,NULL);")).await.unwrap();
+            for index in 0..4_i32 {
+                for kind in ["upload", "gc", "reencrypt"] {
+                    let object_id = format!("{kind}-{tenant}-{index}");
+                    let digest = format!(
+                        "sha256:{:064x}",
+                        index
+                            + match kind {
+                                "upload" => 100,
+                                "gc" => 200,
+                                _ => 300,
+                            }
+                    );
+                    let (state, generation) = match (kind, index) {
+                        ("upload", _) => ("staged", 0_i64),
+                        ("gc", 0) => ("quarantined", 1),
+                        ("gc", _) => ("tombstoned", 1),
+                        _ => ("available", 0),
+                    };
+                    left.execute(&format!("INSERT INTO {schema}.content_objects(tenant_scope,owner_account_id,object_id,content_digest,classification,encryption_domain,key_generation,plaintext_length,ciphertext_length,ciphertext_digest,backend_locator,nonce,state,reference_count,retain_until,tombstone_generation,created_at,available_at) VALUES($1,'owner',$2,$3,'confidential',$4,'old',1,16,$3,$5,$6,$7,0,9999999999999,$8,1,1)"), &[&tenant,&object_id,&digest,&format!("{tenant}/confidential"),&format!("objects/{kind}-{tenant}-{index}.blob"),&vec![0_u8;12],&state,&generation]).await.unwrap();
+                    let attempts = if index < 3 { 1000_i32 } else { 0 };
+                    match kind {
+                        "upload" => {
+                            left.execute(&format!("INSERT INTO {schema}.upload_intents(tenant_scope,upload_id,artifact_id,object_id,state,stage_locator,final_locator,ciphertext_digest,ciphertext_length,lease_epoch,attempts,created_at,updated_at) VALUES($1,$2,$3,$4,'committed',$5,$6,$7,16,1,$8,1,$9)"), &[&tenant,&format!("upload-{tenant}-{index}"),&format!("artifact-{tenant}-{index}"),&object_id,&format!("stage/{tenant}-{index}.blob"),&format!("objects/upload-{tenant}-{index}.blob"),&digest,&attempts,&i64::from(index)]).await.unwrap();
+                        }
+                        "gc" => {
+                            left.execute(&format!("INSERT INTO {schema}.artifact_gc_jobs(tenant_scope,job_id,object_id,tombstone_generation,state,lease_epoch,available_at,attempts) VALUES($1,$2,$3,1,'pending',1,1,$4)"), &[&tenant,&format!("gc-{tenant}-{index}"),&object_id,&attempts]).await.unwrap();
+                        }
+                        _ => {
+                            left.execute(&format!("INSERT INTO {schema}.artifact_reencryption_jobs(tenant_scope,job_id,rotation_id,object_id,old_generation,new_generation,old_locator,state,lease_epoch,attempts,created_at,updated_at) VALUES($1,$2,'rotation-terminal',$3,'old','new',$4,'pending',1,$5,1,$6)"), &[&tenant,&format!("reencrypt-{tenant}-{index}"),&object_id,&format!("objects/reencrypt-{tenant}-{index}.blob"),&attempts,&i64::from(index)]).await.unwrap();
+                        }
+                    }
+                }
+            }
+        }
+        let cases = [
+            (
+                "upload_intents",
+                "failed",
+                format!(
+                    "SELECT * FROM {schema}.claim_artifact_upload('owner','token-left',30000,2)"
+                ),
+                format!(
+                    "UPDATE {schema}.upload_intents SET state='committed',lease_token=NULL,lease_until=NULL WHERE state IN ('failed','promoting')"
+                ),
+            ),
+            (
+                "artifact_gc_jobs",
+                "dead",
+                format!("SELECT * FROM {schema}.claim_artifact_gc('owner','token-left',30000,2)"),
+                format!(
+                    "UPDATE {schema}.artifact_gc_jobs SET state='pending',lease_owner=NULL,lease_token=NULL,lease_until=NULL WHERE state IN ('dead','leased'); UPDATE {schema}.content_objects SET state='tombstoned' WHERE object_id LIKE 'gc-%' AND state='deleting'"
+                ),
+            ),
+            (
+                "artifact_reencryption_jobs",
+                "failed",
+                format!(
+                    "SELECT * FROM {schema}.claim_artifact_reencryption('rotation-terminal','old','new','owner','token-left',30000,2)"
+                ),
+                format!(
+                    "UPDATE {schema}.artifact_reencryption_jobs SET state='pending',lease_owner=NULL,lease_token=NULL,lease_until=NULL WHERE state IN ('failed','leased')"
+                ),
+            ),
+        ];
+        for (table, terminal, sql, reset) in cases {
+            let right_sql = sql.replace("token-left", "token-right");
+            let (a, b) = tokio::join!(left.query(&sql, &[]), right.query(&right_sql, &[]));
+            a.unwrap();
+            b.unwrap();
+            let count: i64 = left
+                .query_one(
+                    &format!("SELECT count(*) FROM {schema}.{table} WHERE state='{terminal}'"),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(
+                (2..=4).contains(&count),
+                "concurrent {table} terminalizers made unbounded or zero progress: {count}"
+            );
+            left.batch_execute(&reset).await.unwrap();
+            for expected in [2_i64, 4, 6] {
+                left.query(&sql, &[]).await.unwrap();
+                let rows = left.query(&format!("SELECT tenant_scope,count(*) FROM {schema}.{table} WHERE state='{terminal}' GROUP BY tenant_scope ORDER BY tenant_scope"), &[]).await.unwrap();
+                let total: i64 = rows.iter().map(|row| row.get::<_, i64>(1)).sum();
+                assert_eq!(
+                    total, expected,
+                    "{table} exceeded its terminal batch or stalled"
+                );
+                assert!(
+                    rows.iter().all(|row| row.get::<_, i64>(1) == expected / 2),
+                    "{table} was not tenant-fair"
+                );
+            }
+        }
+        store.shutdown().await.unwrap();
+        drop(left);
+        drop(right);
+        left_driver.abort();
+        right_driver.abort();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    }
+);
+
+postgres_test!(
+    exhausted_artifact_claims_preserve_active_leases_until_db_time_expiry,
+    60,
+    {
+        let Some(url) = admin_url() else { return };
+        let config = config(url, "art_lease_term");
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let schema = config.schema_name();
+        let (client, driver) = admin_client(&superuser_url()).await;
+        let zeros = "0".repeat(64);
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {schema}.artifact_claim_test_clock(now_ms bigint NOT NULL); \
+                 INSERT INTO {schema}.artifact_claim_test_clock VALUES(100); \
+                 GRANT SELECT ON {schema}.artifact_claim_test_clock TO PUBLIC; \
+                 CREATE OR REPLACE FUNCTION {schema}.db_millis() RETURNS bigint \
+                 LANGUAGE sql VOLATILE SET search_path=pg_catalog AS \
+                 $clock$ SELECT now_ms FROM {schema}.artifact_claim_test_clock $clock$; \
+                 INSERT INTO {schema}.retained_authority_usage VALUES \
+                 ('lease-tenant','tenant','lease-tenant',0,1), \
+                 ('lease-tenant','account','owner',0,1), \
+                 ('lease-tenant','principal','account:owner',0,1); \
+                 INSERT INTO {schema}.artifact_key_generations VALUES \
+                 ('lease-tenant','lease-tenant/confidential','old','active',1,NULL), \
+                 ('lease-tenant','lease-tenant/confidential','new','active',1,NULL); \
+                 INSERT INTO {schema}.artifact_key_rotation_plans VALUES \
+                 ('lease-tenant','rotation-lease','lease-tenant/confidential','old','new', \
+                  'sha256:{zeros}','sha256:{zeros}',10,'active',1,NULL);"
+            ))
+            .await
+            .unwrap();
+
+        for (index, kind, object_state, generation) in [
+            (0_i32, "upload", "staged", 0_i64),
+            (1, "upload", "staged", 0),
+            (2, "upload", "staged", 0),
+            (3, "gc", "tombstoned", 1),
+            (4, "gc", "tombstoned", 1),
+            (5, "gc", "quarantined", 1),
+            (6, "gc", "tombstoned", 1),
+            (7, "reencrypt", "available", 0),
+            (8, "reencrypt", "available", 0),
+            (9, "reencrypt", "available", 0),
+            (10, "gc", "tombstoned", 1),
+        ] {
+            let object_id = format!("lease-object-{index}");
+            let digest = format!("sha256:{:064x}", index + 1);
+            client.execute(&format!("INSERT INTO {schema}.content_objects(tenant_scope,owner_account_id,object_id,content_digest,classification,encryption_domain,key_generation,plaintext_length,ciphertext_length,ciphertext_digest,backend_locator,nonce,state,reference_count,retain_until,tombstone_generation,created_at,available_at) VALUES('lease-tenant','owner',$1,$2,'confidential','lease-tenant/confidential','old',1,16,$2,$3,$4,$5,0,9999999999999,$6,1,1)"), &[&object_id,&digest,&format!("objects/{kind}-{index}.blob"),&vec![0_u8;12],&object_state,&generation]).await.unwrap();
+        }
+        client.batch_execute(&format!(
+            "INSERT INTO {schema}.upload_intents(tenant_scope,upload_id,artifact_id,object_id,state,stage_locator,final_locator,ciphertext_digest,ciphertext_length,lease_epoch,attempts,created_at,updated_at) VALUES \
+             ('lease-tenant','upload-fail','artifact-upload-fail','lease-object-0','committed','stage/upload-fail.tmp','objects/upload-0.blob','sha256:{:064x}',16,1,999,1,1), \
+             ('lease-tenant','upload-expire','artifact-upload-expire','lease-object-1','committed','stage/upload-expire.tmp','objects/upload-1.blob','sha256:{:064x}',16,1,999,1,2), \
+             ('lease-tenant','upload-healthy','artifact-upload-healthy','lease-object-2','committed','stage/upload-healthy.tmp','objects/upload-2.blob','sha256:{:064x}',16,1,0,1,3); \
+             INSERT INTO {schema}.artifact_gc_jobs(tenant_scope,job_id,object_id,tombstone_generation,state,lease_epoch,available_at,attempts) VALUES \
+             ('lease-tenant','gc-fail','lease-object-3',1,'pending',1,1,999), \
+             ('lease-tenant','gc-expire','lease-object-4',1,'pending',1,1,999), \
+             ('lease-tenant','gc-quarantined','lease-object-5',1,'leased',2,1,1000), \
+             ('lease-tenant','gc-healthy','lease-object-6',1,'pending',1,1,0), \
+             ('lease-tenant','gc-mixed-expired','lease-object-10',1,'leased',2,1,1000); \
+             UPDATE {schema}.artifact_gc_jobs SET lease_owner='current-gc',lease_token='gc-quarantine-token',lease_until=200 WHERE job_id='gc-quarantined'; \
+             UPDATE {schema}.artifact_gc_jobs SET lease_owner='expired-gc',lease_token='gc-expired-token',lease_until=100 WHERE job_id='gc-mixed-expired'; \
+             INSERT INTO {schema}.artifact_reencryption_jobs(tenant_scope,job_id,rotation_id,object_id,old_generation,new_generation,old_locator,state,lease_epoch,attempts,created_at,updated_at) VALUES \
+             ('lease-tenant','reencrypt-fail','rotation-lease','lease-object-7','old','new','objects/reencrypt-7.blob','pending',1,999,1,1), \
+             ('lease-tenant','reencrypt-expire','rotation-lease','lease-object-8','old','new','objects/reencrypt-8.blob','pending',1,999,1,2), \
+             ('lease-tenant','reencrypt-healthy','rotation-lease','lease-object-9','old','new','objects/reencrypt-9.blob','pending',1,0,1,3);",
+            1, 2, 3
+        )).await.unwrap();
+
+        let uploads = client.query(&format!("SELECT * FROM {schema}.claim_artifact_upload('current-upload','upload-token',100,10)"), &[]).await.unwrap();
+        assert_eq!(
+            uploads.len(),
+            3,
+            "exhaustion-boundary and healthy uploads claim"
+        );
+        let gc = client
+            .query(
+                &format!(
+                    "SELECT * FROM {schema}.claim_artifact_gc('current-gc','gc-token',100,10)"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(gc.len(), 3, "exhaustion-boundary and healthy GC jobs claim");
+        let reencryption = client.query(&format!("SELECT * FROM {schema}.claim_artifact_reencryption('rotation-lease','old','new','current-reencrypt','reencrypt-token',100,10)"), &[]).await.unwrap();
+        assert_eq!(
+            reencryption.len(),
+            3,
+            "exhaustion-boundary and healthy reencryption jobs claim"
+        );
+        let mixed_gc = client
+            .query_one(
+                &format!(
+                    "SELECT state,lease_owner,lease_token,lease_until FROM {schema}.artifact_gc_jobs WHERE job_id='gc-mixed-expired'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed_gc.get::<_, String>(0), "dead");
+        assert_eq!(mixed_gc.get::<_, Option<String>>(1), None);
+        assert_eq!(mixed_gc.get::<_, Option<String>>(2), None);
+        assert_eq!(mixed_gc.get::<_, Option<i64>>(3), None);
+
+        for sql in [
+            format!(
+                "SELECT * FROM {schema}.claim_artifact_upload('other-upload','other-upload-token',100,10)"
+            ),
+            format!("SELECT * FROM {schema}.claim_artifact_gc('other-gc','other-gc-token',100,10)"),
+            format!(
+                "SELECT * FROM {schema}.claim_artifact_reencryption('rotation-lease','old','new','other-reencrypt','other-reencrypt-token',100,10)"
+            ),
+        ] {
+            assert!(client.query(&sql, &[]).await.unwrap().is_empty());
+        }
+        let protected = client.query(&format!(
+            "SELECT 'upload',upload_id,state,NULL::text,lease_token,lease_epoch,lease_until FROM {schema}.upload_intents WHERE upload_id IN ('upload-fail','upload-expire') \
+             UNION ALL SELECT 'gc',job_id,state,lease_owner,lease_token,lease_epoch,lease_until FROM {schema}.artifact_gc_jobs WHERE job_id IN ('gc-fail','gc-expire','gc-quarantined') \
+             UNION ALL SELECT 'reencrypt',job_id,state,lease_owner,lease_token,lease_epoch,lease_until FROM {schema}.artifact_reencryption_jobs WHERE job_id IN ('reencrypt-fail','reencrypt-expire') ORDER BY 1,2"
+        ), &[]).await.unwrap();
+        assert_eq!(protected.len(), 7);
+        assert!(
+            protected.iter().all(|row| {
+                let state: String = row.get(2);
+                state != "failed" && state != "dead" && row.get::<_, i64>(6) == 200
+            }),
+            "a contender terminalized or mutated a future active lease"
+        );
+        let quarantine = protected
+            .iter()
+            .find(|row| row.get::<_, String>(1) == "gc-quarantined")
+            .unwrap();
+        assert_eq!(
+            quarantine.get::<_, Option<String>>(3).as_deref(),
+            Some("current-gc")
+        );
+        assert_eq!(
+            quarantine.get::<_, Option<String>>(4).as_deref(),
+            Some("gc-quarantine-token")
+        );
+        assert_eq!(quarantine.get::<_, i64>(5), 2);
+
+        for (table, id_column, id, terminal) in [
+            ("upload_intents", "upload_id", "upload-fail", "failed"),
+            ("artifact_gc_jobs", "job_id", "gc-fail", "dead"),
+            (
+                "artifact_reencryption_jobs",
+                "job_id",
+                "reencrypt-fail",
+                "failed",
+            ),
+        ] {
+            let owner_fence = if table == "upload_intents" {
+                "lease_token='upload-token' AND lease_epoch=2"
+            } else if table == "artifact_gc_jobs" {
+                "lease_owner='current-gc' AND lease_token='gc-token' AND lease_epoch=2"
+            } else {
+                "lease_owner='current-reencrypt' AND lease_token='reencrypt-token' AND lease_epoch=2"
+            };
+            let changed = client.execute(&format!("UPDATE {schema}.{table} SET state='{terminal}',lease_token=NULL,lease_until=NULL{} WHERE {id_column}='{id}' AND {owner_fence} AND lease_until>{schema}.db_millis()", if table == "upload_intents" { "" } else { ",lease_owner=NULL" }), &[]).await.unwrap();
+            assert_eq!(changed, 1, "the current worker lost its {table} fence");
+        }
+
+        client
+            .execute(
+                &format!("UPDATE {schema}.artifact_claim_test_clock SET now_ms=200"),
+                &[],
+            )
+            .await
+            .unwrap();
+        let upload_after_expiry = client.query(&format!("SELECT * FROM {schema}.claim_artifact_upload('after-expiry','after-upload',100,2)"), &[]).await.unwrap();
+        assert_eq!(upload_after_expiry.len(), 1);
+        assert_eq!(upload_after_expiry[0].get::<_, String>(1), "upload-healthy");
+        let gc_after_expiry = client
+            .query(
+                &format!(
+                    "SELECT * FROM {schema}.claim_artifact_gc('after-expiry','after-gc',100,2)"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(gc_after_expiry.len(), 1);
+        assert_eq!(gc_after_expiry[0].get::<_, String>(1), "gc-healthy");
+        let reencryption_after_expiry = client.query(&format!("SELECT * FROM {schema}.claim_artifact_reencryption('rotation-lease','old','new','after-expiry','after-reencrypt',100,2)"), &[]).await.unwrap();
+        assert_eq!(reencryption_after_expiry.len(), 1);
+        assert_eq!(
+            reencryption_after_expiry[0].get::<_, String>(1),
+            "reencrypt-healthy"
+        );
+
+        let terminal = client.query(&format!(
+            "SELECT 'upload',upload_id,state,lease_token,lease_until FROM {schema}.upload_intents WHERE upload_id='upload-expire' \
+             UNION ALL SELECT 'gc',job_id,state,lease_token,lease_until FROM {schema}.artifact_gc_jobs WHERE job_id IN ('gc-expire','gc-quarantined') \
+             UNION ALL SELECT 'reencrypt',job_id,state,lease_token,lease_until FROM {schema}.artifact_reencryption_jobs WHERE job_id='reencrypt-expire' ORDER BY 1,2"
+        ), &[]).await.unwrap();
+        assert_eq!(terminal.len(), 4);
+        assert!(
+            terminal.iter().all(|row| {
+                matches!(row.get::<_, String>(2).as_str(), "failed" | "dead")
+                    && row.get::<_, Option<String>>(3).is_none()
+                    && row.get::<_, Option<i64>>(4).is_none()
+            }),
+            "exact-expiry claim did not terminalize the bounded exhausted set"
+        );
+
+        let healthy = client.query_one(&format!(
+            "SELECT \
+             (SELECT state FROM {schema}.upload_intents WHERE upload_id='upload-healthy'), \
+             (SELECT state FROM {schema}.artifact_gc_jobs WHERE job_id='gc-healthy'), \
+             (SELECT state FROM {schema}.artifact_reencryption_jobs WHERE job_id='reencrypt-healthy')"
+        ), &[]).await.unwrap();
+        assert_eq!(healthy.get::<_, String>(0), "promoting");
+        assert_eq!(healthy.get::<_, String>(1), "leased");
+        assert_eq!(healthy.get::<_, String>(2), "leased");
+
+        store.shutdown().await.unwrap();
+        drop(client);
+        driver.abort();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    }
+);
+
+postgres_test!(
     artifact_receiver_publication_faults_roll_back_and_retry_exactly_once,
     {
         use smesh_a2a::{ReceiverAdmission, ReceiverLease};
@@ -4206,352 +4548,8 @@ postgres_test!(artifact_authenticated_socket_wire_matrix, {
     server.await.unwrap();
     gateway.shutdown().await.unwrap();
 
-    // Execute the startup semantic seal as a named mutation matrix. Every case
-    // mutates a real authority row, proves reopen fails closed, then restores
-    // the baseline before the next isolated mutation.
-    let zero = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-    let canonical = staged.canonical_manifest_json.replace("$json$", "");
-    let _legacy_cases = vec![
-        (
-            "object-content-digest",
-            "content_objects",
-            format!(
-                "UPDATE {schema}.content_objects SET content_digest='{zero}' WHERE object_id='{}'",
-                staged.object_id
-            ),
-            format!(
-                "UPDATE {schema}.content_objects SET content_digest='{}' WHERE object_id='{}'",
-                staged.content_digest, staged.object_id
-            ),
-        ),
-        (
-            "object-ciphertext-digest",
-            "content_objects",
-            format!(
-                "UPDATE {schema}.content_objects SET ciphertext_digest='{zero}' WHERE object_id='{}'",
-                staged.object_id
-            ),
-            format!(
-                "UPDATE {schema}.content_objects SET ciphertext_digest='{}' WHERE object_id='{}'",
-                staged.ciphertext_digest, staged.object_id
-            ),
-        ),
-        (
-            "object-plaintext-length",
-            "content_objects",
-            format!(
-                "UPDATE {schema}.content_objects SET plaintext_length=plaintext_length+1 WHERE object_id='{}'",
-                staged.object_id
-            ),
-            format!(
-                "UPDATE {schema}.content_objects SET plaintext_length={} WHERE object_id='{}'",
-                staged.plaintext_length, staged.object_id
-            ),
-        ),
-        (
-            "object-ciphertext-length",
-            "content_objects",
-            format!(
-                "UPDATE {schema}.content_objects SET ciphertext_length=ciphertext_length+1 WHERE object_id='{}'",
-                staged.object_id
-            ),
-            format!(
-                "UPDATE {schema}.content_objects SET ciphertext_length={} WHERE object_id='{}'",
-                staged.ciphertext_length, staged.object_id
-            ),
-        ),
-        (
-            "object-state",
-            "content_objects",
-            format!(
-                "UPDATE {schema}.content_objects SET state='staged' WHERE object_id='{}'",
-                staged.object_id
-            ),
-            format!(
-                "UPDATE {schema}.content_objects SET state='available' WHERE object_id='{}'",
-                staged.object_id
-            ),
-        ),
-        (
-            "object-locator",
-            "content_objects",
-            format!(
-                "UPDATE {schema}.content_objects SET backend_locator='objects/tampered/locator' WHERE object_id='{}'",
-                staged.object_id
-            ),
-            format!(
-                "UPDATE {schema}.content_objects SET backend_locator='{}' WHERE object_id='{}'",
-                staged.final_locator, staged.object_id
-            ),
-        ),
-        (
-            "object-key-generation",
-            "content_objects",
-            format!(
-                "UPDATE {schema}.content_objects SET key_generation='key-tampered' WHERE object_id='{}'",
-                staged.object_id
-            ),
-            format!(
-                "UPDATE {schema}.content_objects SET key_generation='key-a' WHERE object_id='{}'",
-                staged.object_id
-            ),
-        ),
-        (
-            "object-encryption-domain",
-            "content_objects",
-            format!(
-                "UPDATE {schema}.content_objects SET encryption_domain='tenant-wire/other' WHERE object_id='{}'",
-                staged.object_id
-            ),
-            format!(
-                "UPDATE {schema}.content_objects SET encryption_domain='tenant-wire/confidential' WHERE object_id='{}'",
-                staged.object_id
-            ),
-        ),
-        (
-            "object-classification",
-            "content_objects",
-            format!(
-                "UPDATE {schema}.content_objects SET classification='public' WHERE object_id='{}'",
-                staged.object_id
-            ),
-            format!(
-                "UPDATE {schema}.content_objects SET classification='confidential' WHERE object_id='{}'",
-                staged.object_id
-            ),
-        ),
-        (
-            "object-reference-count",
-            "content_objects",
-            format!(
-                "UPDATE {schema}.content_objects SET reference_count=2 WHERE object_id='{}'",
-                staged.object_id
-            ),
-            format!(
-                "UPDATE {schema}.content_objects SET reference_count=1 WHERE object_id='{}'",
-                staged.object_id
-            ),
-        ),
-        (
-            "manifest-canonical",
-            "artifact_manifests",
-            format!(
-                "UPDATE {schema}.artifact_manifests SET canonical_json='{{}}' WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_manifests SET canonical_json=$json${canonical}$json$ WHERE artifact_id='{artifact_id}'"
-            ),
-        ),
-        (
-            "manifest-digest",
-            "artifact_manifests",
-            format!(
-                "UPDATE {schema}.artifact_manifests SET manifest_digest='{zero}' WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_manifests SET manifest_digest='{}' WHERE artifact_id='{artifact_id}'",
-                staged.manifest_digest
-            ),
-        ),
-        (
-            "manifest-producer",
-            "artifact_manifests",
-            format!(
-                "UPDATE {schema}.artifact_manifests SET owner_account_id='tampered' WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_manifests SET owner_account_id='owner' WHERE artifact_id='{artifact_id}'"
-            ),
-        ),
-        (
-            "manifest-task",
-            "artifact_manifests",
-            format!(
-                "UPDATE {schema}.artifact_manifests SET task_id='tampered' WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_manifests SET task_id='task-wire' WHERE artifact_id='{artifact_id}'"
-            ),
-        ),
-        (
-            "manifest-context",
-            "artifact_manifests",
-            format!(
-                "UPDATE {schema}.artifact_manifests SET context_id='tampered' WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_manifests SET context_id='context-wire' WHERE artifact_id='{artifact_id}'"
-            ),
-        ),
-        (
-            "manifest-policy",
-            "artifact_manifests",
-            format!(
-                "UPDATE {schema}.artifact_manifests SET policy_id='tampered' WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_manifests SET policy_id='artifact-default' WHERE artifact_id='{artifact_id}'"
-            ),
-        ),
-        (
-            "manifest-retention",
-            "artifact_manifests",
-            format!(
-                "UPDATE {schema}.artifact_manifests SET retain_until=retain_until+1 WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_manifests SET retain_until={} WHERE artifact_id='{artifact_id}'",
-                staged.retain_until
-            ),
-        ),
-        (
-            "chunk-order",
-            "artifact_chunks",
-            format!(
-                "UPDATE {schema}.artifact_chunks SET ordinal=1 WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_chunks SET ordinal=0 WHERE artifact_id='{artifact_id}'"
-            ),
-        ),
-        (
-            "chunk-digest",
-            "artifact_chunks",
-            format!(
-                "UPDATE {schema}.artifact_chunks SET content_digest='{zero}' WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_chunks SET content_digest='{}' WHERE artifact_id='{artifact_id}'",
-                staged.chunks[0].content_digest
-            ),
-        ),
-        (
-            "chunk-length",
-            "artifact_chunks",
-            format!(
-                "UPDATE {schema}.artifact_chunks SET plaintext_length=plaintext_length+1 WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_chunks SET plaintext_length={} WHERE artifact_id='{artifact_id}'",
-                staged.chunks[0].plaintext_length
-            ),
-        ),
-        (
-            "chunk-object-binding",
-            "artifact_chunks",
-            format!(
-                "UPDATE {schema}.artifact_chunks SET artifact_id='tampered' WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_chunks SET artifact_id='{artifact_id}' WHERE artifact_id='tampered'"
-            ),
-        ),
-        (
-            "provenance-self",
-            "artifact_manifests",
-            format!(
-                "UPDATE {schema}.artifact_manifests SET canonical_json=replace(canonical_json,'\"derivedFrom\":[]','\"derivedFrom\":[{{\"artifactId\":\"{artifact_id}\",\"relation\":\"transformation\"}}]') WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_manifests SET canonical_json=$json${canonical}$json$ WHERE artifact_id='{artifact_id}'"
-            ),
-        ),
-        (
-            "provenance-cycle",
-            "artifact_manifests",
-            format!(
-                "UPDATE {schema}.artifact_manifests SET canonical_json=replace(canonical_json,'\"derivedFrom\":[]','\"derivedFrom\":[{{\"artifactId\":\"{artifact_id}\",\"relation\":\"summary\"}}]') WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.artifact_manifests SET canonical_json=$json${canonical}$json$ WHERE artifact_id='{artifact_id}'"
-            ),
-        ),
-        (
-            "provenance-cross-domain",
-            "content_objects",
-            format!(
-                "UPDATE {schema}.content_objects SET encryption_domain='tenant-wire/cross-domain' WHERE object_id='{}'",
-                staged.object_id
-            ),
-            format!(
-                "UPDATE {schema}.content_objects SET encryption_domain='tenant-wire/confidential' WHERE object_id='{}'",
-                staged.object_id
-            ),
-        ),
-        (
-            "upload-lease-fence",
-            "upload_intents",
-            format!(
-                "UPDATE {schema}.upload_intents SET state='promoting',lease_token=NULL,lease_until=NULL WHERE artifact_id='{artifact_id}'"
-            ),
-            format!(
-                "UPDATE {schema}.upload_intents SET state='available',lease_token=NULL,lease_until=NULL WHERE artifact_id='{artifact_id}'"
-            ),
-        ),
-        (
-            "read-lease-fence",
-            "artifact_read_leases",
-            format!(
-                "INSERT INTO {schema}.artifact_read_leases VALUES('{tenant}','tamper-read','{artifact_id}',1,'','owner','active',1,1)"
-            ),
-            format!("DELETE FROM {schema}.artifact_read_leases WHERE lease_id='tamper-read'"),
-        ),
-        (
-            "backup-lease-fence",
-            "artifact_backup_leases",
-            format!(
-                "INSERT INTO {schema}.artifact_backup_leases VALUES('{tenant}','tamper-backup','{}','',1,'','active',1,1)",
-                staged.object_id
-            ),
-            format!("DELETE FROM {schema}.artifact_backup_leases WHERE lease_id='tamper-backup'"),
-        ),
-        (
-            "retention-hold",
-            "artifact_retention_holds",
-            format!(
-                "INSERT INTO {schema}.artifact_retention_holds VALUES('{tenant}','tamper-hold','{artifact_id}','','','active',1,NULL,NULL)"
-            ),
-            format!("DELETE FROM {schema}.artifact_retention_holds WHERE hold_id='tamper-hold'"),
-        ),
-        (
-            "tombstone",
-            "artifact_tombstones",
-            format!(
-                "INSERT INTO {schema}.artifact_tombstones VALUES('{tenant}','{}',1,'reason','locator',NULL,1,NULL)",
-                staged.object_id
-            ),
-            format!(
-                "DELETE FROM {schema}.artifact_tombstones WHERE object_id='{}'",
-                staged.object_id
-            ),
-        ),
-        (
-            "gc-job",
-            "artifact_gc_jobs",
-            format!(
-                "INSERT INTO {schema}.artifact_gc_jobs VALUES('{tenant}','tamper-gc','{}',1,'leased',1,NULL,NULL,1,NULL,0,NULL)",
-                staged.object_id
-            ),
-            format!("DELETE FROM {schema}.artifact_gc_jobs WHERE job_id='tamper-gc'"),
-        ),
-    ];
-    let cases: Vec<(&str, &str, String, String)> = Vec::new();
-    for (name, table, mutation, restore) in cases {
-        eprintln!("artifact tamper case: {name}");
-        client.batch_execute(&format!("ALTER TABLE {schema}.{table} DISABLE TRIGGER ALL; {mutation}; ALTER TABLE {schema}.{table} ENABLE TRIGGER ALL")).await.unwrap_or_else(|error| panic!("tamper mutation {name}: {error}"));
-        assert!(
-            matches!(
-                PostgresTaskStore::open(config.clone()).await,
-                Err(smesh_a2a::PostgresStoreError::InvalidSchema)
-            ),
-            "tamper case reopened: {name}"
-        );
-        client.batch_execute(&format!("ALTER TABLE {schema}.{table} DISABLE TRIGGER ALL; {restore}; ALTER TABLE {schema}.{table} ENABLE TRIGGER ALL")).await.unwrap_or_else(|error| panic!("tamper restore {name}: {error}"));
-        let restored_case = PostgresTaskStore::open(config.clone())
-            .await
-            .unwrap_or_else(|error| panic!("tamper restore did not reopen {name}: {error:?}"));
-        restored_case.shutdown().await.unwrap();
-    }
+    // Startup semantic-seal tamper cases run in `artifact_tamper_reopen_matrix`,
+    // which mutates each authority row in an isolated schema.
 
     drop(client);
     driver.abort();

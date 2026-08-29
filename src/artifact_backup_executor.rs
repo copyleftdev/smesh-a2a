@@ -159,8 +159,8 @@ FROM numbered ORDER BY ordinal"),
     // any pin is inserted. GC uses the same row lock, so exactly one side wins.
     let locked_objects = tx
         .query(
-            &format!("SELECT o.tenant_scope,o.object_id FROM {schema}.content_objects o JOIN (SELECT DISTINCT tenant_scope,object_id FROM {schema}.artifact_backup_inventory WHERE backup_id=$1) i USING(tenant_scope,object_id) WHERE o.state='available' AND o.retain_until>={schema}.db_millis() ORDER BY o.tenant_scope,o.object_id FOR UPDATE OF o"),
-            &[&plan.backup_id()],
+            &format!("SELECT o.tenant_scope,o.object_id FROM {schema}.content_objects o JOIN (SELECT DISTINCT tenant_scope,object_id FROM {schema}.artifact_backup_inventory WHERE backup_id=$1) i USING(tenant_scope,object_id) WHERE o.state='available' AND o.retain_until>=$2::bigint ORDER BY o.tenant_scope,o.object_id FOR UPDATE OF o"),
+            &[&plan.backup_id(), &now],
         )
         .await
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
@@ -168,8 +168,8 @@ FROM numbered ORDER BY ordinal"),
         .map_err(|_| PostgresStoreError::ArtifactMigrationInvalidSource)?;
     let pin_changed = tx
         .execute(
-            &format!("INSERT INTO {schema}.artifact_backup_leases(tenant_scope,lease_id,object_id,lease_owner,lease_epoch,lease_token,state,lease_until,created_at) SELECT DISTINCT i.tenant_scope,'backup-'||$1||'-'||substr(encode(sha256(convert_to(i.tenant_scope,'UTF8')||decode('00','hex')||convert_to(i.object_id,'UTF8')),'hex'),1,32),i.object_id,$2,1,$3,'active',$4::bigint,$5::bigint FROM {schema}.artifact_backup_inventory i JOIN {schema}.content_objects o ON o.tenant_scope=i.tenant_scope AND o.object_id=i.object_id WHERE i.backup_id=$1 AND o.state='available' ON CONFLICT(tenant_scope,lease_id) DO UPDATE SET lease_owner=EXCLUDED.lease_owner,lease_epoch={schema}.artifact_backup_leases.lease_epoch+1,lease_token=EXCLUDED.lease_token,state='active',lease_until=EXCLUDED.lease_until WHERE {schema}.artifact_backup_leases.lease_owner=$2 OR {schema}.artifact_backup_leases.lease_until<={schema}.db_millis()"),
-            &[&plan.backup_id(), &owner, &token, &until, &now],
+            &format!("INSERT INTO {schema}.artifact_backup_leases(tenant_scope,lease_id,object_id,lease_owner,lease_epoch,lease_token,state,lease_until,created_at) SELECT DISTINCT i.tenant_scope,'backup-'||$1||'-'||substr(encode(sha256(convert_to(i.tenant_scope,'UTF8')||decode('00','hex')||convert_to(i.object_id,'UTF8')),'hex'),1,32),i.object_id,$2,1,$3,'active',$4::bigint,$5::bigint FROM {schema}.artifact_backup_inventory i JOIN {schema}.content_objects o ON o.tenant_scope=i.tenant_scope AND o.object_id=i.object_id WHERE i.backup_id=$1 AND o.state='available' AND o.retain_until>=$6::bigint ON CONFLICT(tenant_scope,lease_id) DO UPDATE SET lease_owner=EXCLUDED.lease_owner,lease_epoch={schema}.artifact_backup_leases.lease_epoch+1,lease_token=EXCLUDED.lease_token,state='active',lease_until=EXCLUDED.lease_until WHERE {schema}.artifact_backup_leases.lease_owner=$2 OR {schema}.artifact_backup_leases.lease_until<={schema}.db_millis()"),
+            &[&plan.backup_id(), &owner, &token, &until, &now, &now],
         )
         .await
         .map_err(|_| PostgresStoreError::ArtifactMigrationBusy)?;

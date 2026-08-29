@@ -6,6 +6,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::DurableAuthority;
 
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+fn retry_backoff(failures: u32) -> Duration {
+    Duration::from_millis(25 * u64::from(failures))
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArtifactOrphanScannerState {
     pub fatal: Option<String>,
@@ -71,14 +76,21 @@ pub fn spawn_artifact_orphan_scanner(
     let batch = artifact.artifact_runtime_limits().worker_batch;
     let join = tokio::spawn(async move {
         let mut current = ArtifactOrphanScannerState::default();
+        let mut consecutive_failures = 0_u32;
         while let Some(artifact) = authority.artifact_authority() {
             let scan = tokio::select! { ()=worker_cancel.cancelled()=>break, scan=artifact.scan_artifact_stage_orphans(300_000,batch)=>scan };
             if let Ok(report) = scan {
+                consecutive_failures = 0;
                 current.deleted = current.deleted.saturating_add(report.deleted as u64);
                 current.refunded_bytes =
                     current.refunded_bytes.saturating_add(report.refunded_bytes);
                 let _ = state_tx.send(current.clone());
             } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures < MAX_CONSECUTIVE_FAILURES {
+                    tokio::select! {()=worker_cancel.cancelled()=>break,()=tokio::time::sleep(retry_backoff(consecutive_failures))=>{}}
+                    continue;
+                }
                 current.fatal = Some("artifact orphan scanner authority failure".into());
                 let _ = state_tx.send(current);
                 break;

@@ -518,6 +518,34 @@ where
                                     let Ok(bytes) =
                                         base64::engine::general_purpose::STANDARD.decode(bytes)
                                     else {
+                                        if control.claim_execution()
+                                            && record_terminal_trace(
+                                                runtime_trace.as_deref(),
+                                                &task_id,
+                                                &context_id,
+                                                TaskState::Failed,
+                                                Vec::new(),
+                                            )
+                                            .await
+                                        {
+                                            let _ = tx
+                                                .send(Ok(task_response(
+                                                    &task_id,
+                                                    &context_id,
+                                                    TaskState::Failed,
+                                                    "SMESH worker emitted an undecodable artifact payload".to_owned(),
+                                                    None,
+                                                    history.clone(),
+                                                    None,
+                                                )))
+                                                .await;
+                                        }
+                                        request_dispatcher_cancel(
+                                            &dispatcher,
+                                            &task_id,
+                                            execution_limits.cancel_timeout,
+                                        )
+                                        .await;
                                         terminal_emitted = true;
                                         break;
                                     };
@@ -532,10 +560,7 @@ where
                                         description: Some(
                                             "Unpublished SMESH candidate output".to_owned(),
                                         ),
-                                        parts: vec![
-                                            Part::data(serde_json::json!({"bytes": bytes}))
-                                                .with_media_type(media_type),
-                                        ],
+                                        parts: vec![Part::raw(bytes).with_media_type(media_type)],
                                         metadata: None,
                                         extensions: None,
                                     });
@@ -546,6 +571,34 @@ where
                                     let Ok(artifact): Result<Artifact, _> =
                                         serde_json::from_str(&projection)
                                     else {
+                                        if control.claim_execution()
+                                            && record_terminal_trace(
+                                                runtime_trace.as_deref(),
+                                                &task_id,
+                                                &context_id,
+                                                TaskState::Failed,
+                                                Vec::new(),
+                                            )
+                                            .await
+                                        {
+                                            let _ = tx
+                                                .send(Ok(task_response(
+                                                    &task_id,
+                                                    &context_id,
+                                                    TaskState::Failed,
+                                                    "SMESH worker emitted an undecodable artifact payload".to_owned(),
+                                                    None,
+                                                    history.clone(),
+                                                    None,
+                                                )))
+                                                .await;
+                                        }
+                                        request_dispatcher_cancel(
+                                            &dispatcher,
+                                            &task_id,
+                                            execution_limits.cancel_timeout,
+                                        )
+                                        .await;
                                         terminal_emitted = true;
                                         break;
                                     };

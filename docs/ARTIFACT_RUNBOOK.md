@@ -123,9 +123,12 @@ preflight roots and keyrings before PostgreSQL acquisition and never invoke a sh
 are absolute executable paths plus a bounded argv; payload bytes are written on stdin.
 
 ```sh
-# Required by every operator command; use explicit least-privilege URLs.
-export SMESH_A2A_POSTGRES_MIGRATOR_URL='postgresql://migrator:...@db.example/smesh'
-export SMESH_A2A_POSTGRES_RUNTIME_URL='postgresql://runtime:...@db.example/smesh'
+# Required by every operator command; use explicit least-privilege URLs and a
+# trusted CA file that validates the database certificate and hostname. The
+# connector uses rustls native roots plus SSL_CERT_FILE (and SSL_CERT_DIR, when set).
+export SSL_CERT_FILE='/run/secrets/postgres-ca.pem'
+export SMESH_A2A_POSTGRES_MIGRATOR_URL='postgresql://migrator:***@db.example/smesh?sslmode=verify-full'
+export SMESH_A2A_POSTGRES_RUNTIME_URL='postgresql://runtime:***@db.example/smesh?sslmode=verify-full'
 export SMESH_A2A_POSTGRES_SCHEMA='smesh_prod'
 export SMESH_A2A_ARTIFACT_ROOT='/srv/smesh/artifacts'
 export SMESH_A2A_ARTIFACT_KEYRING_PATH='/run/secrets/smesh-artifact-keys.json'
@@ -167,8 +170,9 @@ Run the offline executor with the normal explicit PostgreSQL and artifact enviro
 operator owner:
 
 ```sh
-SMESH_A2A_POSTGRES_MIGRATOR_URL='postgresql://...' \
-SMESH_A2A_POSTGRES_RUNTIME_URL='postgresql://...' \
+SSL_CERT_FILE='/run/secrets/postgres-ca.pem' \
+SMESH_A2A_POSTGRES_MIGRATOR_URL='postgresql://db.example/smesh?sslmode=verify-full' \
+SMESH_A2A_POSTGRES_RUNTIME_URL='postgresql://db.example/smesh?sslmode=verify-full' \
 SMESH_A2A_POSTGRES_SCHEMA='smesh_prod' \
 SMESH_A2A_ARTIFACT_ROOT='/srv/smesh/artifacts' \
 SMESH_A2A_ARTIFACT_KEYRING_PATH='/run/secrets/smesh-artifact-keys.json' \

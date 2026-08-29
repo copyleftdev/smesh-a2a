@@ -2,6 +2,11 @@
 -- retention, lease, refcount, and work authority; blob locators are private.
 -- Digest version 3 explicitly marks causative JSON manifest projection while
 -- preserving the original semantic request digest used for exact replay.
+ALTER TABLE __SCHEMA__.quota_intents
+ DROP CONSTRAINT quota_intents_tenant_scope_operation_semantic_id_key;
+ALTER TABLE __SCHEMA__.quota_intents
+ ADD CONSTRAINT quota_intents_replay_identity_key
+ UNIQUE(tenant_scope,account_id,principal_scope,operation,semantic_id);
 ALTER TABLE __SCHEMA__.idempotency_records DROP CONSTRAINT idempotency_records_digest_version_check;
 ALTER TABLE __SCHEMA__.idempotency_records ADD CONSTRAINT idempotency_records_digest_version_check CHECK(digest_version IN (1,2,3));
 ALTER TABLE __SCHEMA__.tasks ADD CONSTRAINT tasks_artifact_owner_binding
@@ -81,16 +86,33 @@ BEGIN
  PERFORM set_config('smesh.internal_global','claim-v1',true);
  IF p_owner IS NULL OR p_owner='' OR p_token IS NULL OR p_token='' OR p_duration<10 OR p_duration>300000 OR p_batch<1 OR p_batch>1000 THEN RAISE EXCEPTION 'invalid artifact lease'; END IF;
  n := __SCHEMA__.db_millis();
+ -- Each call terminalizes at most p_batch rows and separately claims at most p_batch rows:
+ -- no more than 2*p_batch upload-intent rows are mutated, and concurrent callers lock disjoint rows.
  RETURN QUERY
- WITH ranked AS MATERIALIZED (
+ WITH terminal_ranked AS MATERIALIZED (
+   SELECT u.tenant_scope,u.upload_id,row_number() OVER(PARTITION BY u.tenant_scope ORDER BY u.updated_at,u.upload_id) AS terminal_turn
+   FROM __SCHEMA__.upload_intents u
+   WHERE u.attempts>=1000 AND (
+    (u.state='committed' AND u.lease_token IS NULL AND u.lease_until IS NULL)
+    OR (u.state='promoting' AND u.lease_token IS NOT NULL AND u.lease_until IS NOT NULL AND u.lease_until<=n)
+   )
+ ), terminal_due AS MATERIALIZED (
+   SELECT u.tenant_scope,u.upload_id FROM __SCHEMA__.upload_intents u JOIN terminal_ranked r USING(tenant_scope,upload_id)
+   ORDER BY r.terminal_turn,u.updated_at,u.tenant_scope,u.upload_id FOR UPDATE OF u SKIP LOCKED LIMIT p_batch
+ ), terminalized AS (
+   UPDATE __SCHEMA__.upload_intents u SET state='failed',lease_token=NULL,lease_until=NULL,
+    last_error_digest='sha256:'||encode(sha256(convert_to('artifact upload attempts exhausted','UTF8')),'hex'),updated_at=n
+   FROM terminal_due d WHERE u.tenant_scope=d.tenant_scope AND u.upload_id=d.upload_id RETURNING u.tenant_scope
+ ), ranked AS MATERIALIZED (
    SELECT u.tenant_scope,u.upload_id,row_number() OVER(PARTITION BY u.tenant_scope ORDER BY u.updated_at,u.upload_id) AS tenant_turn
-   FROM __SCHEMA__.upload_intents u WHERE u.state IN ('committed','promoting') AND (u.state='committed' OR u.lease_until<=n)
+   FROM __SCHEMA__.upload_intents u WHERE u.state IN ('committed','promoting') AND u.attempts<1000 AND (u.state='committed' OR u.lease_until<=n)
  ), due AS (
    SELECT u.tenant_scope,u.upload_id FROM __SCHEMA__.upload_intents u JOIN ranked r USING(tenant_scope,upload_id)
    ORDER BY r.tenant_turn,u.updated_at,u.tenant_scope,u.upload_id FOR UPDATE OF u SKIP LOCKED LIMIT p_batch
  ),
- changed AS (UPDATE __SCHEMA__.upload_intents u SET state='promoting',lease_epoch=u.lease_epoch+1,lease_token=p_token,lease_until=n+p_duration,attempts=u.attempts+1,updated_at=n FROM due d WHERE u.tenant_scope=d.tenant_scope AND u.upload_id=d.upload_id RETURNING u.*)
- SELECT c.tenant_scope,c.upload_id,c.artifact_id,c.object_id,c.stage_locator,c.final_locator,c.ciphertext_digest,c.ciphertext_length,c.lease_token,c.lease_epoch,c.lease_until FROM changed c;
+  changed AS (UPDATE __SCHEMA__.upload_intents u SET state='promoting',lease_epoch=u.lease_epoch+1,lease_token=p_token,lease_until=n+p_duration,attempts=u.attempts+1,updated_at=n FROM due d WHERE u.tenant_scope=d.tenant_scope AND u.upload_id=d.upload_id RETURNING u.*)
+ SELECT c.tenant_scope,c.upload_id,c.artifact_id,c.object_id,c.stage_locator,c.final_locator,c.ciphertext_digest,c.ciphertext_length,c.lease_token,c.lease_epoch,c.lease_until FROM changed c
+ WHERE (SELECT count(*) FROM terminalized)>=0;
 END $fn$;
 REVOKE ALL ON FUNCTION __SCHEMA__.claim_artifact_upload(text,text,bigint,integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION __SCHEMA__.claim_artifact_upload(text,text,bigint,integer) TO __ROLE__;
@@ -163,24 +185,50 @@ BEGIN
  PERFORM set_config('smesh.internal_global','claim-v1',true);
  IF p_owner IS NULL OR p_owner='' OR p_token IS NULL OR p_token='' OR p_duration<10 OR p_duration>300000 OR p_batch<1 OR p_batch>1000 THEN RAISE EXCEPTION 'invalid artifact gc lease'; END IF;
  n := __SCHEMA__.db_millis();
- WITH candidates AS (
-   SELECT o.tenant_scope,o.object_id FROM __SCHEMA__.content_objects o
+ -- A call terminalizes <=p_batch jobs, tombstones <=p_batch objects (and creates the
+ -- corresponding <=p_batch jobs), then claims <=p_batch jobs. Thus job-state mutations
+ -- are <=2*p_batch and all authority-row mutations are explicitly bounded by 4*p_batch.
+ WITH terminal_ranked AS MATERIALIZED (
+   SELECT j.tenant_scope,j.job_id,row_number() OVER(PARTITION BY j.tenant_scope ORDER BY j.available_at,j.job_id) AS terminal_turn
+   FROM __SCHEMA__.artifact_gc_jobs j JOIN __SCHEMA__.content_objects o USING(tenant_scope,object_id)
+   WHERE (j.attempts>=1000 OR o.state='quarantined') AND (
+    (j.state='pending' AND j.lease_owner IS NULL AND j.lease_token IS NULL AND j.lease_until IS NULL)
+    OR (j.state='leased' AND j.lease_owner IS NOT NULL AND j.lease_token IS NOT NULL
+        AND j.lease_until IS NOT NULL AND j.lease_until<=n)
+   )
+ ), terminal_due AS MATERIALIZED (
+   SELECT j.tenant_scope,j.job_id FROM __SCHEMA__.artifact_gc_jobs j JOIN terminal_ranked r USING(tenant_scope,job_id)
+   ORDER BY r.terminal_turn,j.available_at,j.tenant_scope,j.job_id FOR UPDATE OF j SKIP LOCKED LIMIT p_batch
+ ), terminalized AS (
+   UPDATE __SCHEMA__.artifact_gc_jobs j SET state='dead',lease_owner=NULL,lease_token=NULL,lease_until=NULL,
+    last_error_digest='sha256:'||encode(sha256(convert_to(CASE WHEN o.state='quarantined' THEN 'artifact gc object quarantined' ELSE 'artifact gc attempts exhausted' END,'UTF8')),'hex')
+   FROM terminal_due d, __SCHEMA__.content_objects o WHERE j.tenant_scope=d.tenant_scope AND j.job_id=d.job_id
+    AND o.tenant_scope=j.tenant_scope AND o.object_id=j.object_id RETURNING j.tenant_scope
+ ), candidate_ranked AS MATERIALIZED (
+   SELECT o.tenant_scope,o.object_id,o.retain_until,row_number() OVER(PARTITION BY o.tenant_scope ORDER BY o.retain_until,o.object_id) AS tenant_turn
+   FROM __SCHEMA__.content_objects o
    WHERE o.state='available' AND o.reference_count=0 AND o.retain_until<=n
    AND NOT EXISTS(SELECT 1 FROM __SCHEMA__.artifact_references r WHERE r.tenant_scope=o.tenant_scope AND r.artifact_id IN (SELECT m.artifact_id FROM __SCHEMA__.artifact_manifests m WHERE m.tenant_scope=o.tenant_scope AND m.object_id=o.object_id) AND r.state='active')
    AND NOT EXISTS(SELECT 1 FROM __SCHEMA__.artifact_retention_holds h JOIN __SCHEMA__.artifact_manifests m USING(tenant_scope,artifact_id) WHERE m.tenant_scope=o.tenant_scope AND m.object_id=o.object_id AND h.state='active' AND (h.expires_at IS NULL OR h.expires_at>n))
    AND NOT EXISTS(SELECT 1 FROM __SCHEMA__.artifact_read_leases l JOIN __SCHEMA__.artifact_manifests m USING(tenant_scope,artifact_id) WHERE m.tenant_scope=o.tenant_scope AND m.object_id=o.object_id AND l.state='active' AND l.lease_until>n)
    AND NOT EXISTS(SELECT 1 FROM __SCHEMA__.artifact_backup_leases b WHERE b.tenant_scope=o.tenant_scope AND b.object_id=o.object_id AND b.state='active' AND b.lease_until>n)
-   ORDER BY o.retain_until,o.tenant_scope,o.object_id FOR UPDATE OF o SKIP LOCKED LIMIT p_batch
+ ), candidates AS (
+   SELECT o.tenant_scope,o.object_id FROM __SCHEMA__.content_objects o JOIN candidate_ranked r USING(tenant_scope,object_id)
+   ORDER BY r.tenant_turn,o.retain_until,o.tenant_scope,o.object_id FOR UPDATE OF o SKIP LOCKED LIMIT p_batch
  ), tombstoned AS (
    UPDATE __SCHEMA__.content_objects o SET state='tombstoned',tombstone_generation=o.tombstone_generation+1
    FROM candidates c WHERE o.tenant_scope=c.tenant_scope AND o.object_id=c.object_id AND o.state='available'
    RETURNING o.tenant_scope,o.object_id,o.tombstone_generation
  )
  INSERT INTO __SCHEMA__.artifact_gc_jobs(tenant_scope,job_id,object_id,tombstone_generation,state,lease_epoch,available_at,attempts)
- SELECT t.tenant_scope,'gc-'||encode(sha256(convert_to(t.tenant_scope||E'\\000'||t.object_id||E'\\000'||t.tombstone_generation::text,'UTF8')),'hex'),t.object_id,t.tombstone_generation,'pending',1,n,0 FROM tombstoned t ON CONFLICT DO NOTHING;
- RETURN QUERY WITH due AS (
-   SELECT j.tenant_scope,j.job_id FROM __SCHEMA__.artifact_gc_jobs j WHERE j.state IN ('pending','leased') AND j.available_at<=n AND (j.state='pending' OR j.lease_until<=n)
-   ORDER BY j.tenant_scope,j.available_at,j.job_id FOR UPDATE SKIP LOCKED LIMIT p_batch
+ SELECT t.tenant_scope,'gc-'||encode(sha256(convert_to(t.tenant_scope||E'\\000'||t.object_id||E'\\000'||t.tombstone_generation::text,'UTF8')),'hex'),t.object_id,t.tombstone_generation,'pending',1,n,0 FROM tombstoned t WHERE (SELECT count(*) FROM terminalized)>=0 ON CONFLICT DO NOTHING;
+ RETURN QUERY WITH ranked AS MATERIALIZED (
+   SELECT j.tenant_scope,j.job_id,j.available_at,row_number() OVER(PARTITION BY j.tenant_scope ORDER BY j.available_at,j.job_id) AS tenant_turn
+   FROM __SCHEMA__.artifact_gc_jobs j JOIN __SCHEMA__.content_objects o USING(tenant_scope,object_id)
+  WHERE j.state IN ('pending','leased') AND j.attempts<1000 AND o.state IN ('tombstoned','deleting') AND o.tombstone_generation=j.tombstone_generation AND j.available_at<=n AND (j.state='pending' OR j.lease_until<=n)
+ ), due AS (
+   SELECT j.tenant_scope,j.job_id FROM __SCHEMA__.artifact_gc_jobs j JOIN ranked r USING(tenant_scope,job_id)
+   ORDER BY r.tenant_turn,j.available_at,j.tenant_scope,j.job_id FOR UPDATE OF j SKIP LOCKED LIMIT p_batch
  ), changed AS (
    UPDATE __SCHEMA__.artifact_gc_jobs j SET state='leased',lease_owner=p_owner,lease_token=p_token,lease_until=n+p_duration,lease_epoch=j.lease_epoch+1,attempts=j.attempts+1
    FROM due d WHERE j.tenant_scope=d.tenant_scope AND j.job_id=d.job_id RETURNING j.*
@@ -312,7 +360,7 @@ CREATE TABLE __SCHEMA__.artifact_key_rotation_plans(
 CREATE TABLE __SCHEMA__.artifact_reencryption_jobs(
  tenant_scope text NOT NULL, job_id text NOT NULL, rotation_id text NOT NULL, object_id text NOT NULL,
  old_generation text NOT NULL, new_generation text NOT NULL, old_locator text NOT NULL, new_locator text, new_stage_locator text,
- new_nonce bytea, new_ciphertext_digest text, new_ciphertext_length bigint,
+ new_nonce bytea, new_ciphertext_digest text, new_ciphertext_length bigint, last_error_digest text,
  new_aad_seal text CHECK(new_aad_seal IS NULL OR new_aad_seal ~ '^sha256:[0-9a-f]{64}$'),
  state text NOT NULL CHECK(state IN ('pending','leased','staged','promoted','swapped','cleanup','completed','failed')),
  lease_owner text, lease_token text, lease_epoch bigint NOT NULL DEFAULT 1 CHECK(lease_epoch>0), lease_until bigint,
@@ -330,19 +378,44 @@ BEGIN
  PERFORM set_config('smesh.internal_global','claim-v1',true);
  IF p_rotation_id IS NULL OR p_rotation_id='' OR p_old_generation IS NULL OR p_old_generation='' OR p_new_generation IS NULL OR p_new_generation='' OR p_old_generation=p_new_generation OR p_owner IS NULL OR p_owner='' OR p_token IS NULL OR p_token='' OR p_duration<10 OR p_duration>300000 OR p_batch<1 OR p_batch>1000 THEN RAISE EXCEPTION 'invalid artifact reencryption lease'; END IF;
  n:=__SCHEMA__.db_millis();
- RETURN QUERY WITH due AS (
-  SELECT j.tenant_scope,j.job_id FROM __SCHEMA__.artifact_reencryption_jobs j
+ -- Each call terminalizes at most p_batch rows and separately claims at most p_batch rows:
+ -- no more than 2*p_batch reencryption-job rows are mutated, with tenant-fair disjoint locks.
+ RETURN QUERY WITH terminal_ranked AS MATERIALIZED (
+  SELECT j.tenant_scope,j.job_id,row_number() OVER(PARTITION BY j.tenant_scope ORDER BY j.updated_at,j.job_id) AS terminal_turn
+  FROM __SCHEMA__.artifact_reencryption_jobs j
+  WHERE j.rotation_id=p_rotation_id AND j.old_generation=p_old_generation AND j.new_generation=p_new_generation
+   AND j.attempts>=1000 AND (
+    (j.state='pending' AND j.lease_owner IS NULL AND j.lease_token IS NULL AND j.lease_until IS NULL)
+    OR (j.state='leased' AND j.lease_owner IS NOT NULL AND j.lease_token IS NOT NULL
+        AND j.lease_until IS NOT NULL AND j.lease_until<=n)
+    OR (j.state IN ('staged','promoted','swapped','cleanup')
+        AND (j.lease_until IS NULL OR j.lease_until<=n)
+        AND ((j.lease_owner IS NULL AND j.lease_token IS NULL AND j.lease_until IS NULL)
+             OR (j.lease_owner IS NOT NULL AND j.lease_token IS NOT NULL AND j.lease_until IS NOT NULL)))
+   )
+ ), terminal_due AS MATERIALIZED (
+  SELECT j.tenant_scope,j.job_id FROM __SCHEMA__.artifact_reencryption_jobs j JOIN terminal_ranked r USING(tenant_scope,job_id)
+  ORDER BY r.terminal_turn,j.updated_at,j.tenant_scope,j.job_id FOR UPDATE OF j SKIP LOCKED LIMIT p_batch
+ ), terminalized AS (
+  UPDATE __SCHEMA__.artifact_reencryption_jobs j SET state='failed',lease_owner=NULL,lease_token=NULL,lease_until=NULL,
+   last_error_digest='sha256:'||encode(sha256(convert_to('artifact reencryption attempts exhausted','UTF8')),'hex'),updated_at=n
+  FROM terminal_due d WHERE j.tenant_scope=d.tenant_scope AND j.job_id=d.job_id RETURNING j.tenant_scope
+ ), ranked AS MATERIALIZED (
+  SELECT j.tenant_scope,j.job_id,row_number() OVER(PARTITION BY j.tenant_scope ORDER BY j.updated_at,j.job_id) AS tenant_turn FROM __SCHEMA__.artifact_reencryption_jobs j
   JOIN __SCHEMA__.artifact_key_rotation_plans p ON p.tenant_scope=j.tenant_scope AND p.rotation_id=j.rotation_id
   WHERE j.rotation_id=p_rotation_id AND j.old_generation=p_old_generation AND j.new_generation=p_new_generation
    AND p.old_generation=p_old_generation AND p.new_generation=p_new_generation AND p.state='active'
-   AND j.state IN ('pending','leased','staged','promoted','swapped','cleanup')
+   AND j.state IN ('pending','leased','staged','promoted','swapped','cleanup') AND j.attempts<1000
    AND (j.state='pending' OR j.lease_until IS NULL OR j.lease_until<=n)
-  ORDER BY j.updated_at,j.tenant_scope,j.job_id FOR UPDATE SKIP LOCKED LIMIT p_batch
+ ), due AS (
+  SELECT j.tenant_scope,j.job_id FROM __SCHEMA__.artifact_reencryption_jobs j JOIN ranked r USING(tenant_scope,job_id)
+  ORDER BY r.tenant_turn,j.updated_at,j.tenant_scope,j.job_id FOR UPDATE OF j SKIP LOCKED LIMIT p_batch
  ), changed AS (
   UPDATE __SCHEMA__.artifact_reencryption_jobs j SET state=CASE WHEN j.state IN ('pending','leased') THEN 'leased' ELSE j.state END,lease_owner=p_owner,lease_token=p_token,
    lease_epoch=j.lease_epoch+1,lease_until=n+p_duration,attempts=j.attempts+1,updated_at=n
   FROM due d WHERE j.tenant_scope=d.tenant_scope AND j.job_id=d.job_id RETURNING j.*
- ) SELECT c.tenant_scope,c.job_id,c.rotation_id,c.object_id,c.old_generation,c.new_generation,c.old_locator,c.lease_token,c.lease_epoch,c.state,c.new_locator,c.new_stage_locator,c.new_nonce,c.new_ciphertext_digest,c.new_ciphertext_length,c.new_aad_seal,c.rollback_until FROM changed c;
+ ) SELECT c.tenant_scope,c.job_id,c.rotation_id,c.object_id,c.old_generation,c.new_generation,c.old_locator,c.lease_token,c.lease_epoch,c.state,c.new_locator,c.new_stage_locator,c.new_nonce,c.new_ciphertext_digest,c.new_ciphertext_length,c.new_aad_seal,c.rollback_until FROM changed c
+ WHERE (SELECT count(*) FROM terminalized)>=0;
 END $fn$;
 REVOKE ALL ON FUNCTION __SCHEMA__.claim_artifact_reencryption(text,text,text,text,text,bigint,integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION __SCHEMA__.claim_artifact_reencryption(text,text,text,text,text,bigint,integer) TO __ROLE__;
@@ -451,9 +524,11 @@ BEGIN
  SELECT (canonical_json::jsonb#>>'{limits,retainedAuthorityBytes,tenant}')::bigint,(canonical_json::jsonb#>>'{limits,retainedAuthorityBytes,account}')::bigint,(canonical_json::jsonb#>>'{limits,retainedAuthorityBytes,principal}')::bigint INTO tenant_limit,account_limit,principal_limit FROM __SCHEMA__.quota_policy_versions WHERE tenant_scope=tenant AND lifecycle='active';
  IF current_bytes>COALESCE(tenant_limit,67108864) THEN RAISE EXCEPTION 'retained authority tenant quota exceeded' USING ERRCODE='53000'; END IF;
  UPDATE __SCHEMA__.retained_authority_usage SET retained_bytes=retained_bytes+delta,updated_at=n WHERE tenant_scope=tenant AND scope_kind='account' AND scope_id=account AND retained_bytes+delta>=0 RETURNING retained_bytes INTO current_bytes;
- IF NOT FOUND OR current_bytes>COALESCE(account_limit,67108864) THEN RAISE EXCEPTION 'retained authority account quota exceeded' USING ERRCODE='53000'; END IF;
+ IF NOT FOUND THEN RAISE EXCEPTION 'artifact retained account counter corrupt'; END IF;
+ IF current_bytes>COALESCE(account_limit,67108864) THEN RAISE EXCEPTION 'retained authority account quota exceeded' USING ERRCODE='53000'; END IF;
  UPDATE __SCHEMA__.retained_authority_usage SET retained_bytes=retained_bytes+delta,updated_at=n WHERE tenant_scope=tenant AND scope_kind='principal' AND scope_id=principal AND retained_bytes+delta>=0 RETURNING retained_bytes INTO current_bytes;
- IF NOT FOUND OR current_bytes>COALESCE(principal_limit,67108864) THEN RAISE EXCEPTION 'retained authority principal quota exceeded' USING ERRCODE='53000'; END IF;
+ IF NOT FOUND THEN RAISE EXCEPTION 'artifact retained principal counter corrupt'; END IF;
+ IF current_bytes>COALESCE(principal_limit,67108864) THEN RAISE EXCEPTION 'retained authority principal quota exceeded' USING ERRCODE='53000'; END IF;
  RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
 END $fn$;
 CREATE TRIGGER z_retained_artifact_payload_accounting AFTER INSERT OR UPDATE OR DELETE ON __SCHEMA__.content_objects FOR EACH ROW EXECUTE FUNCTION __SCHEMA__.account_artifact_payload_bytes();
@@ -473,6 +548,8 @@ BEGIN
  total:=total+part;
  RETURN total::bigint;
 END $fn$;
+REVOKE ALL ON FUNCTION __SCHEMA__.artifact_retained_oracle(text,text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION __SCHEMA__.artifact_retained_oracle(text,text) TO __ROLE__;
 
 CREATE FUNCTION __SCHEMA__.artifact_retained_account_oracle(wanted_tenant text,wanted_account text) RETURNS bigint
 LANGUAGE plpgsql STABLE SET search_path=pg_catalog AS $fn$
@@ -488,3 +565,5 @@ BEGIN
  total:=total+part;
  RETURN total::bigint;
 END $fn$;
+REVOKE ALL ON FUNCTION __SCHEMA__.artifact_retained_account_oracle(text,text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION __SCHEMA__.artifact_retained_account_oracle(text,text) TO __ROLE__;

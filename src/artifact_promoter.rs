@@ -6,6 +6,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{DurableAuthority, content_digest};
 
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+fn retry_backoff(failures: u32) -> Duration {
+    Duration::from_millis(25 * u64::from(failures))
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArtifactPromoterState {
     pub fatal: Option<String>,
@@ -70,11 +75,15 @@ pub fn spawn_artifact_promoter(
     let join = tokio::spawn(async move {
         let owner = content_digest(&rand::random::<[u8; 32]>());
         let mut promoted = 0_u64;
+        let mut consecutive_failures = 0_u32;
         while let Some(artifact) = authority.artifact_authority() {
             let claim = tokio::select! {
                 () = worker_cancel.cancelled() => break,
                 claim = artifact.claim_artifact_promotion(&owner, 30_000, batch) => claim,
             };
+            if claim.is_ok() {
+                consecutive_failures = 0;
+            }
             match claim {
                 Ok(claims) if !claims.is_empty() => {
                     crate::artifact_production_checkpoint(
@@ -112,6 +121,14 @@ pub fn spawn_artifact_promoter(
                     () = tokio::time::sleep(Duration::from_millis(100)) => {}
                 },
                 Err(_) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures < MAX_CONSECUTIVE_FAILURES {
+                        tokio::select! {
+                            () = worker_cancel.cancelled() => break,
+                            () = tokio::time::sleep(retry_backoff(consecutive_failures)) => {}
+                        }
+                        continue;
+                    }
                     let _ = state_tx.send(ArtifactPromoterState {
                         fatal: Some("artifact promoter claim failure".into()),
                         promoted,

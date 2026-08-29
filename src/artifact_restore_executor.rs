@@ -40,6 +40,33 @@ struct Inventory {
     key_generations: Vec<serde_json::Value>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InventoryRetentionHold {
+    tenant_scope: String,
+    hold_id: String,
+    artifact_id: String,
+    actor_digest: String,
+    reason_digest: String,
+    state: String,
+    created_at: i64,
+    expires_at: Option<i64>,
+    released_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InventoryTombstone {
+    tenant_scope: String,
+    object_id: String,
+    tombstone_generation: i64,
+    reason_digest: String,
+    locator_digest: String,
+    deletion_receipt_digest: Option<String>,
+    tombstoned_at: i64,
+    deleted_at: Option<i64>,
+}
+
 pub(crate) async fn execute(
     client: &mut Client,
     schema: &str,
@@ -325,7 +352,34 @@ fn shared_row_key(
 }
 
 fn validate_inventory_entries(inv: &Inventory) -> Result<(), PostgresStoreError> {
+    use std::path::Component;
+
     let invalid = || PostgresStoreError::ArtifactMigrationInvalidSource;
+    let canonical_artifacts = inv
+        .entries
+        .iter()
+        .map(|entry| {
+            Ok((
+                s(&entry["manifest"], "tenant_scope")?,
+                s(&entry["manifest"], "artifact_id")?,
+            ))
+        })
+        .collect::<Result<BTreeSet<_>, PostgresStoreError>>()?;
+    let canonical_objects = inv
+        .entries
+        .iter()
+        .map(|entry| {
+            Ok((
+                s(&entry["object"], "tenant_scope")?,
+                s(&entry["object"], "object_id")?,
+            ))
+        })
+        .collect::<Result<BTreeSet<_>, PostgresStoreError>>()?;
+    if canonical_artifacts.len() != inv.entries.len() {
+        return Err(invalid());
+    }
+    let mut hold_keys = BTreeSet::new();
+    let mut tombstone_keys = BTreeSet::new();
     for entry in &inv.entries {
         let task = entry.get("task").ok_or_else(invalid)?;
         let object = entry.get("object").ok_or_else(invalid)?;
@@ -343,6 +397,30 @@ fn validate_inventory_entries(inv: &Inventory) -> Result<(), PostgresStoreError>
             .get("references")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(invalid)?;
+        let holds = entry
+            .get("holds")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(invalid)?;
+        let tombstones = entry
+            .get("tombstones")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(invalid)?;
+        let locator = s(object, "backend_locator")?;
+        if !locator.starts_with("objects/")
+            || std::path::Path::new(&locator)
+                .components()
+                .any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir
+                            | Component::CurDir
+                            | Component::RootDir
+                            | Component::Prefix(_)
+                    )
+                })
+        {
+            return Err(invalid());
+        }
         let canonical = manifest
             .get("canonical_json")
             .and_then(serde_json::Value::as_str)
@@ -426,8 +504,80 @@ fn validate_inventory_entries(inv: &Inventory) -> Result<(), PostgresStoreError>
         {
             return Err(invalid());
         }
+        let tenant = s(manifest, "tenant_scope")?;
+        let artifact_id = s(manifest, "artifact_id")?;
+        let object_id = s(object, "object_id")?;
+        let object_generation = object["tombstone_generation"]
+            .as_i64()
+            .ok_or_else(invalid)?;
+        for value in holds {
+            let hold: InventoryRetentionHold =
+                serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            let valid_state = match hold.state.as_str() {
+                "active" => hold.released_at.is_none(),
+                "released" => hold
+                    .released_at
+                    .is_some_and(|released| released >= hold.created_at),
+                _ => false,
+            };
+            if hold.tenant_scope != tenant
+                || hold.artifact_id != artifact_id
+                || !canonical_artifacts
+                    .contains(&(hold.tenant_scope.clone(), hold.artifact_id.clone()))
+                || hold.hold_id.is_empty()
+                || !digest_string(&hold.actor_digest)
+                || !digest_string(&hold.reason_digest)
+                || hold.created_at <= 0
+                || hold
+                    .expires_at
+                    .is_some_and(|expires| expires < hold.created_at)
+                || !valid_state
+                || !hold_keys.insert((hold.tenant_scope, hold.hold_id))
+            {
+                return Err(invalid());
+            }
+        }
+        for value in tombstones {
+            let tombstone: InventoryTombstone =
+                serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            let deletion_semantics = match (
+                tombstone.deletion_receipt_digest.as_deref(),
+                tombstone.deleted_at,
+            ) {
+                (None, None) => true,
+                (Some(receipt), Some(deleted)) => {
+                    digest_string(receipt) && deleted >= tombstone.tombstoned_at
+                }
+                _ => false,
+            };
+            if tombstone.tenant_scope != tenant
+                || tombstone.object_id != object_id
+                || !canonical_objects.contains(&(tenant.clone(), tombstone.object_id.clone()))
+                || tombstone.tombstone_generation <= 0
+                || tombstone.tombstone_generation > object_generation
+                || !digest_string(&tombstone.reason_digest)
+                || !digest_string(&tombstone.locator_digest)
+                || tombstone.tombstoned_at <= 0
+                || !deletion_semantics
+                || !tombstone_keys.insert((
+                    tombstone.tenant_scope,
+                    tombstone.object_id,
+                    tombstone.tombstone_generation,
+                ))
+            {
+                return Err(invalid());
+            }
+        }
     }
     Ok(())
+}
+
+fn digest_string(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 fn inventory_tenants(inv: &Inventory) -> Result<BTreeSet<String>, PostgresStoreError> {
     let tenants: BTreeSet<String> = inv

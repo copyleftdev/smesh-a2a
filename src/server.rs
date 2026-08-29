@@ -196,7 +196,11 @@ async fn artifact_resolver(
     );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-transform"),
+        HeaderValue::from_static("private, no-store, no-transform"),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
     );
     response
 }

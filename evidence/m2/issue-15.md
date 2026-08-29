@@ -359,3 +359,61 @@ Final closure hashes before this evidence append:
 - `tests/durable_authority_fake.rs`: `d4e45c008ac20504cd833abf292d28b06841e76271ca4949dfc20977173e111c`
 - `tests/durable_authority_public_api.rs`: `57749dd0c9fe42cf33e43e65df671dfca7351d7a34f769bd04b746f4db26e777`
 - `tests/artifact_migration.rs`: `85546ec2849a0d19aa43f4e90b4442908b77df30a7d7007c7d6471679769c758`
+
+## CodeRabbit closure evidence
+
+All explicit PostgreSQL 17 URLs used the parent fixture and credentials remained redacted.
+Focused results: `artifact_migration` **6 passed / 4 helper subprocesses ignored**,
+`artifact_operators` **1 passed**, `artifact_storage` **54 passed**, `postgres_store`
+**57 passed**, and `postgres_artifact_process` **2 passed**. The locked debug all-target
+suite, release all-target suite (release PostgreSQL integration remains debug-fixture-only),
+Clippy `-D warnings`, Rustdoc `-D warnings`, Rust 1.88 all-target check, formatting,
+demo syntax/tests/trace validation, and `git diff --check` passed. `cargo audit` found no
+vulnerabilities and only the two repository-allowed warnings (`bincode` unmaintained and
+transitive `chacha20` yanked).
+
+Final closure hashes before this evidence append:
+
+- `migrations/postgres/0004_distributed_quota_authority.sql`: `aba968141baa9c61df67166c14393e2d84f55628c998e0766fbb2e88f82ec9bd`
+- `migrations/postgres/0005_artifact_authority.sql`: `80f847a0381aacee314a35eccb67bd0e8b83910a388274cebab512787b00bf04`
+- `src/artifact.rs`: `d1c5094335e6a2d5f318940cd653baa29be72e71872dbacee16eed890aa3b81d`
+- `src/artifact_migration_executor.rs`: `b2de431d2ffc2e47dbdccdf15e4159723f1eccd672835c4077ef7630ddc0cbf6`
+- `src/artifact_reencryption_executor.rs`: `2deca2cb6a259c6e62776fc69c01542d526dc1571f72762dd4823cc647de68da`
+- `src/executor.rs`: `27ea4052c0e9da643640a8004e87e8414b73b82550c326579c880d5728cc9656`
+- `src/outbox_driver.rs`: `4f4ccce290ed82d5cf8771e4b06e12726f15503f995c29f3cf38c1353ca170d2`
+- `tests/artifact_storage.rs`: `5116704c9e4ca95de40bbc7db9194a27a20d3aaefef27ee70b362593e242dc7a`
+- `tests/postgres_store.rs`: `b115ef6c6a7dff90300da54aaa7d455cfe8ac2ea20afa6d51b757707db03700a`
+- `tests/postgres_artifact_process.rs`: `b9728184a9ccabf0c19b74c9e0c34cbb6c3d8cee5747a13673a5ad1db0bc67dd`
+
+## Final bounded-terminalization, restore-prevalidation, and TLS closure
+
+Focused PostgreSQL evidence used the explicit parent fixture: `artifact_migration` **6 passed / 4
+helper subprocesses ignored**, `postgres_store` **58 passed**, and `postgres_artifact_process` **2
+passed**. `artifact_storage` **54 passed**, `artifact_operators` **1 passed**, the full debug
+`--all-targets --all-features` suite, Clippy `-D warnings`, formatting, and `git diff --check` passed.
+
+Final hashes for this closure:
+
+- `migrations/postgres/0005_artifact_authority.sql`: `1f21a4bffdbaf339531dad262d7f6dad18e8630d722281470526aec53df630be`
+- `src/artifact_restore_executor.rs`: `0027574ac2320c94c4b420d69af50036bdb6e16921c2e4a13a21cb7ab3471e1f`
+- `docs/ARTIFACT_RUNBOOK.md`: `247b49b30b6800abc12209dd47e0371edadac5381c129f8369c9e9d190ba40a9`
+- `docs/QUOTA_RUNBOOK.md`: `fd4a0596c96b28784e5344d82e9e98cb4f5e24eb2480704218b944a9268e76f6`
+- `tests/artifact_storage.rs`: `6376c324b17b5da4b80adcac7f2bf2d7a809d15b8f5eda57a2c4e109c75b47f8`
+- `tests/artifact_migration.rs`: `7ce3713dd9e775ab947e168925a479354c18e2e393af66f313121d350dfe3a0e`
+- `tests/postgres_store.rs`: `af90b53c63c3c0dcaf14b1c55d71f5710eba2f1a04ce80cb2d1db0acc37ecd1c`
+
+## Active-lease exhausted-terminalization closure
+
+The explicit PostgreSQL regression proved upload, GC (including quarantined and mixed
+expired/active rows), and re-encryption jobs at `attempts=1000` retain future active
+lease fences; the same DB-time capture terminalizes them at exact expiry while healthy
+work continues. The focused regression passed, then serial `postgres_store` passed
+**59/59**. Artifact suites passed: `artifact_migration` **6 passed / 4 helper subprocesses
+ignored**, `artifact_operators` **1/1**, `artifact_storage` **54/54**, and
+`postgres_artifact_process` **2/2**. Formatting, Clippy `-D warnings`, and
+`git diff --check` passed.
+
+Final hashes for this closure:
+
+- `migrations/postgres/0005_artifact_authority.sql`: `ce9a82fc62db67f0d36ee63c89f323184a96a804b70ec6e4d318a87d2e0d1de5`
+- `tests/postgres_store.rs`: `84a79e27e7382fbc9858f6f3c986d26c8fa5b3ee10370387714210d1e0d5612b`

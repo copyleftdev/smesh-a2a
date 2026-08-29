@@ -43,7 +43,7 @@ CREATE TABLE __SCHEMA__.quota_intents(
  created_at bigint NOT NULL CHECK(created_at>0),
  retention_until bigint GENERATED ALWAYS AS (CASE WHEN task_id IS NULL THEN created_at+86400000 END) STORED,
  PRIMARY KEY(tenant_scope,binding_digest),
- UNIQUE(tenant_scope,account_id,principal_scope,operation,semantic_id),
+ UNIQUE(tenant_scope,operation,semantic_id),
  FOREIGN KEY(tenant_scope,policy_id,policy_revision) REFERENCES __SCHEMA__.quota_policy_versions(tenant_scope,policy_id,policy_revision) ON DELETE RESTRICT,
  FOREIGN KEY(tenant_scope,task_id) REFERENCES __SCHEMA__.tasks(tenant_scope,task_id) ON DELETE RESTRICT
 );

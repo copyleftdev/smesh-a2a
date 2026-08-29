@@ -15,6 +15,122 @@ use smesh_a2a::{
 use support::artifact_test_root::ArtifactTestRoot;
 
 #[test]
+fn revision_five_widens_quota_intent_identity_without_rewriting_revision_four() {
+    let v4 = include_str!("../migrations/postgres/0004_distributed_quota_authority.sql");
+    let v5 = include_str!("../migrations/postgres/0005_artifact_authority.sql");
+    assert!(v4.contains("UNIQUE(tenant_scope,operation,semantic_id)"));
+    assert!(!v4.contains("UNIQUE(tenant_scope,account_id,principal_scope,operation,semantic_id)"));
+    assert!(v5.contains("DROP CONSTRAINT quota_intents_tenant_scope_operation_semantic_id_key"));
+    assert!(v5.contains("UNIQUE(tenant_scope,account_id,principal_scope,operation,semantic_id)"));
+}
+
+#[test]
+fn artifact_claim_sql_dead_letters_exhausted_and_unreturnable_work() {
+    let migration = include_str!("../migrations/postgres/0005_artifact_authority.sql");
+    assert_eq!(migration.matches("attempts<1000").count(), 3);
+    assert_eq!(migration.matches("terminal_due AS MATERIALIZED").count(), 3);
+    assert!(migration.matches("terminal_turn").count() >= 6);
+    assert_eq!(migration.matches("), terminalized AS (").count(), 3);
+    assert!(migration.contains(
+        "Each call terminalizes at most p_batch rows and separately claims at most p_batch rows"
+    ));
+    assert!(migration.contains("all authority-row mutations are explicitly bounded by 4*p_batch"));
+    assert!(migration.contains("artifact upload attempts exhausted"));
+    assert!(migration.contains("artifact gc attempts exhausted"));
+    assert!(migration.contains("artifact reencryption attempts exhausted"));
+    assert!(migration.contains("artifact gc object quarantined"));
+    assert!(migration.contains("last_error_digest text"));
+}
+
+#[test]
+fn artifact_retained_counter_underflow_is_corruption_and_oracles_are_private() {
+    let migration = include_str!("../migrations/postgres/0005_artifact_authority.sql");
+    assert!(migration.contains("artifact retained account counter corrupt"));
+    assert!(migration.contains("artifact retained principal counter corrupt"));
+    assert!(migration.contains(
+        "REVOKE ALL ON FUNCTION __SCHEMA__.artifact_retained_oracle(text,text) FROM PUBLIC"
+    ));
+    assert!(migration.contains(
+        "REVOKE ALL ON FUNCTION __SCHEMA__.artifact_retained_account_oracle(text,text) FROM PUBLIC"
+    ));
+}
+
+#[test]
+fn backup_pins_use_one_captured_retention_fence() {
+    let executor = include_str!("../src/artifact_backup_executor.rs");
+    assert!(executor.contains("o.retain_until>=$2::bigint ORDER BY"));
+    assert!(executor.contains("o.state='available' AND o.retain_until>=$6::bigint ON CONFLICT"));
+}
+
+#[test]
+fn binary_artifact_projection_uses_a2a_raw_parts_and_decode_failures_are_terminal() {
+    let executor = include_str!("../src/executor.rs");
+    let outbox = include_str!("../src/outbox_driver.rs");
+    assert!(executor.contains("Part::raw(bytes).with_media_type(media_type)"));
+    assert!(outbox.contains("Part::raw(bytes).with_media_type(media_type.clone())"));
+    assert_eq!(executor.matches("undecodable artifact payload").count(), 2);
+    assert!(executor.matches("request_dispatcher_cancel(").count() >= 8);
+}
+
+#[test]
+fn reencryption_lock_is_released_after_every_rotation_result() {
+    let executor = include_str!("../src/artifact_reencryption_executor.rs");
+    assert!(executor.contains("let rotation_result: Result<ArtifactKeyRotationOutcome"));
+    assert!(executor.contains("let unlock_result = client"));
+    assert!(executor.contains("match (rotation_result, unlock_result)"));
+}
+
+#[test]
+fn artifact_workers_retry_bounded_consecutive_authority_failures() {
+    for worker in [
+        include_str!("../src/artifact_promoter.rs"),
+        include_str!("../src/artifact_gc.rs"),
+        include_str!("../src/artifact_orphan_scanner.rs"),
+    ] {
+        assert!(worker.contains("consecutive_failures"));
+        assert!(worker.contains("MAX_CONSECUTIVE_FAILURES"));
+        assert!(worker.contains("retry_backoff"));
+    }
+}
+
+#[test]
+fn restore_prevalidation_requires_all_arrays_and_parent_free_locators() {
+    let restore = include_str!("../src/artifact_restore_executor.rs");
+    for field in ["holds", "tombstones"] {
+        assert!(restore.contains(&format!(".get(\"{field}\")")));
+    }
+    assert!(restore.contains("Component::ParentDir"));
+}
+
+#[test]
+fn resolver_disables_storage_and_content_sniffing() {
+    let server = include_str!("../src/server.rs");
+    assert!(server.contains("private, no-store, no-transform"));
+    assert!(server.contains("x-content-type-options"));
+    assert!(server.contains("nosniff"));
+}
+
+#[test]
+fn artifact_operator_env_errors_name_every_required_variable() {
+    let main = include_str!("../src/main.rs");
+    assert!(main.contains("fn required_operator_env"));
+    for name in [
+        "SMESH_A2A_POSTGRES_MIGRATOR_URL",
+        "SMESH_A2A_POSTGRES_RUNTIME_URL",
+        "SMESH_A2A_POSTGRES_SCHEMA",
+    ] {
+        assert!(main.contains(&format!("required_operator_env(\"{name}\")")));
+    }
+}
+
+#[test]
+fn zero_work_migration_creates_and_completes_a_sentinel_plan() {
+    let executor = include_str!("../src/artifact_migration_executor.rs");
+    assert!(executor.contains("smesh-artifact-empty-tenant/v1"));
+    assert!(executor.contains("acquire_lease(client, schema, plan_file, lease_owner, &tenant)"));
+}
+
+#[test]
 fn phase_b_operator_plans_are_explicit_bounded_and_redacted() {
     let policy = ContentDigestV1::of(b"artifact-migration-policy");
     let plan = ArtifactMigrationPlan::new(
@@ -113,6 +229,19 @@ fn backup_inventory_is_sorted_domain_sealed_and_contains_no_key_bytes() {
         reversed.push_object(object).unwrap();
     }
     assert_eq!(sealed.digest(), reversed.seal().unwrap().digest());
+    assert!(
+        ArtifactBackupObject::new(
+            "tenant-a",
+            "object-parent",
+            "artifact-parent",
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            23,
+            "key-2025",
+            "objects/shard/../escape",
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -139,7 +268,7 @@ fn phase_b_catalog_declares_migration_backup_restore_and_reencryption_fences() {
         assert!(migration.contains(required), "missing {required}");
     }
     assert!(migration.contains("CHECK(batch_size BETWEEN 1 AND 1000)"));
-    assert!(migration.contains("FOR UPDATE SKIP LOCKED"));
+    assert!(migration.contains("FOR UPDATE OF j SKIP LOCKED"));
     assert!(migration.contains("claim_artifact_reencryption(p_rotation_id text,p_old_generation text,p_new_generation text,p_owner text"));
     assert!(migration.contains("j.rotation_id=p_rotation_id"));
     assert!(migration.contains("j.old_generation=p_old_generation"));
@@ -800,6 +929,66 @@ fn same_domain_dedupes_without_cross_tenant_or_classification_reuse() {
 }
 
 #[test]
+fn gc_isolates_colliding_artifact_ids_by_tenant() {
+    let root = temp_root();
+    let keyring = Arc::new(InMemoryKeyring::new("key-2026-08", [9; 32]).unwrap());
+    let store = Arc::new(PosixArtifactBlobStore::open(&root, keyring).unwrap());
+    let catalog = ArtifactCatalog::new(store);
+    let artifact_id = "shared-artifact-id";
+    for tenant in ["tenant-a", "tenant-b"] {
+        let bytes = tenant.as_bytes();
+        let value = ArtifactManifestV1::new(
+            artifact_id,
+            "shared.bin",
+            None,
+            "application/octet-stream",
+            ArtifactClassification::Confidential,
+            EncryptionDomain::new(format!("{tenant}/confidential")).unwrap(),
+            "key-2026-08",
+            ArtifactProducer::new(
+                tenant,
+                "account-a",
+                "task-a",
+                "context-a",
+                "message-a",
+                "dispatch-a",
+            )
+            .unwrap(),
+            vec![],
+            ArtifactPolicySnapshot::new(
+                "artifact-default",
+                1,
+                ContentDigestV1::of(b"policy"),
+                42,
+                100,
+            )
+            .unwrap(),
+            42,
+            bytes,
+        )
+        .unwrap();
+        catalog.publish(value, bytes).unwrap();
+        if tenant == "tenant-b" {
+            catalog
+                .release_reference(tenant, "task-a", artifact_id)
+                .unwrap();
+        }
+    }
+
+    assert_eq!(
+        catalog.gc("tenant-b", artifact_id, 101, 10).unwrap(),
+        RetentionDecision::Deleted
+    );
+    assert_eq!(
+        catalog
+            .resolve("tenant-a", "account-a", "task-a", artifact_id)
+            .unwrap(),
+        b"tenant-a"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn provenance_and_retention_gc_are_fenced() {
     let root = temp_root();
     let keyring = Arc::new(InMemoryKeyring::new("key-2026-08", [9; 32]).unwrap());
@@ -849,7 +1038,9 @@ fn provenance_and_retention_gc_are_fenced() {
         )
         .unwrap();
     assert_eq!(
-        catalog.gc(parent.artifact_id(), 105, 10).unwrap(),
+        catalog
+            .gc("tenant-a", parent.artifact_id(), 105, 10)
+            .unwrap(),
         RetentionDecision::Live
     );
     catalog.release_read_lease(&lease).unwrap();
@@ -857,7 +1048,9 @@ fn provenance_and_retention_gc_are_fenced() {
         .place_legal_hold("tenant-a", parent.artifact_id(), "case-1")
         .unwrap();
     assert_eq!(
-        catalog.gc(parent.artifact_id(), 1_000, 10).unwrap(),
+        catalog
+            .gc("tenant-a", parent.artifact_id(), 1_000, 10)
+            .unwrap(),
         RetentionDecision::Held
     );
     catalog
@@ -867,7 +1060,9 @@ fn provenance_and_retention_gc_are_fenced() {
         .release_reference("tenant-a", "task-a", parent.artifact_id())
         .unwrap();
     assert_eq!(
-        catalog.gc(parent.artifact_id(), 10_000, 10).unwrap(),
+        catalog
+            .gc("tenant-a", parent.artifact_id(), 10_000, 10)
+            .unwrap(),
         RetentionDecision::Deleted
     );
     fs::remove_dir_all(root).unwrap();
@@ -1073,7 +1268,7 @@ fn cas_disk_usage_is_ciphertext_bounded_and_gc_returns_to_baseline() {
     for (id, task) in &ids {
         catalog.release_reference("tenant-a", task, id).unwrap();
         assert_eq!(
-            catalog.gc(id, 101, 1000).unwrap(),
+            catalog.gc("tenant-a", id, 101, 1000).unwrap(),
             RetentionDecision::Deleted
         );
     }
@@ -1099,7 +1294,7 @@ fn postgres_blob_read_verifies_manifest_before_locator_io() {
 fn gc_claim_reconciles_delete_before_database_ack() {
     let migration = include_str!("../migrations/postgres/0005_artifact_authority.sql");
     assert!(migration.contains("o.state IN ('tombstoned','deleting')"));
-    assert!(migration.contains("FOR UPDATE SKIP LOCKED LIMIT p_batch"));
+    assert!(migration.contains("FOR UPDATE OF j SKIP LOCKED LIMIT p_batch"));
 }
 
 #[test]
@@ -1199,7 +1394,8 @@ fn ci_runs_serial_artifact_evidence_with_a_watchdog() {
     let ci = include_str!("../.github/workflows/ci.yml");
     assert!(ci.contains("Artifact Phase-A evidence"));
     assert!(ci.contains("cargo test --locked --test artifact_storage -- --test-threads=1"));
-    assert!(ci.contains("cargo test --locked --test postgres_store artifact_ -- --test-threads=1"));
+    assert!(ci.contains("cargo test --locked --test postgres_store -- --test-threads=1"));
+    assert!(!ci.contains("--test postgres_store artifact_"));
     assert!(ci.matches("timeout --signal=TERM --kill-after=15s").count() >= 3);
 }
 

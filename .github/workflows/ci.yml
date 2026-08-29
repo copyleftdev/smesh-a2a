@@ -75,7 +75,9 @@ jobs:
 
   postgres:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # Command watchdogs total 75 minutes; keep a bounded margin for builds and
+    # service setup without re-running postgres_store selections.
+    timeout-minutes: 90
     services:
       postgres:
         image: postgres:17
@@ -118,12 +120,6 @@ jobs:
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test artifact_migration -- --test-threads=1
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test artifact_operators -- --test-threads=1
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test artifact_storage -- --test-threads=1
-          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test postgres_store artifact_authenticated_socket_wire_matrix -- --exact --test-threads=1
-          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test postgres_store artifact_tamper_reopen_matrix -- --exact --test-threads=1
-          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test postgres_store artifact_populated_default_plans_and_batch_bound -- --exact --test-threads=1
-          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test postgres_store artifact_claims_are_fair_across_active_tenants -- --exact --test-threads=1
-          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test postgres_store artifact_two_scanners_delete_and_refund_once -- --exact --test-threads=1
-          timeout --signal=TERM --kill-after=15s 10m cargo test --locked --test postgres_store artifact_ -- --test-threads=1
       - name: PostgreSQL schema-v6 conformance, quota abuse matrix, and failover
         run: |
           for run in 1 2 3; do
