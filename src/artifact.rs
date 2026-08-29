@@ -745,7 +745,7 @@ impl DerivedFrom {
         artifact_id: impl Into<String>,
     ) -> Result<Self, ArtifactStoreError> {
         let artifact_id = artifact_id.into();
-        validate_identity(&artifact_id)?;
+        validate_artifact_id(&artifact_id)?;
         Ok(Self {
             relation,
             artifact_id,
@@ -896,7 +896,7 @@ impl ArtifactManifestV1 {
         let name = name.into();
         let media_type = normalize_media_type(&media_type.into())?;
         let key_generation = key_generation.into();
-        validate_identity(&artifact_id)?;
+        validate_artifact_id(&artifact_id)?;
         validate_visible(&name, MAX_NAME_BYTES)?;
         validate_identity(&key_generation)?;
         if let Some(value) = &description {
@@ -913,6 +913,9 @@ impl ArtifactManifestV1 {
         }
         if derived_from.len() > MAX_DERIVED_FROM {
             return Err(ArtifactStoreError::Invalid);
+        }
+        for edge in &derived_from {
+            validate_artifact_id(&edge.artifact_id)?;
         }
         derived_from.sort();
         if derived_from.windows(2).any(|pair| pair[0] == pair[1])
@@ -1095,6 +1098,19 @@ fn validate_identity(value: &str) -> Result<(), ArtifactStoreError> {
     if value.is_empty()
         || value.len() > MAX_ID_BYTES
         || !value.bytes().all(|b| (0x21..=0x7e).contains(&b))
+    {
+        return Err(ArtifactStoreError::Invalid);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_artifact_id(value: &str) -> Result<(), ArtifactStoreError> {
+    if value.is_empty()
+        || value.len() > MAX_ID_BYTES
+        || matches!(value, "." | "..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
     {
         return Err(ArtifactStoreError::Invalid);
     }

@@ -5,8 +5,8 @@ use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task};
 use a2a_server::{DefaultRequestHandler, RequestHandler, StaticAgentCard, TaskStore};
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::extract::{Extension, Path};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::extract::{Extension, OriginalUri, Path};
+use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::get;
 use axum::{Router, middleware};
@@ -46,6 +46,7 @@ async fn quota_retry_after_header(
 async fn artifact_resolver(
     method: Method,
     Path(artifact_id): Path<String>,
+    OriginalUri(uri): OriginalUri,
     Extension(authority): Extension<Arc<dyn DurableAuthority>>,
     Extension(context): Extension<Arc<crate::AuthorizationContext>>,
     headers: axum::http::HeaderMap,
@@ -63,11 +64,7 @@ async fn artifact_resolver(
             .into_response();
     }
     if !matches!(method, Method::GET | Method::HEAD)
-        || artifact_id.is_empty()
-        || artifact_id.len() > 256
-        || !artifact_id
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && byte != b'/')
+        || !canonical_artifact_resolver_request(&uri, &artifact_id)
         || context.authorize(Operation::ArtifactResolve).is_err()
     {
         return (StatusCode::NOT_FOUND, NOT_FOUND).into_response();
@@ -203,6 +200,12 @@ async fn artifact_resolver(
         HeaderValue::from_static("nosniff"),
     );
     response
+}
+
+fn canonical_artifact_resolver_request(uri: &Uri, artifact_id: &str) -> bool {
+    crate::artifact::validate_artifact_id(artifact_id).is_ok()
+        && uri.query().is_none()
+        && uri.path() == format!("/artifacts/v1/{artifact_id}")
 }
 
 /// A task store that declares whether completion receipts must use durable key material.
@@ -891,4 +894,35 @@ where
         .nest("/rest", a2a_server::rest::rest_router(handler))
         .merge(a2a_server::agent_card::agent_card_router(card))
         .layer(RequestBodyLimitLayer::new(max_body_bytes))
+}
+
+#[cfg(test)]
+mod artifact_resolver_path_tests {
+    use axum::http::Uri;
+
+    use super::canonical_artifact_resolver_request;
+
+    #[test]
+    fn resolver_rejects_noncanonical_and_authority_alias_paths() {
+        for uri in [
+            "/artifacts/v1/a%23b",
+            "/artifacts/v1/a%3Fb",
+            "/artifacts/v1/a%2Fb",
+            "/artifacts/v1/%2E",
+            "/artifacts/v1/%2E%2E",
+            "/artifacts/v1/%61",
+            "/artifacts/v1/a?b",
+        ] {
+            let uri: Uri = uri.parse().unwrap();
+            assert!(
+                !canonical_artifact_resolver_request(&uri, "a"),
+                "resolver accepted alternate lookup authority {uri}"
+            );
+        }
+        let canonical: Uri = "/artifacts/v1/artifact-0123_ab.~".parse().unwrap();
+        assert!(canonical_artifact_resolver_request(
+            &canonical,
+            "artifact-0123_ab.~"
+        ));
+    }
 }

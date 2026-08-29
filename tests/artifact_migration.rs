@@ -157,6 +157,22 @@ fn extractor_rejects_ambiguous_parts_and_invalid_base64() {
     }
 }
 
+#[test]
+fn extractor_rejects_artifact_ids_that_cannot_be_canonical_resolver_segments() {
+    for artifact_id in [
+        "a#b", "a?b", "a/b", ".", "..", "a%2fb", "a%2Fb", "%61", "a%25b",
+    ] {
+        let value = serde_json::json!({
+            "artifactId": artifact_id,
+            "parts": [{"text": "must not gain a resolver"}]
+        });
+        assert!(
+            extract_inline_artifacts(&value).is_err(),
+            "migration accepted ambiguous artifact ID {artifact_id:?}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn migration_plan_file_is_private_no_follow_and_strict() {
@@ -864,6 +880,7 @@ async fn populated_postgres_migration_rewrites_causal_copies_and_exact_rerun_is_
         "key-generation",
         "manifest-digest",
         "manifest-canonical-json",
+        "invalid-provenance-parent-id",
         "forged-provenance",
         "cross-bound-hold",
         "malformed-tombstone",
@@ -891,6 +908,28 @@ async fn populated_postgres_migration_rewrites_causal_copies_and_exact_rerun_is_
             }
             "manifest-canonical-json" => {
                 inventory["entries"][0]["manifest"]["canonical_json"] = serde_json::json!("{}");
+            }
+            "invalid-provenance-parent-id" => {
+                let manifest = &mut inventory["entries"][0]["manifest"];
+                let mut canonical: serde_json::Value =
+                    serde_json::from_str(manifest["canonical_json"].as_str().unwrap()).unwrap();
+                canonical["derivedFrom"] = serde_json::json!([{
+                    "artifactId": "parent%2Falias",
+                    "relation": "transformation"
+                }]);
+                let canonical = serde_json::to_string(&canonical).unwrap();
+                let mut manifest_bytes = b"smesh-artifact-manifest/v1\0".to_vec();
+                manifest_bytes.extend_from_slice(canonical.as_bytes());
+                manifest["canonical_json"] = serde_json::json!(canonical);
+                manifest["manifest_digest"] =
+                    serde_json::json!(smesh_a2a::content_digest(&manifest_bytes));
+                inventory["entries"][0]["provenance"] = serde_json::json!([{
+                    "tenant_scope": "tenant-a",
+                    "child_artifact_id": "artifact-inline",
+                    "ordinal": 0,
+                    "parent_artifact_id": "parent%2Falias",
+                    "relation": "transformation"
+                }]);
             }
             "forged-provenance" => {
                 inventory["entries"][0]["provenance"] = serde_json::json!([{"tenant_scope":"tenant-a","child_artifact_id":"artifact-inline","ordinal":0,"parent_artifact_id":"artifact-forged","relation":"derived"}]);

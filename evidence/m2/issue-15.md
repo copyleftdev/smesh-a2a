@@ -417,3 +417,30 @@ Final hashes for this closure:
 
 - `migrations/postgres/0005_artifact_authority.sql`: `ce9a82fc62db67f0d36ee63c89f323184a96a804b70ec6e4d318a87d2e0d1de5`
 - `tests/postgres_store.rs`: `84a79e27e7382fbc9858f6f3c986d26c8fa5b3ee10370387714210d1e0d5612b`
+
+## 2026-08-29 14:10 PDT provenance-ID follow-up closure
+
+This section is append-only follow-up evidence for the uncommitted PR #68 closure. The complete
+historical prefix above was restored byte-for-byte from `f6cd267` before this append. The focused
+RED test deserialized an invalid `DerivedFrom` and proved that `ArtifactManifestV1::new` could seal
+it; after revalidation was added before provenance sorting and sealing, the focused test passed.
+Restore prevalidation now rejects invalid canonical parent artifact IDs through the same canonical
+artifact-ID validator before metadata or object writes. Valid canonical provenance remains accepted.
+
+Exact focused results: `artifact_storage` **55 passed**; `artifact_migration` **7 passed / 4 helper
+subprocesses ignored** (including populated backup/restore prevalidation); and `executor` **24
+passed**. The resolver alias unit test and invalid-artifact cancellation-owner unit test each passed
+**1/1**. Formatting, Clippy `--all-targets --all-features -- -D warnings`, and `git diff --check`
+passed.
+
+SHA-256 scope: current working-tree closure files after formatting, excluding this append-only
+evidence file to avoid self-hashing:
+
+- `src/artifact.rs`: `ef2b4606c97ef6a956b48c1b3ef82559cf2eb7b7b19a1fe5755b73259ce1fdb0`
+- `src/artifact_migration.rs`: `354cbd2ef03773f51b0f80501f18b90b1d439acf1789ff7b11b12fce7641d672`
+- `src/artifact_restore_executor.rs`: `ab86e317e75806f49aa058f8bd0ad71db8b54e3b309a2416bbaebca9e3c87b07`
+- `src/executor.rs`: `6313ad849f6af1f27f42254bb298bb67dba7fdc195293b2a4bf41cdc6113a664`
+- `src/server.rs`: `5462bf7611a5aba91a0cf7120dc4660c8505cf332c5094f92964bde1e8608270`
+- `tests/artifact_migration.rs`: `7ac05d0df57b366b89a96f5db862f36517343638f0c94d8831157d7482f866e6`
+- `tests/artifact_storage.rs`: `ad93ede5562878ec4ba25906d8d658037a82ee16739171a3c803cd6b21283ac1`
+- `tests/executor.rs`: `a99e903226bcc2c92ae67289b7029c4b6f95e19a943daa43def376f7964aa35a`

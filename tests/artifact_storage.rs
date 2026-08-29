@@ -68,7 +68,13 @@ fn binary_artifact_projection_uses_a2a_raw_parts_and_decode_failures_are_termina
     let outbox = include_str!("../src/outbox_driver.rs");
     assert!(executor.contains("Part::raw(bytes).with_media_type(media_type)"));
     assert!(outbox.contains("Part::raw(bytes).with_media_type(media_type.clone())"));
-    assert_eq!(executor.matches("undecodable artifact payload").count(), 2);
+    assert_eq!(executor.matches("undecodable artifact payload").count(), 1);
+    assert_eq!(
+        executor
+            .matches("publish_invalid_internal_artifact_terminal(")
+            .count(),
+        4
+    );
     assert!(executor.matches("request_dispatcher_cancel(").count() >= 8);
 }
 
@@ -1197,6 +1203,103 @@ fn manifest_chunks_split_at_exact_four_mib_boundary() {
         smesh_a2a::ARTIFACT_CHUNK_BYTES as u64
     );
     assert_eq!(two.chunks()[1].length(), 1);
+}
+
+#[test]
+fn artifact_and_deserialized_provenance_ids_are_canonical_path_segments() {
+    for artifact_id in [
+        "a#b", "a?b", "a/b", ".", "..", "a%2fb", "a%2Fb", "%61", "a%25b",
+    ] {
+        let result = ArtifactManifestV1::new(
+            artifact_id,
+            "invalid.bin",
+            None,
+            "application/octet-stream",
+            ArtifactClassification::Confidential,
+            EncryptionDomain::new("tenant-a/confidential").unwrap(),
+            "key-2026-08",
+            ArtifactProducer::new(
+                "tenant-a",
+                "account-a",
+                "task-a",
+                "context-a",
+                "message-a",
+                "dispatch-a",
+            )
+            .unwrap(),
+            vec![],
+            ArtifactPolicySnapshot::new(
+                "artifact-default",
+                1,
+                ContentDigestV1::of(b"policy"),
+                42,
+                100,
+            )
+            .unwrap(),
+            42,
+            b"bytes",
+        );
+        assert!(
+            result.is_err(),
+            "accepted ambiguous artifact ID {artifact_id:?}"
+        );
+    }
+    for artifact_id in [
+        "",
+        ".",
+        "..",
+        "parent/child",
+        "parent?query",
+        "parent#fragment",
+        "%61",
+        "parent%2Fchild",
+        "parent%25alias",
+        "café",
+    ] {
+        let derived_from: DerivedFrom = serde_json::from_value(serde_json::json!({
+            "relation": "transformation",
+            "artifactId": artifact_id,
+        }))
+        .unwrap();
+        let result = ArtifactManifestV1::new(
+            "artifact-child",
+            "child.bin",
+            None,
+            "application/octet-stream",
+            ArtifactClassification::Confidential,
+            EncryptionDomain::new("tenant-a/confidential").unwrap(),
+            "key-2026-08",
+            ArtifactProducer::new(
+                "tenant-a",
+                "account-a",
+                "task-a",
+                "context-a",
+                "message-a",
+                "dispatch-a",
+            )
+            .unwrap(),
+            vec![derived_from],
+            ArtifactPolicySnapshot::new(
+                "artifact-default",
+                1,
+                ContentDigestV1::of(b"policy"),
+                42,
+                100,
+            )
+            .unwrap(),
+            42,
+            b"child bytes",
+        );
+        assert!(
+            result.is_err(),
+            "manifest sealed invalid deserialized provenance artifact ID {artifact_id:?}"
+        );
+    }
+    assert!(
+        manifest(b"generated IDs remain valid")
+            .artifact_id()
+            .starts_with("artifact-")
+    );
 }
 
 #[test]

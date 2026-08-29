@@ -359,10 +359,9 @@ fn validate_inventory_entries(inv: &Inventory) -> Result<(), PostgresStoreError>
         .entries
         .iter()
         .map(|entry| {
-            Ok((
-                s(&entry["manifest"], "tenant_scope")?,
-                s(&entry["manifest"], "artifact_id")?,
-            ))
+            let artifact_id = s(&entry["manifest"], "artifact_id")?;
+            crate::artifact::validate_artifact_id(&artifact_id).map_err(|_| invalid())?;
+            Ok((s(&entry["manifest"], "tenant_scope")?, artifact_id))
         })
         .collect::<Result<BTreeSet<_>, PostgresStoreError>>()?;
     let canonical_objects = inv
@@ -436,6 +435,13 @@ fn validate_inventory_entries(inv: &Inventory) -> Result<(), PostgresStoreError>
             .get("derivedFrom")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(invalid)?;
+        for parent in sealed_provenance {
+            let parent_id = parent
+                .get("artifactId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            crate::artifact::validate_artifact_id(parent_id).map_err(|_| invalid())?;
+        }
         let mut manifest_bytes = b"smesh-artifact-manifest/v1\0".to_vec();
         manifest_bytes.extend_from_slice(canonical.as_bytes());
         let active_references = references

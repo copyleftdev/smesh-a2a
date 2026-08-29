@@ -12,7 +12,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::{ArtifactMigrationPlan, ArtifactStoreError, ContentDigestV1};
+use crate::{
+    ArtifactMigrationPlan, ArtifactStoreError, ContentDigestV1, artifact::validate_artifact_id,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InlineArtifactKind {
@@ -250,9 +252,7 @@ pub fn extract_inline_artifacts(value: &Value) -> Result<Vec<InlineArtifact>, Ar
                         }
                     }
                     if !inline.is_empty() {
-                        if artifact_id.is_empty() || artifact_id.len() > 256 {
-                            return Err(ArtifactStoreError::Invalid);
-                        }
+                        validate_artifact_id(artifact_id)?;
                         found.push(InlineArtifact {
                             artifact_id: artifact_id.to_owned(),
                             name: map.get("name").and_then(Value::as_str).map(str::to_owned),
