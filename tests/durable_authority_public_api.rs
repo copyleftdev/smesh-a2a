@@ -2,8 +2,9 @@ use a2a::{
     Message, Part, Role, SendMessageRequest, SendMessageResponse, Task, TaskState, TaskStatus,
 };
 use smesh_a2a::{
-    AuthorizationAuditInput, AuthorizationDecisionEffect, InputLimits, OwnedTaskScope,
-    QuotaReservationInput, SendMessageAdmission, VisibilityScope,
+    AuthorizationAuditInput, AuthorizationDecisionEffect, AuthorizedMutation, InputLimits,
+    OwnedTaskScope, QuotaOperation, QuotaPolicy, QuotaReservationInput, QuotaSubject,
+    SendMessageAdmission, VisibilityScope,
 };
 
 #[test]
@@ -31,6 +32,36 @@ fn external_backend_can_inspect_bounded_server_quota_reservation() {
     assert_eq!(quota.metadata(), None);
     assert!(QuotaReservationInput::new("", "a", "p", "o", "d", 1, "r", 2, None).is_err());
     assert!(QuotaReservationInput::new("t", "a", "p", "o", "d", 0, "r", 2, None).is_err());
+}
+
+#[test]
+fn authorized_mutation_into_parts_preserves_quota_intent() {
+    let policy = QuotaPolicy::from_json(
+        br#"{
+      "schemaVersion":"smesh-quota-policy/v1","policyId":"public-api","revision":1,
+      "requestWindowMillis":1000,"reconnectWindowMillis":60000,
+      "limits":{"requestCount":{"tenant":2,"account":2,"principal":2},
+      "concurrentActiveWork":{"tenant":2,"account":2,"principal":2},
+      "inputBytes":{"tenant":1024,"account":1024,"principal":1024},
+      "outputBytes":{"tenant":1024,"account":1024,"principal":1024},
+      "eventCount":{"tenant":16,"account":16,"principal":16},
+      "concurrentStreams":{"tenant":2,"account":2,"principal":2},
+      "concurrentSubscriptions":{"tenant":2,"account":2,"principal":2},
+      "reconnectCount":{"tenant":2,"account":2,"principal":2},
+      "retainedAuthorityBytes":{"tenant":1024,"account":1024,"principal":1024}},
+      "overrides":[]}"#,
+    )
+    .unwrap();
+    let subject = QuotaSubject::new("tenant", "account", "principal").unwrap();
+    let intent = policy
+        .operation_intent(&subject, QuotaOperation::TaskGet, "read", 0)
+        .unwrap();
+    let mutation = AuthorizedMutation::with_quota_intent("command", intent.clone());
+
+    let (command, reservation, preserved_intent) = mutation.into_quota_parts();
+    assert_eq!(command, "command");
+    assert!(reservation.is_none());
+    assert_eq!(preserved_intent, Some(intent));
 }
 
 fn task() -> Task {

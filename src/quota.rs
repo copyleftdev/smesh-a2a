@@ -220,7 +220,7 @@ impl QuotaReconciliationTarget {
         dimension: QuotaDimension,
     ) -> Result<Self, QuotaPolicyError> {
         let tenant_scope = tenant_scope.into();
-        if !valid_bounded_identity(&tenant_scope) || scope_kind == QuotaScopeKind::Account {
+        if !valid_bounded_identity(&tenant_scope) {
             return Err(QuotaPolicyError::Invalid);
         }
         Ok(Self {
@@ -466,6 +466,11 @@ impl QuotaCharge {
     pub const fn dimension(&self) -> QuotaDimension {
         self.dimension
     }
+
+    #[must_use]
+    pub const fn units(&self) -> u64 {
+        self.units
+    }
 }
 
 impl QuotaPolicy {
@@ -683,6 +688,8 @@ impl QuotaPolicy {
         if !valid_id(semantic_id, 256) || input_bytes > MAX_BYTE_CAP {
             return Err(QuotaPolicyError::Invalid);
         }
+        let execution_output_budget = self.execution_limit(QuotaDimension::OutputBytes);
+        let execution_event_budget = self.execution_limit(QuotaDimension::EventCount);
         let mut charges = Vec::with_capacity(9);
         for (scope_kind, scope_id) in [
             (QuotaScopeKind::Tenant, subject.tenant_scope()),
@@ -723,13 +730,13 @@ impl QuotaPolicy {
                 operation_charges.push((
                     QuotaDimension::OutputBytes,
                     QuotaAlgorithm::FixedWindow,
-                    self.limit(QuotaDimension::OutputBytes, scope_kind),
+                    execution_output_budget,
                     self.window_millis(QuotaDimension::RequestCount),
                 ));
                 operation_charges.push((
                     QuotaDimension::EventCount,
                     QuotaAlgorithm::FixedWindow,
-                    self.limit(QuotaDimension::EventCount, scope_kind),
+                    execution_event_budget,
                     self.window_millis(QuotaDimension::RequestCount),
                 ));
             }
@@ -883,16 +890,6 @@ impl QuotaPolicy {
                     capacity: self.limit(QuotaDimension::ReconnectCount, scope_kind),
                     window_millis: self.window_millis(QuotaDimension::ReconnectCount),
                 });
-            } else if kind == QuotaLeaseKind::TaskSubscription {
-                charges.push(QuotaCharge {
-                    scope_kind,
-                    scope_id: Arc::from(scope_id),
-                    dimension: QuotaDimension::RequestCount,
-                    algorithm: QuotaAlgorithm::FixedWindow,
-                    units: 1,
-                    capacity: self.limit(QuotaDimension::RequestCount, scope_kind),
-                    window_millis: self.window_millis(QuotaDimension::RequestCount),
-                });
             }
             charges.push(QuotaCharge {
                 scope_kind,
@@ -936,6 +933,13 @@ impl QuotaPolicy {
             binding_digest: binding_digest.into(),
             charges: charges.into(),
         })
+    }
+
+    #[must_use]
+    fn execution_limit(&self, dimension: QuotaDimension) -> u64 {
+        self.limit(dimension, QuotaScopeKind::Tenant)
+            .min(self.limit(dimension, QuotaScopeKind::Account))
+            .min(self.limit(dimension, QuotaScopeKind::Principal))
     }
 
     #[must_use]

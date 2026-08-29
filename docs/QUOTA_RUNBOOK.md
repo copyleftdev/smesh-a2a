@@ -16,7 +16,7 @@ The quota file is opened with no-follow semantics, bounded to 256 KiB, parsed wi
 
 ## Policy
 
-Use schema `smesh-quota-policy/v1`. Every required limit pair has a tenant and principal positive integer. Request and reconnect windows are positive integer database milliseconds. Limits above hard request/concurrency/byte/event caps, fractional values, duplicate keys, malformed IDs, and ambiguous overrides fail readiness. The checked-in `tests/fixtures/quota-policy.json` is a complete shape example, not a recommended deployment value.
+Use schema `smesh-quota-policy/v1`. Every required limit has tenant, account, and principal positive integers. Request and reconnect windows are positive integer database milliseconds. Limits above hard request/concurrency/byte/event caps, fractional values, duplicate keys, malformed IDs, and ambiguous overrides fail readiness. The checked-in `tests/fixtures/quota-policy.json` is a complete shape example, not a recommended deployment value.
 
 Static overrides must name one override ID, operator actor, bounded reason, scope kind and ID, operation, dimension, old/new limit, effective time, and expiry. They cannot wildcard or exceed hard caps. Activation uses PostgreSQL time. Actor, reason, and target are stored as digests in `quota_override_audits`; policy revision/digest and old/new values remain reviewable.
 
@@ -37,7 +37,7 @@ Startup takes a migration-only advisory fence, reads current materialized usage 
 
 The exact quota replay horizon is 86,400,000 database milliseconds (24 hours). Task-bound intents have `retention_until = NULL`: because tasks, idempotency records, outbox/receiver rows, transcripts, and cancellation records currently have no deletion lifecycle, their intents, receipts, and externally referenced execution reservations are retained. This is intentionally not claimed as task GC. Taskless evidence has an explicit generated retention boundary, but authorization decisions and live leases keep it live.
 
-`gc_quota_authority(max_rows)` accepts only `1..=1000`, uses deterministic child-first `FOR UPDATE SKIP LOCKED` batches, and collects only independently safe rows: expired denial/override audit detail, released/expired stream leases, released allocations, unreferenced settled execution reservations, unreferenced taskless receipts/intents, then stale unreferenced fixed-window or zero gauge buckets. The exact boundary is inclusive (`retention_until <= database time`). Row accounting triggers decrement tenant/principal UTF-8 JSON bytes in the same transaction, so faults roll back deletions and counters together and concurrent collectors are idempotent.
+`gc_quota_authority(max_rows)` accepts only `1..=1000`, uses deterministic child-first `FOR UPDATE SKIP LOCKED` batches, and collects only independently safe rows: expired denial/override audit detail, released/expired stream leases, released allocations, unreferenced settled execution reservations, unreferenced taskless receipts/intents, then stale unreferenced fixed-window or zero gauge buckets. The exact boundary is inclusive (`retention_until <= database time`). Row accounting triggers decrement tenant/account/principal UTF-8 JSON bytes in the same transaction, so faults roll back deletions and counters together and concurrent collectors are idempotent.
 
 ## Operations
 

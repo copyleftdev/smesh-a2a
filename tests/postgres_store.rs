@@ -741,6 +741,116 @@ postgres_test!(concurrent_openers_share_one_advisory_locked_migration, {
     PostgresTaskStore::drop_test_schema(&config).await.unwrap();
 });
 
+postgres_test!(
+    populated_revision_three_migrates_atomically_and_reopens_reconciled,
+    {
+        let Some(_) = admin_url() else { return };
+        let schema = format!("smesh_v3_upgrade_{:016x}", rand::random::<u64>());
+        let role = format!("{schema}_runtime");
+        let migrator = url::Url::parse(&superuser_url())
+            .unwrap()
+            .username()
+            .to_owned();
+        let render = |sql: &str| {
+            sql.replace("__SCHEMA__", &schema)
+                .replace("__ROLE__", &role)
+                .replace("__MIGRATOR__", &migrator)
+        };
+        let (client, driver) = admin_client(&superuser_url()).await;
+        client
+            .batch_execute(&render(include_str!(
+                "../migrations/postgres/0001_authority_schema_v6.sql"
+            )))
+            .await
+            .unwrap();
+        client
+            .batch_execute(&render(include_str!(
+                "../migrations/postgres/0002_quota_reservation_seam.sql"
+            )))
+            .await
+            .unwrap();
+        client
+            .batch_execute(&render(include_str!(
+                "../migrations/postgres/0003_receiver_sender_fence.sql"
+            )))
+            .await
+            .unwrap();
+        for (tenant, account, suffix, receiver_state) in [
+            ("tenant-v3-a", "account-a", "a", "completed"),
+            ("tenant-v3-b", "account-b", "b", "processing"),
+        ] {
+            let task = format!("task-{suffix}");
+            let message = format!("message-{suffix}");
+            let dispatch = format!("dispatch-{suffix}");
+            client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES($1,$2,'context','\"TASK_STATE_WORKING\"',1,'{{}}',$3)"), &[&tenant,&task,&account]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,to_state,event_json,created_at) VALUES($1,$2,1,1,'seed','\"TASK_STATE_WORKING\"','{{}}',100)"), &[&tenant,&task]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id) VALUES($1,$2,'digest',$3,'in_progress','{{}}',100,100,2,$4)"), &[&tenant,&message,&task,&account]).await.unwrap();
+            let outbox_state = if receiver_state == "processing" {
+                "leased"
+            } else {
+                "delivered"
+            };
+            let lease_owner: Option<&str> = (outbox_state == "leased").then_some("owner");
+            let lease_token: Option<&str> = (outbox_state == "leased").then_some("token");
+            let lease_until: Option<i64> = (outbox_state == "leased").then_some(1_000);
+            let outbox_id: i64 = client.query_one(&format!("INSERT INTO {schema}.outbox(tenant_scope,dispatch_id,task_id,message_id,causative_revision,payload_json,payload_digest,state,attempt_count,max_attempts,available_at,lease_owner,lease_token,lease_until,created_at,updated_at,dispatch_identity_version) VALUES($1,$2,$3,$4,1,'{{}}','digest',$5,1,2,100,$6,$7,$8,100,100,2) RETURNING outbox_id"), &[&tenant,&dispatch,&task,&message,&outbox_state,&lease_owner,&lease_token,&lease_until]).await.unwrap().get(0);
+            client.execute(&format!("INSERT INTO {schema}.outbox_attempts(tenant_scope,outbox_id,attempt_no,lease_token,started_at,finished_at,outcome) VALUES($1,$2,1,'token',100,CASE WHEN $3='completed' THEN 200 END,CASE WHEN $3='completed' THEN 'delivered' END)"), &[&tenant,&outbox_id,&receiver_state]).await.unwrap();
+            if receiver_state == "completed" {
+                client.execute(&format!("INSERT INTO {schema}.receiver_inbox(tenant_scope,dispatch_id,payload_digest,payload_json,task_id,context_id,state,lease_epoch,completion_kind,termination_json,frame_count,transcript_digest,accepted_at,completed_at,updated_at,sender_attempt_no,sender_lease_token) VALUES($1,$2,'digest','{{}}',$3,'context','completed',1,'success','{{}}',1,'transcript',100,200,200,1,'token')"), &[&tenant,&dispatch,&task]).await.unwrap();
+                client.execute(&format!("INSERT INTO {schema}.receiver_frames VALUES($1,$2,1,1,'mesh_event','{{\"Progress\":\"done\"}}','digest',150)"), &[&tenant,&dispatch]).await.unwrap();
+            } else {
+                client.execute(&format!("INSERT INTO {schema}.receiver_inbox(tenant_scope,dispatch_id,payload_digest,payload_json,task_id,context_id,state,lease_epoch,lease_owner,lease_token,lease_until,accepted_at,updated_at,sender_attempt_no,sender_lease_token) VALUES($1,$2,'digest','{{}}',$3,'context','processing',1,'owner','token',1000,100,100,1,'token')"), &[&tenant,&dispatch,&task]).await.unwrap();
+            }
+            client.execute(&format!("INSERT INTO {schema}.stream_transcripts(tenant_scope,message_id,dispatch_id,task_id,transcript_version,state,frame_count,created_at,updated_at) VALUES($1,$2,$3,$4,1,'open',1,100,100)"), &[&tenant,&message,&dispatch,&task]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.stream_frames VALUES($1,$2,1,1,'task','{{}}','digest',100)"), &[&tenant,&message]).await.unwrap();
+            client.execute(&format!("INSERT INTO {schema}.authorization_decisions(decision_id,tenant_scope,actor_account_id,policy_id,policy_revision,policy_digest,operation,effect,reason,resource_kind,resource_digest,task_id,decided_at) VALUES($1,$2,$3,'policy',1,'digest','TaskGet','allow','seed','task','resource',$4,100)"), &[&format!("decision-{suffix}"),&tenant,&account,&task]).await.unwrap();
+        }
+        let v4 = render(include_str!(
+            "../migrations/postgres/0004_distributed_quota_authority.sql"
+        ));
+        client.batch_execute("BEGIN").await.unwrap();
+        client.batch_execute(&v4).await.unwrap();
+        assert!(client.batch_execute("SELECT 1/0").await.is_err());
+        client.batch_execute("ROLLBACK").await.unwrap();
+        let absent: bool = client.query_one("SELECT NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=$1 AND table_name='receiver_inbox' AND column_name='measured_output_bytes')", &[&schema]).await.unwrap().get(0);
+        assert!(
+            absent,
+            "faulted migration must leave exact revision three catalog"
+        );
+        client.batch_execute("BEGIN").await.unwrap();
+        client.batch_execute(&v4).await.unwrap();
+        client.batch_execute("COMMIT").await.unwrap();
+        drop(client);
+        driver.abort();
+
+        let (reopened, reopened_driver) = admin_client(&superuser_url()).await;
+        let completed = reopened.query_one(&format!("SELECT measured_output_bytes,measured_event_count FROM {schema}.receiver_inbox WHERE tenant_scope='tenant-v3-a'"), &[]).await.unwrap();
+        assert!(completed.get::<_, i64>(0) > 0);
+        assert_eq!(completed.get::<_, i64>(1), 1);
+        let processing = reopened.query_one(&format!("SELECT measured_output_bytes IS NULL AND measured_event_count IS NULL FROM {schema}.receiver_inbox WHERE tenant_scope='tenant-v3-b'"), &[]).await.unwrap();
+        assert!(processing.get::<_, bool>(0));
+        let schedulers: i64 = reopened
+            .query_one(
+                &format!("SELECT count(*) FROM {schema}.outbox_tenant_scheduler"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(schedulers, 2);
+        for tenant in ["tenant-v3-a", "tenant-v3-b"] {
+            let row = reopened.query_one(&format!("SELECT retained_bytes,{schema}.retained_authority_oracle($1,NULL) FROM {schema}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='tenant' AND scope_id=$1"), &[&tenant]).await.unwrap();
+            assert_eq!(row.get::<_, i64>(0), row.get::<_, i64>(1));
+        }
+        reopened
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE; DROP ROLE {role}"))
+            .await
+            .unwrap();
+        drop(reopened);
+        reopened_driver.abort();
+    }
+);
+
 postgres_test!(startup_rejects_mutated_catalog_index, {
     let Some(url) = admin_url() else { return };
     let config = config(url.clone(), "drift");

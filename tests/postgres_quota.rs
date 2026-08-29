@@ -1502,13 +1502,20 @@ async fn retained_usage_is_materialized_exact_and_bounded_gc_releases_expired_ro
             audit("retained"),
         ).await.unwrap();
 
-        let before = store.retained_authority_bytes("tenant-race", Some("principal-race")).await.unwrap();
-        assert!(before.0 > 0);
-        assert!(before.1 > 0);
-
         let pg = tokio_postgres::Config::from_str(&superuser_url()).unwrap();
         let (client, connection) = pg.connect(tokio_postgres::NoTls).await.unwrap();
         let driver = tokio::spawn(async move { let _ = connection.await; });
+        let denial_key = smesh_a2a::content_digest(b"gc-denial-key");
+        let denial_content = smesh_a2a::content_digest(b"gc-denial-content");
+        let denial_bucket = smesh_a2a::content_digest(b"gc-denial-bucket");
+        let denial_reason = smesh_a2a::content_digest(b"gc-denial-reason");
+        client.execute(
+            &format!("INSERT INTO {schema}.quota_denial_audits(tenant_scope,decision_key,content_digest,policy_digest,bucket_digest,reason_digest,retry_after_seconds,denied_at) VALUES('tenant-race',$1,$2,$3,$4,$5,1,1)"),
+            &[&denial_key,&denial_content,&quota_policy.digest(),&denial_bucket,&denial_reason],
+        ).await.unwrap();
+        let before = store.retained_authority_bytes("tenant-race", Some("principal-race")).await.unwrap();
+        assert!(before.0 > 0);
+        assert!(before.1 > 0);
         let oracle: i64 = client.query_one(
             &format!("SELECT {schema}.retained_authority_oracle('tenant-race',NULL)"), &[]
         ).await.unwrap().get(0);
@@ -1519,9 +1526,9 @@ async fn retained_usage_is_materialized_exact_and_bounded_gc_releases_expired_ro
         drop(client); driver.abort();
 
         let deleted = store.gc_quota_authority(1_700_000_000_000, 1).await.unwrap();
-        assert!(deleted <= 1, "one invocation must never exceed its explicit bound");
+        assert_eq!(deleted, 1, "the deterministic fixture seeds exactly one expired denial row");
         let after = store.retained_authority_bytes("tenant-race", Some("principal-race")).await.unwrap();
-        assert!(after.0 <= before.0);
+        assert!(after.0 < before.0, "deleting the seeded row must strictly reduce retained tenant bytes");
 
         store.shutdown().await.unwrap();
         PostgresTaskStore::drop_test_schema(&config).await.unwrap();

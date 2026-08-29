@@ -177,11 +177,20 @@ ALTER TABLE __SCHEMA__.receiver_inbox
  ADD CONSTRAINT receiver_execution_reservation_bounds CHECK(
    (quota_binding_digest IS NULL AND quota_reservation_id IS NULL AND quota_reservation_version IS NULL AND reserved_output_bytes IS NULL AND reserved_event_count IS NULL)
    OR (quota_binding_digest IS NOT NULL AND quota_reservation_id IS NOT NULL AND quota_reservation_version=1 AND reserved_output_bytes>0 AND reserved_event_count>0)
- ),
+ );
+-- Revision-3 processing rows remain explicitly legacy-unreserved; migration never
+-- fabricates a reservation or containment budget. Completed measurements are
+-- reconstructed from the same canonical frame JSON bytes/events used at commit.
+ALTER TABLE __SCHEMA__.receiver_inbox
  ADD CONSTRAINT receiver_execution_measurement_state CHECK(
    (state='processing' AND measured_output_bytes IS NULL AND measured_event_count IS NULL)
    OR (state='completed' AND measured_output_bytes>=0 AND measured_event_count>=0)
- );
+ ) NOT VALID;
+UPDATE __SCHEMA__.receiver_inbox r
+ SET measured_output_bytes=COALESCE((SELECT sum(octet_length(f.frame_json))::bigint FROM __SCHEMA__.receiver_frames f WHERE f.tenant_scope=r.tenant_scope AND f.dispatch_id=r.dispatch_id),0),
+     measured_event_count=(SELECT count(*)::bigint FROM __SCHEMA__.receiver_frames f WHERE f.tenant_scope=r.tenant_scope AND f.dispatch_id=r.dispatch_id)
+ WHERE r.state='completed';
+ALTER TABLE __SCHEMA__.receiver_inbox VALIDATE CONSTRAINT receiver_execution_measurement_state;
 CREATE TRIGGER receiver_execution_reservation_immutable BEFORE UPDATE ON __SCHEMA__.receiver_inbox
  FOR EACH ROW EXECUTE FUNCTION __SCHEMA__.reject_identity_change('quota_binding_digest','quota_reservation_id','quota_reservation_version','reserved_output_bytes','reserved_event_count');
 
@@ -193,6 +202,9 @@ CREATE TABLE __SCHEMA__.outbox_tenant_scheduler(
  updated_at bigint NOT NULL CHECK(updated_at>0)
 );
 CREATE INDEX outbox_tenant_scheduler_eligible ON __SCHEMA__.outbox_tenant_scheduler(virtual_finish,served_sequence,tenant_scope);
+INSERT INTO __SCHEMA__.outbox_tenant_scheduler(tenant_scope,updated_at)
+ SELECT DISTINCT tenant_scope,__SCHEMA__.db_millis() FROM __SCHEMA__.outbox
+ ON CONFLICT ON CONSTRAINT outbox_tenant_scheduler_pkey DO NOTHING;
 CREATE FUNCTION __SCHEMA__.ensure_outbox_tenant_scheduler() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
 BEGIN
@@ -535,25 +547,41 @@ BEGIN
           (canonical_json::jsonb#>>'{limits,retainedAuthorityBytes,account}')::bigint,
           (canonical_json::jsonb#>>'{limits,retainedAuthorityBytes,principal}')::bigint
      INTO tenant_limit,account_limit,principal_limit FROM __SCHEMA__.quota_policy_versions
-    WHERE tenant_scope=new_tenant ORDER BY policy_revision DESC LIMIT 1;
+    WHERE tenant_scope=new_tenant AND lifecycle='active';
    tenant_limit:=COALESCE(tenant_limit,67108864);
    account_limit:=COALESCE(account_limit,67108864);
    principal_limit:=COALESCE(principal_limit,67108864);
-   IF tenant_limit IS NOT NULL AND current_bytes>tenant_limit THEN RAISE EXCEPTION 'retained authority tenant quota exceeded' USING ERRCODE='53000'; END IF;
+   IF current_bytes>tenant_limit THEN RAISE EXCEPTION 'retained authority tenant quota exceeded' USING ERRCODE='53000'; END IF;
    IF new_account IS NOT NULL THEN
      INSERT INTO __SCHEMA__.retained_authority_usage VALUES(new_tenant,'account',new_account,new_bytes,now_ms)
       ON CONFLICT(tenant_scope,scope_kind,scope_id) DO UPDATE SET retained_bytes=__SCHEMA__.retained_authority_usage.retained_bytes+EXCLUDED.retained_bytes,updated_at=EXCLUDED.updated_at
       RETURNING retained_bytes INTO current_bytes;
-     IF account_limit IS NOT NULL AND current_bytes>account_limit THEN RAISE EXCEPTION 'retained authority account quota exceeded' USING ERRCODE='53000'; END IF;
+     IF current_bytes>account_limit THEN RAISE EXCEPTION 'retained authority account quota exceeded' USING ERRCODE='53000'; END IF;
    END IF;
    IF new_principal IS NOT NULL THEN
      INSERT INTO __SCHEMA__.retained_authority_usage VALUES(new_tenant,'principal',new_principal,new_bytes,now_ms)
       ON CONFLICT(tenant_scope,scope_kind,scope_id) DO UPDATE SET retained_bytes=__SCHEMA__.retained_authority_usage.retained_bytes+EXCLUDED.retained_bytes,updated_at=EXCLUDED.updated_at
       RETURNING retained_bytes INTO current_bytes;
-     IF principal_limit IS NOT NULL AND current_bytes>principal_limit THEN RAISE EXCEPTION 'retained authority principal quota exceeded' USING ERRCODE='53000'; END IF;
+     IF current_bytes>principal_limit THEN RAISE EXCEPTION 'retained authority principal quota exceeded' USING ERRCODE='53000'; END IF;
    END IF;
  END IF;
  RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+END $$;
+
+-- Seed counters from the complete revision-3 canonical row oracle before any
+-- accounting trigger can observe an UPDATE or DELETE of pre-existing data.
+DO $$ DECLARE t text; BEGIN
+ FOREACH t IN ARRAY ARRAY[
+  'tasks','task_events','idempotency_records','outbox','outbox_attempts','outbox_tenant_scheduler','receiver_inbox','receiver_frames',
+  'loopback_effects','stream_transcripts','stream_frames','cancellation_intents','authorization_decisions',
+  'list_snapshots','list_snapshot_entries','list_page_tokens','quota_reservations','quota_policy_versions','quota_policy_reconciliation_audits',
+  'quota_intents','quota_buckets','quota_receipts','quota_request_receipts','quota_execution_reservations','quota_allocations','quota_leases',
+  'quota_denial_audits','quota_override_audits'
+ ] LOOP
+   EXECUTE format('INSERT INTO __SCHEMA__.retained_authority_usage(tenant_scope,scope_kind,scope_id,retained_bytes,updated_at) SELECT tenant_scope,''tenant'',tenant_scope,sum(__SCHEMA__.row_retained_bytes(r)),__SCHEMA__.db_millis() FROM __SCHEMA__.%I r GROUP BY tenant_scope ON CONFLICT(tenant_scope,scope_kind,scope_id) DO UPDATE SET retained_bytes=__SCHEMA__.retained_authority_usage.retained_bytes+EXCLUDED.retained_bytes,updated_at=EXCLUDED.updated_at',t);
+   EXECUTE format('INSERT INTO __SCHEMA__.retained_authority_usage(tenant_scope,scope_kind,scope_id,retained_bytes,updated_at) SELECT tenant_scope,''account'',__SCHEMA__.retained_account(to_jsonb(r)),sum(__SCHEMA__.row_retained_bytes(r)),__SCHEMA__.db_millis() FROM __SCHEMA__.%I r WHERE __SCHEMA__.retained_account(to_jsonb(r)) IS NOT NULL GROUP BY tenant_scope,__SCHEMA__.retained_account(to_jsonb(r)) ON CONFLICT(tenant_scope,scope_kind,scope_id) DO UPDATE SET retained_bytes=__SCHEMA__.retained_authority_usage.retained_bytes+EXCLUDED.retained_bytes,updated_at=EXCLUDED.updated_at',t);
+   EXECUTE format('INSERT INTO __SCHEMA__.retained_authority_usage(tenant_scope,scope_kind,scope_id,retained_bytes,updated_at) SELECT tenant_scope,''principal'',__SCHEMA__.retained_principal(to_jsonb(r)),sum(__SCHEMA__.row_retained_bytes(r)),__SCHEMA__.db_millis() FROM __SCHEMA__.%I r WHERE __SCHEMA__.retained_principal(to_jsonb(r)) IS NOT NULL GROUP BY tenant_scope,__SCHEMA__.retained_principal(to_jsonb(r)) ON CONFLICT(tenant_scope,scope_kind,scope_id) DO UPDATE SET retained_bytes=__SCHEMA__.retained_authority_usage.retained_bytes+EXCLUDED.retained_bytes,updated_at=EXCLUDED.updated_at',t);
+ END LOOP;
 END $$;
 
 DO $$ DECLARE t text; BEGIN

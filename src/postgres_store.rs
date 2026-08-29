@@ -656,7 +656,7 @@ impl PostgresTaskStore {
                 let rows = validation
                     .query(
                         &format!(
-                            "SELECT policy_id,policy_revision,policy_digest FROM {}.quota_policy_versions WHERE tenant_scope=$1 ORDER BY policy_revision DESC LIMIT 1",
+                            "SELECT policy_id,policy_revision,policy_digest FROM {}.quota_policy_versions WHERE tenant_scope=$1 AND lifecycle='active'",
                             config.schema
                         ),
                         &[&tenant],

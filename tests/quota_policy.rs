@@ -70,6 +70,46 @@ fn lower_limit_reconciliation_is_digest_bound_typed_and_exact_scope() {
 }
 
 #[test]
+fn account_lower_limit_reconciliation_target_is_valid_and_bounded() {
+    let target = QuotaReconciliationTarget::new(
+        "tenant-a",
+        QuotaScopeKind::Account,
+        QuotaDimension::ConcurrentStreams,
+    )
+    .expect("account scope is a supported reconciliation target");
+    assert!(
+        QuotaReconciliationTarget::new(
+            "x".repeat(65),
+            QuotaScopeKind::Account,
+            QuotaDimension::ConcurrentStreams,
+        )
+        .is_err()
+    );
+
+    let old = QuotaPolicy::from_json(&valid_policy()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&valid_policy()).unwrap();
+    value["revision"] = serde_json::json!(8);
+    value["limits"]["concurrentStreams"]["account"] = serde_json::json!(8);
+    let new = QuotaPolicy::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let plan = QuotaReconciliationPlan::drain(
+        old.digest(),
+        new.digest(),
+        "operator-primary",
+        "ticket-67 account stream drain",
+        1_700_000_000_000,
+        vec![target],
+    )
+    .unwrap();
+    assert!(plan.authorizes(
+        "tenant-a",
+        old.digest(),
+        new.digest(),
+        QuotaScopeKind::Account,
+        QuotaDimension::ConcurrentStreams,
+    ));
+}
+
+#[test]
 fn strict_policy_has_closed_types_canonical_digest_and_hard_caps() {
     let policy = QuotaPolicy::from_json(&valid_policy()).expect("strict policy");
     assert_eq!(policy.policy_id(), "production-defaults");
@@ -276,31 +316,32 @@ fn egress_intent_charges_canonical_bytes_and_events_at_all_scopes() {
 }
 
 #[test]
-fn execution_admission_reserves_output_and_event_maxima_at_all_scopes() {
+fn execution_admission_reserves_one_shared_execution_budget_at_all_scopes() {
     let policy = QuotaPolicy::from_json(&valid_policy()).unwrap();
     let subject = QuotaSubject::new("tenant-a", "account-a", "principal-a").unwrap();
     let intent = policy
         .admission_intent(&subject, "execution-message", 17, false)
         .unwrap();
 
+    let output: Vec<_> = intent
+        .charges()
+        .iter()
+        .filter(|charge| charge.dimension() == QuotaDimension::OutputBytes)
+        .map(smesh_a2a::QuotaCharge::units)
+        .collect();
+    let events: Vec<_> = intent
+        .charges()
+        .iter()
+        .filter(|charge| charge.dimension() == QuotaDimension::EventCount)
+        .map(smesh_a2a::QuotaCharge::units)
+        .collect();
+    assert_eq!(output, vec![8_388_608; 3]);
+    assert_eq!(events, vec![8_192; 3]);
     assert_eq!(
-        intent
-            .charges()
-            .iter()
-            .filter(|charge| charge.dimension() == QuotaDimension::OutputBytes)
-            .count(),
-        3,
-        "execution output must be reserved before dispatch"
+        intent.execution_budget().unwrap().max_output_bytes(),
+        8_388_608
     );
-    assert_eq!(
-        intent
-            .charges()
-            .iter()
-            .filter(|charge| charge.dimension() == QuotaDimension::EventCount)
-            .count(),
-        3,
-        "execution event capacity must be reserved before dispatch"
-    );
+    assert_eq!(intent.execution_budget().unwrap().max_event_count(), 8_192);
 }
 
 #[test]

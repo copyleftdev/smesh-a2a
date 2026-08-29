@@ -49,6 +49,21 @@ fn process_admin_url() -> Option<String> {
     }
 }
 
+async fn postgres_db_millis(admin: &str) -> i64 {
+    let (client, driver) = admin_client(admin).await;
+    let now = client
+        .query_one(
+            "SELECT floor(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::bigint",
+            &[],
+        )
+        .await
+        .expect("read PostgreSQL database time")
+        .get(0);
+    drop(client);
+    driver.abort();
+    now
+}
+
 struct Fixture {
     root: PathBuf,
 }
@@ -69,7 +84,7 @@ impl Fixture {
         Self { root }
     }
 
-    fn write_files(&self) -> (PathBuf, PathBuf, Arc<QuotaPolicy>) {
+    fn write_files(&self, now: i64) -> (PathBuf, PathBuf, Arc<QuotaPolicy>) {
         let tls = self.root.join("tls");
         std::fs::create_dir(&tls).expect("create TLS fixture");
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
@@ -103,13 +118,6 @@ impl Fixture {
         )
         .expect("write authorization policy");
         let quota = self.root.join("quota.json");
-        let now = i64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_millis(),
-        )
-        .expect("system time millis");
         let over_admission = seeded_admission(OUTPUT_OVER_MESSAGE, OUTPUT_OVER_TEXT, false);
         let over_events = production_output_events(&over_admission);
         let output_limit = measured_output_bytes(&over_events)
@@ -517,7 +525,7 @@ async fn production_wire_multi_process_quota_abuse_outage_fairness_and_failover_
         };
         let runtime = required_url("SMESH_TEST_POSTGRES_RUNTIME_URL");
         let fixture = Fixture::new();
-        let (tls, quota_path, policy) = fixture.write_files();
+        let (tls, quota_path, policy) = fixture.write_files(postgres_db_millis(&admin).await);
         let schema = format!("smesh_quota_process_{:016x}", rand::random::<u64>());
         let config = PostgresStoreConfig::new(&admin, &runtime, &schema)
             .expect("PostgreSQL config")
@@ -911,7 +919,7 @@ async fn production_process_rejects_output_and_event_plus_one_before_effect_or_f
         let Some(admin) = process_admin_url() else { return };
         let runtime = required_url("SMESH_TEST_POSTGRES_RUNTIME_URL");
         let fixture = Fixture::new();
-        let (tls, quota_path, policy) = fixture.write_files();
+        let (tls, quota_path, policy) = fixture.write_files(postgres_db_millis(&admin).await);
         let schema = format!("smesh_quota_process_output_{:016x}", rand::random::<u64>());
         let config = PostgresStoreConfig::new(&admin, &runtime, &schema).expect("PostgreSQL config")
             .with_test_only_insecure_loopback(true)

@@ -152,7 +152,7 @@ cross-replica correctness path. Revision 4 adds tenant-leading fixed-window buck
 allocations, immutable multi-dimensional intent receipts, bounded denial/override audit tables, RLS,
 and scope-leading indexes. The live authorized create/send-stream admission path derives tenant,
 account, and principal only from `AuthorizationContext`, resolves the server policy snapshot, and
-charges tenant plus principal request/input/active-work dimensions atomically with workflow state.
+charges tenant, account, and principal request/input/active-work dimensions atomically with workflow state.
 Caller headers, metadata, JSON-RPC IDs, and clocks cannot construct or raise the intent. Exact replay
 verifies the original binding without recharging; terminal/pause transitions release active work once.
 Quota exhaustion is JSON-RPC `-32010` / REST 429 and authority unavailability is `-32011` / REST 503.

@@ -114,9 +114,9 @@ bounded `QuotaIntent`; no A2A field, header, JSON-RPC correlation ID, caller
 clock, or metadata map is accepted as quota authority.
 
 PostgreSQL revision 4 persists immutable policy/intent/receipt evidence and
-mutable tenant/principal fixed-window and gauge buckets under forced RLS. Initial
-admission and every continuation reserve policy output-byte and event-count
-maxima at both scopes in the same transaction as task/event/idempotency/outbox
+mutable tenant/account/principal fixed-window and gauge buckets under forced RLS. Initial
+admission and every continuation reserve one shared per-execution output-byte and event-count
+budget against all three aggregate scopes in the same transaction as task/event/idempotency/outbox
 audit state. The private reservation identity/version, policy digest, and strict
 minimum execution ceiling travel through the outbox, sender envelope, receiver
 inbox, and fully fenced leases; they are never copied to A2A metadata.

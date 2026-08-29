@@ -121,43 +121,99 @@ const QUOTA_LEASE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 struct QuotaLeaseGuard {
     store: Arc<dyn DurableAuthority>,
-    lease: Mutex<crate::QuotaLease>,
+    lease: Arc<Mutex<crate::QuotaLease>>,
     clock: InjectedClock,
+    cancellation: tokio_util::sync::CancellationToken,
+    renewal: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    failure: Arc<Mutex<Option<A2AError>>>,
 }
 
 impl QuotaLeaseGuard {
-    async fn renew(&self, now: i64) -> Result<(), A2AError> {
-        let lease = self
-            .lease
+    fn start(
+        store: Arc<dyn DurableAuthority>,
+        lease: crate::QuotaLease,
+        clock: InjectedClock,
+    ) -> Arc<Self> {
+        let lease = Arc::new(Mutex::new(lease));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let failure = Arc::new(Mutex::new(None));
+        let guard = Arc::new(Self {
+            store: Arc::clone(&store),
+            lease: Arc::clone(&lease),
+            clock: clock.clone(),
+            cancellation: cancellation.clone(),
+            renewal: Mutex::new(None),
+            failure: Arc::clone(&failure),
+        });
+        let renewal = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => break,
+                    () = tokio::time::sleep(QUOTA_LEASE_RENEW_INTERVAL) => {}
+                }
+                let current = if let Ok(lease) = lease.lock() {
+                    lease.clone()
+                } else {
+                    if let Ok(mut slot) = failure.lock() {
+                        *slot = Some(A2AError::internal("quota lease state failed"));
+                    }
+                    break;
+                };
+                let outcome = tokio::time::timeout(
+                    QUOTA_LEASE_CALL_TIMEOUT,
+                    store.renew_quota_lease(&current, clock.now(), QUOTA_LEASE_DURATION_MILLIS),
+                )
+                .await;
+                let Ok(Ok(crate::LeaseRenewalOutcome::Applied { lease_until })) = outcome else {
+                    if let Ok(mut slot) = failure.lock() {
+                        *slot = Some(crate::quota::quota_authority_unavailable());
+                    }
+                    break;
+                };
+                if let Ok(mut lease) = lease.lock() {
+                    lease.lease_until = lease_until;
+                } else {
+                    if let Ok(mut slot) = failure.lock() {
+                        *slot = Some(A2AError::internal("quota lease state failed"));
+                    }
+                    break;
+                }
+            }
+        });
+        *guard
+            .renewal
             .lock()
-            .map_err(|_| A2AError::internal("quota lease state failed"))?
-            .clone();
-        let outcome = tokio::time::timeout(
-            QUOTA_LEASE_CALL_TIMEOUT,
-            self.store
-                .renew_quota_lease(&lease, now, QUOTA_LEASE_DURATION_MILLIS),
-        )
-        .await
-        .map_err(|_| crate::quota::quota_authority_unavailable())??;
-        let crate::LeaseRenewalOutcome::Applied { lease_until } = outcome else {
-            return Err(crate::quota::quota_authority_unavailable());
-        };
-        self.lease
-            .lock()
-            .map_err(|_| A2AError::internal("quota lease state failed"))?
-            .lease_until = lease_until;
-        Ok(())
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(renewal);
+        guard
+    }
+
+    fn failure(&self) -> Option<A2AError> {
+        match self.failure.lock() {
+            Ok(failure) => failure.clone(),
+            Err(_) => Some(A2AError::internal("quota lease failure state failed")),
+        }
     }
 }
 
 impl Drop for QuotaLeaseGuard {
     fn drop(&mut self) {
-        let Ok(lease) = self.lease.lock().map(|lease| lease.clone()) else {
-            return;
-        };
+        self.cancellation.cancel();
+        let renewal = self
+            .renewal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let store = Arc::clone(&self.store);
         let now = self.clock.now();
         tokio::spawn(async move {
+            if let Some(renewal) = renewal {
+                let _ = renewal.await;
+            }
             let _ = tokio::time::timeout(
                 QUOTA_LEASE_CALL_TIMEOUT,
                 store.release_quota_lease(&lease, now),
@@ -184,7 +240,6 @@ struct DurableStreamState {
     authorization: Option<AuthorizationContext>,
     scope: Option<OwnedTaskScope>,
     quota_lease: Option<Arc<QuotaLeaseGuard>>,
-    quota_renew_at: tokio::time::Instant,
     clock: InjectedClock,
 }
 
@@ -202,7 +257,6 @@ struct DurableTaskEventStreamState {
     authorization: Option<AuthorizationContext>,
     scope: Option<OwnedTaskScope>,
     quota_lease: Option<Arc<QuotaLeaseGuard>>,
-    quota_renew_at: tokio::time::Instant,
     clock: InjectedClock,
 }
 
@@ -317,11 +371,11 @@ impl DurableRequestHandler {
         )
         .await
         .map_err(|_| crate::quota::quota_authority_unavailable())??;
-        Ok(Some(Arc::new(QuotaLeaseGuard {
-            store: Arc::clone(&self.store),
-            lease: Mutex::new(lease),
-            clock: self.clock.clone(),
-        })))
+        Ok(Some(QuotaLeaseGuard::start(
+            Arc::clone(&self.store),
+            lease,
+            self.clock.clone(),
+        )))
     }
 
     async fn audit_unsupported(
@@ -605,19 +659,13 @@ impl DurableRequestHandler {
             authorization: context,
             scope,
             quota_lease,
-            quota_renew_at: tokio::time::Instant::now() + QUOTA_LEASE_RENEW_INTERVAL,
             clock: self.clock.clone(),
         };
         Box::pin(stream::unfold(state, |mut state| async move {
             loop {
-                if tokio::time::Instant::now() >= state.quota_renew_at {
-                    if let Some(lease) = state.quota_lease.as_ref()
-                        && let Err(error) = lease.renew(state.clock.now()).await
-                    {
-                        state.finished = true;
-                        return Some((Err(error), state));
-                    }
-                    state.quota_renew_at = tokio::time::Instant::now() + QUOTA_LEASE_RENEW_INTERVAL;
+                if let Some(error) = state.quota_lease.as_ref().and_then(|lease| lease.failure()) {
+                    state.finished = true;
+                    return Some((Err(error), state));
                 }
                 if state.finished {
                     return None;
@@ -738,19 +786,13 @@ impl DurableRequestHandler {
             authorization: context,
             scope,
             quota_lease,
-            quota_renew_at: tokio::time::Instant::now() + QUOTA_LEASE_RENEW_INTERVAL,
             clock: self.clock.clone(),
         };
         Box::pin(stream::unfold(state, |mut state| async move {
             loop {
-                if tokio::time::Instant::now() >= state.quota_renew_at {
-                    if let Some(lease) = state.quota_lease.as_ref()
-                        && let Err(error) = lease.renew(state.clock.now()).await
-                    {
-                        state.closed = true;
-                        return Some((Err(error), state));
-                    }
-                    state.quota_renew_at = tokio::time::Instant::now() + QUOTA_LEASE_RENEW_INTERVAL;
+                if let Some(error) = state.quota_lease.as_ref().and_then(|lease| lease.failure()) {
+                    state.closed = true;
+                    return Some((Err(error), state));
                 }
                 if let Some(frame) = state.pending.pop_front() {
                     if let Err(error) = charge_public_egress(
@@ -1372,7 +1414,7 @@ impl RequestHandler for DurableRequestHandler {
                 .await;
             match outcome {
                 Ok(outcome) => outcome,
-                Err(error) if error.code == -32_001 => {
+                Err(error) if error.code == a2a::error_code::TASK_NOT_FOUND => {
                     self.store
                         .append_authorization_decision(audit.decided(
                             AuthorizationDecisionEffect::Allow,
@@ -1435,14 +1477,28 @@ impl RequestHandler for DurableRequestHandler {
                 "tenant is not supported by the single-tenant gateway",
             ));
         }
-        let quota_lease = self
-            .acquire_quota_stream_lease(
-                authorization.as_ref().map(|(context, _)| context),
-                crate::QuotaLeaseKind::TaskSubscription,
-                &request.id,
-                false,
+        if let Some((context, _)) = authorization.as_ref()
+            && let Some(intent) = quota_operation_intent(
+                self.store.as_ref(),
+                context,
+                crate::QuotaOperation::Subscribe,
+                &content_digest(
+                    format!(
+                        "subscribe-request-v1\0{}\0{}",
+                        request.id,
+                        rand::random::<u128>()
+                    )
+                    .as_bytes(),
+                ),
+            )?
+        {
+            tokio::time::timeout(
+                QUOTA_LEASE_CALL_TIMEOUT,
+                self.store.charge_quota_request(&intent, self.clock.now()),
             )
-            .await?;
+            .await
+            .map_err(|_| crate::quota::quota_authority_unavailable())??;
+        }
         let captured = async {
             let snapshot = if let Some((_, scope)) = authorization.as_ref() {
                 self.store
@@ -1470,6 +1526,14 @@ impl RequestHandler for DurableRequestHandler {
             Ok(captured) => captured,
             Err(error) => return Err(error),
         };
+        let quota_lease = self
+            .acquire_quota_stream_lease(
+                authorization.as_ref().map(|(context, _)| context),
+                crate::QuotaLeaseKind::TaskSubscription,
+                &request.id,
+                false,
+            )
+            .await?;
         charge_public_egress(
             &self.store,
             authorization.as_ref().map(|(context, _)| context),

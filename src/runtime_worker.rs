@@ -493,9 +493,13 @@ async fn run_task(
     )
     .map_err(|_| DispatchError::message("runtime event serialization overflow"))?;
     if budget.max_event_count() < 1 || budget.max_output_bytes() < ingress_progress_bytes {
-        return Err(DispatchError::message(
-            "runtime reserved execution budget is too small",
-        ));
+        let _ = send_dispatch_error(
+            &events,
+            &cancellation,
+            DispatchError::message("runtime reserved execution budget is too small"),
+        )
+        .await;
+        return Ok(());
     }
     let emitted = tokio::select! {
         () = cancellation.cancelled() => return Ok(()),

@@ -22,7 +22,7 @@ Implemented and exercised:
 - Runtime-role startup validation now recursively checks the actual login and generated role before first migration and after catalog sealing, including PG17 admin/inherit/set edge options, cycles/nesting, and reachable privilege attributes. Nested `BYPASSRLS`, unexpected sealed membership, and admin-option poisoning all fail closed with cleanup.
 - Lease expiry maintenance is an explicit validated 100-row operation batch over the `(tenant_scope,state,lease_until,lease_id)` index with ordered `FOR UPDATE SKIP LOCKED LIMIT`; no operation performs an unbounded expired-lease update.
 - Populated default-planner EXPLAIN probes assert exact bucket, lease target/reclaim, retained-counter, eligible-scheduler, and within-tenant index names. The reviewed claim procedure is fragment-checked and pinned to canonical SHA-256 `d5ccf89ab192d316fbfb3f9706b3d98147fcbf266a2c718ddf162a8ecea0df6c`.
-- Vendored protocol patches are limited to `a2a-lf` quota code/status/reason mapping and `a2a-server-lf` streaming-preflight JSON-RPC HTTP mapping. Upstream is `a2a-server-lf 0.4.1`, crates.io archive SHA-256 `c4df08dff9607c4045c892b58f3824bb215262a37bce33f1ab42a72a5c9acd51`. Modified `src/jsonrpc.rs` call sites are the streaming error arms at lines 183-199 and the split unary/streaming response helpers at lines 203-219; the wire-semantics regression is at lines 765-790. Patched file SHA-256: `964da8e9a05accb9f23ab5baf9a96ccc8fd4acf69e028242df15475388e869fd`.
+- Vendored protocol patches cover `a2a-lf` named quota code/status/reason constants, `a2a-server-lf` streaming-preflight JSON-RPC HTTP mapping, and the reviewed in-memory task-list pagination overflow/out-of-range fix. Upstream archives are `a2a-lf 0.3.0` SHA-256 `7fb24275cca126dc3301d272eef07bd4cefd87f9a7dd5d6f27200fe87e8a83d0` and `a2a-server-lf 0.4.1` SHA-256 `c4df08dff9607c4045c892b58f3824bb215262a37bce33f1ab42a72a5c9acd51`. Current patched file SHA-256 values: `a2a-lf/src/errors.rs` `da72256d00d6ced608773e1f72c32155f046840f81484484a2e3b46b1cf66a76`; `a2a-server-lf/src/jsonrpc.rs` `582b660f444ae329b3746e7cef2d6f33f7fdc1d72255896f764ebb4630c78072`; `a2a-server-lf/src/task_store/inmemory.rs` `3e914b52fc03e37f2f506c1019a303dfc61db130b23f3e8ceb56328413f0ac69`.
 
 ## RED → GREEN additions
 
@@ -45,14 +45,15 @@ Implemented and exercised:
 ## Verified commands
 
 ```text
-cargo test --test quota_policy                                      PASS (9)
-SMESH_POSTGRES_TEST_REQUIRED=1 cargo test --test postgres_quota -- --test-threads=1  PASS (29, 24.21s)
-SMESH_POSTGRES_TEST_REQUIRED=1 cargo test --test postgres_store -- --test-threads=1  PASS (47, 30.59s)
+cargo test --test quota_policy                                      PASS (10)
+SMESH_POSTGRES_TEST_REQUIRED=1 cargo test --test postgres_quota -- --test-threads=1  PASS (29, 35.43s)
+SMESH_POSTGRES_TEST_REQUIRED=1 cargo test --test postgres_store -- --test-threads=1  PASS (48, 61.92s)
 SMESH_POSTGRES_TEST_REQUIRED=1 cargo test --test postgres_multi_replica -- --test-threads=1  PASS (2, 8.01s)
 SMESH_POSTGRES_TEST_REQUIRED=1 cargo test --test authorized_gateway_process production_binary_selects_postgres_and_replays_after_graceful_restart -- --exact --test-threads=1  PASS (11.35s)
-SMESH_POSTGRES_TEST_REQUIRED=1 cargo test --test postgres_quota_process -- --test-threads=1  PASS (2, 35.46s)
-cargo test --locked --all-targets --all-features -- --test-threads=1          PASS (3m08.64s)
-cargo test --release --locked --all-targets --all-features -- --test-threads=1  PASS (1m40.70s)
+SMESH_POSTGRES_TEST_REQUIRED=1 cargo test --test postgres_quota_process -- --test-threads=1  PASS (2, 37.79s)
+cargo test --locked --all-targets --all-features -- --test-threads=1          PASS (explicit PG17 fixture; current PR #67 rerun)
+cargo clippy --locked --all-targets --all-features -- -D warnings              PASS
+cargo test --release --locked --all-targets --all-features -- --test-threads=1  PASS (current PR #67 rerun)
 cargo clippy --all-targets --all-features -- -D warnings             PASS
 cargo clippy --release --all-targets --all-features -- -D warnings   PASS
 cargo fmt --all -- --check && git diff --check                       PASS

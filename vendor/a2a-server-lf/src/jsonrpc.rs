@@ -210,8 +210,8 @@ fn streaming_error_response(id: JsonRpcId, err: A2AError) -> axum::response::Res
     // receive denial before SSE headers. Preserve normal JSON-RPC 200 semantics
     // for every other code, but expose the protocol-defined quota HTTP statuses.
     let status = match err.code {
-        -32_010 => StatusCode::TOO_MANY_REQUESTS,
-        -32_011 => StatusCode::SERVICE_UNAVAILABLE,
+        error_code::QUOTA_EXCEEDED => StatusCode::TOO_MANY_REQUESTS,
+        error_code::QUOTA_AUTHORITY_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::OK,
     };
     let resp = JsonRpcResponse::error(id, err.to_jsonrpc_error());

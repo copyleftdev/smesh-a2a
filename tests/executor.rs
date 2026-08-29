@@ -9,9 +9,9 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use smesh_a2a::{
     ArtifactManifest, CompletionEvidence, CompletionPolicySpec, CompletionSnapshot, DispatchError,
-    ExecutionLimits, InputLimits, MeshDispatcher, MeshEvent, MeshRequest, PolicyDecision,
-    RatificationReceipt, RatificationStatement, RuntimeCancellationOutcome, RuntimeEventCapture,
-    RuntimeTerminalState, RuntimeTraceKind, SmeshExecutor, TrustedAuthority,
+    ExecutionBudget, ExecutionLimits, InputLimits, MeshDispatcher, MeshEvent, MeshRequest,
+    PolicyDecision, RatificationReceipt, RatificationStatement, RuntimeCancellationOutcome,
+    RuntimeEventCapture, RuntimeTerminalState, RuntimeTraceKind, SmeshExecutor, TrustedAuthority,
     VersionedCompletionPolicy, artifact_set_digest, content_digest,
 };
 use smesh_core::NodeIdentity;
@@ -94,6 +94,52 @@ fn context_with_id(task_id: &str, text: &str) -> ExecutorContext {
         user: None,
         service_params: HashMap::new(),
         tenant: None,
+    }
+}
+
+#[derive(Clone, Default)]
+struct BudgetRecordingDispatcher {
+    budgets: Arc<Mutex<Vec<ExecutionBudget>>>,
+}
+
+#[async_trait]
+impl MeshDispatcher for BudgetRecordingDispatcher {
+    fn dispatch(
+        &self,
+        request: MeshRequest,
+    ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
+        self.dispatch_bounded(request, ExecutionBudget::new(1, 1).unwrap())
+    }
+
+    fn dispatch_bounded(
+        &self,
+        _request: MeshRequest,
+        budget: ExecutionBudget,
+    ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
+        self.budgets.lock().unwrap().push(budget);
+        Box::pin(stream::empty())
+    }
+
+    async fn cancel(&self, _task_id: &str) -> Result<(), DispatchError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn dispatcher_execution_budget_clamps_event_limit_to_protocol_bounds() {
+    for (configured, expected) in [(0, 1), (17, 16)] {
+        let dispatcher = BudgetRecordingDispatcher::default();
+        let budgets = Arc::clone(&dispatcher.budgets);
+        let executor = SmeshExecutor::new(dispatcher, InputLimits::default(), "gateway-node")
+            .with_execution_limits(ExecutionLimits {
+                max_events: configured,
+                ..ExecutionLimits::default()
+            });
+        let _ = executor
+            .execute(context("budget clamp"))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(budgets.lock().unwrap()[0].max_event_count(), expected);
     }
 }
 

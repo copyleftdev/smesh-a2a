@@ -356,20 +356,20 @@ where
         let _signal = request.to_signal(&self.gateway_node_id);
         let task_id = ctx.task_id;
         let context_id = ctx.context_id;
+        let Ok(execution_budget) = crate::ExecutionBudget::new(
+            u64::try_from(self.execution_limits.max_output_bytes).unwrap_or(u64::MAX),
+            u64::try_from(self.execution_limits.max_events.clamp(1, 16)).unwrap_or(16),
+        ) else {
+            return Box::pin(stream::once(async {
+                Err(A2AError::internal("invalid trusted execution budget"))
+            }));
+        };
         let control = Arc::new(ExecutionControl::new());
         let cancellation = control.cancellation.clone();
         self.cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(task_id.clone(), Arc::clone(&control));
-        let Ok(execution_budget) = crate::ExecutionBudget::new(
-            u64::try_from(self.execution_limits.max_output_bytes).unwrap_or(u64::MAX),
-            u64::try_from(self.execution_limits.max_events).unwrap_or(u64::MAX),
-        ) else {
-            return Box::pin(stream::once(async {
-                Err(A2AError::internal("invalid trusted execution budget"))
-            }));
-        };
         let mut mesh_stream = self.dispatcher.dispatch_bounded(request, execution_budget);
         let cancellations = Arc::clone(&self.cancellations);
         let execution_limits = self.execution_limits;

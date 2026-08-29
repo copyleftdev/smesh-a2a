@@ -181,14 +181,25 @@ impl<T> AuthorizedMutation<T> {
     pub fn quota_intent(&self) -> Option<&crate::QuotaIntent> {
         self.quota_intent.as_ref()
     }
+    /// Consume the command and legacy reservation.
+    ///
+    /// Use [`Self::into_quota_parts`] when the quota intent is required.
     #[must_use]
+    #[deprecated(note = "does not expose quota_intent; use into_quota_parts")]
     pub fn into_parts(self) -> (T, Option<QuotaReservationInput>) {
         (self.command, self.quota_reservation)
+    }
+    /// Consume the authorized mutation without discarding either quota authority.
+    #[must_use]
+    pub fn into_quota_parts(
+        self,
+    ) -> (T, Option<QuotaReservationInput>, Option<crate::QuotaIntent>) {
+        (self.command, self.quota_reservation, self.quota_intent)
     }
     pub(crate) fn into_authority_parts(
         self,
     ) -> (T, Option<QuotaReservationInput>, Option<crate::QuotaIntent>) {
-        (self.command, self.quota_reservation, self.quota_intent)
+        self.into_quota_parts()
     }
 }
 

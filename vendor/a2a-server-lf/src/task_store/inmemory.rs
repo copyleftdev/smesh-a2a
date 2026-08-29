@@ -88,15 +88,15 @@ impl TaskStore for InMemoryTaskStore {
             Some(size) if size > 0 => size as usize,
             _ => 50,
         };
+        let total_size = tasks.len();
         let start = if let Some(ref token) = req.page_token {
-            // Simple offset-based pagination
-            token.parse::<usize>().unwrap_or(0)
+            // Simple offset-based pagination. Clamp untrusted offsets before slicing.
+            token.parse::<usize>().unwrap_or(0).min(total_size)
         } else {
             0
         };
 
-        let total_size = tasks.len();
-        let end = (start + page_size).min(total_size);
+        let end = start.saturating_add(page_size).min(total_size);
         let page = tasks[start..end].to_vec();
 
         let next_page_token = if end < total_size {
@@ -294,6 +294,34 @@ mod tests {
         };
         let resp2 = store.list(&req2).await.unwrap();
         assert_eq!(resp2.tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_out_of_range_and_overflowing_page_tokens_are_empty() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(make_task("t1", "c1", TaskState::Submitted))
+            .await
+            .unwrap();
+        let max = usize::MAX.to_string();
+        for token in ["2", max.as_str()] {
+            let response = store
+                .list(&ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: Some(i32::MAX),
+                    page_token: Some(token.to_owned()),
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                })
+                .await
+                .unwrap();
+            assert!(response.tasks.is_empty());
+            assert_eq!(response.total_size, 1);
+            assert!(response.next_page_token.is_empty());
+        }
     }
 
     #[tokio::test]
