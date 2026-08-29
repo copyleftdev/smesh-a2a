@@ -634,6 +634,7 @@ async fn busy_retry_idles_until_injected_clock_reclaims_receiver_with_stable_dis
         dispatch_id: seed_lease.dispatch_id.clone(),
         payload_digest: content_digest(payload.as_bytes()),
         request: seed_lease.request.clone(),
+        execution_reservation: seed_lease.execution_reservation.clone(),
     };
     let ReceiverAdmission::Execute(receiver_lease) = store
         .begin_receive(envelope, "blocked-receiver", now, 1_000)
@@ -808,6 +809,7 @@ async fn recovered_processing_cancel_finishes_from_sqlite_without_live_control()
         dispatch_id: sender.dispatch_id.clone(),
         payload_digest: content_digest(payload.as_bytes()),
         request: sender.request.clone(),
+        execution_reservation: sender.execution_reservation.clone(),
     };
     let ReceiverAdmission::Execute(_abandoned_receiver) = store
         .begin_receive(envelope, "crashed-receiver", now, 60_000)
@@ -875,6 +877,7 @@ async fn receiver_cancel_fence_rejects_stale_worker_completion_without_effect() 
                 tenant_scope: TRUSTED_SINGLE_TENANT_SCOPE.to_owned(),
                 dispatch_id: sender.dispatch_id.clone(),
                 payload_digest: content_digest(payload.as_bytes()),
+                execution_reservation: sender.execution_reservation.clone(),
                 request: sender.request,
             },
             "receiver",

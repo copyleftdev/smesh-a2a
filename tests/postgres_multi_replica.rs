@@ -505,6 +505,7 @@ async fn two_independent_postgres_gateway_processes_share_authority_and_survive_
         lease_token: row.get(6),
         lease_epoch: u64::try_from(row.get::<_, i64>(7)).unwrap(),
         lease_until: row.get(8),
+        execution_reservation: None,
     };
     assert!(
         stale_receiver

@@ -5,12 +5,13 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::{DispatchError, MeshDispatcher, MeshEvent, MeshRequest};
+use crate::{DispatchError, ExecutionBudget, MeshDispatcher, MeshEvent, MeshRequest};
 
 /// Commands handed from the A2A gateway to a real SMESH worker/runtime.
 pub enum DispatchCommand {
     Execute {
         request: MeshRequest,
+        budget: ExecutionBudget,
         signal: Box<Signal>,
         events: mpsc::Sender<Result<MeshEvent, DispatchError>>,
     },
@@ -54,11 +55,24 @@ impl MeshDispatcher for ChannelDispatcher {
         &self,
         request: MeshRequest,
     ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
+        self.dispatch_bounded(
+            request,
+            ExecutionBudget::new(64 * 1024 * 1024, 1_000_000)
+                .expect("static dispatcher budget is valid"),
+        )
+    }
+
+    fn dispatch_bounded(
+        &self,
+        request: MeshRequest,
+        budget: ExecutionBudget,
+    ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
         let signal = request.to_signal(&self.gateway_node_id);
         let commands = self.commands.clone();
         let (event_tx, event_rx) = mpsc::channel(32);
         let command = DispatchCommand::Execute {
             request,
+            budget,
             signal: Box::new(signal),
             events: event_tx.clone(),
         };

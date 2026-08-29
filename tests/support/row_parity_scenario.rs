@@ -105,6 +105,7 @@ pub async fn populate_pagination_and_active_cancellation(authority: Arc<dyn Dura
                 dispatch_id: lease.dispatch_id.clone(),
                 payload_digest: content_digest(&payload),
                 request: lease.request.clone(),
+                execution_reservation: lease.execution_reservation.clone(),
             },
             "parity-cancel-receiver",
             NOW + 2,
@@ -196,6 +197,7 @@ pub async fn populate_pagination_and_active_cancellation(authority: Arc<dyn Dura
         dispatch_id: interrupted_outbox.dispatch_id.clone(),
         payload_digest: content_digest(&interrupted_payload),
         request: interrupted_outbox.request.clone(),
+        execution_reservation: interrupted_outbox.execution_reservation.clone(),
     };
     let ReceiverAdmission::Execute(interrupted_lease) = authority
         .begin_receive(

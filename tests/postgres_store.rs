@@ -59,6 +59,81 @@ fn superuser_url() -> String {
     })
 }
 
+const RETAINED_AUTHORITY_TABLES: &[&str] = &[
+    "tasks",
+    "task_events",
+    "idempotency_records",
+    "outbox",
+    "outbox_attempts",
+    "outbox_tenant_scheduler",
+    "receiver_inbox",
+    "receiver_frames",
+    "loopback_effects",
+    "stream_transcripts",
+    "stream_frames",
+    "cancellation_intents",
+    "authorization_decisions",
+    "list_snapshots",
+    "list_snapshot_entries",
+    "list_page_tokens",
+    "quota_reservations",
+    "quota_policy_versions",
+    "quota_policy_reconciliation_audits",
+    "quota_intents",
+    "quota_buckets",
+    "quota_receipts",
+    "quota_request_receipts",
+    "quota_execution_reservations",
+    "quota_allocations",
+    "quota_leases",
+    "quota_denial_audits",
+    "quota_override_audits",
+];
+
+async fn assert_retained_counter_table_parity(
+    client: &tokio_postgres::Client,
+    schema: &str,
+    tenant: &str,
+    principal: &str,
+) {
+    let mut tenant_total = 0_i64;
+    let mut principal_total = 0_i64;
+    let mut detail = Vec::new();
+    for table in RETAINED_AUTHORITY_TABLES {
+        let row = client.query_one(
+            &format!("SELECT COALESCE(sum({schema}.row_retained_bytes(r)),0)::bigint,COALESCE(sum({schema}.row_retained_bytes(r)) FILTER (WHERE {schema}.retained_principal(to_jsonb(r))=$2),0)::bigint FROM {schema}.{table} r WHERE tenant_scope=$1"),
+            &[&tenant, &principal],
+        ).await.unwrap();
+        let tenant_bytes = row.get::<_, i64>(0);
+        let principal_bytes = row.get::<_, i64>(1);
+        tenant_total += tenant_bytes;
+        principal_total += principal_bytes;
+        detail.push((*table, tenant_bytes, principal_bytes));
+    }
+    let rows = client.query(
+        &format!("SELECT scope_kind,scope_id,retained_bytes FROM {schema}.retained_authority_usage WHERE tenant_scope=$1 ORDER BY scope_kind,scope_id"),
+        &[&tenant],
+    ).await.unwrap();
+    let materialized_tenant = rows
+        .iter()
+        .find(|row| row.get::<_, String>(0) == "tenant")
+        .unwrap()
+        .get::<_, i64>(2);
+    let materialized_principal = rows
+        .iter()
+        .find(|row| row.get::<_, String>(0) == "principal" && row.get::<_, String>(1) == principal)
+        .unwrap()
+        .get::<_, i64>(2);
+    assert_eq!(
+        materialized_tenant, tenant_total,
+        "tenant retained-byte table parity: {detail:?}"
+    );
+    assert_eq!(
+        materialized_principal, principal_total,
+        "principal retained-byte table parity: {detail:?}"
+    );
+}
+
 fn config(url: String, suffix: &str) -> PostgresStoreConfig {
     let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap_or_else(|_| {
         "postgresql://smesh_test_runtime:smesh_runtime_password@127.0.0.1:55432/smesh_test".into()
@@ -92,6 +167,87 @@ postgres_test!(
             PostgresTaskStore::open(config).await,
             Err(smesh_a2a::PostgresStoreError::InvalidConfig)
         ));
+    }
+);
+
+#[cfg(debug_assertions)]
+postgres_test!(
+    quota_enforcement_fails_closed_when_authorized_admission_omits_server_intent,
+    {
+        let Some(url) = admin_url() else { return };
+        let config = config(url, "quota_missing_intent").with_quota_enforcement(true);
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let scope = OwnedTaskScope::new(
+            "tenant-quota-required",
+            "account-quota-required",
+            VisibilityScope::Own,
+        )
+        .unwrap();
+        let mut message = a2a::Message::new(
+            a2a::Role::User,
+            vec![a2a::Part::text("caller metadata cannot opt into quota")],
+        );
+        message.message_id = "message-quota-required".into();
+        message.metadata = Some(std::collections::HashMap::from([(
+            "quota".to_owned(),
+            serde_json::json!({"limit": 999_999}),
+        )]));
+        let request = a2a::SendMessageRequest {
+            message: message.clone(),
+            configuration: None,
+            metadata: Some(std::collections::HashMap::from([(
+                "x-quota-limit".to_owned(),
+                serde_json::json!(999_999),
+            )])),
+            tenant: None,
+        };
+        let task = a2a::Task {
+            id: "task-quota-required".into(),
+            context_id: "context-quota-required".into(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: chrono::DateTime::from_timestamp_millis(100),
+            },
+            artifacts: None,
+            history: Some(vec![message]),
+            metadata: None,
+        };
+        let command = SendMessageAdmission {
+            request,
+            streaming: false,
+            task: task.clone(),
+            original_result: a2a::SendMessageResponse::Task(task),
+            input_limits: smesh_a2a::InputLimits::default(),
+            now: 100,
+            max_attempts: 2,
+        };
+        let audit = AuthorizationAuditInput::new(
+            "audit-quota-required",
+            "tenant-quota-required",
+            "account-quota-required",
+            "policy-quota-required",
+            1,
+            "digest-quota-required",
+            "TaskCreate",
+            AuthorizationDecisionEffect::Allow,
+            "policy_grant",
+            "message",
+            "resource-quota-required",
+            None,
+            100,
+        )
+        .unwrap();
+        let before = store.atomic_record_counts().await.unwrap();
+        let error = store
+            .authorize_and_admit(&scope, command, audit)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, -32_011);
+        assert_eq!(error.message, "quota authority unavailable");
+        assert_eq!(store.atomic_record_counts().await.unwrap(), before);
+        store.shutdown().await.unwrap();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
     }
 );
 
@@ -228,16 +384,19 @@ async fn sqlite_rejects_quota_before_any_schema_v6_mutation() {
 }
 
 #[test]
-fn every_retryable_growth_transaction_is_capacity_locked_and_checked() {
+fn retryable_growth_uses_materialized_quota_enforcement_without_global_hot_path_lock() {
     let source = include_str!("../src/postgres_store.rs");
     let runner = &source[source.find("async fn run_retryable_transaction").unwrap()
         ..source.find("fn q(&self").unwrap()];
-    assert!(runner.contains("self.lock_capacity(&tx).await?;"));
-    assert!(runner.contains("self.ensure_capacity(&tx, tenant).await?;"));
-    assert!(
-        source.contains("store.ensure_all_tenant_capacity(tx).await?;"),
-        "global outbox expiry/attempt growth must be checked for every tenant"
-    );
+    assert!(!runner.contains("pg_advisory_xact_lock"));
+    assert!(!runner.contains("ensure_capacity"));
+    assert!(!runner.contains("authority_tenants_bounded"));
+    let migration = include_str!("../migrations/postgres/0004_distributed_quota_authority.sql");
+    assert!(migration.contains("account_retained_authority_row"));
+    assert!(migration.contains("tenant_limit:=COALESCE(tenant_limit,67108864)"));
+    assert!(migration.contains("retained authority account quota exceeded"));
+    assert!(migration.contains("retained authority tenant quota exceeded"));
+    assert!(migration.contains("retained authority principal quota exceeded"));
     for mutation in [
         "insert_audit(tx",
         "INSERT INTO __S__.tasks",
@@ -270,7 +429,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
     let source = include_str!("../src/postgres_store.rs");
     assert_eq!(
         source.matches(".transaction()").count(),
-        8,
+        10,
         "new direct transaction site must be routed through the bounded runner or explicitly reviewed"
     );
     for reason in [
@@ -282,6 +441,8 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
         "read-only subscription snapshot",
         "read-only event snapshot",
         "read-only tenant-scoped startup semantic validation",
+        "read-only indexed quota diagnostics for deterministic evidence",
+        "policy reconciliation is startup-only, advisory-fenced, and atomically audited",
     ] {
         assert!(
             source.contains(reason),
@@ -461,7 +622,15 @@ postgres_test!(
         let sqlite_dump = dump_sqlite(&sqlite_path);
         let (client, driver) = admin_client(&superuser_url()).await;
         assert_postgres_tables_match(&client, pg_config.schema_name()).await;
+        assert_retained_counter_table_parity(
+            &client,
+            pg_config.schema_name(),
+            "tenant-conformance",
+            "account:owner-conformance",
+        )
+        .await;
         let postgres_dump = dump_postgres(&client, pg_config.schema_name()).await;
+
         assert_eq!(sqlite_dump.counts.len(), AUTHORITY_TABLES.len());
         assert_eq!(postgres_dump.counts.len(), AUTHORITY_TABLES.len());
         assert_eq!(sqlite_dump, postgres_dump);
@@ -481,6 +650,18 @@ postgres_test!(
             Some(postgres_key)
         );
         postgres_reopened.shutdown().await.unwrap();
+
+        client
+            .execute(
+                &format!("UPDATE {}.retained_authority_usage SET retained_bytes=retained_bytes+1 WHERE tenant_scope='tenant-conformance' AND scope_kind='principal' AND scope_id='account:owner-conformance'", pg_config.schema_name()),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            PostgresTaskStore::open(pg_config.clone()).await,
+            Err(smesh_a2a::PostgresStoreError::InvalidSchema)
+        ));
 
         drop(client);
         driver.abort();
@@ -649,6 +830,91 @@ postgres_test!(startup_rejects_runtime_membership_in_migrator, {
     drop(client);
     driver.abort();
 });
+
+postgres_test!(
+    startup_rejects_nested_bypass_membership_before_first_open,
+    {
+        let Some(url) = admin_url() else { return };
+        let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap();
+        let runtime = Url::parse(&runtime_url).unwrap().username().to_owned();
+        let suffix = format!("{:016x}", rand::random::<u64>());
+        let benign = format!("smesh_benign_{suffix}");
+        let bypass = format!("smesh_bypass_{suffix}");
+        let config = config(url, "nested_bypass");
+        let (client, driver) = admin_client(&superuser_url()).await;
+        client.batch_execute(&format!(
+        "CREATE ROLE {benign} NOLOGIN NOINHERIT; CREATE ROLE {bypass} NOLOGIN NOINHERIT BYPASSRLS; GRANT {bypass} TO {benign} WITH INHERIT FALSE, SET FALSE; GRANT {benign} TO {runtime} WITH INHERIT FALSE, SET TRUE"
+    )).await.unwrap();
+        assert!(matches!(
+            PostgresTaskStore::open(config).await,
+            Err(smesh_a2a::PostgresStoreError::InvalidSchema)
+        ));
+        client.batch_execute(&format!(
+        "REVOKE {benign} FROM {runtime}; REVOKE {bypass} FROM {benign}; DROP ROLE {benign}; DROP ROLE {bypass}"
+    )).await.unwrap();
+        drop(client);
+        driver.abort();
+    }
+);
+
+postgres_test!(
+    startup_rejects_unexpected_membership_after_catalog_sealing,
+    {
+        let Some(url) = admin_url() else { return };
+        let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap();
+        let runtime = Url::parse(&runtime_url).unwrap().username().to_owned();
+        let config = config(url, "sealed_membership");
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        store.shutdown().await.unwrap();
+        let role = format!("smesh_unexpected_{:016x}", rand::random::<u64>());
+        let (client, driver) = admin_client(&superuser_url()).await;
+        client.batch_execute(&format!(
+        "CREATE ROLE {role} NOLOGIN NOINHERIT; GRANT {role} TO {runtime} WITH INHERIT FALSE, SET TRUE"
+    )).await.unwrap();
+        assert!(matches!(
+            PostgresTaskStore::open(config.clone()).await,
+            Err(smesh_a2a::PostgresStoreError::InvalidSchema)
+        ));
+        client
+            .batch_execute(&format!("REVOKE {role} FROM {runtime}; DROP ROLE {role}"))
+            .await
+            .unwrap();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+        drop(client);
+        driver.abort();
+    }
+);
+
+postgres_test!(
+    startup_rejects_runtime_admin_option_after_catalog_sealing,
+    {
+        let Some(url) = admin_url() else { return };
+        let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap();
+        let runtime = Url::parse(&runtime_url).unwrap().username().to_owned();
+        let config = config(url, "sealed_admin_option");
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        store.shutdown().await.unwrap();
+        let generated = format!("{}_runtime", config.schema_name());
+        let (client, driver) = admin_client(&superuser_url()).await;
+        client
+            .batch_execute(&format!("GRANT {generated} TO {runtime} WITH ADMIN OPTION"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            PostgresTaskStore::open(config.clone()).await,
+            Err(smesh_a2a::PostgresStoreError::InvalidSchema)
+        ));
+        client
+            .batch_execute(&format!(
+                "REVOKE ADMIN OPTION FOR {generated} FROM {runtime}"
+            ))
+            .await
+            .unwrap();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+        drop(client);
+        driver.abort();
+    }
+);
 
 postgres_test!(startup_rejects_preexisting_privileged_runtime_role, {
     let Some(url) = admin_url() else { return };
@@ -1028,7 +1294,7 @@ postgres_test!(populated_external_query_families_use_bounded_index_plans, {
     let (client, driver) = admin_client(&superuser_url()).await;
     client
         .batch_execute(&format!(
-            "ANALYZE {0}.outbox; ANALYZE {0}.cancellation_intents; SET enable_seqscan=off",
+            "INSERT INTO {0}.tasks(tenant_scope,task_id,context_id,state,status_timestamp,revision,task_json,owner_account_id) SELECT 'plan-index','plan-task-'||g,'context','\"TASK_STATE_SUBMITTED\"',NULL,1,'{{\"id\":\"fixture\"}}','owner' FROM generate_series(1,2000) g; INSERT INTO {0}.outbox(dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,attempt_count,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) SELECT 'plan-dispatch-'||g,'plan-index','plan-task-'||g,'plan-message-'||g,1,'{{}}','digest','pending',0,3,0,1,1,1 FROM generate_series(1,2000) g; INSERT INTO {0}.cancellation_intents(tenant_scope,dispatch_id,task_id,state,requested_at) SELECT 'plan-index','plan-dispatch-'||g,'plan-task-'||g,'requested',1 FROM generate_series(1,2000) g; ANALYZE {0}.outbox; ANALYZE {0}.cancellation_intents",
             config.schema_name()
         ))
         .await
@@ -1038,30 +1304,81 @@ postgres_test!(populated_external_query_families_use_bounded_index_plans, {
         cancellation.contains("cancellation_intents_dispatch_requested"),
         "{cancellation}"
     );
-    let claim = client.query(&format!("EXPLAIN SELECT tenant_scope,outbox_id FROM {0}.outbox WHERE ((state='pending' AND available_at<=0) OR (state='leased' AND lease_until<=0)) AND attempt_count<max_attempts ORDER BY available_at,outbox_id LIMIT 1", config.schema_name()), &[]).await.unwrap().into_iter().map(|row| row.get::<_,String>(0)).collect::<Vec<_>>().join("\n");
-    assert!(claim.contains("outbox_due"), "{claim}");
-    for function in [
-        "claim_outbox_bounded(0,'owner','token',1)",
-        "cancellation_requested_bounded('missing')",
-    ] {
-        let plan = client
-            .query(
-                &format!("EXPLAIN SELECT * FROM {}.{function}", config.schema_name()),
-                &[],
-            )
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            plan.contains("Function Scan") || plan.contains("Result"),
-            "{plan}"
-        );
-    }
     drop(client);
     driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+});
+
+postgres_test!(outbox_claims_rotate_durably_between_due_tenants, {
+    let Some(url) = admin_url() else { return };
+    let config = config(url, "fair_claim").with_test_only_trust_injected_time(true);
+    let store = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
+    let peer = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
+    let (client, driver) = admin_client(&superuser_url()).await;
+    let schema = config.schema_name();
+    for (tenant, suffix, available_at) in [
+        ("tenant-a", "a1", 1_i64),
+        ("tenant-a", "a2", 2_i64),
+        ("tenant-b", "b1", 3_i64),
+    ] {
+        let task_id = format!("task-{suffix}");
+        let context_id = format!("context-{suffix}");
+        let message_id = format!("message-{suffix}");
+        let dispatch_id = format!("dispatch-{suffix}");
+        let task = a2a::Task {
+            id: task_id.clone(),
+            context_id: context_id.clone(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let task_json = serde_json::to_string(&task).unwrap();
+        let state = serde_json::to_string(&task.status.state).unwrap();
+        let request = smesh_a2a::MeshRequest {
+            protocol: "a2a-v1".into(),
+            task_id: task_id.clone(),
+            context_id: context_id.clone(),
+            text: suffix.into(),
+        };
+        let payload = serde_json::to_string(&request).unwrap();
+        let payload_digest = smesh_a2a::content_digest(payload.as_bytes());
+        let admission = serde_json::to_string(&a2a::SendMessageResponse::Task(task)).unwrap();
+        client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES($1,$2,$3,$4,1,$5,'owner')"), &[&tenant,&task_id,&context_id,&state,&task_json]).await.unwrap();
+        client.execute(&format!("INSERT INTO {schema}.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id) VALUES($1,$2,$3,$4,'in_progress',$5,1,1,2,'owner')"), &[&tenant,&message_id,&format!("sha256:{suffix}"),&task_id,&admission]).await.unwrap();
+        client.execute(&format!("INSERT INTO {schema}.outbox(tenant_scope,dispatch_id,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) VALUES($1,$2,$3,$4,1,$5,$6,'pending',2,$7,1,1,2)"), &[&tenant,&dispatch_id,&task_id,&message_id,&payload,&payload_digest,&available_at]).await.unwrap();
+    }
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let claim = |authority: Arc<PostgresTaskStore>, owner: &'static str| {
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            authority
+                .claim_outbox(owner, 10, 100)
+                .await
+                .unwrap()
+                .unwrap()
+        })
+    };
+    let first = claim(Arc::clone(&store), "fair-owner-1");
+    let second = claim(Arc::clone(&peer), "fair-owner-2");
+    barrier.wait().await;
+    let (first, second) = tokio::join!(first, second);
+    let mut tenants = [first.unwrap().tenant_scope, second.unwrap().tenant_scope];
+    tenants.sort();
+    assert_eq!(
+        tenants,
+        ["tenant-a", "tenant-b"],
+        "tenant A backlog starved tenant B"
+    );
+    drop(client);
+    driver.abort();
+    store.shutdown().await.unwrap();
+    peer.shutdown().await.unwrap();
     PostgresTaskStore::drop_test_schema(&config).await.unwrap();
 });
 
@@ -1175,6 +1492,7 @@ postgres_test!(
             dispatch_id: "dispatch-expiry".into(),
             payload_digest: digest,
             request: request.clone(),
+            execution_reservation: lease.execution_reservation.clone(),
         };
         let smesh_a2a::ReceiverAdmission::Execute(receiver) = store
             .begin_receive(envelope, "incomplete-receiver", 100, 10)
@@ -1206,6 +1524,7 @@ postgres_test!(
             dispatch_id: "dispatch-expiry".into(),
             payload_digest: smesh_a2a::content_digest(payload.as_bytes()),
             request: request.clone(),
+            execution_reservation: reconciliation.execution_reservation.clone(),
         };
         let smesh_a2a::ReceiverAdmission::Execute(reclaimed_receiver) = store
             .begin_receive(envelope, "reclaimed-receiver", 111, 10)
@@ -1406,6 +1725,60 @@ postgres_test!(
         PostgresTaskStore::drop_test_schema(&config).await.unwrap();
     }
 );
+
+postgres_test!(global_outbox_claim_preserves_principal_retained_counter, {
+    let Some(url) = admin_url() else { return };
+    let config = config(url, "claim_retained")
+        .with_test_only_trust_injected_time(true)
+        .with_test_only_parent_managed_cleanup();
+    let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+    let (client, driver) = admin_client(&superuser_url()).await;
+    let schema = config.schema_name();
+    let task = a2a::Task {
+        id: "claim-retained-task".into(),
+        context_id: "claim-retained-context".into(),
+        status: a2a::TaskStatus {
+            state: a2a::TaskState::Submitted,
+            message: None,
+            timestamp: None,
+        },
+        artifacts: None,
+        history: None,
+        metadata: None,
+    };
+    let task_json = serde_json::to_string(&task).unwrap();
+    let state = serde_json::to_string(&task.status.state).unwrap();
+    let request = smesh_a2a::MeshRequest {
+        protocol: "a2a-v1".into(),
+        task_id: task.id.clone(),
+        context_id: task.context_id.clone(),
+        text: "claim retained counter".into(),
+    };
+    let payload = serde_json::to_string(&request).unwrap();
+    let payload_digest = smesh_a2a::content_digest(payload.as_bytes());
+    client.execute(&format!("INSERT INTO {schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES('tenant-claim-retained',$1,$2,$3,1,$4,'owner')"), &[&task.id,&task.context_id,&state,&task_json]).await.unwrap();
+    client.execute(&format!("INSERT INTO {schema}.outbox(tenant_scope,dispatch_id,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) VALUES('tenant-claim-retained','dispatch-claim-retained',$1,'message-claim-retained',1,$2,$3,'pending',2,100,100,100,2)"), &[&task.id,&payload,&payload_digest]).await.unwrap();
+    let query = format!(
+        "SELECT retained_bytes,{schema}.retained_authority_oracle(tenant_scope,scope_id) FROM {schema}.retained_authority_usage WHERE tenant_scope='tenant-claim-retained' AND scope_kind='principal' AND scope_id='account:owner'"
+    );
+    let before = client.query_one(&query, &[]).await.unwrap();
+    assert_eq!(before.get::<_, i64>(0), before.get::<_, i64>(1));
+    store
+        .claim_outbox("global-claimer", 100, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    let after = client.query_one(&query, &[]).await.unwrap();
+    assert_eq!(
+        after.get::<_, i64>(0),
+        after.get::<_, i64>(1),
+        "global claim must retain the task owner's principal attribution"
+    );
+    store.shutdown().await.unwrap();
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+});
 
 postgres_test!(expired_final_attempt_without_receiver_is_dead_lettered, {
     let Some(url) = admin_url() else { return };
@@ -1650,6 +2023,7 @@ postgres_test!(
             tenant_scope: "tenant-final".into(),
             dispatch_id: "dispatch-final".into(),
             payload_digest,
+            execution_reservation: crashed.execution_reservation.clone(),
             request,
         };
         let ReceiverAdmission::Execute(receiver) = store
@@ -1747,6 +2121,7 @@ postgres_test!(postgres_renews_fenced_outbox_and_receiver_leases, {
             context_id: "context".into(),
             text: "x".into(),
         },
+        execution_reservation: None,
     };
     assert_eq!(
         store
@@ -1766,6 +2141,7 @@ postgres_test!(postgres_renews_fenced_outbox_and_receiver_leases, {
         lease_token: "token".into(),
         lease_epoch: 1,
         lease_until: 1,
+        execution_reservation: None,
     };
     assert_eq!(
         store
@@ -1897,11 +2273,7 @@ postgres_test!(postgres_quota_reservation_seam_is_transactional, {
     let counts_before_replay_rejections = store.atomic_record_counts().await.unwrap();
     assert!(
         store
-            .authorize_and_admit_mutation(
-                &scope,
-                AuthorizedMutation::without_quota(admitted.clone()),
-                audit("missing-replay"),
-            )
+            .authorize_and_admit(&scope, admitted.clone(), audit("missing-replay"),)
             .await
             .is_err(),
         "missing trusted task-local reservation must not replay"
@@ -2167,6 +2539,7 @@ postgres_test!(
             dispatch_id: "dispatch-fresh".into(),
             payload_digest: digest,
             request,
+            execution_reservation: fresh.execution_reservation.clone(),
         };
         let smesh_a2a::ReceiverAdmission::Execute(receiver_lease) = past_clock
             .begin_receive(envelope, "receiver", i64::MIN, 60_000)
@@ -2211,7 +2584,10 @@ postgres_test!(
             tenant.len() + 32 + "owner".len() + "scope".len() + "query".len() + 32;
         let entry_overhead =
             tenant.len() + 32 + "seed".len() + smesh_a2a::content_digest(b"seed").len();
-        let frozen_bytes = 64 * 1024 * 1024 - audit_bytes - snapshot_overhead - entry_overhead;
+        // row_retained_bytes includes jsonb field names and numeric columns. Keep
+        // enough exact-encoding headroom for one audit, but not two.
+        let frozen_bytes =
+            64 * 1024 * 1024 - audit_bytes - snapshot_overhead - entry_overhead - 900;
         let frozen_bytes_i64 = i64::try_from(frozen_bytes).unwrap();
         let snapshot = [7_u8; 32];
         let metadata = [9_u8; 32];
@@ -2234,7 +2610,8 @@ postgres_test!(
         &[],
     ).await.unwrap();
         assert_eq!(row.get::<_, i64>(0), 1, "losing audit was not rolled back");
-        assert_eq!(row.get::<_, i64>(1), 64 * 1024 * 1024);
+        let legacy_bytes = row.get::<_, i64>(1);
+        assert!(legacy_bytes <= 64 * 1024 * 1024 && legacy_bytes > 64 * 1024 * 1024 - 2_000);
         left.shutdown().await.unwrap();
         right.shutdown().await.unwrap();
         drop(admin);

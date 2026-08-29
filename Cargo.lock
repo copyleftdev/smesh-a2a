@@ -29,8 +29,6 @@ dependencies = [
 [[package]]
 name = "a2a-lf"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fb24275cca126dc3301d272eef07bd4cefd87f9a7dd5d6f27200fe87e8a83d0"
 dependencies = [
  "base64",
  "chrono",
@@ -64,8 +62,6 @@ dependencies = [
 [[package]]
 name = "a2a-server-lf"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4df08dff9607c4045c892b58f3824bb215262a37bce33f1ab42a72a5c9acd51"
 dependencies = [
  "a2a-lf",
  "a2a-pb",

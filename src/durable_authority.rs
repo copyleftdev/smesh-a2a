@@ -138,14 +138,16 @@ impl QuotaReservationInput {
 pub struct AuthorizedMutation<T> {
     command: T,
     quota_reservation: Option<QuotaReservationInput>,
+    quota_intent: Option<crate::QuotaIntent>,
 }
 
 impl<T> AuthorizedMutation<T> {
     #[must_use]
-    pub fn without_quota(command: T) -> Self {
+    pub(crate) fn without_quota(command: T) -> Self {
         Self {
             command,
             quota_reservation: None,
+            quota_intent: None,
         }
     }
 
@@ -154,6 +156,16 @@ impl<T> AuthorizedMutation<T> {
         Self {
             command,
             quota_reservation: Some(quota_reservation),
+            quota_intent: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_quota_intent(command: T, quota_intent: crate::QuotaIntent) -> Self {
+        Self {
+            command,
+            quota_reservation: None,
+            quota_intent: Some(quota_intent),
         }
     }
 
@@ -166,8 +178,17 @@ impl<T> AuthorizedMutation<T> {
         self.quota_reservation.as_ref()
     }
     #[must_use]
+    pub fn quota_intent(&self) -> Option<&crate::QuotaIntent> {
+        self.quota_intent.as_ref()
+    }
+    #[must_use]
     pub fn into_parts(self) -> (T, Option<QuotaReservationInput>) {
         (self.command, self.quota_reservation)
+    }
+    pub(crate) fn into_authority_parts(
+        self,
+    ) -> (T, Option<QuotaReservationInput>, Option<crate::QuotaIntent>) {
+        (self.command, self.quota_reservation, self.quota_intent)
     }
 }
 
@@ -488,6 +509,18 @@ pub enum AdmissionOutcome {
     Replay(SendMessageResponse),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ExecutionReservation {
+    pub reservation_id: String,
+    pub reservation_version: u64,
+    pub binding_digest: String,
+    pub policy_id: String,
+    pub policy_revision: u64,
+    pub policy_digest: String,
+    pub budget: crate::ExecutionBudget,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxLease {
     pub tenant_scope: String,
@@ -500,6 +533,7 @@ pub struct OutboxLease {
     pub lease_token: String,
     pub lease_until: i64,
     pub request: MeshRequest,
+    pub execution_reservation: Option<ExecutionReservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,6 +554,7 @@ pub struct ReceiverLease {
     pub lease_token: String,
     pub lease_epoch: u64,
     pub lease_until: i64,
+    pub execution_reservation: Option<ExecutionReservation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,6 +571,71 @@ pub enum LeaseRenewalOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaLease {
+    pub tenant_scope: String,
+    pub account_id: String,
+    pub principal_scope: String,
+    pub operation: crate::QuotaOperation,
+    pub kind: crate::QuotaLeaseKind,
+    pub resource_digest: String,
+    pub lease_id: String,
+    pub lease_token: String,
+    pub lease_epoch: u64,
+    pub lease_until: i64,
+}
+
+#[async_trait]
+pub trait QuotaLeaseAuthority: Send + Sync {
+    async fn charge_quota_request(
+        &self,
+        _intent: &crate::QuotaIntent,
+        _now: i64,
+    ) -> Result<(), A2AError> {
+        Err(A2AError::unsupported_operation(
+            "quota request charging is unsupported",
+        ))
+    }
+
+    async fn acquire_quota_lease(
+        &self,
+        _intent: &crate::QuotaIntent,
+        _kind: crate::QuotaLeaseKind,
+        _resource_digest: &str,
+        _now: i64,
+        _lease_duration: i64,
+    ) -> Result<QuotaLease, A2AError> {
+        Err(A2AError::unsupported_operation(
+            "quota leases are unsupported",
+        ))
+    }
+    async fn renew_quota_lease(
+        &self,
+        _lease: &QuotaLease,
+        _now: i64,
+        _lease_duration: i64,
+    ) -> Result<LeaseRenewalOutcome, A2AError> {
+        Err(A2AError::unsupported_operation(
+            "quota leases are unsupported",
+        ))
+    }
+    async fn release_quota_lease(&self, _lease: &QuotaLease, _now: i64) -> Result<bool, A2AError> {
+        Err(A2AError::unsupported_operation(
+            "quota leases are unsupported",
+        ))
+    }
+    async fn charge_quota_egress(
+        &self,
+        _intent: &crate::QuotaIntent,
+        _now: i64,
+    ) -> Result<(), A2AError> {
+        Err(A2AError::unsupported_operation(
+            "quota egress is unsupported",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ReceiverAdmission {
     Execute(ReceiverLease),
     Replay(Vec<MeshEvent>),
@@ -638,6 +738,9 @@ pub trait AuthorityIdentity: Send + Sync {
     fn capabilities(&self) -> AuthorityCapabilities;
     fn completion_receipt_key(&self) -> Option<[u8; 32]>;
     fn authorization_resource_digest(&self, resource: &str) -> Result<String, A2AError>;
+    fn quota_policy_snapshot(&self) -> Option<Arc<crate::QuotaPolicy>> {
+        None
+    }
 }
 
 #[async_trait]
@@ -648,6 +751,20 @@ pub trait AuthorizedTaskRead: Send + Sync {
         task_id: &str,
         audit: AuthorizationAuditInput,
     ) -> Result<Option<Task>, A2AError>;
+    async fn get_authorized_with_quota(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        audit: AuthorizationAuditInput,
+        quota_intent: Option<&crate::QuotaIntent>,
+    ) -> Result<Option<Task>, A2AError> {
+        if quota_intent.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "quota intents are unsupported",
+            ));
+        }
+        self.get_authorized(scope, task_id, audit).await
+    }
     async fn list_authorized(
         &self,
         scope: &OwnedTaskScope,
@@ -655,6 +772,22 @@ pub trait AuthorizedTaskRead: Send + Sync {
         audit: AuthorizationAuditInput,
         cursor_scope_digest: &str,
     ) -> Result<ListTasksResponse, A2AError>;
+    async fn list_authorized_with_quota(
+        &self,
+        scope: &OwnedTaskScope,
+        request: &ListTasksRequest,
+        audit: AuthorizationAuditInput,
+        cursor_scope_digest: &str,
+        quota_intent: Option<&crate::QuotaIntent>,
+    ) -> Result<ListTasksResponse, A2AError> {
+        if quota_intent.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "quota intents are unsupported",
+            ));
+        }
+        self.list_authorized(scope, request, audit, cursor_scope_digest)
+            .await
+    }
 }
 
 #[async_trait]
@@ -685,8 +818,8 @@ pub trait TaskAdmission: Send + Sync {
         mutation: AuthorizedMutation<SendMessageAdmission>,
         audit: AuthorizationAuditInput,
     ) -> Result<AdmissionOutcome, A2AError> {
-        let (command, quota) = mutation.into_parts();
-        if quota.is_some() {
+        let (command, quota, intent) = mutation.into_authority_parts();
+        if quota.is_some() || intent.is_some() {
             return Err(A2AError::unsupported_operation(
                 "quota reservations are unsupported",
             ));
@@ -699,8 +832,8 @@ pub trait TaskAdmission: Send + Sync {
         mutation: AuthorizedMutation<SendMessageAdmission>,
         audit: AuthorizationAuditInput,
     ) -> Result<AdmissionOutcome, A2AError> {
-        let (command, quota) = mutation.into_parts();
-        if quota.is_some() {
+        let (command, quota, intent) = mutation.into_authority_parts();
+        if quota.is_some() || intent.is_some() {
             return Err(A2AError::unsupported_operation(
                 "quota reservations are unsupported",
             ));
@@ -827,8 +960,9 @@ pub trait CancellationAuthority: Send + Sync {
         now: i64,
         audit: AuthorizationAuditInput,
         quota_reservation: Option<&QuotaReservationInput>,
+        quota_intent: Option<&crate::QuotaIntent>,
     ) -> Result<CancellationOutcome, A2AError> {
-        if quota_reservation.is_some() {
+        if quota_reservation.is_some() || quota_intent.is_some() {
             return Err(A2AError::unsupported_operation(
                 "quota reservations are unsupported",
             ));
@@ -884,6 +1018,7 @@ pub trait DurableAuthority:
     + OutboxAuthority
     + ReceiverAuthority
     + TranscriptAuthority
+    + QuotaLeaseAuthority
     + CancellationAuthority
     + AuthorizationAuditSink
     + ChangeObserver
@@ -902,6 +1037,7 @@ impl<T> DurableAuthority for T where
         + OutboxAuthority
         + ReceiverAuthority
         + TranscriptAuthority
+        + QuotaLeaseAuthority
         + CancellationAuthority
         + AuthorizationAuditSink
         + ChangeObserver

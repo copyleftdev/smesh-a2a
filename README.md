@@ -142,14 +142,24 @@ tenant/owner predicates and durable authorization audit. A policy with authentic
 authentication without policy, or authenticated non-loopback serving fails closed.
 
 Production PostgreSQL replicas set `SMESH_A2A_DURABLE_BACKEND=postgres`, distinct TLS
-`SMESH_A2A_POSTGRES_MIGRATOR_URL` and `SMESH_A2A_POSTGRES_RUNTIME_URL`, and
-`SMESH_A2A_POSTGRES_SCHEMA`. `SMESH_A2A_REPLICA_ID` is optional; it must be a bounded ASCII
+`SMESH_A2A_POSTGRES_MIGRATOR_URL` and `SMESH_A2A_POSTGRES_RUNTIME_URL`,
+`SMESH_A2A_POSTGRES_SCHEMA`, and the mandatory strict startup snapshot
+`SMESH_A2A_QUOTA_POLICY_PATH`. `SMESH_A2A_REPLICA_ID` is optional; it must be a bounded ASCII
 identifier and otherwise a random boot identifier is generated. SQLite and PostgreSQL settings may
-not be mixed. PostgreSQL claims and renewals use database time and complete fences; durable polling
-is the cross-replica correctness path. PostgreSQL also advertises the server-owned atomic quota
-reservation seam for admission, continuation, and cancellation; SQLite rejects quota-bearing
-commands without mutation and remains schema v6. Quota policy and dimension selection remain #14
-and may populate the seam only through `scope_quota_reservation`, never caller-controlled A2A fields.
+not be mixed, and configuring distributed quotas with SQLite fails before resource acquisition.
+PostgreSQL claims and renewals use database time and complete fences; durable polling is the
+cross-replica correctness path. Revision 4 adds tenant-leading fixed-window buckets, active-work
+allocations, immutable multi-dimensional intent receipts, bounded denial/override audit tables, RLS,
+and scope-leading indexes. The live authorized create/send-stream admission path derives tenant,
+account, and principal only from `AuthorizationContext`, resolves the server policy snapshot, and
+charges tenant plus principal request/input/active-work dimensions atomically with workflow state.
+Caller headers, metadata, JSON-RPC IDs, and clocks cannot construct or raise the intent. Exact replay
+verifies the original binding without recharging; terminal/pause transitions release active work once.
+Quota exhaustion is JSON-RPC `-32010` / REST 429 and authority unavailability is `-32011` / REST 503.
+See [`evidence/m2/issue-14.md`](evidence/m2/issue-14.md) for the completed distributed-quota
+surface, exact RED/GREEN evidence, focused abuse/fairness/failover matrix, and explicit
+boundaries with artifact storage (#15), observability (#16), push callbacks (#17), and broad
+fuzz/load/chaos qualification (#18).
 Debug CI runs the plaintext local-fixture child-process PostgreSQL failover, durable SSE, renewal,
 crash reconciliation, restart replay, renewal-outage recovery, and full production-binary E2E. The
 plaintext and shortened-lease seams do not exist in release. Release CI instead runs the complete

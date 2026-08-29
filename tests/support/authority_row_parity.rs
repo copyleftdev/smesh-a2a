@@ -64,10 +64,27 @@ pub async fn assert_postgres_tables_match(client: &Client, schema: &str) {
         .into_iter()
         .map(|row| row.get::<_, String>(0))
         .collect::<BTreeSet<_>>();
-    assert!(
-        actual.remove("quota_reservations"),
-        "PostgreSQL quota reservation seam table is missing"
-    );
+    for table in [
+        "outbox_tenant_scheduler",
+        "quota_reservations",
+        "quota_allocations",
+        "quota_buckets",
+        "quota_denial_audits",
+        "quota_execution_reservations",
+        "quota_intents",
+        "quota_leases",
+        "quota_override_audits",
+        "quota_policy_reconciliation_audits",
+        "quota_policy_versions",
+        "quota_receipts",
+        "quota_request_receipts",
+        "retained_authority_usage",
+    ] {
+        assert!(
+            actual.remove(table),
+            "PostgreSQL distributed quota authority table is missing: {table}"
+        );
+    }
     assert_eq!(
         actual,
         expected_tables(),
@@ -369,6 +386,30 @@ fn normalize(tables: &mut BTreeMap<String, Vec<Value>>) {
                         "creation_semantics".into(),
                         Value::String("created-once-during-migration".into()),
                     );
+                }
+                "outbox" => {
+                    for field in [
+                        "quota_binding_digest",
+                        "quota_reservation_id",
+                        "quota_reservation_version",
+                        "reserved_output_bytes",
+                        "reserved_event_count",
+                    ] {
+                        object.remove(field);
+                    }
+                }
+                "receiver_inbox" => {
+                    for field in [
+                        "quota_binding_digest",
+                        "quota_reservation_id",
+                        "quota_reservation_version",
+                        "reserved_output_bytes",
+                        "reserved_event_count",
+                        "measured_output_bytes",
+                        "measured_event_count",
+                    ] {
+                        object.remove(field);
+                    }
                 }
                 "outbox_attempts" => {
                     // SQLite's parent outbox id is globally unique; PostgreSQL repeats the tenant

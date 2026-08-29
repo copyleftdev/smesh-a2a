@@ -100,9 +100,51 @@ both a fully recording fake and real SQLite state. The separate full JSON-RPC
 gateway lifecycle remains SQLite/local compatibility evidence; it is not
 described as backend-neutral conformance.
 
-Issue #61 intentionally exposes no lease-renewal API. Issue #63 will add renewal
-only as a negotiated capability together with runtime calls and atomic fencing;
-SQLite remains exclusive-open and reports no dormant renewal surface.
+PostgreSQL negotiates lease renewal and quota policy snapshots as explicit
+capabilities; SQLite remains exclusive-open and reports neither distributed
+capability.
+
+### Distributed quota authority
+
+`QuotaPolicy` is a strict canonical startup snapshot with a policy ID, revision,
+and digest. Closed `QuotaOperation`, `QuotaDimension`, `QuotaScopeKind`, and
+`QuotaAlgorithm` enums prevent free-form production accounting keys. The server
+derives a keyed principal scope from the verified issuer/subject and builds a
+bounded `QuotaIntent`; no A2A field, header, JSON-RPC correlation ID, caller
+clock, or metadata map is accepted as quota authority.
+
+PostgreSQL revision 4 persists immutable policy/intent/receipt evidence and
+mutable tenant/principal fixed-window and gauge buckets under forced RLS. Initial
+admission and every continuation reserve policy output-byte and event-count
+maxima at both scopes in the same transaction as task/event/idempotency/outbox
+audit state. The private reservation identity/version, policy digest, and strict
+minimum execution ceiling travel through the outbox, sender envelope, receiver
+inbox, and fully fenced leases; they are never copied to A2A metadata.
+
+The channel/runtime boundary receives a trusted `ExecutionBudget` before runtime,
+model, or tool work and clamps canonical serialized `MeshEvent` UTF-8 bytes and
+event count. Receiver completion repeats the canonical measurement before its
+effect marker, frames, transcript, task, or response can commit. Completion,
+cancellation, interruption, failure, dead letter, supersession, and recovery
+settle one reservation transactionally: actual use remains charged and unused
+capacity is refunded. Receiver-completed/sender-uncommitted recovery reuses the
+stored measurement and settlement row. Exact replay verifies the original
+reservation and never reserves or settles twice.
+
+Active-work allocations survive process death and a database trigger settles
+them once on terminal or paused task state. Static operator overrides are
+bounded to one named scope/operation/dimension and database-time interval; actor,
+reason, and target are digest-audited. Public-egress replay charging remains a
+separate `PublicEgress` operation: it limits bytes crossing the public transport
+and is not execution-output settlement, so the two ledgers are not combined or
+double-counted.
+
+The checked-in `a2a-lf` boundary patch reserves JSON-RPC `-32010`/HTTP 429 for
+renewable quota exhaustion and `-32011`/HTTP 503 for authority unavailability.
+Issue #14 is implemented through PostgreSQL revision 4: materialized retained-authority
+accounting, bounded replay-safe GC, tenant-fair claiming, multi-scope quota policy,
+execution reservations, stream/reconnect leases, audited reconciliation/overrides, and
+the production abuse/fairness/failover matrix are documented in `evidence/m2/issue-14.md`.
 
 ### `server`
 
@@ -127,4 +169,4 @@ Composes the official JSON-RPC, REST, Agent Card, task store, and executor into 
 - Bounded push notifications with an allowlist and SSRF defenses.
 - Application-specific semantic work processors and authenticated evidence issuers.
 - gRPC listener.
-- OpenTelemetry tracing and per-principal quotas.
+- OpenTelemetry tracing and retained quota accounting/GC.

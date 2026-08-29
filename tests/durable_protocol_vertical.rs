@@ -2650,6 +2650,7 @@ async fn max_attempts_one_crash_after_receiver_complete_is_committed_by_driver()
         dispatch_id: crashed_sender.dispatch_id.clone(),
         payload_digest: content_digest(&payload),
         request: crashed_sender.request.clone(),
+        execution_reservation: crashed_sender.execution_reservation.clone(),
     };
     let ReceiverAdmission::Execute(receiver) = bounded(
         "final-attempt receiver admission",
@@ -2906,6 +2907,7 @@ fn continuation_restart_checkpoint_helper() {
                 tenant_scope: TRUSTED_SINGLE_TENANT_SCOPE.to_owned(),
                 dispatch_id: sender.dispatch_id,
                 payload_digest: content_digest(payload.as_bytes()),
+                execution_reservation: sender.execution_reservation.clone(),
                 request: sender.request,
             };
             let ReceiverAdmission::Execute(receiver) = bounded(

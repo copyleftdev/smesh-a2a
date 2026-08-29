@@ -245,6 +245,7 @@ fn envelope_for_lease(lease: &smesh_a2a::OutboxLease) -> DurableDispatchEnvelope
         dispatch_id: lease.dispatch_id.clone(),
         payload_digest: content_digest(&payload),
         request: lease.request.clone(),
+        execution_reservation: lease.execution_reservation.clone(),
     }
 }
 

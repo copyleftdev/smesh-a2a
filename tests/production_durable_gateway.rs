@@ -384,6 +384,7 @@ async fn production_system_clock_wakes_busy_receiver_backoff_without_manual_adva
         dispatch_id: sender_lease.dispatch_id.clone(),
         payload_digest: content_digest(payload.as_bytes()),
         request: sender_lease.request.clone(),
+        execution_reservation: sender_lease.execution_reservation.clone(),
     };
     assert!(matches!(
         bounded(

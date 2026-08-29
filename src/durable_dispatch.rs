@@ -8,7 +8,10 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::outbox_driver::{AbortOnDropJoin, RedactedDriverPoll, install_driver_panic_hook};
-use crate::{DurableAuthority, LeaseRenewalOutcome, MeshEvent, MeshRequest, ReceiverLease};
+use crate::{
+    DurableAuthority, ExecutionReservation, LeaseRenewalOutcome, MeshEvent, MeshRequest,
+    ReceiverLease,
+};
 
 #[derive(Debug)]
 pub(crate) enum DurableDispatchError {
@@ -170,6 +173,7 @@ pub struct DurableDispatchEnvelope {
     pub dispatch_id: String,
     pub payload_digest: String,
     pub request: MeshRequest,
+    pub execution_reservation: Option<ExecutionReservation>,
 }
 
 /// Deterministic clock used by the durable sender and receiver lease state machines.
@@ -593,6 +597,7 @@ mod tests {
             lease_token: "receiver-token-renewal-join".to_owned(),
             lease_epoch: 1,
             lease_until: 10_000,
+            execution_reservation: None,
         }
     }
 

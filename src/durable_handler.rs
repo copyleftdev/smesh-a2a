@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use a2a::{
     A2AError, AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest,
@@ -27,10 +27,143 @@ use crate::{
     outbox_driver::{DurableDriverControl, WaiterGuard},
 };
 
-fn authorized_mutation(command: SendMessageAdmission) -> AuthorizedMutation<SendMessageAdmission> {
-    match current_quota_reservation() {
-        Some(quota) => AuthorizedMutation::with_quota(command, quota),
-        None => AuthorizedMutation::without_quota(command),
+fn authorized_mutation(
+    store: &dyn DurableAuthority,
+    command: SendMessageAdmission,
+    operation: crate::QuotaOperation,
+) -> Result<AuthorizedMutation<SendMessageAdmission>, A2AError> {
+    if let Some(quota) = current_quota_reservation() {
+        return Ok(AuthorizedMutation::with_quota(command, quota));
+    }
+    let Some(policy) = store.quota_policy_snapshot() else {
+        return Ok(AuthorizedMutation::without_quota(command));
+    };
+    let context =
+        current_authorization_context().ok_or_else(crate::quota::quota_authority_unavailable)?;
+    let subject = crate::QuotaSubject::new(
+        context.tenant_id(),
+        context.account_id(),
+        context.principal_scope(),
+    )
+    .map_err(|_| crate::quota::quota_authority_unavailable())?;
+    let input_bytes = u64::try_from(
+        serde_json::to_vec(&command.request)
+            .map_err(|_| A2AError::internal("failed to measure quota input"))?
+            .len(),
+    )
+    .map_err(|_| A2AError::invalid_request("quota input is too large"))?;
+    let semantic_id = command.request.message.message_id.clone();
+    let intent = policy
+        .operation_intent(&subject, operation, &semantic_id, input_bytes)
+        .map_err(|_| crate::quota::quota_authority_unavailable())?;
+    Ok(AuthorizedMutation::with_quota_intent(command, intent))
+}
+
+fn quota_operation_intent(
+    store: &dyn DurableAuthority,
+    context: &AuthorizationContext,
+    operation: crate::QuotaOperation,
+    semantic_id: &str,
+) -> Result<Option<crate::QuotaIntent>, A2AError> {
+    let Some(policy) = store.quota_policy_snapshot() else {
+        return Ok(None);
+    };
+    let subject = crate::QuotaSubject::new(
+        context.tenant_id(),
+        context.account_id(),
+        context.principal_scope(),
+    )
+    .map_err(|_| crate::quota::quota_authority_unavailable())?;
+    policy
+        .operation_intent(&subject, operation, semantic_id, 0)
+        .map(Some)
+        .map_err(|_| crate::quota::quota_authority_unavailable())
+}
+
+async fn charge_public_egress<T: serde::Serialize>(
+    store: &Arc<dyn DurableAuthority>,
+    context: Option<&AuthorizationContext>,
+    now: i64,
+    value: &T,
+    events: u64,
+) -> Result<(), A2AError> {
+    let Some(policy) = store.quota_policy_snapshot() else {
+        return Ok(());
+    };
+    let context = context.ok_or_else(crate::quota::quota_authority_unavailable)?;
+    let encoded = serde_json::to_vec(value)
+        .map_err(|_| A2AError::internal("failed to serialize public quota egress"))?;
+    let bytes = u64::try_from(encoded.len())
+        .map_err(|_| A2AError::invalid_request("public quota egress is too large"))?;
+    let subject = crate::QuotaSubject::new(
+        context.tenant_id(),
+        context.account_id(),
+        context.principal_scope(),
+    )
+    .map_err(|_| crate::quota::quota_authority_unavailable())?;
+    let entropy: [u8; 32] = rand::random();
+    let semantic_id = content_digest([encoded.as_slice(), &entropy].concat().as_slice());
+    let intent = policy
+        .egress_intent(&subject, &semantic_id, bytes, events)
+        .map_err(|_| crate::quota::quota_authority_unavailable())?;
+    tokio::time::timeout(
+        QUOTA_LEASE_CALL_TIMEOUT,
+        store.charge_quota_egress(&intent, now),
+    )
+    .await
+    .map_err(|_| crate::quota::quota_authority_unavailable())??;
+    Ok(())
+}
+
+const QUOTA_LEASE_DURATION_MILLIS: i64 = 30_000;
+const QUOTA_LEASE_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const QUOTA_LEASE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct QuotaLeaseGuard {
+    store: Arc<dyn DurableAuthority>,
+    lease: Mutex<crate::QuotaLease>,
+    clock: InjectedClock,
+}
+
+impl QuotaLeaseGuard {
+    async fn renew(&self, now: i64) -> Result<(), A2AError> {
+        let lease = self
+            .lease
+            .lock()
+            .map_err(|_| A2AError::internal("quota lease state failed"))?
+            .clone();
+        let outcome = tokio::time::timeout(
+            QUOTA_LEASE_CALL_TIMEOUT,
+            self.store
+                .renew_quota_lease(&lease, now, QUOTA_LEASE_DURATION_MILLIS),
+        )
+        .await
+        .map_err(|_| crate::quota::quota_authority_unavailable())??;
+        let crate::LeaseRenewalOutcome::Applied { lease_until } = outcome else {
+            return Err(crate::quota::quota_authority_unavailable());
+        };
+        self.lease
+            .lock()
+            .map_err(|_| A2AError::internal("quota lease state failed"))?
+            .lease_until = lease_until;
+        Ok(())
+    }
+}
+
+impl Drop for QuotaLeaseGuard {
+    fn drop(&mut self) {
+        let Ok(lease) = self.lease.lock().map(|lease| lease.clone()) else {
+            return;
+        };
+        let store = Arc::clone(&self.store);
+        let now = self.clock.now();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                QUOTA_LEASE_CALL_TIMEOUT,
+                store.release_quota_lease(&lease, now),
+            )
+            .await;
+        });
     }
 }
 
@@ -48,8 +181,11 @@ struct DurableStreamState {
     interruption: Option<String>,
     history_length: Option<i32>,
     emit_stream_errors: bool,
-    _authorization: Option<AuthorizationContext>,
+    authorization: Option<AuthorizationContext>,
     scope: Option<OwnedTaskScope>,
+    quota_lease: Option<Arc<QuotaLeaseGuard>>,
+    quota_renew_at: tokio::time::Instant,
+    clock: InjectedClock,
 }
 
 struct DurableTaskEventStreamState {
@@ -63,8 +199,11 @@ struct DurableTaskEventStreamState {
     pending: VecDeque<StreamResponse>,
     closed: bool,
     emit_stream_errors: bool,
-    _authorization: Option<AuthorizationContext>,
+    authorization: Option<AuthorizationContext>,
     scope: Option<OwnedTaskScope>,
+    quota_lease: Option<Arc<QuotaLeaseGuard>>,
+    quota_renew_at: tokio::time::Instant,
+    clock: InjectedClock,
 }
 
 pub(crate) struct DurableRequestHandler {
@@ -137,6 +276,52 @@ impl DurableRequestHandler {
             None,
             self.clock.now(),
         )
+    }
+
+    async fn acquire_quota_stream_lease(
+        &self,
+        context: Option<&AuthorizationContext>,
+        kind: crate::QuotaLeaseKind,
+        resource: &str,
+        reconnect: bool,
+    ) -> Result<Option<Arc<QuotaLeaseGuard>>, A2AError> {
+        let Some(policy) = self.store.quota_policy_snapshot() else {
+            return Ok(None);
+        };
+        let context = context.ok_or_else(crate::quota::quota_authority_unavailable)?;
+        let subject = crate::QuotaSubject::new(
+            context.tenant_id(),
+            context.account_id(),
+            context.principal_scope(),
+        )
+        .map_err(|_| crate::quota::quota_authority_unavailable())?;
+        let entropy: [u8; 32] = rand::random();
+        let semantic_id = content_digest(
+            [kind.as_str().as_bytes(), resource.as_bytes(), &entropy]
+                .concat()
+                .as_slice(),
+        );
+        let intent = policy
+            .lease_intent(&subject, kind, &semantic_id, reconnect)
+            .map_err(|_| crate::quota::quota_authority_unavailable())?;
+        let resource_digest = self.store.authorization_resource_digest(resource)?;
+        let lease = tokio::time::timeout(
+            QUOTA_LEASE_CALL_TIMEOUT,
+            self.store.acquire_quota_lease(
+                &intent,
+                kind,
+                &resource_digest,
+                self.clock.now(),
+                QUOTA_LEASE_DURATION_MILLIS,
+            ),
+        )
+        .await
+        .map_err(|_| crate::quota::quota_authority_unavailable())??;
+        Ok(Some(Arc::new(QuotaLeaseGuard {
+            store: Arc::clone(&self.store),
+            lease: Mutex::new(lease),
+            clock: self.clock.clone(),
+        })))
     }
 
     async fn audit_unsupported(
@@ -249,7 +434,12 @@ impl DurableRequestHandler {
         &self,
         error: A2AError,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        if self.errors_before_stream {
+        if self.errors_before_stream
+            || matches!(
+                error.code,
+                a2a::error_code::QUOTA_EXCEEDED | a2a::error_code::QUOTA_AUTHORITY_UNAVAILABLE
+            )
+        {
             Err(error)
         } else {
             Ok(Box::pin(stream::once(async move { Err(error) })))
@@ -395,6 +585,7 @@ impl DurableRequestHandler {
         pending: VecDeque<StreamResponse>,
         history_length: Option<i32>,
         authorization: Option<(AuthorizationContext, OwnedTaskScope)>,
+        quota_lease: Option<Arc<QuotaLeaseGuard>>,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let (context, scope) = authorization.unzip();
         let state = DurableStreamState {
@@ -411,15 +602,39 @@ impl DurableRequestHandler {
             interruption: None,
             history_length,
             emit_stream_errors: !self.errors_before_stream,
-            _authorization: context,
+            authorization: context,
             scope,
+            quota_lease,
+            quota_renew_at: tokio::time::Instant::now() + QUOTA_LEASE_RENEW_INTERVAL,
+            clock: self.clock.clone(),
         };
         Box::pin(stream::unfold(state, |mut state| async move {
             loop {
+                if tokio::time::Instant::now() >= state.quota_renew_at {
+                    if let Some(lease) = state.quota_lease.as_ref()
+                        && let Err(error) = lease.renew(state.clock.now()).await
+                    {
+                        state.finished = true;
+                        return Some((Err(error), state));
+                    }
+                    state.quota_renew_at = tokio::time::Instant::now() + QUOTA_LEASE_RENEW_INTERVAL;
+                }
                 if state.finished {
                     return None;
                 }
                 if let Some(frame) = state.pending.pop_front() {
+                    if let Err(error) = charge_public_egress(
+                        &state.store,
+                        state.authorization.as_ref(),
+                        state.clock.now(),
+                        &frame,
+                        1,
+                    )
+                    .await
+                    {
+                        state.finished = true;
+                        return Some((Err(error), state));
+                    }
                     state.last_sequence += 1;
                     return Some((Ok(frame), state));
                 }
@@ -500,11 +715,13 @@ impl DurableRequestHandler {
         }))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn stream_from_task_revision(
         &self,
         task_id: String,
         last_revision: u64,
         authorization: Option<(AuthorizationContext, OwnedTaskScope)>,
+        quota_lease: Option<Arc<QuotaLeaseGuard>>,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let (context, scope) = authorization.unzip();
         let state = DurableTaskEventStreamState {
@@ -518,12 +735,36 @@ impl DurableRequestHandler {
             pending: VecDeque::new(),
             closed: false,
             emit_stream_errors: !self.errors_before_stream,
-            _authorization: context,
+            authorization: context,
             scope,
+            quota_lease,
+            quota_renew_at: tokio::time::Instant::now() + QUOTA_LEASE_RENEW_INTERVAL,
+            clock: self.clock.clone(),
         };
         Box::pin(stream::unfold(state, |mut state| async move {
             loop {
+                if tokio::time::Instant::now() >= state.quota_renew_at {
+                    if let Some(lease) = state.quota_lease.as_ref()
+                        && let Err(error) = lease.renew(state.clock.now()).await
+                    {
+                        state.closed = true;
+                        return Some((Err(error), state));
+                    }
+                    state.quota_renew_at = tokio::time::Instant::now() + QUOTA_LEASE_RENEW_INTERVAL;
+                }
                 if let Some(frame) = state.pending.pop_front() {
+                    if let Err(error) = charge_public_egress(
+                        &state.store,
+                        state.authorization.as_ref(),
+                        state.clock.now(),
+                        &frame,
+                        1,
+                    )
+                    .await
+                    {
+                        state.closed = true;
+                        return Some((Err(error), state));
+                    }
                     return Some((Ok(frame), state));
                 }
                 if state.closed {
@@ -686,16 +927,34 @@ impl RequestHandler for DurableRequestHandler {
                     || matches!(task.status.state, TaskState::InputRequired | TaskState::AuthRequired))
                 || return_immediately
             {
-                return Ok(project_send_response(replay, history_length));
+                let response = project_send_response(replay, history_length);
+                charge_public_egress(
+                    &self.store,
+                    authorization.as_ref().map(|(context, _)| context),
+                    self.clock.now(),
+                    &response,
+                    1,
+                )
+                .await?;
+                return Ok(response);
             }
             self.driver.wake.notify_one();
-            return self
+            let response = self
                 .wait_for_result(
                     &durable_message_id,
                     authorization.as_ref().map(|(_, scope)| scope),
                 )
                 .await
-                .map(|result| project_send_response(result, history_length));
+                .map(|result| project_send_response(result, history_length))?;
+            charge_public_egress(
+                &self.store,
+                authorization.as_ref().map(|(context, _)| context),
+                self.clock.now(),
+                &response,
+                1,
+            )
+            .await?;
+            return Ok(response);
         }
         let admission = if let Some(task) = continuation_task {
             let command = SendMessageAdmission {
@@ -711,7 +970,11 @@ impl RequestHandler for DurableRequestHandler {
                 self.store
                     .authorize_and_continue_mutation(
                         scope,
-                        authorized_mutation(command),
+                        authorized_mutation(
+                            self.store.as_ref(),
+                            command,
+                            crate::QuotaOperation::TaskContinue,
+                        )?,
                         self.audit(context, Operation::TaskContinue, "task", &task.id)?,
                     )
                     .await?
@@ -733,7 +996,11 @@ impl RequestHandler for DurableRequestHandler {
                 self.store
                     .authorize_and_admit_mutation(
                         scope,
-                        authorized_mutation(command),
+                        authorized_mutation(
+                            self.store.as_ref(),
+                            command,
+                            crate::QuotaOperation::TaskCreate,
+                        )?,
                         self.audit(
                             context,
                             Operation::TaskCreate,
@@ -746,9 +1013,9 @@ impl RequestHandler for DurableRequestHandler {
                 self.local()?.admit(command).await?
             }
         };
-        match admission {
+        let response = match admission {
             AdmissionOutcome::Replay(result) if matches!(&result, SendMessageResponse::Task(task) if task.status.state.is_terminal()) => {
-                Ok(project_send_response(result, history_length))
+                project_send_response(result, history_length)
             }
             AdmissionOutcome::Admitted(_) if return_immediately => {
                 let admitted = if let Some((context, scope)) = authorization.as_ref() {
@@ -766,11 +1033,11 @@ impl RequestHandler for DurableRequestHandler {
                 }
                 .ok_or_else(|| A2AError::internal("admitted result is missing"))?;
                 self.driver.wake.notify_one();
-                Ok(project_send_response(admitted, history_length))
+                project_send_response(admitted, history_length)
             }
             AdmissionOutcome::Replay(result) if return_immediately => {
                 self.driver.wake.notify_one();
-                Ok(project_send_response(result, history_length))
+                project_send_response(result, history_length)
             }
             AdmissionOutcome::Admitted(_) | AdmissionOutcome::Replay(_) => {
                 self.driver.wake.notify_one();
@@ -779,9 +1046,18 @@ impl RequestHandler for DurableRequestHandler {
                     authorization.as_ref().map(|(_, scope)| scope),
                 )
                 .await
-                .map(|result| project_send_response(result, history_length))
+                .map(|result| project_send_response(result, history_length))?
             }
-        }
+        };
+        charge_public_egress(
+            &self.store,
+            authorization.as_ref().map(|(context, _)| context),
+            self.clock.now(),
+            &response,
+            1,
+        )
+        .await?;
+        Ok(response)
     }
 
     async fn send_streaming_message(
@@ -831,7 +1107,7 @@ impl RequestHandler for DurableRequestHandler {
                 self.local()?.replay(&request, true).await?
             };
             if replay.is_some() {
-                return Ok::<_, A2AError>(request.message.message_id.clone());
+                return Ok::<_, A2AError>((request.message.message_id.clone(), true));
             }
             let task = if let Some(task) = continuation_task {
                 task
@@ -847,23 +1123,31 @@ impl RequestHandler for DurableRequestHandler {
                 now: self.clock.now(),
                 max_attempts: 8,
             };
-            if request.message.task_id.is_some() {
+            let outcome = if request.message.task_id.is_some() {
                 if let Some((context, scope)) = authorization.as_ref() {
                     self.store
                         .authorize_and_continue_mutation(
                             scope,
-                            authorized_mutation(command),
+                            authorized_mutation(
+                                self.store.as_ref(),
+                                command,
+                                crate::QuotaOperation::TaskContinue,
+                            )?,
                             self.audit(context, Operation::TaskContinue, "task", &task.id)?,
                         )
-                        .await?;
+                        .await?
                 } else {
-                    self.local()?.continue_task(command).await?;
+                    self.local()?.continue_task(command).await?
                 }
             } else if let Some((context, scope)) = authorization.as_ref() {
                 self.store
                     .authorize_and_admit_mutation(
                         scope,
-                        authorized_mutation(command),
+                        authorized_mutation(
+                            self.store.as_ref(),
+                            command,
+                            crate::QuotaOperation::SendStream,
+                        )?,
                         self.audit(
                             context,
                             Operation::TaskCreate,
@@ -871,15 +1155,18 @@ impl RequestHandler for DurableRequestHandler {
                             &request.message.message_id,
                         )?,
                     )
-                    .await?;
+                    .await?
             } else {
-                self.local()?.admit(command).await?;
-            }
-            Ok::<_, A2AError>(request.message.message_id.clone())
+                self.local()?.admit(command).await?
+            };
+            Ok::<_, A2AError>((
+                request.message.message_id.clone(),
+                matches!(outcome, AdmissionOutcome::Replay(_)),
+            ))
         }
         .await;
-        let message_id = match admitted {
-            Ok(message_id) => message_id,
+        let (message_id, reconnect) = match admitted {
+            Ok(value) => value,
             Err(error) => return self.preflight_stream_error(error),
         };
         let message_id = authorization
@@ -891,7 +1178,20 @@ impl RequestHandler for DurableRequestHandler {
                     &message_id,
                 )
             });
-        // SQLite is authoritative; this only shortens the driver's idle path.
+        let quota_lease = match self
+            .acquire_quota_stream_lease(
+                authorization.as_ref().map(|(context, _)| context),
+                crate::QuotaLeaseKind::MessageStream,
+                &message_id,
+                reconnect,
+            )
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => return self.preflight_stream_error(error),
+        };
+        // The durable slot is acquired before the stream is returned to the
+        // transport, so REST cannot establish SSE headers on a denied lease.
         self.driver.wake.notify_one();
         let history_length = request
             .configuration
@@ -903,6 +1203,7 @@ impl RequestHandler for DurableRequestHandler {
             VecDeque::new(),
             history_length,
             authorization,
+            quota_lease,
         ))
     }
 
@@ -927,12 +1228,15 @@ impl RequestHandler for DurableRequestHandler {
                 .await?;
         }
         let task = if let Some((context, scope)) = authorization.as_ref() {
+            let audit = self.audit(context, Operation::TaskGet, "task", &request.id)?;
+            let quota_intent = quota_operation_intent(
+                self.store.as_ref(),
+                context,
+                crate::QuotaOperation::TaskGet,
+                audit.decision_id(),
+            )?;
             self.store
-                .get_authorized(
-                    scope,
-                    &request.id,
-                    self.audit(context, Operation::TaskGet, "task", &request.id)?,
-                )
+                .get_authorized_with_quota(scope, &request.id, audit, quota_intent.as_ref())
                 .await?
         } else {
             self.local()?.get(&request.id).await?
@@ -952,7 +1256,16 @@ impl RequestHandler for DurableRequestHandler {
             self.audit_unsupported(Operation::ArtifactRead, "task", &request.id)
                 .await?;
         }
-        Ok(project_task(task, request.history_length))
+        let task = project_task(task, request.history_length);
+        charge_public_egress(
+            &self.store,
+            authorization.as_ref().map(|(context, _)| context),
+            self.clock.now(),
+            &task,
+            1,
+        )
+        .await?;
+        Ok(task)
     }
 
     async fn list_tasks(
@@ -974,7 +1287,7 @@ impl RequestHandler for DurableRequestHandler {
             self.audit_unsupported(Operation::ArtifactRead, "task-list", "visible-set")
                 .await?;
         }
-        if let Some((context, scope)) = authorization.as_ref() {
+        let response = if let Some((context, scope)) = authorization.as_ref() {
             let visibility = match scope.visibility() {
                 crate::VisibilityScope::Own => "own",
                 crate::VisibilityScope::Tenant => "tenant",
@@ -992,17 +1305,36 @@ impl RequestHandler for DurableRequestHandler {
                 )
                 .as_bytes(),
             );
+            let audit = self.audit(context, Operation::TaskList, "task-list", "visible-set")?;
+            let quota_intent = quota_operation_intent(
+                self.store.as_ref(),
+                context,
+                crate::QuotaOperation::TaskList,
+                audit.decision_id(),
+            )?;
             self.store
-                .list_authorized(
+                .list_authorized_with_quota(
                     scope,
                     &request,
-                    self.audit(context, Operation::TaskList, "task-list", "visible-set")?,
+                    audit,
                     &cursor_scope,
+                    quota_intent.as_ref(),
                 )
                 .await
         } else {
             self.local()?.list(&request).await
-        }
+        }?;
+        charge_public_egress(
+            &self.store,
+            authorization.as_ref().map(|(context, _)| context),
+            self.clock.now(),
+            &response,
+            u64::try_from(response.tasks.len())
+                .unwrap_or(u64::MAX)
+                .max(1),
+        )
+        .await?;
+        Ok(response)
     }
 
     async fn cancel_task(
@@ -1018,36 +1350,47 @@ impl RequestHandler for DurableRequestHandler {
                 "tenant is not supported by the single-tenant gateway",
             ));
         }
-        if let Some((context, scope)) = authorization.as_ref()
-            && self
-                .store
-                .get_authorized(
-                    scope,
-                    &request.id,
-                    self.audit(context, Operation::TaskCancel, "task", &request.id)?,
-                )
-                .await?
-                .is_none()
-        {
-            return Err(A2AError::task_not_found("resource"));
-        }
         let outcome = if let Some((context, scope)) = authorization.as_ref() {
-            self.store
+            let audit = self.audit(context, Operation::TaskCancel, "task", &request.id)?;
+            let quota_intent = quota_operation_intent(
+                self.store.as_ref(),
+                context,
+                crate::QuotaOperation::TaskCancel,
+                audit.decision_id(),
+            )?;
+            let quota_reservation = current_quota_reservation();
+            let outcome = self
+                .store
                 .cancel_authorized_with_quota(
                     scope,
                     &request.id,
                     self.clock.now(),
-                    self.audit(context, Operation::TaskCancel, "task", &request.id)?,
-                    current_quota_reservation().as_ref(),
+                    audit.clone(),
+                    quota_reservation.as_ref(),
+                    quota_intent.as_ref(),
                 )
-                .await?
+                .await;
+            match outcome {
+                Ok(outcome) => outcome,
+                Err(error) if error.code == -32_001 => {
+                    self.store
+                        .append_authorization_decision(audit.decided(
+                            AuthorizationDecisionEffect::Allow,
+                            "resource_not_found",
+                            None,
+                        ))
+                        .await?;
+                    return Err(A2AError::task_not_found("resource"));
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             self.local()?.cancel(&request.id, self.clock.now()).await?
         };
-        match outcome {
+        let task = match outcome {
             CancellationOutcome::Canceled(task) => {
                 self.driver.changed();
-                Ok(task)
+                task
             }
             CancellationOutcome::AwaitReceiver {
                 dispatch_id,
@@ -1060,9 +1403,18 @@ impl RequestHandler for DurableRequestHandler {
                 let SendMessageResponse::Task(task) = result else {
                     return Err(A2AError::invalid_agent_response());
                 };
-                Ok(task)
+                task
             }
-        }
+        };
+        charge_public_egress(
+            &self.store,
+            authorization.as_ref().map(|(context, _)| context),
+            self.clock.now(),
+            &task,
+            1,
+        )
+        .await?;
+        Ok(task)
     }
 
     async fn subscribe_to_task(
@@ -1077,26 +1429,21 @@ impl RequestHandler for DurableRequestHandler {
             Ok(value) => value,
             Err(error) => return Err(error),
         };
+        self.ensure_driver_healthy()?;
+        if request.tenant.is_some() {
+            return Err(A2AError::invalid_params(
+                "tenant is not supported by the single-tenant gateway",
+            ));
+        }
+        let quota_lease = self
+            .acquire_quota_stream_lease(
+                authorization.as_ref().map(|(context, _)| context),
+                crate::QuotaLeaseKind::TaskSubscription,
+                &request.id,
+                false,
+            )
+            .await?;
         let captured = async {
-            self.ensure_driver_healthy()?;
-            if request.tenant.is_some() {
-                return Err(A2AError::invalid_params(
-                    "tenant is not supported by the single-tenant gateway",
-                ));
-            }
-            if let Some((context, scope)) = authorization.as_ref()
-                && self
-                    .store
-                    .get_authorized(
-                        scope,
-                        &request.id,
-                        self.audit(context, Operation::TaskSubscribe, "task", &request.id)?,
-                    )
-                    .await?
-                    .is_none()
-            {
-                return Err(A2AError::task_not_found("resource"));
-            }
             let snapshot = if let Some((_, scope)) = authorization.as_ref() {
                 self.store
                     .subscription_snapshot_authorized(scope, &request.id)
@@ -1123,6 +1470,14 @@ impl RequestHandler for DurableRequestHandler {
             Ok(captured) => captured,
             Err(error) => return Err(error),
         };
+        charge_public_egress(
+            &self.store,
+            authorization.as_ref().map(|(context, _)| context),
+            self.clock.now(),
+            &StreamResponse::Task(snapshot.clone()),
+            1,
+        )
+        .await?;
         let tail = match cursor {
             SubscriptionCursor::Transcript { message_id, cursor } => self.stream_from_message(
                 message_id,
@@ -1130,10 +1485,14 @@ impl RequestHandler for DurableRequestHandler {
                 VecDeque::new(),
                 None,
                 authorization.clone(),
+                quota_lease,
             ),
-            SubscriptionCursor::TaskRevision(revision) => {
-                self.stream_from_task_revision(request.id, revision, authorization.clone())
-            }
+            SubscriptionCursor::TaskRevision(revision) => self.stream_from_task_revision(
+                request.id,
+                revision,
+                authorization.clone(),
+                quota_lease,
+            ),
         };
         Ok(Box::pin(
             stream::once(async move { Ok(StreamResponse::Task(snapshot)) }).chain(tail),
