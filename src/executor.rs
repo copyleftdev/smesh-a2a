@@ -64,31 +64,19 @@ impl EventBudget {
             ));
         }
 
-        let bytes = match event {
-            MeshEvent::Progress(text) | MeshEvent::Completed { summary: text } => text.len(),
-            MeshEvent::Evidence(evidence) => serde_json::to_vec(evidence)
-                .map_err(|error| {
-                    crate::DispatchError::Message(format!(
-                        "SMESH evidence serialization failed: {error}"
-                    ))
-                })?
-                .len(),
-            MeshEvent::Artifact {
-                name,
-                media_type,
-                content,
-            } => {
-                self.artifacts = self.artifacts.saturating_add(1);
-                if self.artifacts > limits.max_artifacts {
-                    return Err(crate::DispatchError::Message(
-                        "SMESH worker exceeded artifact budget".to_owned(),
-                    ));
-                }
-                name.len()
-                    .saturating_add(media_type.len())
-                    .saturating_add(content.len())
+        if matches!(event, MeshEvent::Artifact { .. }) {
+            self.artifacts = self.artifacts.saturating_add(1);
+            if self.artifacts > limits.max_artifacts {
+                return Err(crate::DispatchError::Message(
+                    "SMESH worker exceeded artifact budget".to_owned(),
+                ));
             }
-        };
+        }
+        let bytes = serde_json::to_vec(event)
+            .map_err(|error| {
+                crate::DispatchError::Message(format!("SMESH event serialization failed: {error}"))
+            })?
+            .len();
         self.output_bytes = self.output_bytes.saturating_add(bytes);
         if self.output_bytes > limits.max_output_bytes {
             return Err(crate::DispatchError::Message(
@@ -208,7 +196,9 @@ where
         // The upstream A2A handler uses a 32-event broadcast buffer. Keep the
         // producer budget below that ceiling so a burst cannot outrun a newly
         // attached subscriber before backpressure begins.
-        limits.max_events = limits.max_events.clamp(1, 16);
+        if limits.max_events > 16 {
+            limits.max_events = 16;
+        }
         self.permits = Arc::new(tokio::sync::Semaphore::new(
             limits.max_concurrent_tasks.max(1),
         ));
@@ -366,13 +356,21 @@ where
         let _signal = request.to_signal(&self.gateway_node_id);
         let task_id = ctx.task_id;
         let context_id = ctx.context_id;
+        let Ok(execution_budget) = crate::ExecutionBudget::new(
+            u64::try_from(self.execution_limits.max_output_bytes).unwrap_or(u64::MAX),
+            u64::try_from(self.execution_limits.max_events.clamp(1, 16)).unwrap_or(16),
+        ) else {
+            return Box::pin(stream::once(async {
+                Err(A2AError::internal("invalid trusted execution budget"))
+            }));
+        };
         let control = Arc::new(ExecutionControl::new());
         let cancellation = control.cancellation.clone();
         self.cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(task_id.clone(), Arc::clone(&control));
-        let mut mesh_stream = self.dispatcher.dispatch(request);
+        let mut mesh_stream = self.dispatcher.dispatch_bounded(request, execution_budget);
         let cancellations = Arc::clone(&self.cancellations);
         let execution_limits = self.execution_limits;
         let completion_policy = Arc::clone(&self.completion_policy);

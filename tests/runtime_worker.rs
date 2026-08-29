@@ -13,9 +13,9 @@ use a2a_server::{AgentExecutor, ExecutorContext};
 use async_trait::async_trait;
 use futures::StreamExt;
 use smesh_a2a::{
-    DispatchError, GatewayConfig, InputLimits, MeshDispatcher, MeshEvent, MeshRequest,
-    RuntimeAdmissionProcessor, RuntimeEventSink, RuntimeTask, RuntimeTaskProcessor, RuntimeWorker,
-    RuntimeWorkerConfig, SmeshExecutor, build_router,
+    DispatchError, ExecutionBudget, GatewayConfig, InputLimits, MeshDispatcher, MeshEvent,
+    MeshRequest, RuntimeAdmissionProcessor, RuntimeEventSink, RuntimeTask, RuntimeTaskProcessor,
+    RuntimeWorker, RuntimeWorkerConfig, SmeshExecutor, build_router,
 };
 use smesh_core::{Network, Node, SignalType};
 use smesh_runtime::{MeshConfig, RuntimeConfig, SmeshRuntime};
@@ -33,6 +33,31 @@ fn runtime_named(name: &str) -> Arc<SmeshRuntime> {
 
 fn runtime() -> Arc<SmeshRuntime> {
     runtime_named("runtime-node")
+}
+
+#[tokio::test]
+async fn undersized_runtime_budget_is_observed_on_the_event_stream() {
+    let runtime = runtime();
+    let (dispatcher, worker) =
+        RuntimeWorker::spawn(runtime, "runtime-node", RuntimeAdmissionProcessor, 1)
+            .await
+            .unwrap();
+    let request = MeshRequest {
+        protocol: "a2a-v1".to_owned(),
+        task_id: "tiny-budget".to_owned(),
+        context_id: "tiny-budget-context".to_owned(),
+        text: "tiny".to_owned(),
+    };
+    let events = dispatcher
+        .dispatch_bounded(request, ExecutionBudget::new(1, 1).unwrap())
+        .collect::<Vec<_>>()
+        .await;
+    assert!(matches!(
+        events.as_slice(),
+        [Err(DispatchError::Message(message))]
+            if message == "runtime reserved execution budget is too small"
+    ));
+    worker.shutdown().await.unwrap();
 }
 
 #[tokio::test]

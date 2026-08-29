@@ -64,6 +64,10 @@ proptest = "1"
 tower = { version = "0.5", features = ["util"] }
 wait-timeout = "0.2"
 
+[patch.crates-io]
+a2a-lf = { path = "vendor/a2a-lf" }
+a2a-server-lf = { path = "vendor/a2a-server-lf" }
+
 [lints.rust]
 unsafe_code = "forbid"
 

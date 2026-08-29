@@ -113,8 +113,9 @@ jobs:
           SQL
           PGPASSWORD=smesh-ci-migrator psql -h 127.0.0.1 -p 55432 -U smesh_migrator -d smesh_test -c 'SELECT current_user'
           PGPASSWORD=smesh-ci-runtime psql -h 127.0.0.1 -p 55432 -U smesh_test_runtime -d smesh_test -c 'SELECT current_user'
-      - name: PostgreSQL schema-v6 conformance and independent-process failover
+      - name: PostgreSQL schema-v6 conformance, quota abuse matrix, and failover
         run: |
           timeout --signal=TERM --kill-after=15s 15m cargo test --locked --test postgres_store -- --test-threads=1
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test postgres_multi_replica -- --test-threads=1
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test authorized_gateway_process production_binary_selects_postgres_and_replays_after_graceful_restart -- --exact --test-threads=1
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test postgres_quota_process -- --test-threads=1

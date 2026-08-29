@@ -180,6 +180,7 @@ fn outbox_lease() -> OutboxLease {
             context_id: "context-conformance".to_owned(),
             text: "work-conformance".to_owned(),
         },
+        execution_reservation: None,
     }
 }
 
@@ -195,6 +196,7 @@ fn receiver_lease() -> ReceiverLease {
         lease_token: "receiver-fence-conformance".to_owned(),
         lease_epoch: 3,
         lease_until: NOW + 700,
+        execution_reservation: None,
     }
 }
 
@@ -376,6 +378,7 @@ async fn run_durable_authority_command_conformance_inner(
             dispatch_id: lease.dispatch_id.clone(),
             payload_digest: content_digest(&payload),
             request: lease.request.clone(),
+            execution_reservation: lease.execution_reservation.clone(),
         };
         let receiver = authority
             .begin_receive(envelope, "receiver-conformance", NOW, 700)
@@ -650,6 +653,7 @@ async fn run_continuation_cancellation_conformance_inner(
         dispatch_id: lease.dispatch_id.clone(),
         payload_digest: content_digest(&payload),
         request: lease.request.clone(),
+        execution_reservation: lease.execution_reservation.clone(),
     };
     let ReceiverAdmission::Execute(receiver) = authority
         .begin_receive(envelope, "cc-receiver", NOW, 700)
@@ -762,6 +766,7 @@ async fn run_continuation_cancellation_conformance_inner(
                     AuthorizationDecisionEffect::Allow,
                 ),
                 Some(&reservation),
+                None,
             )
             .await
     } else {
@@ -843,6 +848,8 @@ impl RecordingAuthority {
         }
     }
 }
+
+impl smesh_a2a::QuotaLeaseAuthority for RecordingAuthority {}
 
 impl AuthorityIdentity for RecordingAuthority {
     fn capabilities(&self) -> AuthorityCapabilities {

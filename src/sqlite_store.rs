@@ -1740,6 +1740,7 @@ impl SqliteTaskStore {
                         lease_token,
                         lease_until,
                         request,
+                        execution_reservation: None,
                     }));
                 }
                 let error = "final outbox attempt lease expired before receiver acceptance";
@@ -1858,6 +1859,7 @@ impl SqliteTaskStore {
                 lease_token,
                 lease_until,
                 request,
+                execution_reservation: None,
             }))
         })
         .await
@@ -3055,6 +3057,7 @@ impl SqliteTaskStore {
                     lease_epoch: u64::try_from(next_epoch)
                         .map_err(|_| A2AError::internal("receiver lease epoch is corrupt"))?,
                     lease_until,
+                    execution_reservation: None,
                 }));
             }
             let lease_until = now
@@ -3105,6 +3108,7 @@ impl SqliteTaskStore {
                 lease_token: token,
                 lease_epoch: 1,
                 lease_until,
+                execution_reservation: None,
             }))
         })
         .await
@@ -7236,6 +7240,8 @@ impl crate::IntoDurableAuthority for SqliteTaskStore {
     }
 }
 
+impl crate::QuotaLeaseAuthority for SqliteTaskStore {}
+
 impl crate::AuthorityIdentity for SqliteTaskStore {
     fn capabilities(&self) -> crate::AuthorityCapabilities {
         crate::AuthorityCapabilities {
@@ -7336,8 +7342,8 @@ impl crate::TaskAdmission for SqliteTaskStore {
         mutation: crate::AuthorizedMutation<SendMessageAdmission>,
         audit: AuthorizationAuditInput,
     ) -> Result<AdmissionOutcome, A2AError> {
-        let (command, quota) = mutation.into_parts();
-        if quota.is_some() {
+        let (command, quota, intent) = mutation.into_authority_parts();
+        if quota.is_some() || intent.is_some() {
             return Err(A2AError::unsupported_operation(
                 "quota reservations are unsupported by SQLite",
             ));
@@ -7351,8 +7357,8 @@ impl crate::TaskAdmission for SqliteTaskStore {
         mutation: crate::AuthorizedMutation<SendMessageAdmission>,
         audit: AuthorizationAuditInput,
     ) -> Result<AdmissionOutcome, A2AError> {
-        let (command, quota) = mutation.into_parts();
-        if quota.is_some() {
+        let (command, quota, intent) = mutation.into_authority_parts();
+        if quota.is_some() || intent.is_some() {
             return Err(A2AError::unsupported_operation(
                 "quota reservations are unsupported by SQLite",
             ));
@@ -7391,8 +7397,9 @@ impl crate::CancellationAuthority for SqliteTaskStore {
         now: i64,
         audit: AuthorizationAuditInput,
         quota: Option<&crate::QuotaReservationInput>,
+        quota_intent: Option<&crate::QuotaIntent>,
     ) -> Result<CancellationOutcome, A2AError> {
-        if quota.is_some() {
+        if quota.is_some() || quota_intent.is_some() {
             return Err(A2AError::unsupported_operation(
                 "quota reservations are unsupported by SQLite",
             ));

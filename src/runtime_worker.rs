@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -8,7 +8,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ChannelDispatcher, DispatchCommand, DispatchError, MeshEvent, MeshRequest};
+use crate::{
+    ChannelDispatcher, DispatchCommand, DispatchError, ExecutionBudget, MeshEvent, MeshRequest,
+};
 
 const PROCESSOR_CANCEL_GRACE: Duration = Duration::from_secs(1);
 const MAX_PROCESSOR_CANCEL_GRACE: Duration = Duration::from_secs(1);
@@ -25,6 +27,8 @@ pub struct RuntimeTask {
 pub struct RuntimeEventSink {
     events: mpsc::Sender<Result<MeshEvent, DispatchError>>,
     cancellation: CancellationToken,
+    budget: ExecutionBudget,
+    usage: Arc<Mutex<(u64, u64)>>,
 }
 
 impl RuntimeEventSink {
@@ -32,36 +36,29 @@ impl RuntimeEventSink {
     ///
     /// # Errors
     ///
-    /// Returns an error after cancellation or when the gateway receiver closes.
+    /// Returns an error when the execution was canceled, its output budget is exhausted,
+    /// or the bounded event channel is unavailable.
     pub async fn progress(&self, text: impl Into<String>) -> Result<(), DispatchError> {
-        send_event(
-            &self.events,
-            &self.cancellation,
-            MeshEvent::Progress(text.into()),
-        )
-        .await
+        self.emit(MeshEvent::Progress(text.into())).await
     }
 
     /// Submit one private candidate artifact.
     ///
     /// # Errors
     ///
-    /// Returns an error after cancellation or when the gateway receiver closes.
+    /// Returns an error when the execution was canceled, its output budget is exhausted,
+    /// or the bounded event channel is unavailable.
     pub async fn artifact(
         &self,
         name: impl Into<String>,
         media_type: impl Into<String>,
         content: impl Into<String>,
     ) -> Result<(), DispatchError> {
-        send_event(
-            &self.events,
-            &self.cancellation,
-            MeshEvent::Artifact {
-                name: name.into(),
-                media_type: media_type.into(),
-                content: content.into(),
-            },
-        )
+        self.emit(MeshEvent::Artifact {
+            name: name.into(),
+            media_type: media_type.into(),
+            content: content.into(),
+        })
         .await
     }
 
@@ -69,19 +66,48 @@ impl RuntimeEventSink {
     ///
     /// # Errors
     ///
-    /// Returns an error after cancellation or when the gateway receiver closes.
+    /// Returns an error when the execution was canceled, its output budget is exhausted,
+    /// or the bounded event channel is unavailable.
     pub async fn propose_completion(
         &self,
         summary: impl Into<String>,
     ) -> Result<(), DispatchError> {
-        send_event(
-            &self.events,
-            &self.cancellation,
-            MeshEvent::Completed {
-                summary: summary.into(),
-            },
-        )
+        self.emit(MeshEvent::Completed {
+            summary: summary.into(),
+        })
         .await
+    }
+
+    async fn emit(&self, event: MeshEvent) -> Result<(), DispatchError> {
+        let bytes = u64::try_from(
+            serde_json::to_vec(&event)
+                .map_err(|_| DispatchError::message("runtime event serialization failed"))?
+                .len(),
+        )
+        .map_err(|_| DispatchError::message("runtime event serialization overflow"))?;
+        {
+            let mut usage = self
+                .usage
+                .lock()
+                .map_err(|_| DispatchError::message("runtime execution budget lock failed"))?;
+            let next_events = usage
+                .0
+                .checked_add(1)
+                .ok_or_else(|| DispatchError::message("runtime event budget overflow"))?;
+            let next_bytes = usage
+                .1
+                .checked_add(bytes)
+                .ok_or_else(|| DispatchError::message("runtime output budget overflow"))?;
+            if next_events > self.budget.max_event_count()
+                || next_bytes > self.budget.max_output_bytes()
+            {
+                return Err(DispatchError::message(
+                    "runtime exceeded reserved execution budget",
+                ));
+            }
+            *usage = (next_events, next_bytes);
+        }
+        send_event(&self.events, &self.cancellation, event).await
     }
 }
 
@@ -337,7 +363,7 @@ async fn run_worker(
             command = commands.recv() => {
                 let Some(command) = command else { break; };
                 match command {
-                    DispatchCommand::Execute { request, signal, events } => {
+                    DispatchCommand::Execute { request, budget, signal, events } => {
                         if active.contains_key(&request.task_id)
                             || cancelling.contains(&request.task_id)
                         {
@@ -359,6 +385,7 @@ async fn run_worker(
                             node_id.clone(),
                             Arc::clone(&processor),
                             request,
+                            budget,
                             *signal,
                             cancellation.clone(),
                             events,
@@ -447,15 +474,33 @@ async fn reap_canceled_task(
     task_id
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_task(
     runtime: Arc<SmeshRuntime>,
     node_id: String,
     processor: Arc<dyn RuntimeTaskProcessor>,
     request: MeshRequest,
+    budget: ExecutionBudget,
     signal: smesh_core::Signal,
     cancellation: CancellationToken,
     events: mpsc::Sender<Result<MeshEvent, DispatchError>>,
 ) -> Result<(), DispatchError> {
+    let ingress_progress = MeshEvent::Progress("SMESH runtime retained the query".to_owned());
+    let ingress_progress_bytes = u64::try_from(
+        serde_json::to_vec(&ingress_progress)
+            .map_err(|_| DispatchError::message("runtime event serialization failed"))?
+            .len(),
+    )
+    .map_err(|_| DispatchError::message("runtime event serialization overflow"))?;
+    if budget.max_event_count() < 1 || budget.max_output_bytes() < ingress_progress_bytes {
+        let _ = send_dispatch_error(
+            &events,
+            &cancellation,
+            DispatchError::message("runtime reserved execution budget is too small"),
+        )
+        .await;
+        return Ok(());
+    }
     let emitted = tokio::select! {
         () = cancellation.cancelled() => return Ok(()),
         emitted = runtime.emit(signal, &node_id) => emitted,
@@ -466,13 +511,9 @@ async fn run_task(
         )));
         return Ok(());
     };
-    if send_event(
-        &events,
-        &cancellation,
-        MeshEvent::Progress("SMESH runtime retained the query".to_owned()),
-    )
-    .await
-    .is_err()
+    if send_event(&events, &cancellation, ingress_progress)
+        .await
+        .is_err()
     {
         return Ok(());
     }
@@ -484,6 +525,8 @@ async fn run_task(
     let sink = RuntimeEventSink {
         events: events.clone(),
         cancellation: cancellation.clone(),
+        budget,
+        usage: Arc::new(Mutex::new((1, ingress_progress_bytes))),
     };
     match processor.process(task, cancellation.clone(), sink).await {
         Ok(()) => Ok(()),

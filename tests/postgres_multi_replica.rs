@@ -505,6 +505,7 @@ async fn two_independent_postgres_gateway_processes_share_authority_and_survive_
         lease_token: row.get(6),
         lease_epoch: u64::try_from(row.get::<_, i64>(7)).unwrap(),
         lease_until: row.get(8),
+        execution_reservation: None,
     };
     assert!(
         stale_receiver
@@ -657,6 +658,20 @@ async fn two_independent_postgres_gateway_processes_share_authority_and_survive_
             .or_else(|| shutdown_replay["result"]["id"].as_str()),
         Some(shutdown_task.as_str())
     );
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let task = json(client.get(format!(
+                "http://127.0.0.1:{}/rest/tasks/{shutdown_task}",
+                shutdown_recovery.port
+            )))
+            .await;
+            if task["status"]["state"] == "TASK_STATE_COMPLETED" {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("shutdown recovery must finish before the outage scenario");
     shutdown_subscriber.command("STOP", "STOPPED shutdown-subscriber");
     shutdown_subscriber.kill_and_reap();
     shutdown_recovery.command("STOP", "STOPPED shutdown-recovery");

@@ -493,6 +493,13 @@ async fn production_binary_selects_postgres_and_replays_after_graceful_restart()
             .env("SMESH_A2A_POSTGRES_MIGRATOR_URL", &admin)
             .env("SMESH_A2A_POSTGRES_RUNTIME_URL", &runtime)
             .env("SMESH_A2A_POSTGRES_SCHEMA", &schema)
+            .env(
+                "SMESH_A2A_QUOTA_POLICY_PATH",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/quota-policy.json"
+                ),
+            )
             .env("SMESH_A2A_REPLICA_ID", replica)
             .env("SMESH_TEST_POSTGRES_INSECURE_LOOPBACK", "1")
             .env("SMESH_TEST_POSTGRES_PARENT_MANAGED_CLEANUP", "1");
@@ -602,6 +609,13 @@ fn release_binary_rejects_plaintext_postgres_and_auth_misconfiguration_before_re
                 "postgresql://runtime:secret@127.0.0.1:9/postgres",
             )
             .env("SMESH_A2A_POSTGRES_SCHEMA", "release_plaintext_probe")
+            .env(
+                "SMESH_A2A_QUOTA_POLICY_PATH",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/quota-policy.json"
+                ),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         value

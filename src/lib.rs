@@ -20,6 +20,7 @@ mod loopback;
 mod outbox_driver;
 mod policy;
 mod postgres_store;
+mod quota;
 mod runtime_config;
 mod runtime_trace;
 mod runtime_worker;
@@ -45,12 +46,13 @@ pub use durable_authority::{
     AuthorityCapabilities, AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown,
     AuthorizationAuditInput, AuthorizationAuditParts, AuthorizationAuditSink,
     AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead, CancellationAuthority,
-    CancellationOutcome, ChangeObservation, ChangeObserver, DurableAuthority, IntoDurableAuthority,
-    LeaseRenewalOutcome, OutboxAuthority, OutboxLease, OwnedTaskScope, PollInterval,
-    QuotaReservationInput, ReceiverAdmission, ReceiverAuthority, ReceiverLease,
-    SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE,
-    TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority, TransitionOutcome,
-    authorized_message_identity, canonical_send_message_digest, canonical_send_message_digest_v2,
+    CancellationOutcome, ChangeObservation, ChangeObserver, DurableAuthority, ExecutionReservation,
+    IntoDurableAuthority, LeaseRenewalOutcome, OutboxAuthority, OutboxLease, OwnedTaskScope,
+    PollInterval, QuotaLease, QuotaLeaseAuthority, QuotaReservationInput, ReceiverAdmission,
+    ReceiverAuthority, ReceiverLease, SendMessageAdmission, StreamTranscriptBatch,
+    SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE, TaskAdmission, TaskEventBatch, TaskLifecycle,
+    TranscriptAuthority, TransitionOutcome, authorized_message_identity,
+    canonical_send_message_digest, canonical_send_message_digest_v2,
 };
 pub use durable_dispatch::{
     DurableDispatchEnvelope, DurableInterruptionKind, DurableLoopbackEndpoint,
@@ -71,6 +73,11 @@ pub use policy::{
 };
 pub use postgres_store::{
     PostgresStoreConfig, PostgresStoreError, PostgresTaskStore, PostgresTransactionTestFault,
+};
+pub use quota::{
+    ExecutionBudget, QuotaAlgorithm, QuotaCharge, QuotaDimension, QuotaExceeded, QuotaIntent,
+    QuotaLeaseKind, QuotaOperation, QuotaPolicy, QuotaPolicyError, QuotaReconciliationPlan,
+    QuotaReconciliationTarget, QuotaScopeKind, QuotaSubject,
 };
 pub use runtime_config::{GatewayMode, GatewayModeError, RuntimeModeConfig};
 pub use runtime_trace::{

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use smesh_core::{Signal, SignalType};
 use thiserror::Error;
 
-use crate::{CompletionEvidence, InputError, InputLimits, extract_text};
+use crate::{CompletionEvidence, ExecutionBudget, InputError, InputLimits, extract_text};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -47,6 +47,16 @@ pub trait MeshDispatcher: Send + Sync + 'static {
         &self,
         request: MeshRequest,
     ) -> BoxStream<'static, Result<MeshEvent, DispatchError>>;
+
+    /// Trusted bounded execution seam. Production dispatchers override this so
+    /// the ceiling crosses into model/tool/runtime execution before work starts.
+    fn dispatch_bounded(
+        &self,
+        request: MeshRequest,
+        _budget: ExecutionBudget,
+    ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
+        self.dispatch(request)
+    }
 
     async fn cancel(&self, task_id: &str) -> Result<(), DispatchError>;
 }

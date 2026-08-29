@@ -11,10 +11,11 @@ use smesh_a2a::transport::{
 use smesh_a2a::{
     AuthorizationPolicy, CorrelatingRuntimeProcessor, DurableLoopbackEndpoint, GatewayConfig,
     GatewayMode, InjectedClock, LegacyTenantBinding, LoopbackDispatcher, PostgresStoreConfig,
-    PostgresTaskStore, RuntimeAdmissionProcessor, RuntimeEventCapture, RuntimeModeConfig,
-    RuntimeWorker, SqliteTaskStore, SystemClockTicker, build_authenticated_router,
-    build_authenticated_router_with_trace, build_authorized_durable_loopback_gateway,
-    build_durable_loopback_gateway, build_router, build_router_with_trace,
+    PostgresTaskStore, QuotaPolicy, RuntimeAdmissionProcessor, RuntimeEventCapture,
+    RuntimeModeConfig, RuntimeWorker, SqliteTaskStore, SystemClockTicker,
+    build_authenticated_router, build_authenticated_router_with_trace,
+    build_authorized_durable_loopback_gateway, build_durable_loopback_gateway, build_router,
+    build_router_with_trace,
 };
 use smesh_core::{Network, Node};
 use smesh_runtime::{MeshConfig, RuntimeConfig, SmeshRuntime};
@@ -403,7 +404,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pg_migrator = std::env::var("SMESH_A2A_POSTGRES_MIGRATOR_URL").ok();
     let pg_runtime = std::env::var("SMESH_A2A_POSTGRES_RUNTIME_URL").ok();
     let pg_schema = std::env::var("SMESH_A2A_POSTGRES_SCHEMA").ok();
+    let quota_policy = std::env::var_os("SMESH_A2A_QUOTA_POLICY_PATH")
+        .map(|path| QuotaPolicy::load(std::path::PathBuf::from(path)).map(Arc::new))
+        .transpose()?;
     let backend = std::env::var("SMESH_A2A_DURABLE_BACKEND").ok();
+    if quota_policy.is_some() && backend.as_deref() != Some("postgres") {
+        return Err(
+            "distributed quota enforcement requires the PostgreSQL durable authority".into(),
+        );
+    }
     if let Ok(replica_id) = std::env::var("SMESH_A2A_REPLICA_ID")
         && (replica_id.is_empty()
             || replica_id.len() > 128
@@ -428,7 +437,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pg_migrator.ok_or("SMESH_A2A_POSTGRES_MIGRATOR_URL is required")?,
                 pg_runtime.ok_or("SMESH_A2A_POSTGRES_RUNTIME_URL is required")?,
                 pg_schema.ok_or("SMESH_A2A_POSTGRES_SCHEMA is required")?,
-            )?;
+            )?
+            .with_quota_policy(quota_policy.clone().ok_or(
+                "SMESH_A2A_QUOTA_POLICY_PATH is required for PostgreSQL production authority",
+            )?);
             #[cfg(debug_assertions)]
             let config = {
                 let mut config = config;

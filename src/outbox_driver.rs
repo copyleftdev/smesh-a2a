@@ -369,6 +369,7 @@ fn spawn_durable_driver_inner(
                     dispatch_id: lease.dispatch_id.clone(),
                     payload_digest: content_digest(payload.as_bytes()),
                     request: lease.request.clone(),
+                    execution_reservation: lease.execution_reservation.clone(),
                 };
                 let committed_progress =
                     if let Some(task) = authority.task_for_outbox(&lease).await? {
@@ -739,6 +740,8 @@ mod tests {
     fn unused() -> a2a::A2AError {
         a2a::A2AError::internal("unused panicking authority capability")
     }
+
+    impl crate::QuotaLeaseAuthority for PanickingAuthority {}
 
     impl AuthorityIdentity for PanickingAuthority {
         fn capabilities(&self) -> AuthorityCapabilities {

@@ -218,6 +218,7 @@ enum AccountKind {
 pub struct AuthorizationContext {
     account_id: Arc<str>,
     tenant_id: Arc<str>,
+    principal_scope: Arc<str>,
     roles: Arc<[TenantRole]>,
     policy_id: Arc<str>,
     policy_revision: u64,
@@ -232,6 +233,10 @@ impl AuthorizationContext {
     #[must_use]
     pub fn tenant_id(&self) -> &str {
         &self.tenant_id
+    }
+    #[must_use]
+    pub fn principal_scope(&self) -> &str {
+        &self.principal_scope
     }
     #[must_use]
     pub fn policy_id(&self) -> &str {
@@ -584,6 +589,14 @@ impl AuthorizationPolicy {
         Ok(AuthorizationContext {
             account_id: account.id.clone(),
             tenant_id: tenant_id.clone(),
+            principal_scope: Arc::from(crate::content_digest(
+                format!(
+                    "quota-principal-v1\0{}\0{}",
+                    principal.issuer(),
+                    principal.subject()
+                )
+                .as_bytes(),
+            )),
             roles: roles.clone(),
             policy_id: self.policy_id.clone(),
             policy_revision: self.revision,

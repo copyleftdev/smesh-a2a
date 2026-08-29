@@ -24,12 +24,15 @@ async fn channel_dispatcher_hands_a_real_signal_to_the_smesh_worker() {
         request: received,
         signal,
         events: event_tx,
+        budget,
     } = command
     else {
         panic!("expected execute command");
     };
 
     assert_eq!(received, request);
+    assert!(budget.max_output_bytes() > 0);
+    assert!(budget.max_event_count() > 0);
     assert_eq!(signal.signal_type, SignalType::Query);
     assert_eq!(signal.origin_node_id, "gateway-node");
 

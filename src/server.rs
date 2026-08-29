@@ -4,6 +4,8 @@ use std::time::Duration;
 use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task};
 use a2a_server::{DefaultRequestHandler, RequestHandler, StaticAgentCard, TaskStore};
 use async_trait::async_trait;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::Response;
 use axum::{Router, middleware};
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -21,6 +23,19 @@ use crate::{
 };
 
 struct SharedTaskStore<S>(Arc<S>);
+
+async fn quota_retry_after_header(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    response
+}
 
 /// A task store that declares whether completion receipts must use durable key material.
 #[async_trait]
@@ -420,6 +435,7 @@ fn build_durable_gateway_inner(
             .nest("/rest", a2a_server::rest::rest_router(rest_handler))
             .layer(RequestBodyLimitLayer::new(max_body_bytes))
     };
+    let protocol = protocol.layer(middleware::from_fn(quota_retry_after_header));
     let router = protocol.merge(a2a_server::agent_card::agent_card_router(card));
     DurableGateway {
         router: Some(router),
