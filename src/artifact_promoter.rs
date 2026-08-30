@@ -64,6 +64,14 @@ impl Drop for ArtifactPromoterHandle {
 pub fn spawn_artifact_promoter(
     authority: Arc<dyn DurableAuthority>,
 ) -> Option<ArtifactPromoterHandle> {
+    spawn_artifact_promoter_with_telemetry(authority, None)
+}
+
+#[must_use]
+pub fn spawn_artifact_promoter_with_telemetry(
+    authority: Arc<dyn DurableAuthority>,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
+) -> Option<ArtifactPromoterHandle> {
     let artifact = authority.artifact_authority()?;
     if !artifact.artifact_capabilities().promotion {
         return None;
@@ -93,6 +101,18 @@ pub fn spawn_artifact_promoter(
                         match artifact.commit_artifact_promotion(&claim).await {
                             Ok(true) => {
                                 promoted = promoted.saturating_add(1);
+                                if let Some(telemetry) = &telemetry {
+                                    telemetry.artifact_event(
+                                        crate::telemetry::EventName::ArtifactPromoted,
+                                        "ok",
+                                        "published",
+                                        "artifact_promote",
+                                        Some(&claim.artifact_id),
+                                        None,
+                                        None,
+                                        None,
+                                    );
+                                }
                                 let _ = state_tx.send(ArtifactPromoterState {
                                     fatal: None,
                                     promoted,

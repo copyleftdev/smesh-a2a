@@ -8,7 +8,8 @@ never grants access. Normal task rendering and replay never dereference URL part
 
 ## Prerequisites
 
-1. PostgreSQL revision 5 must pass startup catalog validation with forced tenant RLS.
+1. PostgreSQL revision 6 must pass the exact startup catalog-manifest validation, including forced
+   tenant RLS policy definitions, grants, role attributes, and membership.
 2. Configure an absolute artifact root owned by the gateway UID with mode 0700. The root itself
    must not be a symlink. Object files are 0600.
 3. Configure an explicit 32-byte AES-256 key generation through the server keyring hook. Protected
@@ -79,8 +80,24 @@ backup set.
 
 ### Restore
 
-Restore into an empty PostgreSQL authority and empty 0700 artifact root. The executor checks every
-mutable authority table, including global orphan journals, before creating a restore journal. The source and restored
+Restore into an empty PostgreSQL authority and empty 0700 artifact root. Stop every gateway and
+projector that can use the target schema before invoking `artifact-restore`; the restore command is the
+only permitted target process. The executor checks every mutable authoritative table, including global
+orphan journals, before creating a restore journal. `audit_projection_control` and
+`audit_projection_outbox` are optional derived state, not authority: with no causative authoritative
+rows, restore transactionally locks the projection outbox and control row, refuses an unexpired
+projector lease as busy, deletes orphan projection rows, disables projection, and creates the restore
+journal in the same transaction. It never ignores arbitrary outbox rows when task, event,
+authorization, quota, artifact, or operator source state exists. A gateway configured to enable
+projection cannot open while a restore journal is `restoring`.
+
+The operator `artifact-restore` command leaves projection disabled through import and atomic enable, so
+restored historical rows are not projected. After successful restore, start the production gateway
+with its normal OTLP configuration; that open enables starts-at-enable projection, and only newly
+committed causative rows produce events. Do not start a projector early or manually edit projection
+leases/checkpoints.
+
+The source and restored
 `store_id` must differ, and `artifact_restore_one_enabled_identity` prevents enabling two writable
 restores with one identity. Load required keys through the owner-private no-follow keyring; stage
 ciphertext at inventory locators; validate schema/catalog/policy, inventory digest/signature,

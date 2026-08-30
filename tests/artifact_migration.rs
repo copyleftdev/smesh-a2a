@@ -1376,7 +1376,8 @@ async fn empty_backup_restore_is_sealed_retryable_and_requires_a_truly_empty_tar
     let target_base = PostgresStoreConfig::new(&admin, &runtime, &target_schema)
         .unwrap()
         .with_test_only_insecure_loopback(true)
-        .with_test_only_parent_managed_cleanup();
+        .with_test_only_parent_managed_cleanup()
+        .with_audit_projection(true);
     PostgresTaskStore::open(target_base.clone())
         .await
         .unwrap()
@@ -1433,6 +1434,15 @@ async fn empty_backup_restore_is_sealed_retryable_and_requires_a_truly_empty_tar
     let restore = ArtifactRestorePlanFile::open(&restore_path).unwrap();
     let target_config =
         target_base.with_artifact_store(ArtifactStoreConfig::new(&target_root, &keyring).unwrap());
+    let orphan_projection_event = smesh_a2a::content_digest(b"bootstrap-only-projection-event");
+    let orphan_projection_source = smesh_a2a::content_digest(b"bootstrap-only-projection-source");
+    client
+        .execute(
+            &format!("INSERT INTO {target_schema}.audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at) VALUES('tenant-bootstrap',$1,'task_events',$2,'task_terminal',1,1)"),
+            &[&orphan_projection_event, &orphan_projection_source],
+        )
+        .await
+        .unwrap();
     client
         .execute(
             &format!("INSERT INTO {target_schema}.artifact_orphan_audits VALUES($1,0,1)"),
@@ -1451,11 +1461,125 @@ async fn empty_backup_restore_is_sealed_retryable_and_requires_a_truly_empty_tar
         )
         .await
         .unwrap();
+
+    // An active projector lease proves a live optional consumer and must fence restore
+    // without changing the control row or outbox lease.
+    assert_eq!(
+        client
+            .execute(
+                &format!("UPDATE {target_schema}.audit_projection_outbox SET state='leased',attempts=1,lease_owner='live-projector',lease_token='lease-token',lease_epoch=1,lease_expires_at={target_schema}.db_millis()+60000"),
+                &[],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(client
+        .query_one(
+            &format!("SELECT EXISTS(SELECT 1 FROM {target_schema}.audit_projection_outbox WHERE state='leased' AND lease_expires_at>{target_schema}.db_millis())"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    let active_lease_restore =
+        PostgresTaskStore::restore_artifacts(target_config.clone(), &restore).await;
+    assert!(
+        matches!(
+            active_lease_restore,
+            Err(PostgresStoreError::ArtifactMigrationBusy)
+        ),
+        "active lease restore outcome: {active_lease_restore:?}"
+    );
+    let leased = client
+        .query_one(
+            &format!("SELECT state,lease_owner,(SELECT enabled FROM {target_schema}.audit_projection_control WHERE singleton=1) FROM {target_schema}.audit_projection_outbox WHERE event_id=$1"),
+            &[&orphan_projection_event],
+        )
+        .await
+        .unwrap();
+    assert_eq!(leased.get::<_, String>(0), "leased");
+    assert_eq!(leased.get::<_, String>(1), "live-projector");
+    assert!(leased.get::<_, bool>(2));
+    client
+        .execute(
+            &format!("UPDATE {target_schema}.audit_projection_outbox SET state='pending',attempts=0,lease_owner=NULL,lease_token=NULL,lease_epoch=0,lease_expires_at=NULL"),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // Optional rows are resettable only while no causative authority exists. A
+    // preexisting task/event keeps both projection state and enablement exact.
+    client
+        .batch_execute(&format!("SET session_replication_role=replica;
+          INSERT INTO {target_schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES('tenant-bootstrap','preexisting-task','preexisting-context','\"TASK_STATE_COMPLETED\"',1,'{{}}','preexisting-account');
+          INSERT INTO {target_schema}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,to_state,event_json,created_at) VALUES('tenant-bootstrap','preexisting-task',1,1,'completed','\"TASK_STATE_COMPLETED\"','{{}}',1);
+          SET session_replication_role=origin;"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        PostgresTaskStore::restore_artifacts(target_config.clone(), &restore).await,
+        Err(PostgresStoreError::ArtifactRestoreTargetNotEmpty)
+    ));
+    assert_eq!(
+        client
+            .query_one(
+                &format!("SELECT count(*) FROM {target_schema}.audit_projection_outbox"),
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    assert!(
+        client
+            .query_one(
+                &format!(
+                    "SELECT enabled FROM {target_schema}.audit_projection_control WHERE singleton=1"
+                ),
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    client
+        .batch_execute(&format!(
+            "SET session_replication_role=replica; DELETE FROM {target_schema}.task_events; DELETE FROM {target_schema}.tasks; SET session_replication_role=origin;"
+        ))
+        .await
+        .unwrap();
+
     let restored = PostgresTaskStore::restore_artifacts(target_config.clone(), &restore)
         .await
         .unwrap();
     assert_eq!(restored.objects, 0);
     assert!(restored.enabled);
+    assert_eq!(
+        client
+            .query_one(
+                &format!("SELECT count(*) FROM {target_schema}.audit_projection_outbox"),
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    assert!(
+        client
+            .query_one(
+                &format!(
+                    "SELECT enabled FROM {target_schema}.audit_projection_control WHERE singleton=1"
+                ),
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
     PostgresTaskStore::open(target_config.clone())
         .await
         .unwrap()

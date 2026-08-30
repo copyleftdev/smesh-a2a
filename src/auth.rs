@@ -807,6 +807,7 @@ pub struct AuthState {
     mutual_tls: bool,
     mutual_tls_required: bool,
     bridge: PrincipalBridge,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
 }
 
 impl AuthState {
@@ -818,6 +819,7 @@ impl AuthState {
             mutual_tls: false,
             mutual_tls_required: false,
             bridge: PrincipalBridge { key: bridge_key },
+            telemetry: None,
         }
     }
 
@@ -830,6 +832,7 @@ impl AuthState {
             mutual_tls: true,
             mutual_tls_required: true,
             bridge: PrincipalBridge { key: bridge_key },
+            telemetry: None,
         }
     }
 
@@ -846,6 +849,13 @@ impl AuthState {
     pub fn with_required_mutual_tls(mut self) -> Self {
         self.mutual_tls = true;
         self.mutual_tls_required = true;
+        self
+    }
+
+    /// Attach an optional bounded telemetry sink without changing authentication authority.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: crate::telemetry::TelemetryHandle) -> Self {
+        self.telemetry = Some(telemetry);
         self
     }
 
@@ -910,12 +920,37 @@ fn unauthorized(invalid_token: bool, bearer_enabled: bool) -> axum::response::Re
 }
 
 /// Axum middleware that strips spoofable credentials and establishes one authoritative principal.
+#[allow(clippy::too_many_lines)]
 pub async fn authenticate_request(
     axum::extract::State(state): axum::extract::State<AuthState>,
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::http::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION};
+    let telemetry_context = request
+        .extensions()
+        .get::<crate::telemetry::RequestTelemetryContext>()
+        .cloned();
+    let telemetry_start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |duration| {
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+        });
+    let deny = |invalid_token: bool, bearer_enabled: bool| {
+        if let Some(telemetry) = state.telemetry.as_ref() {
+            telemetry.authentication_decision(
+                telemetry_context.as_ref(),
+                "denied",
+                if invalid_token {
+                    "invalid_token"
+                } else {
+                    "missing"
+                },
+                telemetry_start,
+            );
+        }
+        unauthorized(invalid_token, bearer_enabled)
+    };
     for value in request.headers_mut().values_mut() {
         value.set_sensitive(true);
     }
@@ -924,9 +959,9 @@ pub async fn authenticate_request(
         [] => None,
         [value] => match value.to_str() {
             Ok(raw) if !raw.contains(',') => Some(raw.to_owned()),
-            _ => return unauthorized(true, state.bearer_enabled()),
+            _ => return deny(true, state.bearer_enabled()),
         },
-        _ => return unauthorized(true, state.bearer_enabled()),
+        _ => return deny(true, state.bearer_enabled()),
     };
     for name in [
         AUTHORIZATION.as_str(),
@@ -947,7 +982,7 @@ pub async fn authenticate_request(
         .and_then(|identity| identity.principal())
         .cloned();
     if mtls_principal.is_some() && !state.mutual_tls_enabled() {
-        return unauthorized(true, state.bearer_enabled());
+        return deny(true, state.bearer_enabled());
     }
     if tls_identity
         .is_some_and(|identity| identity.certificate_present() && identity.principal().is_none())
@@ -956,14 +991,14 @@ pub async fn authenticate_request(
         // but it is not mapped to an application identity. This is an mTLS
         // identity failure, so advertising Bearer would incorrectly suggest
         // that another credential could recover the same request.
-        return unauthorized(true, false);
+        return deny(true, false);
     }
     if state.mutual_tls_required() && mtls_principal.is_none() {
-        return unauthorized(false, state.bearer_enabled());
+        return deny(false, state.bearer_enabled());
     }
     let bearer_principal = if let Some(raw) = raw {
         let Some(separator) = raw.find(' ') else {
-            return unauthorized(true, state.bearer_enabled());
+            return deny(true, state.bearer_enabled());
         };
         let scheme = &raw[..separator];
         let token = raw[separator..].trim_start_matches(' ');
@@ -971,16 +1006,16 @@ pub async fn authenticate_request(
             || token.is_empty()
             || token.contains(char::is_whitespace)
         {
-            return unauthorized(true, state.bearer_enabled());
+            return deny(true, state.bearer_enabled());
         }
         let Ok(presented) = PresentedBearer::new(token) else {
-            return unauthorized(true, state.bearer_enabled());
+            return deny(true, state.bearer_enabled());
         };
         let Some(verifier) = state.verifier.as_ref() else {
-            return unauthorized(true, state.bearer_enabled());
+            return deny(true, state.bearer_enabled());
         };
         let Ok(principal) = verifier.verify(presented).await else {
-            return unauthorized(true, state.bearer_enabled());
+            return deny(true, state.bearer_enabled());
         };
         Some(principal)
     } else {
@@ -993,18 +1028,26 @@ pub async fn authenticate_request(
         {
             mtls
         }
-        (Some(_), Some(_)) => return unauthorized(true, state.bearer_enabled()),
+        (Some(_), Some(_)) => return deny(true, state.bearer_enabled()),
         (Some(principal), None) | (None, Some(principal)) => principal,
-        (None, None) => return unauthorized(false, state.bearer_enabled()),
+        (None, None) => return deny(false, state.bearer_enabled()),
     };
     let Ok(mut bridge) = axum::http::HeaderValue::from_str(&state.bridge.seal(&principal)) else {
-        return unauthorized(true, state.bearer_enabled());
+        return deny(true, state.bearer_enabled());
     };
     bridge.set_sensitive(true);
     request
         .headers_mut()
         .insert(RESERVED_PRINCIPAL_HEADER, bridge);
     request.extensions_mut().insert(Arc::new(principal));
+    if let Some(telemetry) = state.telemetry.as_ref() {
+        telemetry.authentication_decision(
+            telemetry_context.as_ref(),
+            "ok",
+            "verified",
+            telemetry_start,
+        );
+    }
     next.run(request).await
 }
 

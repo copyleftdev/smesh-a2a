@@ -161,6 +161,7 @@ struct CaptureState {
 pub struct RuntimeEventCapture {
     state: Mutex<CaptureState>,
     failure: CancellationToken,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
 }
 
 pub struct CorrelatingRuntimeProcessor<P> {
@@ -213,7 +214,14 @@ impl RuntimeEventCapture {
                 correlations: HashMap::new(),
             }),
             failure: CancellationToken::new(),
+            telemetry: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: Option<crate::telemetry::TelemetryHandle>) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 
     #[must_use]
@@ -320,10 +328,40 @@ impl RuntimeEventCapture {
             Some(next) => next,
             None => return self.fail(RuntimeTraceError::SequenceOverflow),
         };
+        let projection = (
+            trace_event.kind,
+            trace_event.task_id.clone(),
+            trace_event.context_id.clone(),
+            trace_event.signal_hash.clone(),
+        );
         if required {
             state.required.push(trace_event);
         } else {
             state.optional.push(trace_event);
+        }
+        drop(state);
+        if let Some(telemetry) = &self.telemetry {
+            let (name, reason) = match projection.0 {
+                RuntimeTraceKind::Claim => (crate::telemetry::EventName::RuntimeClaim, "claim"),
+                RuntimeTraceKind::Contradiction => (
+                    crate::telemetry::EventName::RuntimeContradiction,
+                    "contradiction",
+                ),
+                RuntimeTraceKind::TerminalOutput => {
+                    (crate::telemetry::EventName::RuntimeTerminal, "terminal")
+                }
+                RuntimeTraceKind::TickCompleted => {
+                    (crate::telemetry::EventName::RuntimeLifecycle, "tick")
+                }
+                _ => (crate::telemetry::EventName::RuntimeLifecycle, "lifecycle"),
+            };
+            telemetry.runtime_event(
+                name,
+                reason,
+                projection.1.as_deref(),
+                projection.2.as_deref(),
+                projection.3.as_deref(),
+            );
         }
         Ok(())
     }
@@ -509,7 +547,28 @@ impl RuntimeEventCapture {
             Some(next) => next,
             None => return self.fail(RuntimeTraceError::SequenceOverflow),
         };
+        let event_name = match event.kind {
+            RuntimeTraceKind::Claim => crate::telemetry::EventName::RuntimeClaim,
+            RuntimeTraceKind::Contradiction => crate::telemetry::EventName::RuntimeContradiction,
+            RuntimeTraceKind::TerminalOutput => crate::telemetry::EventName::RuntimeTerminal,
+            _ => crate::telemetry::EventName::RuntimeLifecycle,
+        };
         state.required.push(event);
+        drop(state);
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.runtime_event(
+                event_name,
+                match kind {
+                    RuntimeTraceKind::Claim => "claim",
+                    RuntimeTraceKind::Contradiction => "contradiction",
+                    RuntimeTraceKind::TerminalOutput => "terminal",
+                    _ => "lifecycle",
+                },
+                Some(task_id),
+                Some(context_id),
+                None,
+            );
+        }
         Ok(())
     }
 

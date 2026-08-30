@@ -12,10 +12,10 @@ use a2a::{
     Message, Part, Role, SendMessageRequest, SendMessageResponse, Task, TaskState, TaskStatus,
 };
 use smesh_a2a::{
-    AdmissionOutcome, AttemptDisposition, CancellationOutcome, DurableDispatchEnvelope,
-    InputLimits, LegacyTenantBinding, MeshEvent, MeshRequest, ReceiverAdmission,
-    SendMessageAdmission, SqliteTaskStore, TransitionOutcome, canonical_send_message_digest,
-    content_digest,
+    AdmissionOutcome, AttemptDisposition, AuthorityIdentity, CancellationOutcome,
+    DurableDispatchEnvelope, InputLimits, LegacyTenantBinding, MeshEvent, MeshRequest,
+    ReceiverAdmission, SendMessageAdmission, SqliteTaskStore, TransitionOutcome,
+    canonical_send_message_digest, content_digest,
 };
 
 const WATCHDOG: Duration = Duration::from_secs(5);
@@ -34,7 +34,7 @@ async fn open_store_with_binding(
     path: impl AsRef<Path>,
     max_tasks: usize,
 ) -> Result<SqliteTaskStore, smesh_a2a::SqliteStoreError> {
-    SqliteTaskStore::open_with_legacy_binding(
+    SqliteTaskStore::open_with_legacy_binding_and_audit_projection(
         path,
         max_tasks,
         LegacyTenantBinding::new(
@@ -1871,7 +1871,8 @@ fn canonical_digest_binds_semantics_not_caller_tenant_or_transport() {
 }
 
 #[tokio::test]
-async fn exact_v1_schema_migrates_to_v6_with_explicit_binding_preserving_keys_and_task() {
+#[allow(clippy::too_many_lines)] // Keep the complete v1-to-v7 migration fixture auditable together.
+async fn exact_v1_schema_migrates_to_v7_with_explicit_binding_preserving_keys_and_task() {
     const V1: &str = "CREATE TABLE store_metadata (
      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
      schema_version INTEGER NOT NULL,
@@ -1941,6 +1942,12 @@ async fn exact_v1_schema_migrates_to_v6_with_explicit_binding_preserving_keys_an
                 "explicit migration failed at version {version} with {error:?}; objects={objects:?}"
             )
         });
+    assert!(
+        store
+            .audit_projection_authority()
+            .is_some_and(|authority| authority.audit_projection_capabilities().enabled),
+        "combined legacy migration must expose the projection authority to the worker"
+    );
     assert_eq!(store.completion_receipt_key(), receipt_key);
     assert_eq!(
         a2a_server::TaskStore::get(&store, "migrated-terminal")
@@ -1968,7 +1975,7 @@ async fn exact_v1_schema_migrates_to_v6_with_explicit_binding_preserving_keys_an
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert_eq!(event_kind, "migration_snapshot");
 }
 

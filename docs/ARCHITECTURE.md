@@ -168,6 +168,24 @@ accounting, bounded replay-safe GC, tenant-fair claiming, multi-scope quota poli
 execution reservations, stream/reconnect leases, audited reconciliation/overrides, and
 the production abuse/fairness/failover matrix are documented in `evidence/m2/issue-14.md`.
 
+### `telemetry` and audit projection
+
+`telemetry` is a closed schema: static span/log/metric names, bounded attributes, closed outcomes,
+no raw error bodies, at most eight metric attributes, 2,000 series per instrument, and 10,000
+process-wide series. Correlation IDs are span/log-only. The outer production router generates a
+random 128-bit request ID and removes inbound `x-request-id`, `traceparent`, `tracestate`, and
+`baggage` before handlers run.
+
+Durable authority rows and `runtime-trace/2` remain required evidence. `OtlpOwner` is a distinct,
+bounded, drop-newest optional projection on an isolated OS thread. HTTP protobuf and gRPC log
+exports are exercised against real decoding collectors; network export is never awaited by request,
+worker, or authority transaction paths. Configuration is parsed before binding, but exporter
+startup occurs only after listener reservation. HTTP uses no ambient proxy and no redirects.
+
+`AuditProjector` claims a bounded leased durable outbox with per-row pending/leased/delivered/dead delivery state. It emits a stable domain-separated digest `event.id` and marks only the fenced row delivered after sink queue acceptance. There is no monotonic global cursor, so out-of-order commits cannot be skipped. It is an optional backend-neutral capability rather than a new `DurableAuthority` requirement.
+There is no audit-read HTTP API in this release; the operator projection is OTLP-only. The concrete
+SQLite/PostgreSQL ledgers remain authoritative and are not dual-written from handlers.
+
 ### `server`
 
 Composes the official JSON-RPC, REST, Agent Card, task store, and executor into one Axum router. It binds to loopback by default.
@@ -191,4 +209,4 @@ Composes the official JSON-RPC, REST, Agent Card, task store, and executor into 
 - Bounded push notifications with an allowlist and SSRF defenses.
 - Application-specific semantic work processors and authenticated evidence issuers.
 - gRPC listener.
-- OpenTelemetry tracing and retained quota accounting/GC.
+- Retained quota accounting/GC and deployment-specific telemetry backend retention.

@@ -197,12 +197,38 @@ pub struct ProductionTransportConfig {
     pub max_connections: usize,
 }
 
+/// Parse an advertised URL and return only its log-safe scheme/host/port origin.
+///
+/// # Errors
+/// Rejects controls, credentials, query strings, fragments, unsupported schemes,
+/// missing hosts, and values above the public configuration bound.
+pub fn canonical_public_origin(value: &str) -> Result<String, TransportConfigError> {
+    if value.is_empty() || value.len() > 4_096 || value.chars().any(char::is_control) {
+        return Err(TransportConfigError::Policy("public URL violates bounds"));
+    }
+    let parsed = url::Url::parse(value)
+        .map_err(|_| TransportConfigError::Policy("public URL must be a valid HTTP(S) URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(TransportConfigError::Policy(
+            "public URL must use HTTP(S) without credentials, query, or fragment",
+        ));
+    }
+    Ok(parsed.origin().ascii_serialization())
+}
+
 impl ProductionTransportConfig {
     /// Validate exposure policy and bounded settings without acquiring resources.
     ///
     /// # Errors
     /// Returns a policy error for any unsafe or inconsistent combination.
     pub fn validate_paths_and_policy(&self) -> Result<(), TransportConfigError> {
+        let _public_origin = canonical_public_origin(&self.public_url)?;
         if !self.bind.ip().is_loopback() && self.mode != TransportMode::DirectTls {
             return Err(TransportConfigError::Policy(
                 "non-loopback binds require direct TLS",

@@ -1,0 +1,26 @@
+groups:
+  - name: smesh-a2a-alerts
+    interval: 30s
+    rules:
+      - alert: SmeshA2AEdgeAvailability
+        expr: ((sum(rate(smesh_a2a_sli_event_total{smesh_slo="edge_availability",smesh_result="eligible_bad"}[5m])) / clamp_min(sum(rate(smesh_a2a_sli_event_total{smesh_slo="edge_availability",smesh_result=~"eligible_good|eligible_bad"}[5m])), 1e-12) > 0.0144) and (sum(rate(smesh_a2a_sli_event_total{smesh_slo="edge_availability",smesh_result="eligible_bad"}[1h])) / clamp_min(sum(rate(smesh_a2a_sli_event_total{smesh_slo="edge_availability",smesh_result=~"eligible_good|eligible_bad"}[1h])), 1e-12) > 0.0144) and (sum(increase(smesh_a2a_sli_event_total{smesh_slo="edge_availability",smesh_result=~"eligible_good|eligible_bad"}[1h])) >= 100)) or ((sum(rate(smesh_a2a_sli_event_total{smesh_slo="edge_availability",smesh_result="eligible_bad"}[30m])) / clamp_min(sum(rate(smesh_a2a_sli_event_total{smesh_slo="edge_availability",smesh_result=~"eligible_good|eligible_bad"}[30m])), 1e-12) > 0.006) and (sum(rate(smesh_a2a_sli_event_total{smesh_slo="edge_availability",smesh_result="eligible_bad"}[6h])) / clamp_min(sum(rate(smesh_a2a_sli_event_total{smesh_slo="edge_availability",smesh_result=~"eligible_good|eligible_bad"}[6h])), 1e-12) > 0.006) and (sum(increase(smesh_a2a_sli_event_total{smesh_slo="edge_availability",smesh_result=~"eligible_good|eligible_bad"}[6h])) >= 100))
+        labels:
+          severity: page
+        annotations:
+          summary: SMESH A2A edge availability is burning the 99.9% error budget
+          runbook: docs/OBSERVABILITY_RUNBOOK.md#edge-availability
+      - alert: SmeshA2AAuditProjectionFailures
+        expr: increase(smesh_a2a_audit_projection_failure_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: SMESH A2A audit projection failures detected
+          runbook: docs/OBSERVABILITY_RUNBOOK.md#audit-projection
+      - alert: SmeshA2AAuditProjectionLag
+        expr: smesh_a2a_audit_projection_lag_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: SMESH A2A audit projection is more than five minutes behind
+          runbook: docs/OBSERVABILITY_RUNBOOK.md#audit-projection

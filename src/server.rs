@@ -23,8 +23,11 @@ use crate::{
     durable_authority::DurableAuthorityParts,
     durable_handler::DurableRequestHandler,
     guard::GuardedRequestHandler,
-    outbox_driver::{DurableDriverHandle, spawn_durable_driver},
+    outbox_driver::{
+        DurableDriverHandle, spawn_durable_driver, spawn_durable_driver_with_telemetry,
+    },
     spawn_artifact_gc, spawn_artifact_orphan_scanner, spawn_artifact_promoter,
+    spawn_artifact_promoter_with_telemetry,
 };
 
 struct SharedTaskStore<S>(Arc<S>);
@@ -367,6 +370,7 @@ impl GatewayConfig {
 /// Structured owner for the durable unary router and its joinable outbox driver.
 pub struct DurableGateway {
     router: Option<Router>,
+    projector: Option<crate::telemetry::AuditProjectorWorker>,
     driver: Option<DurableDriverHandle>,
     promoter: Option<ArtifactPromoterHandle>,
     gc: Option<ArtifactGcHandle>,
@@ -375,6 +379,32 @@ pub struct DurableGateway {
 }
 
 impl DurableGateway {
+    /// Start the optional projector after both the authority and OTLP owner exist.
+    ///
+    /// # Errors
+    /// Returns an error for invalid configuration or a failed worker spawn.
+    pub fn start_audit_projector(
+        &mut self,
+        telemetry: crate::telemetry::TelemetryHandle,
+        config: crate::telemetry::AuditProjectorConfig,
+    ) -> Result<bool, crate::telemetry::AuditProjectorError> {
+        if self.projector.is_some() {
+            return Ok(true);
+        }
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or(crate::telemetry::AuditProjectorError::Unsupported)?;
+        if authority.audit_projection_authority().is_none() {
+            return Ok(false);
+        }
+        self.projector = Some(crate::telemetry::AuditProjectorWorker::spawn(
+            Arc::clone(authority),
+            telemetry,
+            config,
+        )?);
+        Ok(true)
+    }
     /// Clone the protocol router owned by this live gateway.
     ///
     /// # Panics
@@ -425,6 +455,14 @@ impl DurableGateway {
     ///
     /// Returns an internal protocol error if the owned driver fails or panics.
     pub async fn shutdown(mut self) -> Result<(), A2AError> {
+        let projector_result = if let Some(projector) = self.projector.take() {
+            projector.shutdown(Duration::from_secs(5)).await
+        } else {
+            Ok(())
+        };
+        if projector_result.is_err() {
+            eprintln!("smesh.telemetry.shutdown_failed category=audit_projector");
+        }
         let driver = self
             .driver
             .take()
@@ -458,6 +496,7 @@ impl DurableGateway {
         gc_result?;
         orphan_result?;
         authority_result?;
+        projector_result.map_err(|_| A2AError::internal("optional telemetry shutdown failed"))?;
         Ok(())
     }
 }
@@ -468,6 +507,7 @@ impl Drop for DurableGateway {
         // cancellation and transfers its abort-on-drop root join into a bounded
         // Tokio reaper. Closing the authority then rejects new work and closes
         // durable pools; explicit shutdown remains authoritative and joins inline.
+        self.projector.take();
         self.driver.take();
         self.promoter.take();
         self.gc.take();
@@ -497,9 +537,23 @@ pub fn build_durable_loopback_gateway<A: IntoDurableAuthority>(
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
 ) -> Result<DurableGateway, PolicyError> {
+    build_durable_loopback_gateway_with_telemetry(config, store, endpoint, clock, None)
+}
+
+/// Build the repository-owned durable gateway with an optional telemetry handle.
+///
+/// # Errors
+/// Returns an error if durable gateway policy construction fails.
+pub fn build_durable_loopback_gateway_with_telemetry<A: IntoDurableAuthority>(
+    config: GatewayConfig,
+    store: A,
+    endpoint: DurableLoopbackEndpoint,
+    clock: InjectedClock,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
+) -> Result<DurableGateway, PolicyError> {
     let parts = store.into_durable_authority_parts();
     Ok(build_durable_gateway_inner(
-        config, parts, endpoint, clock, None, None,
+        config, parts, endpoint, clock, None, None, telemetry,
     ))
 }
 
@@ -526,6 +580,7 @@ pub fn build_authenticated_durable_loopback_gateway<A: IntoDurableAuthority>(
         endpoint,
         clock,
         Some(auth),
+        None,
         None,
     ))
 }
@@ -554,9 +609,39 @@ pub fn build_authorized_durable_loopback_gateway<A: IntoDurableAuthority>(
         clock,
         Some(auth),
         Some(policy),
+        None,
     ))
 }
 
+/// Build the production authorized durable gateway with an optional telemetry handle.
+///
+/// # Errors
+/// Returns an error if durable gateway policy construction fails.
+pub fn build_authorized_durable_loopback_gateway_with_telemetry<A: IntoDurableAuthority>(
+    config: GatewayConfig,
+    store: A,
+    endpoint: DurableLoopbackEndpoint,
+    clock: InjectedClock,
+    auth: AuthState,
+    policy: Arc<AuthorizationPolicy>,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
+) -> Result<DurableGateway, PolicyError> {
+    let authority = store.into_durable_authority();
+    Ok(build_durable_gateway_inner(
+        config,
+        DurableAuthorityParts {
+            authority,
+            local: None,
+        },
+        endpoint,
+        clock,
+        Some(auth),
+        Some(policy),
+        telemetry,
+    ))
+}
+
+#[allow(clippy::too_many_lines)]
 fn build_durable_gateway_inner(
     config: GatewayConfig,
     parts: DurableAuthorityParts,
@@ -564,6 +649,7 @@ fn build_durable_gateway_inner(
     clock: InjectedClock,
     auth: Option<AuthState>,
     authorization: Option<Arc<AuthorizationPolicy>>,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
 ) -> DurableGateway {
     let DurableAuthorityParts { authority, local } = parts;
     let GatewayConfig {
@@ -572,14 +658,27 @@ fn build_durable_gateway_inner(
         max_body_bytes,
         ..
     } = config;
-    let driver = spawn_durable_driver(Arc::clone(&authority), endpoint, clock.clone());
-    let jsonrpc_handler = Arc::new(DurableRequestHandler::new_with_local(
-        Arc::clone(&authority),
-        local.clone(),
-        driver.control(),
-        clock.clone(),
-        input_limits,
-    ));
+    let endpoint = endpoint.with_telemetry(telemetry.clone());
+    let driver = if telemetry.is_some() {
+        spawn_durable_driver_with_telemetry(
+            Arc::clone(&authority),
+            endpoint,
+            clock.clone(),
+            telemetry.clone(),
+        )
+    } else {
+        spawn_durable_driver(Arc::clone(&authority), endpoint, clock.clone())
+    };
+    let jsonrpc_handler = Arc::new(
+        DurableRequestHandler::new_with_local(
+            Arc::clone(&authority),
+            local.clone(),
+            driver.control(),
+            clock.clone(),
+            input_limits,
+        )
+        .with_telemetry(telemetry.clone()),
+    );
     let rest_handler = Arc::new(
         DurableRequestHandler::new_with_local(
             Arc::clone(&authority),
@@ -588,7 +687,8 @@ fn build_durable_gateway_inner(
             clock.clone(),
             input_limits,
         )
-        .with_errors_before_stream(),
+        .with_errors_before_stream()
+        .with_telemetry(telemetry.clone()),
     );
     let mut durable_card = if let Some(auth) = auth.as_ref() {
         build_secured_agent_card_with_policy(
@@ -639,11 +739,16 @@ fn build_durable_gateway_inner(
     };
     let protocol = protocol.layer(middleware::from_fn(quota_retry_after_header));
     let router = protocol.merge(a2a_server::agent_card::agent_card_router(card));
-    let promoter = spawn_artifact_promoter(Arc::clone(&authority));
+    let promoter = if telemetry.is_some() {
+        spawn_artifact_promoter_with_telemetry(Arc::clone(&authority), telemetry)
+    } else {
+        spawn_artifact_promoter(Arc::clone(&authority))
+    };
     let gc = spawn_artifact_gc(Arc::clone(&authority));
     let orphan_scanner = spawn_artifact_orphan_scanner(Arc::clone(&authority));
     DurableGateway {
         router: Some(router),
+        projector: None,
         driver: Some(driver),
         promoter,
         gc,

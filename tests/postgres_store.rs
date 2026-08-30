@@ -75,6 +75,57 @@ fn superuser_url() -> String {
     required_postgres_url("SMESH_TEST_POSTGRES_SUPERUSER_URL")
 }
 
+struct EphemeralRoleGuard {
+    superuser_url: String,
+    schema: String,
+    migrator: String,
+}
+
+impl EphemeralRoleGuard {
+    fn new(schema: String, migrator: String) -> Self {
+        assert!(schema.starts_with("smesh_non_super_") || schema.starts_with("smesh_guard_"));
+        assert!(migrator.starts_with("smesh_migrator_"));
+        Self {
+            superuser_url: superuser_url(),
+            schema,
+            migrator,
+        }
+    }
+}
+
+impl Drop for EphemeralRoleGuard {
+    fn drop(&mut self) {
+        let url = self.superuser_url.clone();
+        let schema = self.schema.clone();
+        let migrator = self.migrator.clone();
+        let _ = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            runtime.block_on(async move {
+                let (client, connection) = tokio_postgres::connect(&url, NoTls).await.ok()?;
+                let driver = tokio::spawn(connection);
+                let _ = client
+                    .execute(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1 AND pid <> pg_backend_pid()",
+                        &[&migrator],
+                    )
+                    .await;
+                let _ = client
+                    .batch_execute(&format!(
+                        "DROP SCHEMA IF EXISTS {schema} CASCADE; DROP ROLE IF EXISTS {schema}_runtime; REVOKE CREATE ON DATABASE smesh_test FROM {migrator}; DROP OWNED BY {migrator}; DROP ROLE IF EXISTS {migrator}"
+                    ))
+                    .await;
+                drop(client);
+                driver.abort();
+                Some(())
+            })
+        })
+        .join();
+    }
+}
+
 const RETAINED_AUTHORITY_TABLES: &[&str] = &[
     "tasks",
     "task_events",
@@ -265,6 +316,158 @@ postgres_test!(
     }
 );
 
+#[cfg(debug_assertions)]
+postgres_test!(
+    stream_snapshot_is_consistent_when_publication_commits_between_metadata_and_frames,
+    {
+        let Some(url) = admin_url() else { return };
+        let config = config(url, "stream_snapshot");
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let tenant = "tenant-stream-snapshot";
+        let message_id = "message-stream-snapshot";
+        let bound_message_id =
+            smesh_a2a::authorized_message_identity(tenant, "owner-stream-snapshot", message_id);
+        let mut message = a2a::Message::new(
+            a2a::Role::User,
+            vec![a2a::Part::text("consistent stream snapshot")],
+        );
+        message.message_id = message_id.into();
+        let task = a2a::Task {
+            id: "task-stream-snapshot".into(),
+            context_id: "context-stream-snapshot".into(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: chrono::DateTime::from_timestamp_millis(100),
+            },
+            artifacts: None,
+            history: Some(vec![message.clone()]),
+            metadata: None,
+        };
+        let initial = a2a::StreamResponse::Task(task.clone());
+        let command = SendMessageAdmission {
+            request: a2a::SendMessageRequest {
+                message,
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            },
+            streaming: true,
+            task: task.clone(),
+            original_result: a2a::SendMessageResponse::Task(task.clone()),
+            input_limits: smesh_a2a::InputLimits::default(),
+            now: 100,
+            max_attempts: 2,
+        };
+        let scope =
+            OwnedTaskScope::new(tenant, "owner-stream-snapshot", VisibilityScope::Own).unwrap();
+        let audit = AuthorizationAuditInput::new(
+            "audit-stream-snapshot",
+            tenant,
+            "owner-stream-snapshot",
+            "policy-stream-snapshot",
+            1,
+            "digest-stream-snapshot",
+            "TaskCreate",
+            AuthorizationDecisionEffect::Allow,
+            "policy_grant",
+            "message",
+            "resource-stream-snapshot",
+            None,
+            100,
+        )
+        .unwrap();
+        store
+            .authorize_and_admit(&scope, command, audit)
+            .await
+            .unwrap();
+
+        let (mut writer, writer_connection) = tokio_postgres::connect(&superuser_url(), NoTls)
+            .await
+            .unwrap();
+        let writer_driver = tokio::spawn(writer_connection);
+        let tx = writer.transaction().await.unwrap();
+        let schema = config.schema_name();
+        tx.batch_execute(&format!(
+            "LOCK TABLE {schema}.stream_frames IN ACCESS EXCLUSIVE MODE"
+        ))
+        .await
+        .unwrap();
+        let reader_store = store.clone();
+        let reader_message_id = bound_message_id.clone();
+        let reader = tokio::spawn(async move {
+            reader_store
+                .stream_frames_after_scoped(tenant, &reader_message_id, 0)
+                .await
+        });
+        let reached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = tx
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND relation=to_regclass($1))",
+                        &[&format!("{schema}.stream_frames")],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if blocked {
+                    break;
+                }
+                if reader.is_finished() {
+                    break;
+                }
+            }
+        })
+        .await;
+        if reached.is_err() || reader.is_finished() {
+            tx.rollback().await.unwrap();
+            panic!("reader barrier failed; reader={:?}", reader.await.unwrap());
+        }
+
+        let update = a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+            task_id: task.id.clone(),
+            context_id: task.context_id.clone(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Working,
+                message: None,
+                timestamp: chrono::DateTime::from_timestamp_millis(101),
+            },
+            metadata: None,
+        });
+        let update_json = serde_json::to_string(&update).unwrap();
+        let transcript_digest = smesh_a2a::content_digest(
+            &serde_json::to_vec(&[initial.clone(), update.clone()]).unwrap(),
+        );
+        tx.batch_execute(&format!("SET LOCAL smesh.tenant_scope='{tenant}'"))
+            .await
+            .unwrap();
+        tx.execute(
+            &format!("INSERT INTO {schema}.stream_frames(tenant_scope,message_id,frame_seq,frame_version,frame_kind,frame_json,frame_digest,created_at) VALUES($1,$2,2,1,'status_update',$3,$4,101)"),
+            &[&tenant, &bound_message_id, &update_json, &smesh_a2a::content_digest(update_json.as_bytes())],
+        ).await.unwrap();
+        tx.execute(
+            &format!("UPDATE {schema}.stream_transcripts SET frame_count=2,transcript_digest=$1,updated_at=101 WHERE tenant_scope=$2 AND message_id=$3"),
+            &[&transcript_digest, &tenant, &bound_message_id],
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let snapshot = reader
+            .await
+            .unwrap()
+            .expect("snapshot read must remain valid");
+        assert_eq!(snapshot.frames, vec![initial]);
+        assert!(!snapshot.closed);
+        let after = store
+            .stream_frames_after_scoped(tenant, &bound_message_id, 1)
+            .await
+            .unwrap();
+        assert_eq!(after.frames, vec![update]);
+        writer_driver.abort();
+        store.shutdown().await.unwrap();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    }
+);
+
 #[test]
 fn postgres_config_redacts_both_migrator_and_runtime_urls() {
     let config = PostgresStoreConfig::new(
@@ -442,9 +645,14 @@ fn retryable_growth_uses_materialized_quota_enforcement_without_global_hot_path_
 fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist() {
     let source = include_str!("../src/postgres_store.rs");
     assert_eq!(
-        source.matches(".transaction()").count(),
-        13,
+        source.matches(".transaction()").count() + source.matches(".build_transaction()").count(),
+        14,
         "new direct transaction site must be routed through the bounded runner or explicitly reviewed"
+    );
+    assert_eq!(
+        source.matches("IsolationLevel::RepeatableRead").count(),
+        1,
+        "the multi-statement transcript snapshot must use one PostgreSQL snapshot"
     );
     for reason in [
         "central whole-transaction retry runner owns this site",
@@ -456,6 +664,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
         "read-only event snapshot",
         "read-only tenant-scoped startup semantic validation",
         "read-only indexed quota diagnostics for deterministic evidence",
+        "read-only indexed scoped telemetry correlation lookup",
         "policy reconciliation is startup-only, advisory-fenced, and atomically audited",
         "artifact orphan claim persists before unlink",
         "artifact orphan finalize fences exact ownership",
@@ -613,10 +822,14 @@ postgres_test!(
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let sqlite_path = root.join("authority.sqlite3");
-        let sqlite = Arc::new(SqliteTaskStore::open(&sqlite_path, 64).await.unwrap());
+        let sqlite = Arc::new(
+            SqliteTaskStore::open_with_audit_projection(&sqlite_path, 64)
+                .await
+                .unwrap(),
+        );
         let sqlite_key = sqlite.completion_receipt_key();
 
-        let pg_config = config(url.clone(), "row_parity");
+        let pg_config = config(url.clone(), "row_parity").with_audit_projection(true);
         let postgres = Arc::new(PostgresTaskStore::open(pg_config.clone()).await.unwrap());
         let postgres_key = postgres
             .completion_receipt_key()
@@ -658,7 +871,9 @@ postgres_test!(
             );
         }
 
-        let sqlite_reopened = SqliteTaskStore::open(&sqlite_path, 64).await.unwrap();
+        let sqlite_reopened = SqliteTaskStore::open_with_audit_projection(&sqlite_path, 64)
+            .await
+            .unwrap();
         assert_eq!(sqlite_reopened.completion_receipt_key(), sqlite_key);
         sqlite_reopened.shutdown().await.unwrap();
         let postgres_reopened = PostgresTaskStore::open(pg_config.clone()).await.unwrap();
@@ -1073,6 +1288,7 @@ postgres_test!(non_superuser_migrator_opens_and_runtime_cannot_escalate, {
     client.batch_execute(&format!(
         "CREATE ROLE {migrator} LOGIN PASSWORD 'bounded-migrator' NOSUPERUSER NOBYPASSRLS NOCREATEDB CREATEROLE NOREPLICATION NOINHERIT; GRANT CREATE ON DATABASE smesh_test TO {migrator}"
     )).await.unwrap();
+    let _cleanup = EphemeralRoleGuard::new(schema.clone(), migrator.clone());
     let migrator_url =
         format!("postgresql://{migrator}:bounded-migrator@127.0.0.1:55432/smesh_test");
     let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap_or_else(|_| {
@@ -1110,6 +1326,53 @@ postgres_test!(non_superuser_migrator_opens_and_runtime_cannot_escalate, {
         .unwrap();
     drop(runtime);
     runtime_driver.abort();
+    drop(client);
+    driver.abort();
+});
+
+postgres_test!(ephemeral_migrator_guard_cleans_after_injected_failure, {
+    let Some(_admin) = admin_url() else { return };
+    let suffix = format!("{:016x}", rand::random::<u64>());
+    let migrator = format!("smesh_migrator_{suffix}");
+    let schema = format!("smesh_guard_{suffix}");
+    let (client, driver) = admin_client(&superuser_url()).await;
+    client
+        .batch_execute(&format!(
+            "CREATE ROLE {migrator} LOGIN CREATEROLE; GRANT CREATE ON DATABASE smesh_test TO {migrator}; CREATE SCHEMA {schema} AUTHORIZATION {migrator}; CREATE ROLE {schema}_runtime NOLOGIN"
+        ))
+        .await
+        .unwrap();
+    let failed = std::panic::catch_unwind({
+        let schema = schema.clone();
+        let migrator = migrator.clone();
+        move || {
+            let _cleanup = EphemeralRoleGuard::new(schema, migrator);
+            panic!("injected failure after schema creation");
+        }
+    });
+    assert!(failed.is_err());
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_roles WHERE rolname = $1 OR rolname = $2",
+                &[&migrator, &format!("{schema}_runtime")],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM information_schema.schemata WHERE schema_name = $1",
+                &[&schema],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
     drop(client);
     driver.abort();
 });

@@ -125,6 +125,16 @@ Defaults:
 - public URL: `http://127.0.0.1:3000`
 - node ID: `smesh-a2a-gateway`
 - mode: `loopback`
+- OTLP: disabled
+
+Observability is configured with `SMESH_A2A_OTLP_MODE=grpc|http-protobuf` and a strict root
+`SMESH_A2A_OTLP_ENDPOINT`. Enabled production endpoints require HTTPS; debug tests may opt into a
+literal plaintext loopback collector with `SMESH_TEST_OTLP_INSECURE_LOOPBACK=1`. Export runs on an
+isolated bounded owner and is optional: collector absence, reset, or shutdown timeout cannot change
+protocol or durable-authority results. Ingress replaces caller `x-request-id` and ignores
+`traceparent`, `tracestate`, and `baggage` as authority. See
+[`docs/OBSERVABILITY_RUNBOOK.md`](docs/OBSERVABILITY_RUNBOOK.md), the bootstrap objectives,
+Prometheus rules, Grafana dashboard, and normalized OTLP fixture under `observability/`.
 
 Configuration:
 

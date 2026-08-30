@@ -9,7 +9,7 @@ use rusqlite::{Connection, types::ValueRef};
 use serde_json::{Map, Value};
 use tokio_postgres::Client;
 
-pub const AUTHORITY_TABLES: [&str; 17] = [
+pub const AUTHORITY_TABLES: [&str; 18] = [
     "store_metadata",
     "store_identity",
     "tasks",
@@ -24,6 +24,7 @@ pub const AUTHORITY_TABLES: [&str; 17] = [
     "stream_frames",
     "cancellation_intents",
     "authorization_decisions",
+    "audit_projection_outbox",
     "list_snapshots",
     "list_snapshot_entries",
     "list_page_tokens",
@@ -65,6 +66,13 @@ pub async fn assert_postgres_tables_match(client: &Client, schema: &str) {
         .map(|row| row.get::<_, String>(0))
         .collect::<BTreeSet<_>>();
     for table in [
+        // PostgreSQL keeps the starts-at-enable switch in a sealed control row;
+        // SQLite carries the equivalent enablement in its open mode.
+        "audit_projection_control",
+        // PostgreSQL-only protected connection capability state has no SQLite
+        // analogue and is never authoritative task data.
+        "audit_projection_session_secret",
+        "audit_projection_sessions",
         // PostgreSQL-only artifact authority. SQLite intentionally remains a
         // development compatibility backend and must not claim artifact parity.
         "artifact_backup_inventory",
@@ -377,6 +385,13 @@ fn normalize(tables: &mut BTreeMap<String, Vec<Value>>) {
             }
             match table.as_str() {
                 "store_metadata" => {
+                    // Physical migration counters are backend-local (SQLite 7,
+                    // PostgreSQL 6); both represent the same current logical
+                    // authority plus optional audit projection schema.
+                    object.insert(
+                        "schema_version".into(),
+                        Value::String("current-logical-authority".into()),
+                    );
                     for field in ["cursor_key", "receipt_key"] {
                         if let Some(value) = object.get_mut(field) {
                             let encoded_len = value.as_str().map_or(0, str::len);

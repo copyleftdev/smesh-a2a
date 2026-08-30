@@ -2,6 +2,7 @@
 #![allow(
     clippy::if_not_else,
     clippy::missing_errors_doc,
+    clippy::struct_excessive_bools,
     clippy::too_many_lines
 )]
 
@@ -24,7 +25,9 @@ use a2a::{
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime};
+use deadpool_postgres::{
+    Hook, HookError, Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime,
+};
 use hmac::{Hmac, Mac};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -62,6 +65,9 @@ const DISTRIBUTED_QUOTA_MIGRATION_NAME: &str = "0004_distributed_quota_authority
 const ARTIFACT_MIGRATION_SQL: &str =
     include_str!("../migrations/postgres/0005_artifact_authority.sql");
 const ARTIFACT_MIGRATION_NAME: &str = "0005_artifact_authority";
+const AUDIT_PROJECTION_MIGRATION_SQL: &str =
+    include_str!("../migrations/postgres/0006_audit_projection.sql");
+const AUDIT_PROJECTION_MIGRATION_NAME: &str = "0006_audit_projection";
 const LOGICAL_SCHEMA_VERSION: i64 = 6;
 const MAX_CONFIG_BYTES: usize = 4096;
 const PAGE_TOKEN_VERSION: i64 = 1;
@@ -129,6 +135,10 @@ pub(crate) const EXPECTED_TABLES: &[&str] = &[
     "artifact_restore_jobs",
     "artifact_retention_holds",
     "artifact_tombstones",
+    "audit_projection_control",
+    "audit_projection_outbox",
+    "audit_projection_session_secret",
+    "audit_projection_sessions",
     "authorization_decisions",
     "cancellation_intents",
     "content_objects",
@@ -184,6 +194,7 @@ const TENANT_TABLES: &[&str] = &[
     "artifact_restore_jobs",
     "artifact_retention_holds",
     "artifact_tombstones",
+    "audit_projection_outbox",
     "authorization_decisions",
     "cancellation_intents",
     "content_objects",
@@ -233,6 +244,8 @@ const EXPECTED_CUSTOM_INDEXES: &[&str] = &[
     "artifact_references_resolve",
     "artifact_restore_one_enabled_identity",
     "artifact_retention_holds_active",
+    "audit_projection_claim",
+    "audit_projection_tenant_claim",
     "authorization_decisions_actor_time",
     "authorization_decisions_resource_time",
     "authorization_decisions_tenant_time",
@@ -285,6 +298,7 @@ pub struct PostgresStoreConfig {
     acquire_timeout: Duration,
     test_only_insecure_loopback: bool,
     trust_injected_time: bool,
+    audit_projection_enabled: bool,
     quota_enforcement: bool,
     quota_policy: Option<Arc<crate::QuotaPolicy>>,
     quota_reconciliation_plan: Option<Arc<crate::QuotaReconciliationPlan>>,
@@ -345,6 +359,7 @@ impl fmt::Debug for PostgresStoreConfig {
                 &self.artifact_migration_plan_file.is_some(),
             )
             .field("trust_injected_time", &self.trust_injected_time)
+            .field("audit_projection_enabled", &self.audit_projection_enabled)
             .field("quota_enforcement", &self.quota_enforcement)
             .field("quota_policy_configured", &self.quota_policy.is_some())
             .field(
@@ -414,6 +429,7 @@ impl PostgresStoreConfig {
             acquire_timeout: Duration::from_secs(5),
             test_only_insecure_loopback: false,
             trust_injected_time: false,
+            audit_projection_enabled: false,
             quota_enforcement: false,
             quota_policy: None,
             quota_reconciliation_plan: None,
@@ -508,6 +524,13 @@ impl PostgresStoreConfig {
     #[must_use]
     pub fn with_quota_enforcement(mut self, enabled: bool) -> Self {
         self.quota_enforcement = enabled;
+        self
+    }
+
+    /// Enable connection-scoped, starts-at-enable durable audit projection.
+    #[must_use]
+    pub fn with_audit_projection(mut self, enabled: bool) -> Self {
+        self.audit_projection_enabled = enabled;
         self
     }
 
@@ -647,6 +670,7 @@ pub struct PostgresTaskStore {
     observation: ChangeObservation,
     max_tasks: usize,
     trust_injected_time: bool,
+    audit_projection_enabled: bool,
     quota_enforcement: bool,
     quota_policy: Option<Arc<crate::QuotaPolicy>>,
     transaction_test_faults: Arc<Mutex<VecDeque<PostgresTransactionTestFault>>>,
@@ -657,6 +681,7 @@ pub struct PostgresTaskStore {
     artifact_store: Option<Arc<PosixArtifactBlobStore>>,
     artifact_keyring: Option<Arc<ReloadingArtifactKeyring>>,
     artifact_runtime_limits: crate::ArtifactRuntimeLimits,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
     _test_cleanup: Option<Arc<PostgresTestCleanup>>,
 }
 
@@ -690,6 +715,18 @@ impl crate::ArtifactAuthority for PostgresTaskStore {
                 .map_err(|_| A2AError::internal("artifact staging worker failed"))?
                 .map_err(|_| A2AError::invalid_request("artifact staging failed"))?;
         crate::artifact_production_checkpoint("publication_stage_before_receiver_transaction");
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.artifact_event(
+                crate::telemetry::EventName::ArtifactStaged,
+                "ok",
+                "encrypted",
+                "artifact_stage",
+                Some(&staged.artifact_id),
+                Some(&staged.task_id),
+                Some(&staged.context_id),
+                Some(&staged.dispatch_id),
+            );
+        }
         Ok(staged)
     }
 
@@ -740,6 +777,18 @@ impl crate::ArtifactAuthority for PostgresTaskStore {
             })
         }).await?;
         crate::artifact_production_checkpoint("receiver_commit_before_physical_promotion");
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.artifact_event(
+                crate::telemetry::EventName::ArtifactRegistered,
+                "ok",
+                "committed",
+                "artifact_register",
+                Some(&registration.artifact_id),
+                Some(&registration.task_id),
+                Some(&registration.context_id),
+                Some(&registration.dispatch_id),
+            );
+        }
         Ok(())
     }
 
@@ -968,6 +1017,18 @@ impl crate::ArtifactAuthority for PostgresTaskStore {
                         Ok(())
                     })
             }).await?;
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.artifact_event(
+                    crate::telemetry::EventName::ArtifactCorruptionDetected,
+                    "failed",
+                    "quarantined",
+                    "artifact_resolve",
+                    Some(&r.artifact_id),
+                    Some(&r.task_id),
+                    None,
+                    None,
+                );
+            }
             Err(A2AError::internal("artifact integrity verification failed"))
         }
     }
@@ -979,7 +1040,20 @@ impl crate::ArtifactAuthority for PostgresTaskStore {
     ) -> Result<bool, A2AError> {
         let tenant = r.tenant_scope.clone();
         let r = r.clone();
-        self.run_retryable_transaction(&tenant,None,|store,tx|{let r=r.clone();Box::pin(async move{let q=store.q("UPDATE __S__.artifact_read_leases SET state='released' WHERE tenant_scope=$1 AND lease_id=$2 AND lease_token=$3 AND lease_epoch=$4 AND state IN ('active','released')");tx.execute(&q,&[&r.tenant_scope,&r.lease_id,&r.lease_token,&i64::try_from(r.lease_epoch).unwrap_or(i64::MAX)]).await.map(|n|n==1).map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact lease finish failed")))})}).await
+        let committed = self.run_retryable_transaction(&tenant,None,|store,tx|{let r=r.clone();Box::pin(async move{let q=store.q("UPDATE __S__.artifact_read_leases SET state='released' WHERE tenant_scope=$1 AND lease_id=$2 AND lease_token=$3 AND lease_epoch=$4 AND state IN ('active','released')");tx.execute(&q,&[&r.tenant_scope,&r.lease_id,&r.lease_token,&i64::try_from(r.lease_epoch).unwrap_or(i64::MAX)]).await.map(|n|n==1).map_err(|e|Self::transaction_body_error(&e,A2AError::internal("artifact lease finish failed")))})}).await?;
+        if committed && let Some(telemetry) = &self.telemetry {
+            telemetry.artifact_event(
+                crate::telemetry::EventName::ArtifactResolved,
+                "ok",
+                "integrity_verified",
+                "artifact_resolve",
+                Some(&r.artifact_id),
+                Some(&r.task_id),
+                None,
+                None,
+            );
+        }
+        Ok(committed)
     }
     async fn place_artifact_hold(
         &self,
@@ -1342,6 +1416,12 @@ impl crate::ArtifactAuthority for PostgresTaskStore {
 }
 
 impl PostgresTaskStore {
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: Option<crate::telemetry::TelemetryHandle>) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
     /// Verify and restore an encrypted artifact root against offline restored PostgreSQL metadata.
     pub async fn restore_artifacts(
         config: PostgresStoreConfig,
@@ -1388,6 +1468,7 @@ impl PostgresTaskStore {
                 source,
                 target,
                 plan,
+                config.audit_projection_enabled,
             )
             .await;
             let _ = client
@@ -1420,6 +1501,7 @@ impl PostgresTaskStore {
                 source,
                 target,
                 plan,
+                config.audit_projection_enabled,
             )
             .await;
             let _ = client
@@ -1739,6 +1821,38 @@ impl PostgresTaskStore {
         };
         validate_runtime_login(&migration, &config.schema, &runtime_user).await?;
         migrate(&mut migration, &config.schema, &runtime_user).await?;
+        if config.audit_projection_enabled {
+            let changed = migration
+                .execute(
+                    &format!(
+                        "UPDATE {}.audit_projection_control SET enabled=true WHERE singleton=1 AND NOT EXISTS(SELECT 1 FROM {}.artifact_restore_jobs WHERE state='restoring')",
+                        config.schema, config.schema
+                    ),
+                    &[],
+                )
+                .await
+                .map_err(|_| PostgresStoreError::Initialization)?;
+            if changed != 1 {
+                return Err(PostgresStoreError::ArtifactMigrationBusy);
+            }
+        }
+        let projection_proof = if config.audit_projection_enabled {
+            Some(
+                migration
+                    .query_one(
+                        &format!(
+                            "SELECT proof FROM {}.audit_projection_session_secret WHERE singleton=1",
+                            config.schema
+                        ),
+                        &[],
+                    )
+                    .await
+                    .map_err(|_| PostgresStoreError::Initialization)?
+                    .get::<_, String>(0),
+            )
+        } else {
+            None
+        };
 
         validate_runtime_login(&migration, &config.schema, &runtime_user).await?;
 
@@ -1849,12 +1963,31 @@ impl PostgresTaskStore {
 
         drop(migration);
         driver.abort();
-        let pool = Pool::builder(manager)
+        let mut pool_builder = Pool::builder(manager)
             .max_size(config.pool_size)
             .runtime(Runtime::Tokio1)
             .wait_timeout(Some(config.acquire_timeout))
             .create_timeout(Some(config.connect_timeout))
-            .recycle_timeout(Some(config.acquire_timeout))
+            .recycle_timeout(Some(config.acquire_timeout));
+        if let Some(proof) = projection_proof {
+            let sql = Arc::new(format!(
+                "SELECT {}.register_audit_projection_session($1)",
+                config.schema
+            ));
+            let proof = Arc::new(proof);
+            pool_builder = pool_builder.post_create(Hook::async_fn(move |client, _| {
+                let sql = Arc::clone(&sql);
+                let proof = Arc::clone(&proof);
+                Box::pin(async move {
+                    client
+                        .query_one(sql.as_str(), &[&proof.as_str()])
+                        .await
+                        .map(|_| ())
+                        .map_err(|_| HookError::message("projection session registration failed"))
+                })
+            }));
+        }
+        let pool = pool_builder
             .build()
             .map_err(|_| PostgresStoreError::Initialization)?;
         let mut object = tokio::time::timeout(config.acquire_timeout, pool.get())
@@ -2018,6 +2151,7 @@ impl PostgresTaskStore {
                 .map_err(|_| PostgresStoreError::Initialization)?,
             max_tasks: config.max_tasks,
             trust_injected_time: config.trust_injected_time,
+            audit_projection_enabled: config.audit_projection_enabled,
             quota_enforcement: config.quota_enforcement,
             quota_policy: config.quota_policy,
             transaction_test_faults: config.transaction_test_faults,
@@ -2028,6 +2162,7 @@ impl PostgresTaskStore {
             artifact_store,
             artifact_keyring,
             artifact_runtime_limits,
+            telemetry: None,
             _test_cleanup: config.test_cleanup,
         })
     }
@@ -3592,9 +3727,23 @@ impl PostgresTaskStore {
                 self.append_quota_denial_audit(intent, requested_now, 1)
                     .await
                     .map_err(|_| crate::quota::quota_authority_unavailable())?;
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.quota_decision("quota_exceeded", intent.operation().as_str());
+                }
                 Err(error)
             }
-            other => other,
+            Ok(value) => {
+                if let (Some(telemetry), Some(intent)) = (&self.telemetry, intent) {
+                    telemetry.quota_decision("ok", intent.operation().as_str());
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if let (Some(telemetry), Some(intent)) = (&self.telemetry, intent) {
+                    telemetry.quota_decision("unavailable", intent.operation().as_str());
+                }
+                Err(error)
+            }
         }
     }
 
@@ -4320,6 +4469,49 @@ async fn migrate(
         .await
         .map_err(|_| PostgresStoreError::Initialization)?;
     }
+    let audit_checksum = content_digest(AUDIT_PROJECTION_MIGRATION_SQL.as_bytes());
+    let audit_row = tx.query_opt(&format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=6"), &[])
+        .await.map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if let Some(row) = audit_row {
+        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+            || row.get::<_, String>(1) != audit_checksum
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    } else {
+        let sql = AUDIT_PROJECTION_MIGRATION_SQL
+            .replace("__SCHEMA__", schema)
+            .replace("__ROLE__", &format!("{schema}_runtime"))
+            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        tx.batch_execute(&sql)
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {schema}.schema_migrations VALUES(6,6,$1,$2,{schema}.db_millis())"
+            ),
+            &[&AUDIT_PROJECTION_MIGRATION_NAME, &audit_checksum],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        let catalog = catalog_digest(&tx, schema).await?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata DISABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!("UPDATE {schema}.store_metadata SET catalog_hash=$1 WHERE singleton=1"),
+            &[&catalog],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    }
     tx.commit()
         .await
         .map_err(|_| PostgresStoreError::Initialization)
@@ -4843,6 +5035,7 @@ async fn validate_catalog(
             "artifact_inline_migration_required",
             "artifact_restore_incomplete",
             "artifact_stage_locator_live",
+            "audit_projection_session_valid",
             "authority_diagnostics_bounded",
             "authority_retained_scopes_bounded",
             "authority_tenants_bounded",
@@ -4850,9 +5043,15 @@ async fn validate_catalog(
             "claim_artifact_gc",
             "claim_artifact_reencryption",
             "claim_artifact_upload",
+            "claim_audit_projection",
             "claim_outbox_bounded",
+            "cleanup_audit_projection",
+            "commit_audit_projection",
+            "enqueue_audit_projection",
             "ensure_outbox_tenant_scheduler",
+            "fail_audit_projection",
             "gc_quota_authority_bounded",
+            "register_audit_projection_session",
         ]
         || definer_rows.iter().any(|row| {
             if row.get::<_, &str>(1) != expected_owner {
@@ -4945,6 +5144,11 @@ async fn validate_catalog(
             5_i64,
             ARTIFACT_MIGRATION_NAME,
             content_digest(ARTIFACT_MIGRATION_SQL.as_bytes()),
+        ),
+        (
+            6_i64,
+            AUDIT_PROJECTION_MIGRATION_NAME,
+            content_digest(AUDIT_PROJECTION_MIGRATION_SQL.as_bytes()),
         ),
     ];
     if migration_rows.len() != expected_migrations.len()
@@ -5464,7 +5668,141 @@ impl crate::IntoDurableAuthority for PostgresTaskStore {
     }
 }
 
+#[async_trait]
+impl crate::AuditProjectionAuthority for PostgresTaskStore {
+    fn audit_projection_capabilities(&self) -> crate::AuditProjectionCapabilities {
+        crate::AuditProjectionCapabilities {
+            enabled: self.audit_projection_enabled,
+            starts_at_enable: true,
+        }
+    }
+
+    async fn claim_audit_projection(
+        &self,
+        owner: &str,
+        lease_duration_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::AuditProjectionLease>, A2AError> {
+        if !self.audit_projection_enabled
+            || !crate::durable_authority::valid_bounded_identity(owner)
+            || !(1..=300_000).contains(&lease_duration_ms)
+            || !(1..=1_000).contains(&limit)
+        {
+            return Err(A2AError::invalid_request("invalid audit projection claim"));
+        }
+        let token = content_digest(&rand::random::<[u8; 32]>());
+        let client = self.connection().await?;
+        let rows = client
+            .query(
+                &self.q("SELECT * FROM __S__.claim_audit_projection($1,$2,$3,$4)"),
+                &[
+                    &owner,
+                    &token,
+                    &lease_duration_ms,
+                    &i32::try_from(limit).unwrap_or(1000),
+                ],
+            )
+            .await
+            .map_err(|_| A2AError::internal("audit projection claim failed"))?;
+        rows.into_iter()
+            .map(|r| {
+                let tenant: String = r.get(0);
+                let source: String = r.get(2);
+                let kind: String = r.get(4);
+                crate::AuditProjectionLease::new(
+                    content_digest(tenant.as_bytes()),
+                    r.get::<_, String>(1),
+                    crate::AuditProjectionSource::parse(&source)
+                        .ok_or_else(|| A2AError::internal("invalid audit projection source"))?,
+                    r.get::<_, String>(3),
+                    crate::AuditProjectionEventKind::parse(&kind)
+                        .ok_or_else(|| A2AError::internal("invalid audit projection kind"))?,
+                    r.get(5),
+                    owner,
+                    &token,
+                    u64::try_from(r.get::<_, i64>(6)).unwrap_or(0),
+                    r.get(7),
+                    u32::try_from(r.get::<_, i32>(8)).unwrap_or(0),
+                )
+            })
+            .collect()
+    }
+
+    async fn commit_audit_projection(
+        &self,
+        lease: &crate::AuditProjectionLease,
+    ) -> Result<bool, A2AError> {
+        let client = self.connection().await?;
+        client
+            .query_one(
+                &self.q("SELECT __S__.commit_audit_projection($1,$2,$3,$4)"),
+                &[
+                    &lease.event_id(),
+                    &lease.lease_owner(),
+                    &lease.lease_token(),
+                    &i64::try_from(lease.lease_epoch()).unwrap_or(-1),
+                ],
+            )
+            .await
+            .map(|r| r.get(0))
+            .map_err(|_| A2AError::internal("audit projection commit failed"))
+    }
+    async fn fail_audit_projection(
+        &self,
+        lease: &crate::AuditProjectionLease,
+        error_digest: &str,
+        retry_delay_ms: i64,
+    ) -> Result<crate::AuditProjectionState, A2AError> {
+        let client = self.connection().await?;
+        let state: String = client
+            .query_one(
+                &self.q("SELECT __S__.fail_audit_projection($1,$2,$3,$4,$5,$6)"),
+                &[
+                    &lease.event_id(),
+                    &lease.lease_owner(),
+                    &lease.lease_token(),
+                    &i64::try_from(lease.lease_epoch()).unwrap_or(-1),
+                    &error_digest,
+                    &retry_delay_ms,
+                ],
+            )
+            .await
+            .map_err(|_| A2AError::internal("audit projection failure commit failed"))?
+            .get(0);
+        Ok(match state.as_str() {
+            "pending" => crate::AuditProjectionState::Pending,
+            "dead" => crate::AuditProjectionState::Dead,
+            _ => crate::AuditProjectionState::Leased,
+        })
+    }
+    async fn cleanup_audit_projection(
+        &self,
+        retention_ms: i64,
+        limit: usize,
+    ) -> Result<u64, A2AError> {
+        if !(1..=1000).contains(&limit) {
+            return Err(A2AError::invalid_request(
+                "invalid audit projection cleanup",
+            ));
+        }
+        let client = self.connection().await?;
+        let n: i64 = client
+            .query_one(
+                &self.q("SELECT __S__.cleanup_audit_projection($1,$2)"),
+                &[&retention_ms, &i32::try_from(limit).unwrap_or(1000)],
+            )
+            .await
+            .map_err(|_| A2AError::internal("audit projection cleanup failed"))?
+            .get(0);
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+}
+
 impl AuthorityIdentity for PostgresTaskStore {
+    fn audit_projection_authority(&self) -> Option<&dyn crate::AuditProjectionAuthority> {
+        self.audit_projection_enabled.then_some(self)
+    }
+
     fn artifact_authority(&self) -> Option<&dyn crate::ArtifactAuthority> {
         Some(self)
     }
@@ -6937,6 +7275,29 @@ impl TaskLifecycle for PostgresTaskStore {
 
 #[async_trait]
 impl OutboxAuthority for PostgresTaskStore {
+    async fn telemetry_correlation_for_outbox(
+        &self,
+        lease: &OutboxLease,
+    ) -> Result<Option<crate::TelemetryCorrelation>, A2AError> {
+        let mut connection = self.connection().await?;
+        // ALLOWLIST: read-only indexed scoped telemetry correlation lookup.
+        let tx = connection
+            .transaction()
+            .await
+            .map_err(|_| A2AError::internal("durable telemetry correlation lookup failed"))?;
+        self.set_tenant(&tx, &lease.tenant_scope, None).await?;
+        let sql = self.q("SELECT o.message_id,o.task_id,t.context_id FROM __S__.outbox o JOIN __S__.tasks t ON t.tenant_scope=o.tenant_scope AND t.task_id=o.task_id WHERE o.tenant_scope=$1 AND o.dispatch_id=$2");
+        let row = tx
+            .query_opt(&sql, &[&lease.tenant_scope, &lease.dispatch_id])
+            .await
+            .map_err(|_| A2AError::internal("durable telemetry correlation lookup failed"))?;
+        tx.commit()
+            .await
+            .map_err(|_| A2AError::internal("durable telemetry correlation lookup failed"))?;
+        row.map(|row| crate::TelemetryCorrelation::new(row.get(0), row.get(1), row.get(2)))
+            .transpose()
+    }
+
     async fn claim_outbox(
         &self,
         lease_owner: &str,
@@ -8357,7 +8718,9 @@ impl TranscriptAuthority for PostgresTaskStore {
         // ALLOWLIST: read-only transcript snapshot; no serialization writes.
         let mut client = self.connection().await?;
         let tx = client
-            .transaction()
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .start()
             .await
             .map_err(|_| A2AError::internal("stream read transaction failed"))?;
         self.set_tenant(&tx, tenant, None).await?;
