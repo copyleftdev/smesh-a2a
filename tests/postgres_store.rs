@@ -316,6 +316,158 @@ postgres_test!(
     }
 );
 
+#[cfg(debug_assertions)]
+postgres_test!(
+    stream_snapshot_is_consistent_when_publication_commits_between_metadata_and_frames,
+    {
+        let Some(url) = admin_url() else { return };
+        let config = config(url, "stream_snapshot");
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let tenant = "tenant-stream-snapshot";
+        let message_id = "message-stream-snapshot";
+        let bound_message_id =
+            smesh_a2a::authorized_message_identity(tenant, "owner-stream-snapshot", message_id);
+        let mut message = a2a::Message::new(
+            a2a::Role::User,
+            vec![a2a::Part::text("consistent stream snapshot")],
+        );
+        message.message_id = message_id.into();
+        let task = a2a::Task {
+            id: "task-stream-snapshot".into(),
+            context_id: "context-stream-snapshot".into(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: chrono::DateTime::from_timestamp_millis(100),
+            },
+            artifacts: None,
+            history: Some(vec![message.clone()]),
+            metadata: None,
+        };
+        let initial = a2a::StreamResponse::Task(task.clone());
+        let command = SendMessageAdmission {
+            request: a2a::SendMessageRequest {
+                message,
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            },
+            streaming: true,
+            task: task.clone(),
+            original_result: a2a::SendMessageResponse::Task(task.clone()),
+            input_limits: smesh_a2a::InputLimits::default(),
+            now: 100,
+            max_attempts: 2,
+        };
+        let scope =
+            OwnedTaskScope::new(tenant, "owner-stream-snapshot", VisibilityScope::Own).unwrap();
+        let audit = AuthorizationAuditInput::new(
+            "audit-stream-snapshot",
+            tenant,
+            "owner-stream-snapshot",
+            "policy-stream-snapshot",
+            1,
+            "digest-stream-snapshot",
+            "TaskCreate",
+            AuthorizationDecisionEffect::Allow,
+            "policy_grant",
+            "message",
+            "resource-stream-snapshot",
+            None,
+            100,
+        )
+        .unwrap();
+        store
+            .authorize_and_admit(&scope, command, audit)
+            .await
+            .unwrap();
+
+        let (mut writer, writer_connection) = tokio_postgres::connect(&superuser_url(), NoTls)
+            .await
+            .unwrap();
+        let writer_driver = tokio::spawn(writer_connection);
+        let tx = writer.transaction().await.unwrap();
+        let schema = config.schema_name();
+        tx.batch_execute(&format!(
+            "LOCK TABLE {schema}.stream_frames IN ACCESS EXCLUSIVE MODE"
+        ))
+        .await
+        .unwrap();
+        let reader_store = store.clone();
+        let reader_message_id = bound_message_id.clone();
+        let reader = tokio::spawn(async move {
+            reader_store
+                .stream_frames_after_scoped(tenant, &reader_message_id, 0)
+                .await
+        });
+        let reached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = tx
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND relation=to_regclass($1))",
+                        &[&format!("{schema}.stream_frames")],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if blocked {
+                    break;
+                }
+                if reader.is_finished() {
+                    break;
+                }
+            }
+        })
+        .await;
+        if reached.is_err() || reader.is_finished() {
+            tx.rollback().await.unwrap();
+            panic!("reader barrier failed; reader={:?}", reader.await.unwrap());
+        }
+
+        let update = a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+            task_id: task.id.clone(),
+            context_id: task.context_id.clone(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Working,
+                message: None,
+                timestamp: chrono::DateTime::from_timestamp_millis(101),
+            },
+            metadata: None,
+        });
+        let update_json = serde_json::to_string(&update).unwrap();
+        let transcript_digest = smesh_a2a::content_digest(
+            &serde_json::to_vec(&[initial.clone(), update.clone()]).unwrap(),
+        );
+        tx.batch_execute(&format!("SET LOCAL smesh.tenant_scope='{tenant}'"))
+            .await
+            .unwrap();
+        tx.execute(
+            &format!("INSERT INTO {schema}.stream_frames(tenant_scope,message_id,frame_seq,frame_version,frame_kind,frame_json,frame_digest,created_at) VALUES($1,$2,2,1,'status_update',$3,$4,101)"),
+            &[&tenant, &bound_message_id, &update_json, &smesh_a2a::content_digest(update_json.as_bytes())],
+        ).await.unwrap();
+        tx.execute(
+            &format!("UPDATE {schema}.stream_transcripts SET frame_count=2,transcript_digest=$1,updated_at=101 WHERE tenant_scope=$2 AND message_id=$3"),
+            &[&transcript_digest, &tenant, &bound_message_id],
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let snapshot = reader
+            .await
+            .unwrap()
+            .expect("snapshot read must remain valid");
+        assert_eq!(snapshot.frames, vec![initial]);
+        assert!(!snapshot.closed);
+        let after = store
+            .stream_frames_after_scoped(tenant, &bound_message_id, 1)
+            .await
+            .unwrap();
+        assert_eq!(after.frames, vec![update]);
+        writer_driver.abort();
+        store.shutdown().await.unwrap();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    }
+);
+
 #[test]
 fn postgres_config_redacts_both_migrator_and_runtime_urls() {
     let config = PostgresStoreConfig::new(
@@ -493,9 +645,14 @@ fn retryable_growth_uses_materialized_quota_enforcement_without_global_hot_path_
 fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist() {
     let source = include_str!("../src/postgres_store.rs");
     assert_eq!(
-        source.matches(".transaction()").count(),
+        source.matches(".transaction()").count() + source.matches(".build_transaction()").count(),
         14,
         "new direct transaction site must be routed through the bounded runner or explicitly reviewed"
+    );
+    assert_eq!(
+        source.matches("IsolationLevel::RepeatableRead").count(),
+        1,
+        "the multi-statement transcript snapshot must use one PostgreSQL snapshot"
     );
     for reason in [
         "central whole-transaction retry runner owns this site",

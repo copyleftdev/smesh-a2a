@@ -8718,7 +8718,9 @@ impl TranscriptAuthority for PostgresTaskStore {
         // ALLOWLIST: read-only transcript snapshot; no serialization writes.
         let mut client = self.connection().await?;
         let tx = client
-            .transaction()
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .start()
             .await
             .map_err(|_| A2AError::internal("stream read transaction failed"))?;
         self.set_tenant(&tx, tenant, None).await?;

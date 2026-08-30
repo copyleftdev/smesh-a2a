@@ -332,3 +332,25 @@ Selected SHA-256 hashes:
 - `tests/telemetry_schema.rs` — `9fca76f7fdafe486b5f61209879ec35588876989e901f7c2923c50361bec7ba3`
 - `docs/OBSERVABILITY_RUNBOOK.md` — `64e3b67b3b7f02cc9539c9f7bc4845d03ad2b3c82390e7d10b6413d9a70e72e4`
 - `observability/fixtures/normalized-otlp-golden.json` — `1b069b1f60cbf98310d2a4f8901ce3e7c8eb8441565b38f82ad80d8140d25073`
+## PostgreSQL stream snapshot closure — 2026-08-30
+
+- A repeated production PostgreSQL gateway test exposed a pre-existing snapshot race: terminal
+  publication could commit between the transcript-metadata and frame queries, causing one poll to
+  combine metadata from an older snapshot with frames from a newer snapshot and reject the stream
+  cursor as corrupt.
+- `stream_frames_after_scoped` now reads metadata, frames, digest, and terminal result in one
+  bounded, query-only `REPEATABLE READ` transaction. A subsequent poll starts a fresh transaction
+  and observes later commits.
+- A deterministic `ACCESS EXCLUSIVE` test barrier reproduced the old failure and verifies both the
+  original consistent snapshot and the later committed frame.
+- The production PostgreSQL restart/replay test passed 10 consecutive telemetry-enabled runs and
+  three telemetry-disabled isolation runs. The exact PostgreSQL CI sequence passed: artifact
+  process 3x, PostgreSQL store 61/61, multi-replica 2/2, target process, quota process 2/2, and
+  PostgreSQL quota 29/29.
+- Independent review confirmed transaction-local tenant/role context, bounded statement/lock
+  watchdogs, rollback on every error path, no lock expansion, and no SQLite change.
+
+Selected SHA-256 hashes:
+
+- `src/postgres_store.rs` — `a9cbfdad31ced7b90c5025415aa3b0159789a734cbf5aad1da067f005d9ec353`
+- `tests/postgres_store.rs` — `2023a3c912afa9a582913a7a196e4f74558661c608279529fba0bcf3c728cae6`
