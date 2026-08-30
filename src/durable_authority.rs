@@ -547,6 +547,31 @@ pub struct OutboxLease {
     pub execution_reservation: Option<ExecutionReservation>,
 }
 
+/// Bounded correlation loaded from the authoritative outbox/task row after claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryCorrelation {
+    pub message_id: String,
+    pub task_id: String,
+    pub context_id: String,
+}
+
+impl TelemetryCorrelation {
+    pub fn new(message_id: String, task_id: String, context_id: String) -> Result<Self, A2AError> {
+        if [&message_id, &task_id, &context_id].iter().any(|value| {
+            value.is_empty()
+                || value.len() > crate::telemetry::MAX_CORRELATION_BYTES
+                || value.chars().any(char::is_control)
+        }) {
+            return Err(A2AError::internal("invalid durable telemetry correlation"));
+        }
+        Ok(Self {
+            message_id,
+            task_id,
+            context_id,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptDisposition {
     Retry { available_at: i64, error: String },
@@ -1251,6 +1276,252 @@ pub struct TaskEventBatch {
     pub last_revision: u64,
 }
 
+/// Closed durable relations that may originate an optional audit projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditProjectionSource {
+    AuthorizationDecision,
+    TaskEvent,
+    CancellationIntent,
+    QuotaDenial,
+    QuotaOverride,
+    QuotaReconciliation,
+    ArtifactCorruption,
+    ArtifactKey,
+    ArtifactMigration,
+    ArtifactBackup,
+    ArtifactRestore,
+    ArtifactKeyRotation,
+}
+impl AuditProjectionSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthorizationDecision => "authorization_decisions",
+            Self::TaskEvent => "task_events",
+            Self::CancellationIntent => "cancellation_intents",
+            Self::QuotaDenial => "quota_denial_audits",
+            Self::QuotaOverride => "quota_override_audits",
+            Self::QuotaReconciliation => "quota_policy_reconciliation_audits",
+            Self::ArtifactCorruption => "artifact_corruption_audits",
+            Self::ArtifactKey => "artifact_key_audits",
+            Self::ArtifactMigration => "artifact_migration_plans",
+            Self::ArtifactBackup => "artifact_backup_jobs",
+            Self::ArtifactRestore => "artifact_restore_jobs",
+            Self::ArtifactKeyRotation => "artifact_key_rotation_plans",
+        }
+    }
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "authorization_decisions" => Self::AuthorizationDecision,
+            "task_events" => Self::TaskEvent,
+            "cancellation_intents" => Self::CancellationIntent,
+            "quota_denial_audits" => Self::QuotaDenial,
+            "quota_override_audits" => Self::QuotaOverride,
+            "quota_policy_reconciliation_audits" => Self::QuotaReconciliation,
+            "artifact_corruption_audits" => Self::ArtifactCorruption,
+            "artifact_key_audits" => Self::ArtifactKey,
+            "artifact_migration_plans" => Self::ArtifactMigration,
+            "artifact_backup_jobs" => Self::ArtifactBackup,
+            "artifact_restore_jobs" => Self::ArtifactRestore,
+            "artifact_key_rotation_plans" => Self::ArtifactKeyRotation,
+            _ => return None,
+        })
+    }
+}
+
+/// Closed audit meanings emitted by the projector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditProjectionEventKind {
+    AuthorizationDecided,
+    TaskTerminal,
+    TaskCanceled,
+    QuotaDenied,
+    QuotaOverridden,
+    QuotaReconciled,
+    ArtifactCorruptionDetected,
+    ArtifactKeyChanged,
+    ArtifactOperatorCompleted,
+}
+impl AuditProjectionEventKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthorizationDecided => "authorization_decided",
+            Self::TaskTerminal => "task_terminal",
+            Self::TaskCanceled => "task_canceled",
+            Self::QuotaDenied => "quota_denied",
+            Self::QuotaOverridden => "quota_overridden",
+            Self::QuotaReconciled => "quota_reconciled",
+            Self::ArtifactCorruptionDetected => "artifact_corruption_detected",
+            Self::ArtifactKeyChanged => "artifact_key_changed",
+            Self::ArtifactOperatorCompleted => "artifact_operator_completed",
+        }
+    }
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "authorization_decided" => Self::AuthorizationDecided,
+            "task_terminal" => Self::TaskTerminal,
+            "task_canceled" => Self::TaskCanceled,
+            "quota_denied" => Self::QuotaDenied,
+            "quota_overridden" => Self::QuotaOverridden,
+            "quota_reconciled" => Self::QuotaReconciled,
+            "artifact_corruption_detected" => Self::ArtifactCorruptionDetected,
+            "artifact_key_changed" => Self::ArtifactKeyChanged,
+            "artifact_operator_completed" => Self::ArtifactOperatorCompleted,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditProjectionState {
+    Pending,
+    Leased,
+    Delivered,
+    Dead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditProjectionCapabilities {
+    pub enabled: bool,
+    pub starts_at_enable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditProjectionLease {
+    tenant_digest: String,
+    event_id: String,
+    source: AuditProjectionSource,
+    source_pk_digest: String,
+    event_kind: AuditProjectionEventKind,
+    occurred_at: i64,
+    lease_owner: String,
+    lease_token: String,
+    lease_epoch: u64,
+    lease_expires_at: i64,
+    attempts: u32,
+}
+impl AuditProjectionLease {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tenant_digest: impl Into<String>,
+        event_id: impl Into<String>,
+        source: AuditProjectionSource,
+        source_pk_digest: impl Into<String>,
+        event_kind: AuditProjectionEventKind,
+        occurred_at: i64,
+        lease_owner: impl Into<String>,
+        lease_token: impl Into<String>,
+        lease_epoch: u64,
+        lease_expires_at: i64,
+        attempts: u32,
+    ) -> Result<Self, A2AError> {
+        let value = Self {
+            tenant_digest: tenant_digest.into(),
+            event_id: event_id.into(),
+            source,
+            source_pk_digest: source_pk_digest.into(),
+            event_kind,
+            occurred_at,
+            lease_owner: lease_owner.into(),
+            lease_token: lease_token.into(),
+            lease_epoch,
+            lease_expires_at,
+            attempts,
+        };
+        let digest = |v: &str| {
+            v.len() == 71
+                && v.starts_with("sha256:")
+                && v[7..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        };
+        if value.tenant_digest.is_empty()
+            || value.tenant_digest.len() > 71
+            || !digest(&value.event_id)
+            || !digest(&value.source_pk_digest)
+            || !valid_bounded_identity(&value.lease_owner)
+            || value.lease_token.is_empty()
+            || value.lease_token.len() > 128
+            || value.lease_epoch == 0
+            || value.attempts == 0
+            || value.lease_expires_at <= 0
+            || value.occurred_at <= 0
+        {
+            return Err(A2AError::invalid_request("invalid audit projection lease"));
+        }
+        Ok(value)
+    }
+    #[must_use]
+    pub fn tenant_digest(&self) -> &str {
+        &self.tenant_digest
+    }
+    #[must_use]
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+    #[must_use]
+    pub const fn source(&self) -> AuditProjectionSource {
+        self.source
+    }
+    #[must_use]
+    pub fn source_pk_digest(&self) -> &str {
+        &self.source_pk_digest
+    }
+    #[must_use]
+    pub const fn event_kind(&self) -> AuditProjectionEventKind {
+        self.event_kind
+    }
+    #[must_use]
+    pub const fn occurred_at(&self) -> i64 {
+        self.occurred_at
+    }
+    #[must_use]
+    pub fn lease_owner(&self) -> &str {
+        &self.lease_owner
+    }
+    #[must_use]
+    pub fn lease_token(&self) -> &str {
+        &self.lease_token
+    }
+    #[must_use]
+    pub const fn lease_epoch(&self) -> u64 {
+        self.lease_epoch
+    }
+    #[must_use]
+    pub const fn lease_expires_at(&self) -> i64 {
+        self.lease_expires_at
+    }
+    #[must_use]
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+}
+
+#[async_trait]
+pub trait AuditProjectionAuthority: Send + Sync {
+    fn audit_projection_capabilities(&self) -> AuditProjectionCapabilities;
+    async fn claim_audit_projection(
+        &self,
+        owner: &str,
+        lease_duration_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<AuditProjectionLease>, A2AError>;
+    async fn commit_audit_projection(&self, lease: &AuditProjectionLease)
+    -> Result<bool, A2AError>;
+    async fn fail_audit_projection(
+        &self,
+        lease: &AuditProjectionLease,
+        error_digest: &str,
+        retry_delay_ms: i64,
+    ) -> Result<AuditProjectionState, A2AError>;
+    async fn cleanup_audit_projection(
+        &self,
+        retention_ms: i64,
+        limit: usize,
+    ) -> Result<u64, A2AError>;
+}
+
 pub trait AuthorityIdentity: Send + Sync {
     fn capabilities(&self) -> AuthorityCapabilities;
     fn completion_receipt_key(&self) -> Option<[u8; 32]>;
@@ -1261,6 +1532,10 @@ pub trait AuthorityIdentity: Send + Sync {
     /// Optional artifact-storage capability. Existing authority implementations
     /// remain source compatible and artifact-disabled by default.
     fn artifact_authority(&self) -> Option<&dyn ArtifactAuthority> {
+        None
+    }
+    /// Optional audit projection extension. Existing implementations remain source compatible.
+    fn audit_projection_authority(&self) -> Option<&dyn AuditProjectionAuthority> {
         None
     }
 }
@@ -1387,6 +1662,14 @@ pub trait OutboxAuthority: Send + Sync {
         lease_duration: i64,
     ) -> Result<LeaseRenewalOutcome, A2AError>;
     async fn task_for_outbox(&self, lease: &OutboxLease) -> Result<Option<Task>, A2AError>;
+    /// Optional source-compatible observability capability. Implementations should
+    /// return correlation from the same scoped authoritative rows as the claim.
+    async fn telemetry_correlation_for_outbox(
+        &self,
+        _lease: &OutboxLease,
+    ) -> Result<Option<TelemetryCorrelation>, A2AError> {
+        Ok(None)
+    }
     async fn finish_outbox_attempt(
         &self,
         lease: &OutboxLease,

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "smesh.observability-objectives/1",
+  "classification": "bootstrap-not-universal",
+  "reviewAfterDays": 30,
+  "notice": "Initial default for the currently emitted edge-availability SLI; additional objectives require production metric instrumentation before use.",
+  "objectives": [
+    {"slo":"edge_availability","target":0.999,"window":"30d"}
+  ]
+}

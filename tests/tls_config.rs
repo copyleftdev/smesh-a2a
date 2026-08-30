@@ -110,6 +110,35 @@ fn public_bind_requires_direct_tls_https_and_authentication() {
 }
 
 #[test]
+fn public_url_is_secret_free_in_every_transport_mode() {
+    use smesh_a2a::transport::canonical_public_origin;
+    for mode in [
+        TransportMode::LoopbackPlain,
+        TransportMode::ReverseProxyLoopback,
+    ] {
+        let config = ProductionTransportConfig {
+            mode,
+            client_auth: ClientAuthMode::Disabled,
+            bind: "127.0.0.1:3000".parse().unwrap(),
+            public_url: "http://user:CANARY@gateway.example/path?token=CANARY#fragment".to_owned(),
+            oidc_enabled: mode != TransportMode::LoopbackPlain,
+            cert_path: None,
+            key_path: None,
+            client_ca_path: None,
+            principal_map_path: None,
+            handshake_timeout: std::time::Duration::from_secs(5),
+            max_connections: 10,
+        };
+        assert!(config.validate_paths_and_policy().is_err());
+    }
+    assert_eq!(
+        canonical_public_origin("https://gateway.example:8443/base").unwrap(),
+        "https://gateway.example:8443"
+    );
+    assert!(canonical_public_origin("https://user:CANARY@gateway.example").is_err());
+}
+
+#[test]
 fn tls_loader_builds_hardened_rustls_snapshot_and_rejects_insecure_key_mode() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
     let secure_key = SecureTestKey::copy(&root.join("server.key"), "secure-key");

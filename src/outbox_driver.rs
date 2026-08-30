@@ -277,10 +277,20 @@ pub(crate) fn spawn_durable_driver(
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
 ) -> DurableDriverHandle {
+    spawn_durable_driver_with_telemetry(authority, endpoint, clock, None)
+}
+
+pub(crate) fn spawn_durable_driver_with_telemetry(
+    authority: Arc<dyn DurableAuthority>,
+    endpoint: DurableLoopbackEndpoint,
+    clock: InjectedClock,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
+) -> DurableDriverHandle {
     spawn_durable_driver_inner(
         authority,
         endpoint,
         clock,
+        telemetry,
         #[cfg(test)]
         DriverTestHooks::default(),
     )
@@ -293,7 +303,13 @@ pub(crate) fn spawn_durable_driver_with_test_hooks<A: crate::IntoDurableAuthorit
     clock: InjectedClock,
     hooks: DriverTestHooks,
 ) -> DurableDriverHandle {
-    spawn_durable_driver_inner(authority.into_durable_authority(), endpoint, clock, hooks)
+    spawn_durable_driver_inner(
+        authority.into_durable_authority(),
+        endpoint,
+        clock,
+        None,
+        hooks,
+    )
 }
 
 #[allow(clippy::too_many_lines)] // The loop is one cohesive fenced-lease state machine.
@@ -301,6 +317,7 @@ fn spawn_durable_driver_inner(
     authority: Arc<dyn DurableAuthority>,
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
     #[cfg(test)] hooks: DriverTestHooks,
 ) -> DurableDriverHandle {
     install_driver_panic_hook();
@@ -362,6 +379,25 @@ fn spawn_durable_driver_inner(
                     }
                     continue;
                 };
+                let correlation = authority
+                    .telemetry_correlation_for_outbox(&lease)
+                    .await
+                    .ok()
+                    .flatten();
+                if let (Some(telemetry), Some(correlation)) = (&telemetry, correlation) {
+                    telemetry.remember_dispatch_correlation(&lease.dispatch_id, correlation);
+                }
+                if let Some(telemetry) = &telemetry {
+                    telemetry.dispatch_event(
+                        crate::telemetry::EventName::DispatchClaimed,
+                        "ok",
+                        "claimed",
+                        "outbox_claim",
+                        &lease.dispatch_id,
+                        Some(&lease.task_id),
+                        Some(&lease.request.context_id),
+                    );
+                }
                 let payload = serde_json::to_string(&lease.request)
                     .map_err(|_| a2a::A2AError::internal("failed to encode durable dispatch"))?;
                 let envelope = DurableDispatchEnvelope {
@@ -398,6 +434,7 @@ fn spawn_durable_driver_inner(
                     let (tx, rx) = watch::channel(lease.clone());
                     let renewal_authority = Arc::clone(&authority);
                     let renewal_cancel_task = renewal_cancel.clone();
+                    let renewal_telemetry = telemetry.clone();
                     let mut current = lease.clone();
                     let join = tokio::spawn(RedactedDriverPoll::new(async move {
                         loop {
@@ -415,13 +452,61 @@ fn spawn_durable_driver_inner(
                             match renewal {
                                 Ok(Ok(LeaseRenewalOutcome::Applied { lease_until })) => {
                                     current.lease_until = lease_until;
+                                    if let Some(telemetry) = &renewal_telemetry {
+                                        telemetry.dispatch_event(
+                                            crate::telemetry::EventName::LeaseRenewed,
+                                            "ok",
+                                            "renewed",
+                                            "outbox_renew",
+                                            &current.dispatch_id,
+                                            Some(&current.task_id),
+                                            Some(&current.request.context_id),
+                                        );
+                                    }
                                     if tx.send(current.clone()).is_err() { return Ok(()); }
                                 }
                                 Ok(Ok(LeaseRenewalOutcome::Stale | LeaseRenewalOutcome::Unsupported)) => {
+                                    if let Some(telemetry) = &renewal_telemetry {
+                                        telemetry.dispatch_event(
+                                            crate::telemetry::EventName::LeaseRenewed,
+                                            "stale",
+                                            "lost",
+                                            "outbox_renew",
+                                            &current.dispatch_id,
+                                            Some(&current.task_id),
+                                            Some(&current.request.context_id),
+                                        );
+                                    }
                                     return Err(a2a::A2AError::internal("durable lease renewal became stale"));
                                 }
-                                Ok(Err(error)) => return Err(error),
-                                Err(_) => return Err(a2a::A2AError::internal("durable lease renewal timed out")),
+                                Ok(Err(error)) => {
+                                    if let Some(telemetry) = &renewal_telemetry {
+                                        telemetry.dispatch_event(
+                                            crate::telemetry::EventName::LeaseRenewed,
+                                            "failed",
+                                            "fatal",
+                                            "outbox_renew",
+                                            &current.dispatch_id,
+                                            Some(&current.task_id),
+                                            Some(&current.request.context_id),
+                                        );
+                                    }
+                                    return Err(error);
+                                }
+                                Err(_) => {
+                                    if let Some(telemetry) = &renewal_telemetry {
+                                        telemetry.dispatch_event(
+                                            crate::telemetry::EventName::LeaseRenewed,
+                                            "timeout",
+                                            "fatal",
+                                            "outbox_renew",
+                                            &current.dispatch_id,
+                                            Some(&current.task_id),
+                                            Some(&current.request.context_id),
+                                        );
+                                    }
+                                    return Err(a2a::A2AError::internal("durable lease renewal timed out"));
+                                }
                             }
                         }
                     }));
@@ -429,6 +514,17 @@ fn spawn_durable_driver_inner(
                 } else {
                     (None, None)
                 };
+                if let Some(telemetry) = &telemetry {
+                    telemetry.dispatch_event(
+                        crate::telemetry::EventName::DispatchAttempted,
+                        "ok",
+                        "execute",
+                        "outbox_attempt",
+                        &lease.dispatch_id,
+                        Some(&lease.task_id),
+                        Some(&lease.request.context_id),
+                    );
+                }
                 let dispatch_cancel = CancellationToken::new();
                 let dispatch_future = endpoint.dispatch_once(
                     Arc::clone(&authority),
@@ -499,6 +595,17 @@ fn spawn_durable_driver_inner(
                     return Ok(());
                 }
                 let Some(dispatch) = dispatch else {
+                    if let Some(telemetry) = &telemetry {
+                        telemetry.dispatch_event(
+                            crate::telemetry::EventName::LeaseRenewed,
+                            "failed",
+                            "fatal",
+                            "outbox_renew",
+                            &lease.dispatch_id,
+                            Some(&lease.task_id),
+                            Some(&lease.request.context_id),
+                        );
+                    }
                     return Err(a2a::A2AError::internal("durable lease renewal failed"));
                 };
                 let (events, termination) = match dispatch {
@@ -524,7 +631,28 @@ fn spawn_durable_driver_inner(
                             )
                             .await?;
                         if outcome == TransitionOutcome::DeadLettered {
+                            if let Some(telemetry) = &telemetry {
+                                telemetry.dispatch_event(
+                                    crate::telemetry::EventName::DispatchDeadLettered,
+                                    "failed",
+                                    "attempts_exhausted",
+                                    "outbox_attempt",
+                                    &lease.dispatch_id,
+                                    Some(&lease.task_id),
+                                    Some(&lease.request.context_id),
+                                );
+                            }
                             worker_control.changed();
+                        } else if let Some(telemetry) = &telemetry {
+                            telemetry.dispatch_event(
+                                crate::telemetry::EventName::DispatchRetried,
+                                "retry",
+                                "busy",
+                                "outbox_attempt",
+                                &lease.dispatch_id,
+                                Some(&lease.task_id),
+                                Some(&lease.request.context_id),
+                            );
                         }
                         continue;
                     }
@@ -544,6 +672,17 @@ fn spawn_durable_driver_inner(
                             )
                             .await?;
                         if outcome == TransitionOutcome::DeadLettered {
+                            if let Some(telemetry) = &telemetry {
+                                telemetry.dispatch_event(
+                                    crate::telemetry::EventName::DispatchDeadLettered,
+                                    "failed",
+                                    "permanent",
+                                    "outbox_attempt",
+                                    &lease.dispatch_id,
+                                    Some(&lease.task_id),
+                                    Some(&lease.request.context_id),
+                                );
+                            }
                             worker_control.changed();
                         }
                         continue;
@@ -573,6 +712,17 @@ fn spawn_durable_driver_inner(
                     .await?
                     == TransitionOutcome::Applied
                 {
+                    if let Some(telemetry) = &telemetry {
+                        telemetry.dispatch_event(
+                            crate::telemetry::EventName::TaskTerminal,
+                            "ok",
+                            "committed",
+                            "terminal_commit",
+                            &lease.dispatch_id,
+                            Some(&lease.task_id),
+                            Some(&lease.request.context_id),
+                        );
+                    }
                     #[cfg(test)]
                     if let Some(gate) = &hooks.after_commit_before_publish
                         && !gate.enter_once(&worker_shutdown).await

@@ -4,9 +4,13 @@ use std::sync::Arc;
 use smesh_a2a::auth::{
     AuthState, HttpJwksProvider, JwtBearerVerifier, JwtVerifierConfig, SystemAuthClock,
 };
+use smesh_a2a::telemetry::{
+    AuditProjectorConfig, OtlpConfig, OtlpMode, OtlpOwner, TelemetryHandle,
+    instrument_router_with_telemetry,
+};
 use smesh_a2a::transport::{
     ClientAuthMode, ProductionTransportConfig, TlsIdentityAcceptor, TlsMaterialPaths,
-    TlsSnapshotManager, TransportMode, load_tls_snapshot,
+    TlsSnapshotManager, TransportMode, canonical_public_origin, load_tls_snapshot,
 };
 use smesh_a2a::{
     ArtifactAuthority, ArtifactBackupPlanFile, ArtifactKeyRotationPlanFile,
@@ -15,8 +19,9 @@ use smesh_a2a::{
     InjectedClock, LegacyTenantBinding, LoopbackDispatcher, PostgresStoreConfig, PostgresTaskStore,
     QuotaPolicy, RuntimeAdmissionProcessor, RuntimeEventCapture, RuntimeModeConfig, RuntimeWorker,
     SqliteTaskStore, SystemClockTicker, build_authenticated_router,
-    build_authenticated_router_with_trace, build_authorized_durable_loopback_gateway,
-    build_durable_loopback_gateway, build_router, build_router_with_trace,
+    build_authenticated_router_with_trace,
+    build_authorized_durable_loopback_gateway_with_telemetry,
+    build_durable_loopback_gateway_with_telemetry, build_router, build_router_with_trace,
 };
 use smesh_core::{Network, Node};
 use smesh_runtime::{MeshConfig, RuntimeConfig, SmeshRuntime};
@@ -253,7 +258,9 @@ async fn serve_router(
     listener: std::net::TcpListener,
     app: axum::Router,
     transport: HttpTransport,
+    telemetry: Option<TelemetryHandle>,
 ) -> Result<(), std::io::Error> {
+    let app = instrument_router_with_telemetry(app, telemetry);
     let cancellation = tokio_util::sync::CancellationToken::new();
     let direct_handle = a2a_server::tls::axum_server::Handle::new();
     let snapshots = match &transport {
@@ -538,6 +545,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (transport_config, http_transport) =
         transport_from_environment(bind, &public_base_url, oidc_enabled)?;
+    let otlp_config = OtlpConfig::parse(std::env::vars().filter(|(key, _)| {
+        key.starts_with("SMESH_A2A_OTLP_") || key == "SMESH_TEST_OTLP_INSECURE_LOOPBACK"
+    }))?;
+    let audit_projection_enabled = otlp_config.mode != OtlpMode::Disabled;
     let legacy_unsafe_public = std::env::var("SMESH_A2A_UNSAFE_PUBLIC").as_deref() == Ok("1");
     if legacy_unsafe_public {
         tracing::warn!(
@@ -603,6 +614,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pg_runtime.ok_or("SMESH_A2A_POSTGRES_RUNTIME_URL is required")?,
                 pg_schema.ok_or("SMESH_A2A_POSTGRES_SCHEMA is required")?,
             )?
+            .with_audit_projection(audit_projection_enabled)
             .with_quota_policy(quota_policy.clone().ok_or(
                 "SMESH_A2A_QUOTA_POLICY_PATH is required for PostgreSQL production authority",
             )?);
@@ -660,6 +672,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reserve the public endpoint before SQLite, runtime, mesh, ticker, or
     // worker resources can be acquired or mutate durable state.
     let listener = std::net::TcpListener::bind(bind)?;
+    let telemetry_shutdown_timeout = otlp_config.shutdown_timeout;
+    let telemetry = OtlpOwner::start(otlp_config)?;
+    let telemetry_handle = telemetry.as_ref().map(OtlpOwner::handle);
+    if let Some(handle) = telemetry_handle.as_ref() {
+        auth = auth.map(|state| state.with_telemetry(handle.clone()));
+    }
 
     match mode {
         GatewayMode::Loopback => {
@@ -675,6 +693,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     authorization.clone(),
                     legacy_binding,
                     http_transport.clone(),
+                    telemetry_handle.clone(),
                 )
                 .await?;
             } else if let Some(postgres_config) = postgres_config {
@@ -692,6 +711,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     auth,
                     authorization.clone(),
                     http_transport.clone(),
+                    telemetry_handle.clone(),
                 )
                 .await?;
             } else {
@@ -700,8 +720,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     build_router(config, LoopbackDispatcher)
                 };
-                tracing::info!(%bind, %public_base_url, mode = "loopback", transport = %transport_config.mode, "SMESH A2A gateway listening");
-                serve_router(listener, app, http_transport.clone()).await?;
+                let public_origin = canonical_public_origin(&public_base_url)?;
+                tracing::info!(%bind, %public_origin, mode = "loopback", transport = %transport_config.mode, "SMESH A2A gateway listening");
+                serve_router(
+                    listener,
+                    app,
+                    http_transport.clone(),
+                    telemetry_handle.clone(),
+                )
+                .await?;
             }
         }
         GatewayMode::Runtime(runtime_config) => {
@@ -713,11 +740,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 runtime_config,
                 auth,
                 http_transport,
+                telemetry_handle.clone(),
             )
             .await?;
         }
     }
+    drop(telemetry_handle);
+    if let Some(owner) = telemetry
+        && !owner.shutdown(telemetry_shutdown_timeout)
+    {
+        eprintln!("smesh.telemetry.shutdown_failed category=otlp_owner");
+    }
     Ok(())
+}
+
+fn audit_projector_config() -> Result<AuditProjectorConfig, Box<dyn std::error::Error>> {
+    let poll = std::env::var("SMESH_A2A_AUDIT_PROJECTOR_POLL_MS")
+        .ok()
+        .map(|v| v.parse())
+        .transpose()?
+        .unwrap_or(100_u64);
+    let batch = std::env::var("SMESH_A2A_AUDIT_PROJECTOR_BATCH")
+        .ok()
+        .map(|v| v.parse())
+        .transpose()?
+        .unwrap_or(100_usize);
+    let owner = std::env::var("SMESH_A2A_REPLICA_ID")
+        .unwrap_or_else(|_| "smesh-audit-projector".to_owned());
+    Ok(AuditProjectorConfig::new(
+        owner,
+        std::time::Duration::from_millis(poll),
+        batch,
+    )?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -731,41 +785,50 @@ async fn run_durable_loopback_gateway(
     authorization: Option<Arc<AuthorizationPolicy>>,
     legacy_binding: Option<LegacyTenantBinding>,
     transport: HttpTransport,
+    telemetry: Option<TelemetryHandle>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if auth.is_some() != authorization.is_some() {
         return Err("durable production authentication and tenant authorization must be configured together".into());
     }
     let store = if let Some(binding) = legacy_binding {
         SqliteTaskStore::open_with_legacy_binding(sqlite_path, config.max_tasks, binding).await?
+    } else if telemetry.is_some() {
+        SqliteTaskStore::open_with_audit_projection(sqlite_path, config.max_tasks).await?
     } else {
         SqliteTaskStore::open(sqlite_path, config.max_tasks).await?
     };
     let clock = InjectedClock::new(chrono::Utc::now().timestamp_millis());
-    let gateway = if let Some(auth) = auth {
+    let mut gateway = if let Some(auth) = auth {
         if let Some(policy) = authorization {
-            build_authorized_durable_loopback_gateway(
+            build_authorized_durable_loopback_gateway_with_telemetry(
                 config,
                 store,
                 DurableLoopbackEndpoint::new(),
                 clock.clone(),
                 auth,
                 policy,
+                telemetry.clone(),
             )?
         } else {
             unreachable!("authentication without tenant authorization was rejected before SQLite")
         }
     } else {
-        build_durable_loopback_gateway(
+        build_durable_loopback_gateway_with_telemetry(
             config,
             store,
             DurableLoopbackEndpoint::new(),
             clock.clone(),
+            telemetry.clone(),
         )?
     };
+    if let Some(handle) = telemetry.clone() {
+        let _started = gateway.start_audit_projector(handle, audit_projector_config()?)?;
+    }
     let ticker = SystemClockTicker::spawn(clock);
     let app = gateway.router();
-    tracing::info!(%bind, %public_base_url, mode = "loopback", durable = true, "SMESH A2A gateway listening");
-    let serve_result = serve_router(listener, app, transport).await;
+    let public_origin = canonical_public_origin(&public_base_url)?;
+    tracing::info!(%bind, %public_origin, mode = "loopback", durable = true, "SMESH A2A gateway listening");
+    let serve_result = serve_router(listener, app, transport, telemetry).await;
 
     let ticker_result = ticker.shutdown().await;
     let gateway_result = gateway.shutdown().await;
@@ -785,28 +848,36 @@ async fn run_postgres_durable_loopback_gateway(
     auth: Option<AuthState>,
     authorization: Option<Arc<AuthorizationPolicy>>,
     transport: HttpTransport,
+    telemetry: Option<TelemetryHandle>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth = auth.ok_or("PostgreSQL durable authority requires authentication")?;
     let policy =
         authorization.ok_or("PostgreSQL durable authority requires authorization policy")?;
-    let store = PostgresTaskStore::open(postgres_config).await?;
+    let store = PostgresTaskStore::open(postgres_config)
+        .await?
+        .with_telemetry(telemetry.clone());
     tracing::info!(
         artifact_storage = store.artifact_capabilities().publication,
         "PostgreSQL durable authority opened"
     );
     let clock = InjectedClock::new(chrono::Utc::now().timestamp_millis());
-    let gateway = build_authorized_durable_loopback_gateway(
+    let mut gateway = build_authorized_durable_loopback_gateway_with_telemetry(
         config,
         store,
         DurableLoopbackEndpoint::new(),
         clock.clone(),
         auth,
         policy,
+        telemetry.clone(),
     )?;
+    if let Some(handle) = telemetry.clone() {
+        let _started = gateway.start_audit_projector(handle, audit_projector_config()?)?;
+    }
     let ticker = SystemClockTicker::spawn(clock);
     let app = gateway.router();
-    tracing::info!(%bind, %public_base_url, mode = "loopback", durable = true, backend = "postgres", "SMESH A2A gateway listening");
-    let serve_result = serve_router(listener, app, transport).await;
+    let public_origin = canonical_public_origin(&public_base_url)?;
+    tracing::info!(%bind, %public_origin, mode = "loopback", durable = true, backend = "postgres", "SMESH A2A gateway listening");
+    let serve_result = serve_router(listener, app, transport, telemetry).await;
     let ticker_result = ticker.shutdown().await;
     let gateway_result = gateway.shutdown().await;
     serve_result?;
@@ -815,7 +886,7 @@ async fn run_postgres_durable_loopback_gateway(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)] // Keep runtime startup, trace supervision, and shutdown ownership linear.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // Keep runtime startup, trace supervision, and shutdown ownership linear.
 async fn run_runtime_gateway(
     listener: std::net::TcpListener,
     bind: SocketAddr,
@@ -824,6 +895,7 @@ async fn run_runtime_gateway(
     runtime_config: RuntimeModeConfig,
     auth: Option<AuthState>,
     transport: HttpTransport,
+    telemetry: Option<TelemetryHandle>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayConfig::new(&public_base_url, &gateway_node_id);
     let mut network = Network::new();
@@ -833,7 +905,8 @@ async fn run_runtime_gateway(
         .take_events()
         .ok_or("SMESH runtime event receiver was already taken")?;
     let runtime = Arc::new(runtime_value);
-    let capture = Arc::new(RuntimeEventCapture::new(65_536, 1_024));
+    let capture =
+        Arc::new(RuntimeEventCapture::new(65_536, 1_024).with_telemetry(telemetry.clone()));
     let mut runtime_loop = {
         let runtime = Arc::clone(&runtime);
         tokio::spawn(async move { runtime.run().await })
@@ -849,8 +922,8 @@ async fn run_runtime_gateway(
                 event = runtime_events.recv() => event,
                 () = trace_drain_stop_signal.cancelled() => {
                     while let Ok(event) = runtime_events.try_recv() {
-                        if let Err(error) = event_capture.record(event).await {
-                            tracing::error!(%error, "required SMESH runtime trace capture failed");
+                        if let Err(_error) = event_capture.record(event).await {
+                            tracing::error!(error_category = "runtime_trace_capture", "required SMESH runtime trace capture failed");
                             return;
                         }
                     }
@@ -860,8 +933,11 @@ async fn run_runtime_gateway(
             let Some(event) = event else {
                 return;
             };
-            if let Err(error) = event_capture.record(event).await {
-                tracing::error!(%error, "required SMESH runtime trace capture failed");
+            if let Err(_error) = event_capture.record(event).await {
+                tracing::error!(
+                    error_category = "runtime_trace_capture",
+                    "required SMESH runtime trace capture failed"
+                );
                 return;
             }
         }
@@ -894,15 +970,16 @@ async fn run_runtime_gateway(
     } else {
         build_router_with_trace(config, dispatcher, Arc::clone(&capture))
     };
+    let public_origin = canonical_public_origin(&public_base_url)?;
     tracing::info!(
         %bind,
-        %public_base_url,
+        %public_origin,
         %mesh_listen,
         mode = "runtime",
         "SMESH A2A gateway listening"
     );
     let mut event_drain_finished = false;
-    let mut http_server = std::pin::pin!(serve_router(listener, app, transport));
+    let mut http_server = std::pin::pin!(serve_router(listener, app, transport, telemetry));
     let serve_result = tokio::select! {
         result = &mut http_server => result,
         () = trace_failure.cancelled() => Err(std::io::Error::other(

@@ -293,6 +293,7 @@ pub struct DurableLoopbackEndpoint {
     completion_committed: Option<(Arc<Notify>, Arc<Notify>)>,
     active: Arc<Mutex<HashMap<String, CancellationToken>>>,
     interruption: Option<(String, DurableInterruptionKind, String)>,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
 }
 
 impl DurableLoopbackEndpoint {
@@ -314,6 +315,7 @@ impl DurableLoopbackEndpoint {
             completion_committed: None,
             active: Arc::new(Mutex::new(HashMap::new())),
             interruption: None,
+            telemetry: None,
         }
     }
 
@@ -325,6 +327,7 @@ impl DurableLoopbackEndpoint {
             completion_committed: None,
             active: Arc::new(Mutex::new(HashMap::new())),
             interruption: None,
+            telemetry: None,
         }
     }
 
@@ -342,6 +345,7 @@ impl DurableLoopbackEndpoint {
             completion_committed: Some((completion_committed, publish_release)),
             active: Arc::new(Mutex::new(HashMap::new())),
             interruption: None,
+            telemetry: None,
         }
     }
 
@@ -357,6 +361,7 @@ impl DurableLoopbackEndpoint {
             completion_committed: None,
             active: Arc::new(Mutex::new(HashMap::new())),
             interruption: Some((text.into(), kind, message.into())),
+            telemetry: None,
         }
     }
 
@@ -364,6 +369,12 @@ impl DurableLoopbackEndpoint {
     #[must_use]
     pub fn with_barrier(mut self, effect_started: Arc<Notify>, release: Arc<Notify>) -> Self {
         self.completion_barrier = Some((effect_started, release));
+        self
+    }
+
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: Option<crate::telemetry::TelemetryHandle>) -> Self {
+        self.telemetry = telemetry;
         self
     }
 
@@ -407,13 +418,59 @@ impl DurableLoopbackEndpoint {
             .await?;
         match admission {
             crate::ReceiverAdmission::Replay(events) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.dispatch_event(
+                        crate::telemetry::EventName::ReceiverAdmitted,
+                        "ok",
+                        "replay",
+                        "receiver_admit",
+                        &envelope.dispatch_id,
+                        Some(&envelope.request.task_id),
+                        Some(&envelope.request.context_id),
+                    );
+                }
                 Ok(DurableDispatchOutcome::Delivered(events))
             }
             crate::ReceiverAdmission::ReplayOutcome(outcome) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.dispatch_event(
+                        crate::telemetry::EventName::ReceiverAdmitted,
+                        "ok",
+                        "replay",
+                        "receiver_admit",
+                        &envelope.dispatch_id,
+                        Some(&envelope.request.task_id),
+                        Some(&envelope.request.context_id),
+                    );
+                }
                 Ok(DurableDispatchOutcome::Interrupted(outcome))
             }
-            crate::ReceiverAdmission::Busy => Ok(DurableDispatchOutcome::Busy),
+            crate::ReceiverAdmission::Busy => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.dispatch_event(
+                        crate::telemetry::EventName::ReceiverAdmitted,
+                        "busy",
+                        "busy",
+                        "receiver_admit",
+                        &envelope.dispatch_id,
+                        Some(&envelope.request.task_id),
+                        Some(&envelope.request.context_id),
+                    );
+                }
+                Ok(DurableDispatchOutcome::Busy)
+            }
             crate::ReceiverAdmission::Execute(lease) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.dispatch_event(
+                        crate::telemetry::EventName::ReceiverAdmitted,
+                        "ok",
+                        "execute",
+                        "receiver_admit",
+                        &envelope.dispatch_id,
+                        Some(&envelope.request.task_id),
+                        Some(&envelope.request.context_id),
+                    );
+                }
                 let mut renewal = ReceiverRenewal::start(Arc::clone(&authority), &lease);
                 let cancellation = CancellationToken::new();
                 self.active
@@ -497,12 +554,34 @@ impl DurableLoopbackEndpoint {
                                 authority
                                     .complete_canceled_receive(&fenced, &events, clock.now())
                                     .await?;
+                                if let Some(telemetry) = &self.telemetry {
+                                    telemetry.dispatch_event(
+                                        crate::telemetry::EventName::ReceiverCompleted,
+                                        "canceled",
+                                        "committed",
+                                        "receiver_execute",
+                                        &envelope.dispatch_id,
+                                        Some(&envelope.request.task_id),
+                                        Some(&envelope.request.context_id),
+                                    );
+                                }
                                 Ok(DurableDispatchOutcome::Delivered(events))
                             }
                             ReceiverCompletion::Interrupted(outcome) => {
                                 authority
                                     .complete_loopback_outcome(&fenced, &outcome, clock.now())
                                     .await?;
+                                if let Some(telemetry) = &self.telemetry {
+                                    telemetry.dispatch_event(
+                                        crate::telemetry::EventName::ReceiverCompleted,
+                                        "ok",
+                                        "committed",
+                                        "receiver_execute",
+                                        &envelope.dispatch_id,
+                                        Some(&envelope.request.task_id),
+                                        Some(&envelope.request.context_id),
+                                    );
+                                }
                                 self.effects.fetch_add(1, Ordering::SeqCst);
                                 Ok(DurableDispatchOutcome::Interrupted(outcome))
                             }
@@ -528,6 +607,17 @@ impl DurableLoopbackEndpoint {
                                     return Err(error.into());
                                 }
                                 self.effects.fetch_add(1, Ordering::SeqCst);
+                                if let Some(telemetry) = &self.telemetry {
+                                    telemetry.dispatch_event(
+                                        crate::telemetry::EventName::ReceiverCompleted,
+                                        "ok",
+                                        "committed",
+                                        "receiver_execute",
+                                        &envelope.dispatch_id,
+                                        Some(&envelope.request.task_id),
+                                        Some(&envelope.request.context_id),
+                                    );
+                                }
                                 if let Some((completed, publish_release)) =
                                     &self.completion_committed
                                 {

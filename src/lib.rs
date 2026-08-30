@@ -39,6 +39,8 @@ mod runtime_worker;
 mod server;
 mod sqlite_store;
 mod store;
+/// Closed, bounded optional OpenTelemetry projection schema and exporter owner.
+pub mod telemetry;
 /// Production exposure policy, TLS material loading, reload, and bounded acceptor.
 pub mod transport;
 
@@ -67,6 +69,7 @@ pub use artifact_orphan_scanner::{
 };
 pub use artifact_promoter::{
     ArtifactPromoterHandle, ArtifactPromoterState, spawn_artifact_promoter,
+    spawn_artifact_promoter_with_telemetry,
 };
 pub use artifact_reencryption_executor::ArtifactKeyRotationOutcome;
 pub use artifact_restore_executor::ArtifactRestoreOutcome;
@@ -86,16 +89,18 @@ pub use durable_authority::{
     ArtifactCapabilities, ArtifactChunkRegistration, ArtifactGcClaim, ArtifactHold,
     ArtifactPromotionClaim, ArtifactProvenanceRegistration, ArtifactReadLease,
     ArtifactReadMetadata, ArtifactRuntimeLimits, ArtifactStageReference, ArtifactStageRegistration,
-    AtomicRecordCounts, AttemptDisposition, AuthorityCapabilities, AuthorityDiagnostics,
-    AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput, AuthorizationAuditParts,
-    AuthorizationAuditSink, AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead,
-    CancellationAuthority, CancellationOutcome, ChangeObservation, ChangeObserver,
-    DurableAuthority, ExecutionReservation, IntoDurableAuthority, LeaseRenewalOutcome,
-    OutboxAuthority, OutboxLease, OwnedTaskScope, PollInterval, QuotaLease, QuotaLeaseAuthority,
-    QuotaReservationInput, ReceiverAdmission, ReceiverAuthority, ReceiverLease,
-    SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE,
-    TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority, TransitionOutcome,
-    authorized_message_identity, canonical_send_message_digest, canonical_send_message_digest_v2,
+    AtomicRecordCounts, AttemptDisposition, AuditProjectionAuthority, AuditProjectionCapabilities,
+    AuditProjectionEventKind, AuditProjectionLease, AuditProjectionSource, AuditProjectionState,
+    AuthorityCapabilities, AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown,
+    AuthorizationAuditInput, AuthorizationAuditParts, AuthorizationAuditSink,
+    AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead, CancellationAuthority,
+    CancellationOutcome, ChangeObservation, ChangeObserver, DurableAuthority, ExecutionReservation,
+    IntoDurableAuthority, LeaseRenewalOutcome, OutboxAuthority, OutboxLease, OwnedTaskScope,
+    PollInterval, QuotaLease, QuotaLeaseAuthority, QuotaReservationInput, ReceiverAdmission,
+    ReceiverAuthority, ReceiverLease, SendMessageAdmission, StreamTranscriptBatch,
+    SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE, TaskAdmission, TaskEventBatch, TaskLifecycle,
+    TelemetryCorrelation, TranscriptAuthority, TransitionOutcome, authorized_message_identity,
+    canonical_send_message_digest, canonical_send_message_digest_v2,
 };
 pub use durable_dispatch::{
     DurableDispatchEnvelope, DurableInterruptionKind, DurableLoopbackEndpoint,
@@ -137,7 +142,8 @@ pub use server::{
     CompletionPolicyStore, DurableGateway, GatewayConfig,
     build_authenticated_durable_loopback_gateway, build_authenticated_router,
     build_authenticated_router_with_trace, build_authorized_durable_loopback_gateway,
-    build_durable_loopback_gateway, build_router, build_router_with_policy,
+    build_authorized_durable_loopback_gateway_with_telemetry, build_durable_loopback_gateway,
+    build_durable_loopback_gateway_with_telemetry, build_router, build_router_with_policy,
     build_router_with_policy_and_trace, build_router_with_sqlite,
     build_router_with_sqlite_and_trace, build_router_with_trace,
 };

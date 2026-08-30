@@ -73,6 +73,51 @@ jobs:
           cargo run --quiet --bin lifeline-trace -- /tmp/lifeline.trace.jsonl
           cmp /tmp/lifeline.trace.jsonl demo/lifeline.trace.jsonl
 
+  observability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: smesh-ci-postgres
+          POSTGRES_DB: smesh_test
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SMESH_TEST_POSTGRES_SUPERUSER_URL: postgresql://postgres:smesh-ci-postgres@127.0.0.1:55432/smesh_test
+      SMESH_TEST_POSTGRES_ADMIN_URL: postgresql://smesh_migrator:smesh-ci-migrator@127.0.0.1:55432/smesh_test
+      SMESH_TEST_POSTGRES_RUNTIME_URL: postgresql://smesh_test_runtime:smesh-ci-runtime@127.0.0.1:55432/smesh_test
+      SMESH_POSTGRES_TEST_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Provision explicit PostgreSQL observability roles
+        env:
+          PGPASSWORD: smesh-ci-postgres
+        run: |
+          pg_isready -h 127.0.0.1 -p 55432 -U postgres -d smesh_test
+          psql -h 127.0.0.1 -p 55432 -U postgres -d smesh_test -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE smesh_migrator LOGIN PASSWORD 'smesh-ci-migrator' NOSUPERUSER NOBYPASSRLS NOCREATEDB CREATEROLE NOREPLICATION NOINHERIT;
+          CREATE ROLE smesh_test_runtime LOGIN PASSWORD 'smesh-ci-runtime' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT;
+          GRANT CREATE ON DATABASE smesh_test TO smesh_migrator;
+          SQL
+      - name: Closed schema, outage, audit projection, process recovery, real OTLP, and assets
+        run: |
+          timeout --signal=TERM --kill-after=10s 5m cargo test --locked --test telemetry_schema --test telemetry_outage --test telemetry_ingress --test telemetry_audit_projection --test telemetry_otlp --test telemetry_multisignal --test telemetry_golden --test observability_assets
+          timeout --signal=TERM --kill-after=15s 8m cargo test --locked --test postgres_observability_process -- --test-threads=1
+      - name: Validate Prometheus recording and alert rules
+        run: docker run --rm --entrypoint=/bin/promtool -v "$PWD:/workspace:ro" prom/prometheus:v3.5.0 check rules /workspace/observability/prometheus-rules.yml
+
   postgres:
     runs-on: ubuntu-latest
     # Command watchdogs total 75 minutes; keep a bounded margin for builds and

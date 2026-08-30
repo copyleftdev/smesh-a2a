@@ -241,6 +241,7 @@ struct DurableStreamState {
     scope: Option<OwnedTaskScope>,
     quota_lease: Option<Arc<QuotaLeaseGuard>>,
     clock: InjectedClock,
+    telemetry_context: Option<crate::telemetry::RequestTelemetryContext>,
 }
 
 struct DurableTaskEventStreamState {
@@ -258,6 +259,7 @@ struct DurableTaskEventStreamState {
     scope: Option<OwnedTaskScope>,
     quota_lease: Option<Arc<QuotaLeaseGuard>>,
     clock: InjectedClock,
+    telemetry_context: Option<crate::telemetry::RequestTelemetryContext>,
 }
 
 pub(crate) struct DurableRequestHandler {
@@ -267,6 +269,7 @@ pub(crate) struct DurableRequestHandler {
     clock: InjectedClock,
     input_limits: InputLimits,
     errors_before_stream: bool,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
     #[cfg(test)]
     after_empty_read: Option<(Arc<Notify>, Arc<Notify>)>,
 }
@@ -288,6 +291,9 @@ impl DurableRequestHandler {
             self.store
                 .append_denied_authorization_decision(audit)
                 .await?;
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.authorization_decision("denied", "role_denied", "authorize");
+            }
             return Err(A2AError::invalid_request("forbidden"));
         };
         let scope = OwnedTaskScope::new(context.tenant_id(), context.account_id(), visibility)?;
@@ -359,7 +365,7 @@ impl DurableRequestHandler {
             .lease_intent(&subject, kind, &semantic_id, reconnect)
             .map_err(|_| crate::quota::quota_authority_unavailable())?;
         let resource_digest = self.store.authorization_resource_digest(resource)?;
-        let lease = tokio::time::timeout(
+        let lease = match tokio::time::timeout(
             QUOTA_LEASE_CALL_TIMEOUT,
             self.store.acquire_quota_lease(
                 &intent,
@@ -370,7 +376,33 @@ impl DurableRequestHandler {
             ),
         )
         .await
-        .map_err(|_| crate::quota::quota_authority_unavailable())??;
+        {
+            Ok(Ok(lease)) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.quota_decision("ok", "lease_acquire");
+                }
+                lease
+            }
+            Ok(Err(error)) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.quota_decision(
+                        if error.code == a2a::error_code::QUOTA_EXCEEDED {
+                            "quota_exceeded"
+                        } else {
+                            "unavailable"
+                        },
+                        "lease_acquire",
+                    );
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.quota_decision("unavailable", "lease_acquire");
+                }
+                return Err(crate::quota::quota_authority_unavailable());
+            }
+        };
         Ok(Some(QuotaLeaseGuard::start(
             Arc::clone(&self.store),
             lease,
@@ -461,6 +493,7 @@ impl DurableRequestHandler {
             clock,
             input_limits,
             errors_before_stream: false,
+            telemetry: None,
             #[cfg(test)]
             after_empty_read: None,
         }
@@ -474,6 +507,14 @@ impl DurableRequestHandler {
 
     pub(crate) fn with_errors_before_stream(mut self) -> Self {
         self.errors_before_stream = true;
+        self
+    }
+
+    pub(crate) fn with_telemetry(
+        mut self,
+        telemetry: Option<crate::telemetry::TelemetryHandle>,
+    ) -> Self {
+        self.telemetry = telemetry;
         self
     }
 
@@ -660,106 +701,113 @@ impl DurableRequestHandler {
             scope,
             quota_lease,
             clock: self.clock.clone(),
+            telemetry_context: crate::telemetry::capture_request_telemetry_context(),
         };
         Box::pin(stream::unfold(state, |mut state| async move {
-            loop {
-                if state.finished {
-                    return None;
-                }
-                if let Some(error) = state.quota_lease.as_ref().and_then(|lease| lease.failure()) {
-                    state.finished = true;
-                    return Some((Err(error), state));
-                }
-                if let Some(frame) = state.pending.pop_front() {
-                    if let Err(error) = charge_public_egress(
-                        &state.store,
-                        state.authorization.as_ref(),
-                        state.clock.now(),
-                        &frame,
-                        1,
-                    )
-                    .await
+            let telemetry_context = state.telemetry_context.clone();
+            crate::telemetry::scope_request_telemetry_context(telemetry_context, async move {
+                loop {
+                    if state.finished {
+                        return None;
+                    }
+                    if let Some(error) =
+                        state.quota_lease.as_ref().and_then(|lease| lease.failure())
                     {
                         state.finished = true;
                         return Some((Err(error), state));
                     }
-                    state.last_sequence += 1;
-                    return Some((Ok(frame), state));
-                }
-                if state.closed {
-                    state.finished = true;
-                    if !state.emit_stream_errors {
-                        return None;
-                    }
-                    return state
-                        .interruption
-                        .take()
-                        .map(|error| (Err(A2AError::internal(error)), state));
-                }
-                let batch = match if let Some(scope) = state.scope.as_ref() {
-                    state
-                        .store
-                        .stream_frames_after_scoped(
-                            scope.tenant_scope(),
-                            &state.message_id,
-                            state.last_sequence,
+                    if let Some(frame) = state.pending.pop_front() {
+                        if let Err(error) = charge_public_egress(
+                            &state.store,
+                            state.authorization.as_ref(),
+                            state.clock.now(),
+                            &frame,
+                            1,
                         )
                         .await
-                } else if let Some(local) = state.local.as_ref() {
-                    local
-                        .stream_frames_after(&state.message_id, state.last_sequence)
-                        .await
-                } else {
-                    Err(A2AError::internal(
-                        "local development compatibility is unavailable",
-                    ))
-                } {
-                    Ok(batch) => batch,
-                    Err(error) => {
+                        {
+                            state.finished = true;
+                            return Some((Err(error), state));
+                        }
+                        state.last_sequence += 1;
+                        return Some((Ok(frame), state));
+                    }
+                    if state.closed {
                         state.finished = true;
                         if !state.emit_stream_errors {
                             return None;
                         }
-                        return Some((Err(error), state));
+                        return state
+                            .interruption
+                            .take()
+                            .map(|error| (Err(A2AError::internal(error)), state));
                     }
-                };
-                state.closed = batch.closed;
-                state.interruption = batch.interruption;
-                state.pending.extend(
-                    batch
-                        .frames
-                        .into_iter()
-                        .map(|frame| project_stream_response(frame, state.history_length)),
-                );
-                if !state.pending.is_empty() {
-                    continue;
-                }
-                if state.closed {
-                    continue;
-                }
-                let failure = { state.driver_state.borrow().failure.clone() };
-                if let Some(failure) = failure {
-                    state.finished = true;
-                    if !state.emit_stream_errors {
-                        return None;
+                    let batch = match if let Some(scope) = state.scope.as_ref() {
+                        state
+                            .store
+                            .stream_frames_after_scoped(
+                                scope.tenant_scope(),
+                                &state.message_id,
+                                state.last_sequence,
+                            )
+                            .await
+                    } else if let Some(local) = state.local.as_ref() {
+                        local
+                            .stream_frames_after(&state.message_id, state.last_sequence)
+                            .await
+                    } else {
+                        Err(A2AError::internal(
+                            "local development compatibility is unavailable",
+                        ))
+                    } {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            state.finished = true;
+                            if !state.emit_stream_errors {
+                                return None;
+                            }
+                            return Some((Err(error), state));
+                        }
+                    };
+                    state.closed = batch.closed;
+                    state.interruption = batch.interruption;
+                    state.pending.extend(
+                        batch
+                            .frames
+                            .into_iter()
+                            .map(|frame| project_stream_response(frame, state.history_length)),
+                    );
+                    if !state.pending.is_empty() {
+                        continue;
                     }
-                    return Some((Err(A2AError::internal(failure)), state));
-                }
-                let change = tokio::select! {
-                    change = state.driver_state.changed() => change,
-                    () = tokio::time::sleep(state.poll_interval.as_duration()) => Ok(()),
-                };
-                if change.is_err() {
-                    state.finished = true;
-                    if !state.emit_stream_errors {
-                        return None;
+                    if state.closed {
+                        continue;
                     }
-                    return Some((
-                        Err(A2AError::internal("durable outbox driver stopped")),
-                        state,
-                    ));
+                    let failure = { state.driver_state.borrow().failure.clone() };
+                    if let Some(failure) = failure {
+                        state.finished = true;
+                        if !state.emit_stream_errors {
+                            return None;
+                        }
+                        return Some((Err(A2AError::internal(failure)), state));
+                    }
+                    let change = tokio::select! {
+                        change = state.driver_state.changed() => change,
+                        () = tokio::time::sleep(state.poll_interval.as_duration()) => Ok(()),
+                    };
+                    if change.is_err() {
+                        state.finished = true;
+                        if !state.emit_stream_errors {
+                            return None;
+                        }
+                        return Some((
+                            Err(A2AError::internal("durable outbox driver stopped")),
+                            state,
+                        ));
+                    }
                 }
-            }
+            })
+            .await
         }))
     }
 
@@ -787,87 +835,94 @@ impl DurableRequestHandler {
             scope,
             quota_lease,
             clock: self.clock.clone(),
+            telemetry_context: crate::telemetry::capture_request_telemetry_context(),
         };
         Box::pin(stream::unfold(state, |mut state| async move {
-            loop {
-                if let Some(error) = state.quota_lease.as_ref().and_then(|lease| lease.failure()) {
-                    state.quota_lease = None;
-                    state.pending.clear();
-                    state.closed = true;
-                    return Some((Err(error), state));
-                }
-                if let Some(frame) = state.pending.pop_front() {
-                    if let Err(error) = charge_public_egress(
-                        &state.store,
-                        state.authorization.as_ref(),
-                        state.clock.now(),
-                        &frame,
-                        1,
-                    )
-                    .await
+            let telemetry_context = state.telemetry_context.clone();
+            crate::telemetry::scope_request_telemetry_context(telemetry_context, async move {
+                loop {
+                    if let Some(error) =
+                        state.quota_lease.as_ref().and_then(|lease| lease.failure())
                     {
+                        state.quota_lease = None;
+                        state.pending.clear();
                         state.closed = true;
                         return Some((Err(error), state));
                     }
-                    return Some((Ok(frame), state));
-                }
-                if state.closed {
-                    return None;
-                }
-                let batch = if let Some(scope) = state.scope.as_ref() {
-                    state
-                        .store
-                        .task_events_after_scoped(scope, &state.task_id, state.last_revision)
+                    if let Some(frame) = state.pending.pop_front() {
+                        if let Err(error) = charge_public_egress(
+                            &state.store,
+                            state.authorization.as_ref(),
+                            state.clock.now(),
+                            &frame,
+                            1,
+                        )
                         .await
-                } else if let Some(local) = state.local.as_ref() {
-                    local
-                        .task_events_after(&state.task_id, state.last_revision)
-                        .await
-                } else {
-                    Err(A2AError::internal(
-                        "local development compatibility is unavailable",
-                    ))
-                };
-                match batch {
-                    Ok(batch) => {
-                        state.last_revision = batch.last_revision;
-                        state.closed = batch.closed;
-                        state.pending.extend(batch.frames);
-                        if !state.pending.is_empty() || state.closed {
-                            continue;
+                        {
+                            state.closed = true;
+                            return Some((Err(error), state));
+                        }
+                        return Some((Ok(frame), state));
+                    }
+                    if state.closed {
+                        return None;
+                    }
+                    let batch = if let Some(scope) = state.scope.as_ref() {
+                        state
+                            .store
+                            .task_events_after_scoped(scope, &state.task_id, state.last_revision)
+                            .await
+                    } else if let Some(local) = state.local.as_ref() {
+                        local
+                            .task_events_after(&state.task_id, state.last_revision)
+                            .await
+                    } else {
+                        Err(A2AError::internal(
+                            "local development compatibility is unavailable",
+                        ))
+                    };
+                    match batch {
+                        Ok(batch) => {
+                            state.last_revision = batch.last_revision;
+                            state.closed = batch.closed;
+                            state.pending.extend(batch.frames);
+                            if !state.pending.is_empty() || state.closed {
+                                continue;
+                            }
+                        }
+                        Err(error) => {
+                            state.closed = true;
+                            if !state.emit_stream_errors {
+                                return None;
+                            }
+                            return Some((Err(error), state));
                         }
                     }
-                    Err(error) => {
+                    let failure = state.driver_state.borrow().failure.clone();
+                    if let Some(failure) = failure {
                         state.closed = true;
                         if !state.emit_stream_errors {
                             return None;
                         }
-                        return Some((Err(error), state));
+                        return Some((Err(A2AError::internal(failure)), state));
+                    }
+                    let change = tokio::select! {
+                        change = state.driver_state.changed() => change,
+                        () = tokio::time::sleep(state.poll_interval.as_duration()) => Ok(()),
+                    };
+                    if change.is_err() {
+                        state.closed = true;
+                        if !state.emit_stream_errors {
+                            return None;
+                        }
+                        return Some((
+                            Err(A2AError::internal("durable outbox driver stopped")),
+                            state,
+                        ));
                     }
                 }
-                let failure = state.driver_state.borrow().failure.clone();
-                if let Some(failure) = failure {
-                    state.closed = true;
-                    if !state.emit_stream_errors {
-                        return None;
-                    }
-                    return Some((Err(A2AError::internal(failure)), state));
-                }
-                let change = tokio::select! {
-                    change = state.driver_state.changed() => change,
-                    () = tokio::time::sleep(state.poll_interval.as_duration()) => Ok(()),
-                };
-                if change.is_err() {
-                    state.closed = true;
-                    if !state.emit_stream_errors {
-                        return None;
-                    }
-                    return Some((
-                        Err(A2AError::internal("durable outbox driver stopped")),
-                        state,
-                    ));
-                }
-            }
+            })
+            .await
         }))
     }
 }
@@ -1057,6 +1112,10 @@ impl RequestHandler for DurableRequestHandler {
                 self.local()?.admit(command).await?
             }
         };
+        let admission_reason = match &admission {
+            AdmissionOutcome::Admitted(_) => "admitted",
+            AdmissionOutcome::Replay(_) => "replay",
+        };
         let response = match admission {
             AdmissionOutcome::Replay(result) if matches!(&result, SendMessageResponse::Task(task) if task.status.state.is_terminal()) => {
                 project_send_response(result, history_length)
@@ -1101,6 +1160,25 @@ impl RequestHandler for DurableRequestHandler {
             1,
         )
         .await?;
+        if let Some(telemetry) = &self.telemetry {
+            let (task_id, context_id) = match &response {
+                SendMessageResponse::Task(task) => {
+                    (Some(task.id.as_str()), Some(task.context_id.as_str()))
+                }
+                SendMessageResponse::Message(message) => {
+                    (message.task_id.as_deref(), message.context_id.as_deref())
+                }
+            };
+            telemetry.durable_event(
+                crate::telemetry::EventName::TaskAdmitted,
+                "ok",
+                admission_reason,
+                "send_message",
+                task_id,
+                context_id,
+                Some(&durable_message_id),
+            );
+        }
         Ok(response)
     }
 
@@ -1150,8 +1228,24 @@ impl RequestHandler for DurableRequestHandler {
             } else {
                 self.local()?.replay(&request, true).await?
             };
-            if replay.is_some() {
-                return Ok::<_, A2AError>((request.message.message_id.clone(), true));
+            if let Some(result) = replay {
+                let (task_id, context_id) = match result {
+                    SendMessageResponse::Task(task) => (task.id, task.context_id),
+                    SendMessageResponse::Message(message) => (
+                        message.task_id.ok_or_else(|| {
+                            A2AError::internal("replayed stream task correlation is missing")
+                        })?,
+                        message.context_id.ok_or_else(|| {
+                            A2AError::internal("replayed stream context correlation is missing")
+                        })?,
+                    ),
+                };
+                return Ok::<_, A2AError>((
+                    request.message.message_id.clone(),
+                    true,
+                    task_id,
+                    context_id,
+                ));
             }
             let task = if let Some(task) = continuation_task {
                 task
@@ -1203,13 +1297,30 @@ impl RequestHandler for DurableRequestHandler {
             } else {
                 self.local()?.admit(command).await?
             };
+            let (reconnect, task_id, context_id) = match outcome {
+                AdmissionOutcome::Admitted(record) => (false, record.task_id, task.context_id),
+                AdmissionOutcome::Replay(SendMessageResponse::Task(task)) => {
+                    (true, task.id, task.context_id)
+                }
+                AdmissionOutcome::Replay(SendMessageResponse::Message(message)) => (
+                    true,
+                    message.task_id.ok_or_else(|| {
+                        A2AError::internal("replayed stream task correlation is missing")
+                    })?,
+                    message.context_id.ok_or_else(|| {
+                        A2AError::internal("replayed stream context correlation is missing")
+                    })?,
+                ),
+            };
             Ok::<_, A2AError>((
                 request.message.message_id.clone(),
-                matches!(outcome, AdmissionOutcome::Replay(_)),
+                reconnect,
+                task_id,
+                context_id,
             ))
         }
         .await;
-        let (message_id, reconnect) = match admitted {
+        let (message_id, reconnect, task_id, context_id) = match admitted {
             Ok(value) => value,
             Err(error) => return self.preflight_stream_error(error),
         };
@@ -1237,6 +1348,17 @@ impl RequestHandler for DurableRequestHandler {
         // The durable slot is acquired before the stream is returned to the
         // transport, so REST cannot establish SSE headers on a denied lease.
         self.driver.wake.notify_one();
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.durable_event(
+                crate::telemetry::EventName::TaskAdmitted,
+                "ok",
+                if reconnect { "replay" } else { "admitted" },
+                "send_streaming_message",
+                Some(&task_id),
+                Some(&context_id),
+                Some(&message_id),
+            );
+        }
         let history_length = request
             .configuration
             .as_ref()
@@ -1284,14 +1406,25 @@ impl RequestHandler for DurableRequestHandler {
                 .await?
         } else {
             self.local()?.get(&request.id).await?
-        }
-        .ok_or_else(|| {
-            A2AError::task_not_found(if authorization.is_some() {
+        };
+        let Some(task) = task else {
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.durable_event(
+                    crate::telemetry::EventName::TaskTransitioned,
+                    "not_found",
+                    "not_found",
+                    "get_task",
+                    Some(&request.id),
+                    None,
+                    None,
+                );
+            }
+            return Err(A2AError::task_not_found(if authorization.is_some() {
                 "resource"
             } else {
                 &request.id
-            })
-        })?;
+            }));
+        };
         if task
             .artifacts
             .as_ref()
@@ -1309,6 +1442,17 @@ impl RequestHandler for DurableRequestHandler {
             1,
         )
         .await?;
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.durable_event(
+                crate::telemetry::EventName::TaskTransitioned,
+                "ok",
+                "read",
+                "get_task",
+                Some(&task.id),
+                Some(&task.context_id),
+                None,
+            );
+        }
         Ok(task)
     }
 
@@ -1378,6 +1522,17 @@ impl RequestHandler for DurableRequestHandler {
                 .max(1),
         )
         .await?;
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.durable_event(
+                crate::telemetry::EventName::TaskTransitioned,
+                "ok",
+                "read",
+                "list_tasks",
+                None,
+                None,
+                None,
+            );
+        }
         Ok(response)
     }
 
@@ -1431,6 +1586,24 @@ impl RequestHandler for DurableRequestHandler {
         } else {
             self.local()?.cancel(&request.id, self.clock.now()).await?
         };
+        let immediate_cancel = matches!(&outcome, CancellationOutcome::Canceled(_));
+        if let Some(telemetry) = &self.telemetry {
+            let (task_id, context_id) = match &outcome {
+                CancellationOutcome::Canceled(task) => {
+                    (Some(task.id.as_str()), Some(task.context_id.as_str()))
+                }
+                CancellationOutcome::AwaitReceiver { .. } => (Some(request.id.as_str()), None),
+            };
+            telemetry.durable_event(
+                crate::telemetry::EventName::CancellationRequested,
+                "ok",
+                "durable_ack",
+                "cancel_task",
+                task_id,
+                context_id,
+                None,
+            );
+        }
         let task = match outcome {
             CancellationOutcome::Canceled(task) => {
                 self.driver.changed();
@@ -1458,6 +1631,37 @@ impl RequestHandler for DurableRequestHandler {
             1,
         )
         .await?;
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.durable_event(
+                crate::telemetry::EventName::CancellationAcknowledged,
+                "canceled",
+                "committed",
+                "cancel_task",
+                Some(&task.id),
+                Some(&task.context_id),
+                None,
+            );
+            telemetry.durable_event(
+                crate::telemetry::EventName::CancellationStopped,
+                "canceled",
+                "cooperative_stop",
+                "cancel_task",
+                Some(&task.id),
+                Some(&task.context_id),
+                None,
+            );
+            if immediate_cancel {
+                telemetry.durable_event(
+                    crate::telemetry::EventName::TaskTerminal,
+                    "canceled",
+                    "committed",
+                    "terminal_commit",
+                    Some(&task.id),
+                    Some(&task.context_id),
+                    None,
+                );
+            }
+        }
         Ok(task)
     }
 
@@ -1544,6 +1748,17 @@ impl RequestHandler for DurableRequestHandler {
             1,
         )
         .await?;
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.durable_event(
+                crate::telemetry::EventName::TaskTransitioned,
+                "ok",
+                "replay",
+                "subscribe_to_task",
+                Some(&snapshot.id),
+                Some(&snapshot.context_id),
+                None,
+            );
+        }
         let tail = match cursor {
             SubscriptionCursor::Transcript { message_id, cursor } => self.stream_from_message(
                 message_id,

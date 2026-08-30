@@ -1,0 +1,1094 @@
+[
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.dispatch.id",
+        "<dispatch-id>"
+      ],
+      [
+        "smesh.operation",
+        "outbox_attempt"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "execute"
+      ]
+    ],
+    "name": "smesh.dispatch.attempted",
+    "required": false,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.dispatch.id",
+        "<dispatch-id>"
+      ],
+      [
+        "smesh.operation",
+        "outbox_claim"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "claimed"
+      ]
+    ],
+    "name": "smesh.dispatch.claimed",
+    "required": false,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.dispatch.id",
+        "<dispatch-id>"
+      ],
+      [
+        "smesh.operation",
+        "receiver_admit"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "execute"
+      ]
+    ],
+    "name": "smesh.receiver.admitted",
+    "required": false,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.dispatch.id",
+        "<dispatch-id>"
+      ],
+      [
+        "smesh.operation",
+        "receiver_execute"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "committed"
+      ]
+    ],
+    "name": "smesh.receiver.completed",
+    "required": false,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.dispatch.id",
+        "<dispatch-id>"
+      ],
+      [
+        "smesh.operation",
+        "terminal_commit"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "committed"
+      ]
+    ],
+    "name": "smesh.task.terminal",
+    "required": true,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.operation",
+        "send_message"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "admitted"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.task.admitted",
+    "required": true,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "smesh.dispatch.id",
+        "<dispatch-id>"
+      ],
+      [
+        "smesh.operation",
+        "outbox_attempt"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "execute"
+      ]
+    ],
+    "name": "smesh.outbox.attempt",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "smesh.dispatch.id",
+        "<dispatch-id>"
+      ],
+      [
+        "smesh.operation",
+        "outbox_claim"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "claimed"
+      ]
+    ],
+    "name": "smesh.outbox.claim",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "smesh.dispatch.id",
+        "<dispatch-id>"
+      ],
+      [
+        "smesh.operation",
+        "receiver_admit"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "execute"
+      ]
+    ],
+    "name": "smesh.receiver.admit",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "smesh.dispatch.id",
+        "<dispatch-id>"
+      ],
+      [
+        "smesh.operation",
+        "receiver_execute"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "committed"
+      ]
+    ],
+    "name": "smesh.receiver.execute",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "smesh.dispatch.id",
+        "<dispatch-id>"
+      ],
+      [
+        "smesh.operation",
+        "terminal_commit"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "committed"
+      ]
+    ],
+    "name": "smesh.outbox.attempt",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.message.id",
+        "<message-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "smesh.operation",
+        "send_message"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "admitted"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.durable.admission",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.operation",
+        "get_task"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "read"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.task.transitioned",
+    "required": true,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "a2a.context.id",
+        "<context-id>"
+      ],
+      [
+        "a2a.task.id",
+        "<task-id>"
+      ],
+      [
+        "smesh.operation",
+        "get_task"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "read"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.durable.read",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.request.completed",
+    "required": false,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.request.completed",
+    "required": false,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.request.completed",
+    "required": false,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.request.completed",
+    "required": false,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "event.schema",
+        "smesh.telemetry/1"
+      ],
+      [
+        "smesh.operation",
+        "list_tasks"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "read"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.task.transitioned",
+    "required": true,
+    "signal": "log"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "get_task"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ]
+    ],
+    "name": "smesh.a2a.durable.operation",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.http.request",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.http.request",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.http.request",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.http.request",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ]
+    ],
+    "name": "smesh.a2a.request",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ]
+    ],
+    "name": "smesh.a2a.request",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ]
+    ],
+    "name": "smesh.a2a.request",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ]
+    ],
+    "name": "smesh.a2a.request",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ]
+    ],
+    "name": "smesh.a2a.request.duration",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ]
+    ],
+    "name": "smesh.a2a.request.duration",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ]
+    ],
+    "name": "smesh.a2a.request.duration",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "http_request"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "served"
+      ]
+    ],
+    "name": "smesh.a2a.request.duration",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "list_tasks"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ],
+      [
+        "smesh.reason",
+        "read"
+      ],
+      [
+        "smesh.request.id",
+        "<request-id>"
+      ]
+    ],
+    "name": "smesh.durable.read",
+    "required": false,
+    "signal": "span"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "list_tasks"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ]
+    ],
+    "name": "smesh.a2a.durable.operation",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "outbox_attempt"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ]
+    ],
+    "name": "smesh.a2a.durable.operation",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "outbox_claim"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ]
+    ],
+    "name": "smesh.a2a.durable.operation",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "receiver_admit"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ]
+    ],
+    "name": "smesh.a2a.durable.operation",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "receiver_execute"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ]
+    ],
+    "name": "smesh.a2a.durable.operation",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "send_message"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ]
+    ],
+    "name": "smesh.a2a.durable.operation",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.operation",
+        "terminal_commit"
+      ],
+      [
+        "smesh.outcome",
+        "ok"
+      ]
+    ],
+    "name": "smesh.a2a.durable.operation",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.result",
+        "eligible_good"
+      ],
+      [
+        "smesh.slo",
+        "edge_availability"
+      ]
+    ],
+    "name": "smesh.a2a.sli.event",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.result",
+        "eligible_good"
+      ],
+      [
+        "smesh.slo",
+        "edge_availability"
+      ]
+    ],
+    "name": "smesh.a2a.sli.event",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.result",
+        "eligible_good"
+      ],
+      [
+        "smesh.slo",
+        "edge_availability"
+      ]
+    ],
+    "name": "smesh.a2a.sli.event",
+    "required": false,
+    "signal": "metric"
+  },
+  {
+    "attributes": [
+      [
+        "smesh.result",
+        "eligible_good"
+      ],
+      [
+        "smesh.slo",
+        "edge_availability"
+      ]
+    ],
+    "name": "smesh.a2a.sli.event",
+    "required": false,
+    "signal": "metric"
+  }
+]

@@ -1968,7 +1968,7 @@ async fn exact_v1_schema_migrates_to_v6_with_explicit_binding_preserving_keys_an
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert_eq!(event_kind, "migration_snapshot");
 }
 

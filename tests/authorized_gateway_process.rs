@@ -208,6 +208,22 @@ fn command(root: &Path, database: &Path, bind: std::net::SocketAddr) -> Command 
         )
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    #[cfg(debug_assertions)]
+    {
+        let absent_collector = free_address();
+        command
+            .env("SMESH_A2A_OTLP_MODE", "http-protobuf")
+            .env(
+                "SMESH_A2A_OTLP_ENDPOINT",
+                format!("http://{absent_collector}/"),
+            )
+            .env("SMESH_TEST_OTLP_INSECURE_LOOPBACK", "1")
+            .env("SMESH_A2A_OTLP_TRACE_QUEUE", "64")
+            .env("SMESH_A2A_OTLP_LOG_QUEUE", "64")
+            .env("SMESH_A2A_OTLP_METRIC_QUEUE", "64")
+            .env("SMESH_A2A_OTLP_EXPORT_TIMEOUT_MILLIS", "100")
+            .env("SMESH_A2A_OTLP_SHUTDOWN_TIMEOUT_MILLIS", "1000");
+    }
     command
 }
 
@@ -440,7 +456,7 @@ async fn production_mtls_gateway_migrates_restarts_and_serves_both_protocols() {
         reopened
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     drop(reopened);
 

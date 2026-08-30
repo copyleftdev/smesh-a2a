@@ -73,6 +73,7 @@ pub(crate) async fn execute(
     source: Arc<PosixArtifactBlobStore>,
     target: Arc<PosixArtifactBlobStore>,
     plan: &ArtifactRestorePlanFile,
+    audit_projection_enabled: bool,
 ) -> Result<ArtifactRestoreOutcome, PostgresStoreError> {
     if schema != plan.target_schema() {
         return Err(PostgresStoreError::ArtifactMigrationPlanMismatch);
@@ -225,6 +226,7 @@ pub(crate) async fn execute(
         &tenants,
         &token,
         copied.len(),
+        audit_projection_enabled,
     )
     .await?;
     crate::artifact_production_checkpoint("restore_atomic_enable_before_ack");
@@ -607,6 +609,26 @@ async fn assert_target_empty_or_resume(
     inv: &Inventory,
     digest: &str,
 ) -> Result<(), PostgresStoreError> {
+    client
+        .batch_execute("SELECT set_config('smesh.internal_global','audit-projector-v1',false)")
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    let projection_status = client
+        .query_one(
+            &format!("SELECT EXISTS(SELECT 1 FROM {schema}.audit_projection_outbox WHERE state='leased' AND lease_expires_at>{schema}.db_millis()),(SELECT count(*) FROM {schema}.audit_projection_outbox)"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    let active_projection_lease: bool = projection_status.get(0);
+    let projection_rows: i64 = projection_status.get(1);
+    if active_projection_lease {
+        return Err(PostgresStoreError::ArtifactMigrationBusy);
+    }
+    client
+        .batch_execute("SELECT set_config('smesh.internal_global','claim-v1',false)")
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
     let journals=client.query(&format!("SELECT DISTINCT restore_id,inventory_digest,state FROM {schema}.artifact_restore_jobs"),&[]).await.map_err(|_|PostgresStoreError::InvalidSchema)?;
     if journals.is_empty() {
         return assert_target_empty(client, schema).await;
@@ -616,6 +638,9 @@ async fn assert_target_empty_or_resume(
             || row.get::<_, String>(1) != digest
             || row.get::<_, String>(2) != "restoring"
     }) {
+        return Err(PostgresStoreError::ArtifactRestoreTargetNotEmpty);
+    }
+    if projection_rows != 0 {
         return Err(PostgresStoreError::ArtifactRestoreTargetNotEmpty);
     }
     let array_count = |field: &str| {
@@ -669,7 +694,13 @@ async fn assert_target_empty_or_resume(
         .filter(|table| {
             !matches!(
                 *table,
-                "schema_migrations" | "store_identity" | "store_metadata"
+                "schema_migrations"
+                    | "store_identity"
+                    | "store_metadata"
+                    | "audit_projection_control"
+                    | "audit_projection_outbox"
+                    | "audit_projection_session_secret"
+                    | "audit_projection_sessions"
             )
         })
     {
@@ -692,7 +723,13 @@ async fn assert_target_empty(client: &Client, schema: &str) -> Result<(), Postgr
         .filter(|table| {
             !matches!(
                 *table,
-                "schema_migrations" | "store_identity" | "store_metadata"
+                "schema_migrations"
+                    | "store_identity"
+                    | "store_metadata"
+                    | "audit_projection_control"
+                    | "audit_projection_outbox"
+                    | "audit_projection_session_secret"
+                    | "audit_projection_sessions"
             )
         })
     {
@@ -724,6 +761,48 @@ async fn commit_restore_journal(
         .transaction()
         .await
         .map_err(|_| PostgresStoreError::Unavailable)?;
+    // Fence claims before resetting optional projection state. Holding the
+    // outbox table lock and control-row lock through journal creation makes the
+    // reset and the authoritative restore fence one atomic transition.
+    tx.batch_execute("SET LOCAL smesh.internal_global='audit-projector-v1'")
+        .await
+        .map_err(|_| PostgresStoreError::Unavailable)?;
+    tx.batch_execute(&format!(
+        "LOCK TABLE {schema}.audit_projection_outbox IN ACCESS EXCLUSIVE MODE"
+    ))
+    .await
+    .map_err(|_| PostgresStoreError::Unavailable)?;
+    tx.query_one(
+        &format!(
+            "SELECT enabled FROM {schema}.audit_projection_control WHERE singleton=1 FOR UPDATE"
+        ),
+        &[],
+    )
+    .await
+    .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    let active_projection_lease: bool = tx
+        .query_one(
+            &format!("SELECT EXISTS(SELECT 1 FROM {schema}.audit_projection_outbox WHERE state='leased' AND lease_expires_at>{schema}.db_millis())"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?
+        .get(0);
+    if active_projection_lease {
+        return Err(PostgresStoreError::ArtifactMigrationBusy);
+    }
+    tx.execute(
+        &format!("UPDATE {schema}.audit_projection_control SET enabled=false WHERE singleton=1"),
+        &[],
+    )
+    .await
+    .map_err(|_| PostgresStoreError::Unavailable)?;
+    tx.execute(
+        &format!("DELETE FROM {schema}.audit_projection_outbox"),
+        &[],
+    )
+    .await
+    .map_err(|_| PostgresStoreError::Unavailable)?;
     tx.batch_execute("SET LOCAL smesh.internal_global='claim-v1'")
         .await
         .map_err(|_| PostgresStoreError::Unavailable)?;
@@ -925,6 +1004,7 @@ async fn atomic_enable(
     tenants: &BTreeSet<String>,
     token: &str,
     copied: usize,
+    audit_projection_enabled: bool,
 ) -> Result<(), PostgresStoreError> {
     let expected_objects = inv
         .entries
@@ -1006,6 +1086,12 @@ async fn atomic_enable(
     if changed != tenants.len() as u64 {
         return Err(PostgresStoreError::ArtifactMigrationBusy);
     }
+    tx.execute(
+        &format!("UPDATE {schema}.audit_projection_control SET enabled=$1 WHERE singleton=1"),
+        &[&audit_projection_enabled],
+    )
+    .await
+    .map_err(|_| PostgresStoreError::Unavailable)?;
     tx.commit()
         .await
         .map_err(|_| PostgresStoreError::Unavailable)

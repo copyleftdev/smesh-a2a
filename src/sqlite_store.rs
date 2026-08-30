@@ -14,6 +14,7 @@ use a2a_server::TaskStore;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac as _};
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
@@ -29,7 +30,8 @@ use crate::{
     canonical_send_message_digest_v2, content_digest, durable_authority::valid_bounded_identity,
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
+const V6_SCHEMA_VERSION: i64 = 6;
 const V5_SCHEMA_VERSION: i64 = 5;
 const V4_SCHEMA_VERSION: i64 = 4;
 const V2_SCHEMA_VERSION: i64 = 2;
@@ -526,6 +528,41 @@ const V6_SCHEMA_SQL: &str = "CREATE TABLE list_snapshots (
  CREATE INDEX tasks_tenant_owner_context_time_v6 ON tasks(tenant_scope,owner_account_id,context_id,status_timestamp DESC,task_id ASC);
  CREATE INDEX tasks_tenant_owner_context_state_time_v6 ON tasks(tenant_scope,owner_account_id,context_id,state,status_timestamp DESC,task_id ASC);";
 
+const V7_SCHEMA_SQL: &str = "CREATE TABLE audit_projection_outbox (
+ tenant_scope TEXT NOT NULL,
+ event_id TEXT NOT NULL UNIQUE CHECK(length(CAST(event_id AS BLOB))=71 AND substr(event_id,1,7)='sha256:' AND substr(event_id,8) NOT GLOB '*[^0-9a-f]*'),
+ source TEXT NOT NULL CHECK(source IN ('authorization_decisions','task_events','cancellation_intents')),
+ source_pk_digest TEXT NOT NULL CHECK(length(CAST(source_pk_digest AS BLOB))=71 AND substr(source_pk_digest,1,7)='sha256:' AND substr(source_pk_digest,8) NOT GLOB '*[^0-9a-f]*'),
+ event_kind TEXT NOT NULL CHECK(event_kind IN ('authorization_decided','task_terminal','task_canceled')),
+ occurred_at INTEGER NOT NULL,
+ state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','leased','delivered','dead')),
+ attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 10),
+ lease_owner TEXT, lease_token TEXT, lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK(lease_epoch>=0),
+ lease_expires_at INTEGER, available_at INTEGER NOT NULL, delivered_at INTEGER, dead_at INTEGER,
+ last_error_digest TEXT CHECK(last_error_digest IS NULL OR (length(CAST(last_error_digest AS BLOB))=71 AND substr(last_error_digest,1,7)='sha256:' AND substr(last_error_digest,8) NOT GLOB '*[^0-9a-f]*')),
+ PRIMARY KEY(tenant_scope,event_id),
+ CHECK((state='leased')=(lease_owner IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)),
+ CHECK((state='delivered')=(delivered_at IS NOT NULL)),
+ CHECK((state='dead')=(dead_at IS NOT NULL))
+ );
+ CREATE INDEX audit_projection_claim ON audit_projection_outbox(state,available_at,tenant_scope,occurred_at,event_id);
+ CREATE INDEX audit_projection_tenant_claim ON audit_projection_outbox(tenant_scope,state,available_at,occurred_at,event_id);
+ CREATE TRIGGER audit_projection_authorization AFTER INSERT ON authorization_decisions
+ WHEN smesh_audit_projection_enabled()=1 BEGIN
+  INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
+  VALUES(NEW.tenant_scope,smesh_projection_digest('authorization_decisions',NEW.tenant_scope,NEW.decision_id,NEW.policy_revision),'authorization_decisions',smesh_projection_pk_digest('authorization_decisions',NEW.tenant_scope,NEW.decision_id,NEW.policy_revision),'authorization_decided',NEW.decided_at,NEW.decided_at);
+ END;
+ CREATE TRIGGER audit_projection_task_terminal AFTER INSERT ON task_events
+ WHEN smesh_audit_projection_enabled()=1 AND NEW.to_state IN ('\"TASK_STATE_COMPLETED\"','\"TASK_STATE_FAILED\"','\"TASK_STATE_CANCELED\"','\"TASK_STATE_REJECTED\"') BEGIN
+  INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
+  VALUES(NEW.tenant_scope,smesh_projection_digest('task_events',NEW.tenant_scope,NEW.task_id,NEW.event_seq),'task_events',smesh_projection_pk_digest('task_events',NEW.tenant_scope,NEW.task_id,NEW.event_seq),CASE WHEN NEW.to_state='\"TASK_STATE_CANCELED\"' THEN 'task_canceled' ELSE 'task_terminal' END,NEW.created_at,NEW.created_at);
+ END;
+ CREATE TRIGGER audit_projection_cancellation AFTER INSERT ON cancellation_intents
+ WHEN smesh_audit_projection_enabled()=1 BEGIN
+  INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
+  VALUES(NEW.tenant_scope,smesh_projection_digest('cancellation_intents',NEW.tenant_scope,NEW.dispatch_id,0),'cancellation_intents',smesh_projection_pk_digest('cancellation_intents',NEW.tenant_scope,NEW.dispatch_id,0),'task_canceled',NEW.requested_at,NEW.requested_at);
+ END;";
+
 #[derive(Debug, Error)]
 pub enum SqliteStoreError {
     #[error("persistent task-store path is a symbolic link")]
@@ -552,6 +589,7 @@ pub struct SqliteTaskStore {
     max_tasks: usize,
     default_scope: Arc<str>,
     default_account: Arc<str>,
+    audit_projection_enabled: bool,
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -562,7 +600,15 @@ impl SqliteTaskStore {
     ///
     /// Returns an error for symbolic-link paths, unknown/corrupt schemas, or initialization failure.
     pub async fn open(path: impl AsRef<Path>, max_tasks: usize) -> Result<Self, SqliteStoreError> {
-        Self::open_inner(path, max_tasks, None, true).await
+        Self::open_inner(path, max_tasks, None, true, false).await
+    }
+
+    /// Open with connection-scoped trigger projection enabled. Existing rows are not backfilled.
+    pub async fn open_with_audit_projection(
+        path: impl AsRef<Path>,
+        max_tasks: usize,
+    ) -> Result<Self, SqliteStoreError> {
+        Self::open_inner(path, max_tasks, None, true, true).await
     }
 
     /// Open a store and explicitly bind any legacy v1-v4 records to one validated owner.
@@ -571,7 +617,7 @@ impl SqliteTaskStore {
         max_tasks: usize,
         binding: LegacyTenantBinding,
     ) -> Result<Self, SqliteStoreError> {
-        Self::open_inner(path, max_tasks, Some(binding), false).await
+        Self::open_inner(path, max_tasks, Some(binding), false, false).await
     }
 
     async fn open_inner(
@@ -579,10 +625,17 @@ impl SqliteTaskStore {
         max_tasks: usize,
         binding: Option<LegacyTenantBinding>,
         dev_new_only: bool,
+        audit_projection_enabled: bool,
     ) -> Result<Self, SqliteStoreError> {
         #[cfg(not(unix))]
         {
-            let _ = (path, max_tasks, binding, dev_new_only);
+            let _ = (
+                path,
+                max_tasks,
+                binding,
+                dev_new_only,
+                audit_projection_enabled,
+            );
             Err(SqliteStoreError::UnsupportedPlatform)
         }
 
@@ -594,7 +647,13 @@ impl SqliteTaskStore {
             let capacity = max_tasks.max(1);
             let (connection, cursor_key, receipt_key, default_scope, default_account) =
                 tokio::task::spawn_blocking(move || {
-                    open_database(&path, capacity, binding, dev_new_only)
+                    open_database(
+                        &path,
+                        capacity,
+                        binding,
+                        dev_new_only,
+                        audit_projection_enabled,
+                    )
                 })
                 .await
                 .map_err(|_| SqliteStoreError::Initialization)??;
@@ -608,6 +667,7 @@ impl SqliteTaskStore {
                 max_tasks: capacity,
                 default_scope: Arc::from(default_scope),
                 default_account: Arc::from(default_account),
+                audit_projection_enabled,
             })
         }
     }
@@ -4355,6 +4415,7 @@ fn open_database(
     max_tasks: usize,
     binding: Option<LegacyTenantBinding>,
     dev_new_only: bool,
+    audit_projection_enabled: bool,
 ) -> Result<(Connection, [u8; 32], [u8; 32], String, String), SqliteStoreError> {
     let mut connection = Connection::open_with_flags(
         path,
@@ -4363,6 +4424,39 @@ fn open_database(
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|_| SqliteStoreError::Initialization)?;
+
+    let flags = FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS;
+    connection
+        .create_scalar_function("smesh_audit_projection_enabled", 0, flags, move |_| {
+            Ok(i64::from(audit_projection_enabled))
+        })
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    connection
+        .create_scalar_function("smesh_projection_digest", 4, flags, |ctx| {
+            let source: String = ctx.get(0)?;
+            let tenant: String = ctx.get(1)?;
+            let key: String = ctx.get(2)?;
+            let revision: i64 = ctx.get(3)?;
+            Ok(content_digest(
+                format!("smesh-audit-projection/v1\u{1f}{source}\u{1f}{tenant}\u{1f}{key}\u{1f}{revision}")
+                    .as_bytes(),
+            ))
+        })
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    connection
+        .create_scalar_function("smesh_projection_pk_digest", 4, flags, |ctx| {
+            let source: String = ctx.get(0)?;
+            let tenant: String = ctx.get(1)?;
+            let key: String = ctx.get(2)?;
+            let revision: i64 = ctx.get(3)?;
+            Ok(content_digest(
+                format!(
+                    "pk\u{1f}smesh-audit-projection/v1\u{1f}{source}\u{1f}{tenant}\u{1f}{key}\u{1f}{revision}"
+                )
+                .as_bytes(),
+            ))
+        })
+        .map_err(|_| SqliteStoreError::Initialization)?;
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
@@ -4373,6 +4467,7 @@ fn open_database(
             | V3_SCHEMA_VERSION
             | V4_SCHEMA_VERSION
             | V5_SCHEMA_VERSION
+            | V6_SCHEMA_VERSION
             | SCHEMA_VERSION
     ) {
         return Err(SqliteStoreError::InvalidSchema);
@@ -4418,7 +4513,7 @@ fn open_database(
     }
     let selected_binding = if version == 0 {
         binding.unwrap_or_else(LegacyTenantBinding::development)
-    } else if version < SCHEMA_VERSION {
+    } else if version < V5_SCHEMA_VERSION {
         if dev_new_only {
             return Err(SqliteStoreError::InvalidSchema);
         }
@@ -4433,24 +4528,32 @@ fn open_database(
             migrate_v2_to_v3(&mut connection, max_tasks)?;
             migrate_v3_to_v4(&mut connection, max_tasks)?;
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
-            migrate_v5_to_v6(&mut connection)
+            migrate_v5_to_v6(&mut connection)?;
+            migrate_v6_to_v7(&mut connection)
         }
         V2_SCHEMA_VERSION => {
             migrate_v2_to_v3(&mut connection, max_tasks)?;
             migrate_v3_to_v4(&mut connection, max_tasks)?;
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
-            migrate_v5_to_v6(&mut connection)
+            migrate_v5_to_v6(&mut connection)?;
+            migrate_v6_to_v7(&mut connection)
         }
         V3_SCHEMA_VERSION => {
             migrate_v3_to_v4(&mut connection, max_tasks)?;
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
-            migrate_v5_to_v6(&mut connection)
+            migrate_v5_to_v6(&mut connection)?;
+            migrate_v6_to_v7(&mut connection)
         }
         V4_SCHEMA_VERSION => {
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
-            migrate_v5_to_v6(&mut connection)
+            migrate_v5_to_v6(&mut connection)?;
+            migrate_v6_to_v7(&mut connection)
         }
-        V5_SCHEMA_VERSION => migrate_v5_to_v6(&mut connection),
+        V5_SCHEMA_VERSION => {
+            migrate_v5_to_v6(&mut connection)?;
+            migrate_v6_to_v7(&mut connection)
+        }
+        V6_SCHEMA_VERSION => migrate_v6_to_v7(&mut connection),
         SCHEMA_VERSION => validate_schema(&connection),
         _ => Err(SqliteStoreError::InvalidSchema),
     }?;
@@ -5533,7 +5636,7 @@ fn initialize_schema(
     }
     let cursor_key: [u8; 32] = rand::random();
     let receipt_key: [u8; 32] = rand::random();
-    let migration_hash = schema_v6_hash();
+    let migration_hash = schema_v7_hash();
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| SqliteStoreError::Initialization)?;
@@ -5570,6 +5673,9 @@ fn initialize_schema(
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
         .execute_batch(V6_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(V7_SCHEMA_SQL)
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction.execute(
         "INSERT INTO store_identity(singleton, tenant_scope, owner_account_id, policy_id, policy_revision, policy_digest)
@@ -5779,6 +5885,75 @@ const V6_OBJECTS: &[&str] = &[
     "tasks_tenant_owner_context_time_v6",
     "tasks_tenant_owner_context_state_time_v6",
 ];
+const V7_OBJECTS: &[&str] = &[
+    "store_metadata",
+    "tasks",
+    "tasks_context_state_time",
+    "task_events",
+    "task_events_task_revision",
+    "idempotency_records",
+    "idempotency_records_task",
+    "outbox",
+    "outbox_due",
+    "outbox_task_state",
+    "outbox_message_identity",
+    "outbox_message_immutable",
+    "outbox_attempts",
+    "receiver_inbox",
+    "receiver_inbox_reclaim",
+    "receiver_frames",
+    "loopback_effects",
+    "stream_transcripts",
+    "stream_transcripts_task",
+    "stream_frames",
+    "cancellation_intents",
+    "cancellation_intents_task",
+    "store_identity",
+    "tasks_tenant_owner_time",
+    "authorization_decisions",
+    "authorization_decisions_tenant_time",
+    "authorization_decisions_actor_time",
+    "authorization_decisions_resource_time",
+    "tasks_ownership_immutable",
+    "authorization_decisions_no_update",
+    "authorization_decisions_no_delete",
+    "authorization_decisions_task_scope",
+    "task_events_tenant_match",
+    "idempotency_tenant_match",
+    "outbox_tenant_match",
+    "stream_transcripts_tenant_match",
+    "cancellation_tenant_match",
+    "task_events_identity_update",
+    "idempotency_identity_update",
+    "outbox_identity_update",
+    "outbox_attempts_identity_update",
+    "receiver_inbox_task_match",
+    "receiver_inbox_identity_update",
+    "receiver_frames_identity_update",
+    "loopback_effects_identity_update",
+    "stream_transcripts_identity_update",
+    "stream_frames_identity_update",
+    "cancellation_identity_update",
+    "list_snapshots",
+    "list_snapshots_expiry",
+    "list_snapshot_entries",
+    "list_page_tokens",
+    "list_page_tokens_snapshot",
+    "tasks_tenant_time_v6",
+    "tasks_tenant_state_time_v6",
+    "tasks_tenant_context_time_v6",
+    "tasks_tenant_context_state_time_v6",
+    "tasks_tenant_owner_time_v6",
+    "tasks_tenant_owner_state_time_v6",
+    "tasks_tenant_owner_context_time_v6",
+    "tasks_tenant_owner_context_state_time_v6",
+    "audit_projection_outbox",
+    "audit_projection_claim",
+    "audit_projection_tenant_claim",
+    "audit_projection_authorization",
+    "audit_projection_task_terminal",
+    "audit_projection_cancellation",
+];
 const V3_OBJECTS: &[&str] = &[
     "store_metadata",
     "tasks",
@@ -5839,6 +6014,14 @@ fn schema_v6_hash() -> String {
     )
 }
 
+fn schema_v7_hash() -> String {
+    content_digest(
+        [schema_v6_hash().as_bytes(), V7_SCHEMA_SQL.as_bytes()]
+            .concat()
+            .as_slice(),
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn validate_schema_version(
     connection: &Connection,
@@ -5867,7 +6050,8 @@ fn validate_schema_version(
             .or_else(|| expected_schema_sql(OUTBOX_MESSAGE_BINDING_SQL, object_name))
             .or_else(|| expected_schema_sql(CANCELLATION_SCHEMA_SQL, object_name))
             .or_else(|| expected_schema_sql(V5_SCHEMA_SQL, object_name))
-            .or_else(|| expected_schema_sql(V6_SCHEMA_SQL, object_name));
+            .or_else(|| expected_schema_sql(V6_SCHEMA_SQL, object_name))
+            .or_else(|| expected_schema_sql(V7_SCHEMA_SQL, object_name));
         let actual = normalize_schema_sql(&actual);
         let matches_expected = if version >= V5_SCHEMA_VERSION && *object_name == "tasks" {
             let base = expected_schema_sql(V2_SCHEMA_SQL, "tasks").expect("v2 tasks schema");
@@ -5931,7 +6115,8 @@ fn validate_schema_version(
         )
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
     let expected_hash = match version {
-        SCHEMA_VERSION => schema_v6_hash(),
+        SCHEMA_VERSION => schema_v7_hash(),
+        V6_SCHEMA_VERSION => schema_v6_hash(),
         V5_SCHEMA_VERSION => schema_v5_hash(),
         V4_SCHEMA_VERSION => schema_v4_hash(),
         V3_SCHEMA_VERSION => schema_v3_hash(),
@@ -5965,7 +6150,7 @@ fn validate_schema_version(
 }
 
 fn validate_schema(connection: &Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
-    validate_schema_version(connection, SCHEMA_VERSION, V2_SCHEMA_SQL, V6_OBJECTS)
+    validate_schema_version(connection, SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)
 }
 
 fn migrate_v1_to_v2(
@@ -6302,15 +6487,43 @@ fn migrate_v5_to_v6(connection: &mut Connection) -> Result<([u8; 32], [u8; 32]),
     transaction
         .execute(
             "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
-            params![SCHEMA_VERSION, schema_v6_hash()],
+            params![V6_SCHEMA_VERSION, schema_v6_hash()],
+        )
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .pragma_update(None, "user_version", V6_SCHEMA_VERSION)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    validate_foreign_keys(&transaction)?;
+    let validated =
+        validate_schema_version(&transaction, V6_SCHEMA_VERSION, V2_SCHEMA_SQL, V6_OBJECTS)?;
+    if validated != keys {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    transaction
+        .commit()
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    Ok(validated)
+}
+
+fn migrate_v6_to_v7(connection: &mut Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_version(connection, V6_SCHEMA_VERSION, V2_SCHEMA_SQL, V6_OBJECTS)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(V7_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute(
+            "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
+            params![SCHEMA_VERSION, schema_v7_hash()],
         )
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| SqliteStoreError::Initialization)?;
-    validate_foreign_keys(&transaction)?;
     let validated =
-        validate_schema_version(&transaction, SCHEMA_VERSION, V2_SCHEMA_SQL, V6_OBJECTS)?;
+        validate_schema_version(&transaction, SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
     if validated != keys {
         return Err(SqliteStoreError::InvalidSchema);
     }
@@ -7243,6 +7456,10 @@ impl crate::IntoDurableAuthority for SqliteTaskStore {
 impl crate::QuotaLeaseAuthority for SqliteTaskStore {}
 
 impl crate::AuthorityIdentity for SqliteTaskStore {
+    fn audit_projection_authority(&self) -> Option<&dyn crate::AuditProjectionAuthority> {
+        self.audit_projection_enabled.then_some(self)
+    }
+
     fn capabilities(&self) -> crate::AuthorityCapabilities {
         crate::AuthorityCapabilities {
             lease_renewal: false,
@@ -7256,6 +7473,100 @@ impl crate::AuthorityIdentity for SqliteTaskStore {
 
     fn authorization_resource_digest(&self, resource: &str) -> Result<String, A2AError> {
         SqliteTaskStore::authorization_resource_digest(self, resource)
+    }
+}
+
+#[async_trait]
+impl crate::AuditProjectionAuthority for SqliteTaskStore {
+    fn audit_projection_capabilities(&self) -> crate::AuditProjectionCapabilities {
+        crate::AuditProjectionCapabilities {
+            enabled: self.audit_projection_enabled,
+            starts_at_enable: true,
+        }
+    }
+
+    async fn claim_audit_projection(
+        &self,
+        owner: &str,
+        lease_duration_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::AuditProjectionLease>, A2AError> {
+        if !self.audit_projection_enabled
+            || !valid_bounded_identity(owner)
+            || !(1..=300_000).contains(&lease_duration_ms)
+            || !(1..=1_000).contains(&limit)
+        {
+            return Err(A2AError::invalid_request("invalid audit projection claim"));
+        }
+        let owner = owner.to_owned();
+        self.run(move |connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| A2AError::internal("audit projection claim failed"))?;
+            let now: i64 = tx.query_row("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER)", [], |r| r.get(0)).map_err(|_| A2AError::internal("audit projection DB clock failed"))?;
+            tx.execute("UPDATE audit_projection_outbox SET state='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,available_at=?1 WHERE state='leased' AND lease_expires_at<=?1 AND attempts<10", [now]).map_err(|_| A2AError::internal("audit projection reclaim failed"))?;
+            tx.execute("UPDATE audit_projection_outbox SET state='dead',dead_at=?1,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE state='leased' AND lease_expires_at<=?1 AND attempts>=10", [now]).map_err(|_| A2AError::internal("audit projection dead transition failed"))?;
+            let token = content_digest(&rand::random::<[u8; 32]>());
+            let mut stmt = tx.prepare("WITH ranked AS (SELECT tenant_scope,event_id,attempts,available_at,occurred_at,row_number() OVER(PARTITION BY tenant_scope ORDER BY attempts,available_at,occurred_at,event_id) tenant_rank FROM audit_projection_outbox WHERE state='pending' AND available_at<=?1 AND attempts<10) SELECT tenant_scope,event_id FROM ranked ORDER BY tenant_rank,attempts,available_at,tenant_scope,occurred_at,event_id LIMIT ?2").map_err(|_| A2AError::internal("audit projection selection failed"))?;
+            let ids = stmt.query_map(params![now, i64::try_from(limit).unwrap_or(1000)], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?))).map_err(|_| A2AError::internal("audit projection selection failed"))?.collect::<Result<Vec<_>,_>>().map_err(|_| A2AError::internal("audit projection selection failed"))?;
+            drop(stmt);
+            let mut leases = Vec::with_capacity(ids.len());
+            for (tenant,event_id) in ids {
+                tx.execute("UPDATE audit_projection_outbox SET state='leased',attempts=attempts+1,lease_owner=?3,lease_token=?4,lease_epoch=lease_epoch+1,lease_expires_at=?5 WHERE tenant_scope=?1 AND event_id=?2 AND state='pending'", params![tenant,event_id,owner,token,now+lease_duration_ms]).map_err(|_| A2AError::internal("audit projection lease failed"))?;
+                let row = tx.query_row("SELECT source,source_pk_digest,event_kind,occurred_at,lease_epoch,attempts FROM audit_projection_outbox WHERE tenant_scope=?1 AND event_id=?2", params![tenant,event_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?))).map_err(|_| A2AError::internal("audit projection lease read failed"))?;
+                leases.push(crate::AuditProjectionLease::new(content_digest(tenant.as_bytes()),event_id,
+                    crate::AuditProjectionSource::parse(&row.0).ok_or_else(|| A2AError::internal("invalid audit projection source"))?,row.1,
+                    crate::AuditProjectionEventKind::parse(&row.2).ok_or_else(|| A2AError::internal("invalid audit projection kind"))?,row.3,&owner,&token,
+                    u64::try_from(row.4).unwrap_or(0),now+lease_duration_ms,u32::try_from(row.5).unwrap_or(0))?);
+            }
+            tx.commit().map_err(|_| A2AError::internal("audit projection claim commit failed"))?;
+            Ok(leases)
+        }).await
+    }
+
+    async fn commit_audit_projection(
+        &self,
+        lease: &crate::AuditProjectionLease,
+    ) -> Result<bool, A2AError> {
+        let lease = lease.clone();
+        self.run(move |c| {
+            let now: i64 = c.query_row("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER)", [], |r| r.get(0)).map_err(|_| A2AError::internal("audit projection DB clock failed"))?;
+            c.execute("UPDATE audit_projection_outbox SET state='delivered',delivered_at=?1,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE event_id=?2 AND state='leased' AND lease_owner=?3 AND lease_token=?4 AND lease_epoch=?5 AND lease_expires_at>?1", params![now,lease.event_id(),lease.lease_owner(),lease.lease_token(),i64::try_from(lease.lease_epoch()).unwrap_or(-1)]).map(|n| n==1).map_err(|_| A2AError::internal("audit projection commit failed"))
+        }).await
+    }
+
+    async fn fail_audit_projection(
+        &self,
+        lease: &crate::AuditProjectionLease,
+        error_digest: &str,
+        retry_delay_ms: i64,
+    ) -> Result<crate::AuditProjectionState, A2AError> {
+        if error_digest.len() != 71 || !(0..=300_000).contains(&retry_delay_ms) {
+            return Err(A2AError::invalid_request(
+                "invalid audit projection failure",
+            ));
+        }
+        let lease = lease.clone();
+        let error = error_digest.to_owned();
+        self.run(move |c| {
+            let now: i64 = c.query_row("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER)", [], |r| r.get(0)).map_err(|_| A2AError::internal("audit projection DB clock failed"))?;
+            let dead=lease.attempts()>=10;
+            let n=c.execute("UPDATE audit_projection_outbox SET state=CASE WHEN attempts>=10 THEN 'dead' ELSE 'pending' END,dead_at=CASE WHEN attempts>=10 THEN ?7 ELSE NULL END,available_at=?1,last_error_digest=?2,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE event_id=?3 AND state='leased' AND lease_owner=?4 AND lease_token=?5 AND lease_epoch=?6 AND lease_expires_at>?7", params![now+retry_delay_ms,error,lease.event_id(),lease.lease_owner(),lease.lease_token(),i64::try_from(lease.lease_epoch()).unwrap_or(-1),now]).map_err(|_| A2AError::internal("audit projection failure commit failed"))?;
+            if n!=1 { return Ok(crate::AuditProjectionState::Leased); }
+            Ok(if dead { crate::AuditProjectionState::Dead } else { crate::AuditProjectionState::Pending })
+        }).await
+    }
+
+    async fn cleanup_audit_projection(
+        &self,
+        retention_ms: i64,
+        limit: usize,
+    ) -> Result<u64, A2AError> {
+        if retention_ms < 0 || !(1..=1_000).contains(&limit) {
+            return Err(A2AError::invalid_request(
+                "invalid audit projection cleanup",
+            ));
+        }
+        self.run(move |c| { let now: i64=c.query_row("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER)",[],|r|r.get(0)).map_err(|_|A2AError::internal("audit projection DB clock failed"))?;
+            c.execute("DELETE FROM audit_projection_outbox WHERE rowid IN (SELECT rowid FROM audit_projection_outbox WHERE (state='delivered' AND delivered_at<=?1) OR (state='dead' AND dead_at<=?1) ORDER BY COALESCE(delivered_at,dead_at),tenant_scope,event_id LIMIT ?2)",params![now-retention_ms,i64::try_from(limit).unwrap_or(1000)]).map(|n|u64::try_from(n).unwrap_or(0)).map_err(|_|A2AError::internal("audit projection cleanup failed")) }).await
     }
 }
 
@@ -7410,6 +7721,27 @@ impl crate::CancellationAuthority for SqliteTaskStore {
 
 #[async_trait]
 impl crate::OutboxAuthority for SqliteTaskStore {
+    async fn telemetry_correlation_for_outbox(
+        &self,
+        lease: &crate::OutboxLease,
+    ) -> Result<Option<crate::TelemetryCorrelation>, A2AError> {
+        let tenant = lease.tenant_scope.clone();
+        let dispatch = lease.dispatch_id.clone();
+        self.run(move |connection| {
+            connection
+                .query_row(
+                    "SELECT o.message_id,o.task_id,t.context_id FROM outbox o JOIN tasks t ON t.tenant_scope=o.tenant_scope AND t.task_id=o.task_id WHERE o.tenant_scope=?1 AND o.dispatch_id=?2",
+                    params![tenant, dispatch],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                )
+                .optional()
+                .map_err(|_| A2AError::internal("durable telemetry correlation lookup failed"))?
+                .map(|(message, task, context)| crate::TelemetryCorrelation::new(message, task, context))
+                .transpose()
+        })
+        .await
+    }
+
     async fn claim_outbox(
         &self,
         lease_owner: &str,

@@ -28,7 +28,7 @@ fs2 = "0.4"
 hmac = "0.12"
 httpdate = "1"
 rand = "0.9"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "functions"] }
 rustix = { version = "1", features = ["fs", "process"] }
 arc-swap = "1"
 tokio-rustls = "0.26"
@@ -46,14 +46,21 @@ smesh-core = { git = "https://github.com/copyleftdev/smesh-rust", rev = "ff0a88b
 smesh-runtime = { git = "https://github.com/copyleftdev/smesh-rust", rev = "ff0a88ba75590957e2e108f99e90135cd4b6de80" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = "0.7"
 tower-http = { version = "0.6", features = ["limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 mime = "0.3"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-rustls", "tls-aws-lc", "tls-roots"] }
+opentelemetry-appender-tracing = { version = "0.32", default-features = false }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs", "trace", "metrics"] }
+prost = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+tonic = "0.14"
 url = "2"
 # Direct dependency: reloads must inspect leaf DNS/IP SANs before atomic publish;
 # rustls/webpki verify names internally but do not expose parsed SANs for this invariant.
@@ -63,6 +70,7 @@ x509-parser = "0.18"
 a2a-client = { package = "a2a-client-lf", version = "0.2.2" }
 http-body-util = "0.1"
 proptest = "1"
+tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
 wait-timeout = "0.2"
 
