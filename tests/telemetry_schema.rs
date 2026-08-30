@@ -79,9 +79,16 @@ fn required_event_attributes(event: EventName) -> Vec<Attribute> {
         ],
         EventName::QuotaDecided => vec![a(K::Outcome, "ok"), a(K::Operation, "lease_acquire")],
         EventName::TaskAdmitted | EventName::TaskTerminal => task(),
-        EventName::CancellationRequested
-        | EventName::CancellationAcknowledged
-        | EventName::CancellationStopped => task()
+        EventName::CancellationRequested => task()
+            .into_iter()
+            .filter(|attribute| {
+                !matches!(
+                    attribute.key(),
+                    key if key == K::MessageId.as_str() || key == K::ContextId.as_str()
+                )
+            })
+            .collect(),
+        EventName::CancellationAcknowledged | EventName::CancellationStopped => task()
             .into_iter()
             .filter(|attribute| attribute.key() != K::MessageId.as_str())
             .collect(),

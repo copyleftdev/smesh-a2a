@@ -3,13 +3,69 @@
   "uid": "smesh-a2a-overview",
   "title": "SMESH A2A — Emitted Signals",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "refresh": "30s",
   "time": {"from": "now-6h", "to": "now"},
-  "templating": {"list": []},
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      }
+    ]
+  },
   "panels": [
-    {"id":1,"type":"timeseries","title":"Edge availability","targets":[{"expr":"1 - (sum(rate(smesh_a2a_sli_event_total{smesh_slo=\"edge_availability\",smesh_result=\"eligible_bad\"}[5m])) / clamp_min(sum(rate(smesh_a2a_sli_event_total{smesh_slo=\"edge_availability\",smesh_result=~\"eligible_good|eligible_bad\"}[5m])), 1e-12))","refId":"A"}],"gridPos":{"x":0,"y":0,"w":8,"h":8}},
-    {"id":2,"type":"timeseries","title":"Edge requests","targets":[{"expr":"sum(rate(smesh_a2a_request_total[5m])) by (smesh_outcome)","refId":"A"},{"expr":"histogram_quantile(0.99, sum(rate(smesh_a2a_request_duration_milliseconds_bucket[5m])) by (le))","refId":"B"}],"gridPos":{"x":8,"y":0,"w":8,"h":8}},
-    {"id":3,"type":"timeseries","title":"Audit projection","targets":[{"expr":"max(smesh_a2a_audit_projection_lag_seconds)","refId":"A"},{"expr":"sum(rate(smesh_a2a_audit_projection_failure_total[5m]))","refId":"B"}],"gridPos":{"x":16,"y":0,"w":8,"h":8}}
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Edge availability",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "1 - (sum(rate(smesh_a2a_sli_event_total{smesh_slo=\"edge_availability\",smesh_result=\"eligible_bad\"}[5m])) / clamp_min(sum(rate(smesh_a2a_sli_event_total{smesh_slo=\"edge_availability\",smesh_result=~\"eligible_good|eligible_bad\"}[5m])), 1e-12))",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {"x": 0, "y": 0, "w": 8, "h": 8}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Edge requests",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(smesh_a2a_request_total[5m])) by (smesh_outcome)",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "histogram_quantile(0.99, sum(rate(smesh_a2a_request_duration_milliseconds_bucket[5m])) by (le))",
+          "refId": "B"
+        }
+      ],
+      "gridPos": {"x": 8, "y": 0, "w": 8, "h": 8}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Audit projection",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "max(smesh_a2a_audit_projection_lag_seconds)",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(smesh_a2a_audit_projection_failure_total[5m]))",
+          "refId": "B"
+        }
+      ],
+      "gridPos": {"x": 16, "y": 0, "w": 8, "h": 8}
+    }
   ]
 }

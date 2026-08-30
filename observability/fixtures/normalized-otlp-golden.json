@@ -188,6 +188,10 @@
       [
         "smesh.reason",
         "committed"
+      ],
+      [
+        "smesh.task.state",
+        "completed"
       ]
     ],
     "name": "smesh.task.terminal",
@@ -402,9 +406,13 @@
       [
         "smesh.reason",
         "committed"
+      ],
+      [
+        "smesh.task.state",
+        "completed"
       ]
     ],
-    "name": "smesh.outbox.attempt",
+    "name": "smesh.durable.commit",
     "required": false,
     "signal": "span"
   },

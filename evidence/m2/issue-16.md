@@ -354,3 +354,105 @@ Selected SHA-256 hashes:
 
 - `src/postgres_store.rs` — `a9cbfdad31ced7b90c5025415aa3b0159789a734cbf5aad1da067f005d9ec353`
 - `tests/postgres_store.rs` — `2023a3c912afa9a582913a7a196e4f74558661c608279529fba0bcf3c728cae6`
+
+## CodeRabbit closure after SSE snapshot fix — 2026-08-30
+
+- Live post-commit telemetry now emits `smesh.durable.commit`; only absorbing successful receiver
+  terminations emit `TaskTerminal`. Input/auth interruptions emit one state-bearing
+  `TaskTransitioned` plus the state-bearing `ReceiverCompleted` fact. Immediate cancellation omits
+  `CancellationStopped`; cooperative cancellation emits it only after the active receiver result is
+  joined. Both paths have deterministic production-gateway tests.
+- Replica IDs through 128 bytes map to domain-separated, stable, opaque, distinct projector owners no
+  longer than 64 bytes. SQLite can combine explicit legacy binding and audit projection, production
+  startup selects that API, and telemetry startup rejects an unavailable projector instead of
+  discarding `false`.
+- The duplicate-projection restart test waits on an observable completed worker cycle (no sleep) and
+  verifies the delivered state and attempt count remain unchanged. The live golden shuts down before
+  drain and passed 20 consecutive comparisons.
+- The artifact prerequisite names PostgreSQL revision 6 and exact catalog/RLS validation. The 99.9%
+  edge alert uses fast/slow multi-window burn rates plus a 100-event floor; every rule has summary and
+  runbook annotations. Prometheus rules and every Grafana expression are checked against emitted
+  metric/label schema, and every panel uses the Prometheus datasource variable.
+
+Verification:
+
+- focused telemetry/schema/audit/golden/asset suites: **26 passed**;
+- full non-PostgreSQL all-target/all-feature suite: **passed** (PostgreSQL URLs and both required flags
+  explicitly absent);
+- explicit PostgreSQL `postgres_store`: **61 passed**; `telemetry_audit_projection`: **9 passed**;
+  `postgres_observability_process`: **1 passed**;
+- live golden: **20/20 repeated passes**;
+- `promtool` v3.5.0: **SUCCESS, 3 rules**;
+- formatter, all-target/all-feature Clippy `-D warnings`, rustdoc `-D warnings`, doctest, and diff
+  whitespace checks: **passed**.
+
+Selected SHA-256 hashes:
+
+- `src/telemetry.rs` — `6aafb3778cff6bb984582ca3820440a16a55fbbe7e01d8a2aa4eda66bdf7af2f`
+- `src/outbox_driver.rs` — `2e482e0d150156e793bcc82edc514ae7cf91a4de810946c2d5b25c8e9cd2dcde`
+- `src/durable_handler.rs` — `826f420cfa50228a6dfa7b0e00aa478d9022372ff05cb9c50a01b03c8ede9f77`
+- `src/sqlite_store.rs` — `a7a2f9d801b33c4c5b706105bbf7b5d3c80ad045e0be9672f1c4e86d04ce93b6`
+- `src/main.rs` — `ada286b50e4bc32ed5f13016e480a39eff8b06ec9ed8658a0c6207c20346bd61`
+- `tests/telemetry_live_paths.rs` — `4e8c10d4ded81092bc39463958feaf07f35885af6af050d283b6f9354b4fb199`
+- `tests/telemetry_audit_projection.rs` — `bebe62ab9fc024829bf9d7bd26e28d858198b799dc2c91580131fe29401900c8`
+- `tests/observability_assets.rs` — `34b4cc891f2c0547c1604b4efc3228d0bec8ccb4bb0ca2691c2c92ae2470c91f`
+- `tests/telemetry_schema.rs` — `1ba938b05a00787433e1bd5bd1e4ffe1c4746dde6fc0c176fc6c1246e3870e6b`
+- `observability/fixtures/normalized-otlp-golden.json` — `9355adca60a5e5f32c53aa490492d1e5747fb94b03cc31524ab8a557d4945ce8`
+- `observability/prometheus-rules.yml` — `1273e16c279a1093b65d6602957652ab3beedb444c37f9151b2475ca5795fc26`
+- `observability/grafana/smesh-a2a-overview.json` — `32b7ddb80a47815d723c16c4ee7a3b657b628c307ae5a7961a36d69e1106f56d`
+
+## PromQL aggregation and vector-matching schema closure — 2026-08-30
+
+- Replaced token-prefix scanning with a bounded, fully consuming PromQL lexer/parser for the checked-in
+  expression grammar. It extracts selector labels plus every `by`, `without`, `on`, `ignoring`,
+  `group_left`, and `group_right` label list; malformed, unsupported, or trailing input is rejected.
+- Metric references are closed over the default Prometheus translation of `MetricName::ALL`, including
+  counter/unit translation and only the generated histogram `_bucket`, `_sum`, and `_count` series.
+  Label references are closed over the Prometheus translation of `AttributeKey::ALL` plus generated
+  classic-histogram `le`; unused generated `quantile`, `job`, and `instance` labels are not allowed.
+- Strict RED copied `sum by (smesh_outcomm) (smesh_a2a_request_total)` and failed because the old scanner
+  returned no grouping labels. GREEN rejects `smesh_outcomm`; valid `smesh_outcome`, `le`, and
+  `on(smesh_slo)` cases pass. Matching-label typo and malformed/unparsed probes also fail closed.
+- All **3 rule expressions** and **5 dashboard target expressions** are parsed and schema-validated. The
+  existing three alert annotations and every dashboard Prometheus datasource assertion remain checked.
+
+Focused exact-tree verification:
+
+- `cargo test --test observability_assets`: **6 passed**;
+- `cargo clippy --locked --test observability_assets -- -D warnings`: **passed**;
+- `cargo fmt --all -- --check` and `git diff --check`: **passed**;
+- pinned `prom/prometheus:v3.5.0` promtool: **SUCCESS, 3 rules**;
+- the broader all-target Clippy attempt reached an unrelated existing `too_many_lines` failure in
+  `tests/atomic_lifecycle.rs`; the focused observability target is warning-clean.
+
+Selected SHA-256 hashes:
+
+- `tests/observability_assets.rs` — `fbd15d76f83235abcd2e1af17c982a1a6f1208c49ce38260688ba3a6f06d00fa`
+- `observability/prometheus-rules.yml` — `1273e16c279a1093b65d6602957652ab3beedb444c37f9151b2475ca5795fc26`
+- `observability/grafana/smesh-a2a-overview.json` — `32b7ddb80a47815d723c16c4ee7a3b657b628c307ae5a7961a36d69e1106f56d`
+## Final asset and lint closure — 2026-08-30
+
+- The observability asset validator now fully parses all checked-in PromQL and validates metric
+  selectors, selector labels, aggregation labels, and vector-matching/group labels against the
+  emitted telemetry schema. Malformed or partially parsed expressions fail closed.
+- The complete v1-to-v7 migration fixture carries a narrow, documented `too_many_lines` allowance
+  so its schema, keys, task state, and projection migration remain auditable as one fixture.
+- Full all-target/all-feature Clippy with `-D warnings`, formatter, and `git diff --check` pass.
+
+Selected SHA-256 hashes:
+
+- `tests/observability_assets.rs` — `fbd15d76f83235abcd2e1af17c982a1a6f1208c49ce38260688ba3a6f06d00fa`
+- `tests/atomic_lifecycle.rs` — `3b6efafa8945aea25baee8122c49f0e4383d1752940efbc33664c55e7350a114`
+## Immediate-cancellation span closure — 2026-08-30
+
+- Immediate durable cancellation now maps its post-commit `terminal_commit` span to
+  `smesh.durable.commit`, matching the terminal log and the ordinary outbox commit path.
+- A strict RED/GREEN regression first observed the incorrect `smesh.durable.admission` span and
+  now verifies `SpanName::DurableCommit` while retaining the immediate-cancel rule that no receiver
+  `CancellationStopped` fact is emitted.
+- Focused live-path, formatter, all-target Clippy, and diff gates pass.
+
+Selected SHA-256 hashes:
+
+- `src/telemetry.rs` — `6a36550d81be283356eb66f318a03c10f23250b44e38fc524022a96e55aacc5a`
+- `tests/telemetry_live_paths.rs` — `2c0e9dce6af6bc538ad41859594205d58690c92ea021de280c3b2db7f398a324`

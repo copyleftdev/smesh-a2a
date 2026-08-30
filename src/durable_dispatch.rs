@@ -572,7 +572,18 @@ impl DurableLoopbackEndpoint {
                                     .complete_loopback_outcome(&fenced, &outcome, clock.now())
                                     .await?;
                                 if let Some(telemetry) = &self.telemetry {
-                                    telemetry.dispatch_event(
+                                    let task_state = match &outcome.termination {
+                                        DurableReceiverTermination::InputRequired { .. } => {
+                                            "input_required"
+                                        }
+                                        DurableReceiverTermination::AuthRequired { .. } => {
+                                            "auth_required"
+                                        }
+                                        DurableReceiverTermination::Success => unreachable!(
+                                            "interrupted receiver cannot report success"
+                                        ),
+                                    };
+                                    telemetry.dispatch_event_with_task_state(
                                         crate::telemetry::EventName::ReceiverCompleted,
                                         "ok",
                                         "committed",
@@ -580,6 +591,7 @@ impl DurableLoopbackEndpoint {
                                         &envelope.dispatch_id,
                                         Some(&envelope.request.task_id),
                                         Some(&envelope.request.context_id),
+                                        Some(task_state),
                                     );
                                 }
                                 self.effects.fetch_add(1, Ordering::SeqCst);

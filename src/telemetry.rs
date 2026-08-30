@@ -559,6 +559,7 @@ fn validate_value(key: AttributeKey, value: &str) -> Result<(), TelemetrySchemaE
             "quota_reconciled",
             "task_canceled",
             "task_terminal",
+            "task_transition",
             "terminal_commit",
         ]),
         AttributeKey::Protocol => closed(&["a2a", "jsonrpc", "rest", "sse", "other"]),
@@ -779,6 +780,7 @@ fn validate_log_shape(
     const ORO: &[K] = &[K::Outcome, K::Reason, K::Operation];
     const OO: &[K] = &[K::Outcome, K::Operation];
     const REQUEST: &[K] = &[K::RequestId, K::Outcome, K::Reason, K::Operation];
+    const TASK_ID_CORRELATION: &[K] = &[K::Outcome, K::Reason, K::Operation, K::TaskId];
     const TASK_CORRELATION: &[K] = &[K::Outcome, K::Reason, K::Operation, K::TaskId, K::ContextId];
     const TASK_MESSAGE_CORRELATION: &[K] = &[
         K::Outcome,
@@ -809,7 +811,7 @@ fn validate_log_shape(
         EventName::TaskAdmitted => (DURABLE, TASK_MESSAGE_CORRELATION),
         EventName::TaskTransitioned => (DURABLE, ORO),
         EventName::TaskTerminal => (DURABLE, TASK_MESSAGE_CORRELATION),
-        EventName::CancellationRequested => (DURABLE, TASK_CORRELATION),
+        EventName::CancellationRequested => (DURABLE, TASK_ID_CORRELATION),
         EventName::CancellationAcknowledged => (DURABLE, TASK_CORRELATION),
         EventName::CancellationStopped => (DURABLE, TASK_CORRELATION),
         EventName::DispatchClaimed => (DISPATCH, DISPATCH_CORRELATION),
@@ -875,6 +877,7 @@ fn validate_span_shape(
         K::TaskId,
         K::ContextId,
         K::MessageId,
+        K::DispatchId,
         K::Outcome,
         K::Reason,
         K::Operation,
@@ -2170,6 +2173,7 @@ impl TelemetryHandle {
             let span_name = match operation {
                 "get_task" | "list_tasks" | "subscribe_to_task" => SpanName::DurableRead,
                 "cancel_task" => SpanName::DurableCancel,
+                "terminal_commit" => SpanName::DurableCommit,
                 _ => SpanName::DurableAdmission,
             };
             let now = now_unix_nanos();
@@ -2222,6 +2226,30 @@ impl TelemetryHandle {
         task_id: Option<&str>,
         context_id: Option<&str>,
     ) {
+        self.dispatch_event_with_task_state(
+            name,
+            outcome,
+            reason,
+            operation,
+            dispatch_id,
+            task_id,
+            context_id,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_event_with_task_state(
+        &self,
+        name: EventName,
+        outcome: &'static str,
+        reason: &'static str,
+        operation: &'static str,
+        dispatch_id: &str,
+        task_id: Option<&str>,
+        context_id: Option<&str>,
+        task_state: Option<&'static str>,
+    ) {
         let correlation = self
             .correlations
             .try_lock()
@@ -2238,7 +2266,7 @@ impl TelemetryHandle {
             .as_ref()
             .map_or(context_id, |value| Some(value.context_id.as_str()));
         let message_id = correlation.as_ref().map(|value| value.message_id.as_str());
-        let mut attributes = Vec::with_capacity(7);
+        let mut attributes = Vec::with_capacity(8);
         for attribute in [
             Attribute::new(AttributeKey::Outcome, outcome),
             Attribute::new(AttributeKey::Reason, reason),
@@ -2252,6 +2280,7 @@ impl TelemetryHandle {
             task_id.map(|v| Attribute::new(AttributeKey::TaskId, v)),
             context_id.map(|v| Attribute::new(AttributeKey::ContextId, v)),
             message_id.map(|v| Attribute::new(AttributeKey::MessageId, v)),
+            task_state.map(|v| Attribute::new(AttributeKey::TaskState, v)),
         ]
         .into_iter()
         .flatten()
@@ -2268,6 +2297,7 @@ impl TelemetryHandle {
                 "outbox_renew" => SpanName::LeaseRenew,
                 "receiver_admit" => SpanName::ReceiverAdmit,
                 "receiver_execute" => SpanName::ReceiverExecute,
+                "terminal_commit" | "task_transition" => SpanName::DurableCommit,
                 _ => SpanName::OutboxAttempt,
             };
             let root = SpanLink::for_dispatch(dispatch_id);
@@ -3426,6 +3456,26 @@ pub struct AuditProjectorConfig {
     cleanup_limit: usize,
 }
 impl AuditProjectorConfig {
+    /// Derive a stable, bounded, opaque projector lease owner from a replica ID.
+    pub fn for_replica_id(
+        replica_id: &str,
+        poll_interval: std::time::Duration,
+        batch_size: usize,
+    ) -> Result<Self, AuditProjectorError> {
+        if replica_id.is_empty()
+            || replica_id.len() > 128
+            || !replica_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+        {
+            return Err(AuditProjectorError::InvalidConfig);
+        }
+        let mut owner_input = b"smesh-audit-projector-owner-v1\0".to_vec();
+        owner_input.extend_from_slice(replica_id.as_bytes());
+        let digest = crate::content_digest(&owner_input);
+        Self::new(format!("ap-{}", &digest[..61]), poll_interval, batch_size)
+    }
+
     pub fn new(
         owner: impl Into<String>,
         poll_interval: std::time::Duration,
@@ -3456,6 +3506,7 @@ impl AuditProjectorConfig {
 pub struct AuditProjectorWorker {
     stop: tokio_util::sync::CancellationToken,
     join: tokio::task::JoinHandle<()>,
+    completed_cycles: tokio::sync::watch::Receiver<u64>,
     shutdown_health: std::sync::Arc<ShutdownHealth>,
 }
 impl AuditProjectorWorker {
@@ -3476,8 +3527,10 @@ impl AuditProjectorWorker {
         let shutdown_health = std::sync::Arc::clone(&telemetry.shutdown_health);
         let stop = tokio_util::sync::CancellationToken::new();
         let stopped = stop.clone();
+        let (cycle_tx, completed_cycles) = tokio::sync::watch::channel(0_u64);
         let join = tokio::spawn(async move {
             let mut consecutive_errors = 0_u32;
+            let mut cycle = 0_u64;
             loop {
                 if stopped.is_cancelled() {
                     break;
@@ -3543,6 +3596,8 @@ impl AuditProjectorWorker {
                         }
                     }
                 }
+                cycle = cycle.saturating_add(1);
+                let _ = cycle_tx.send(cycle);
                 let multiplier = 1_u32 << consecutive_errors.min(6);
                 let wait = config
                     .poll_interval
@@ -3554,8 +3609,31 @@ impl AuditProjectorWorker {
         Ok(Self {
             stop,
             join,
+            completed_cycles,
             shutdown_health,
         })
+    }
+
+    #[doc(hidden)]
+    pub async fn wait_for_completed_cycle(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), AuditProjectorError> {
+        let mut cycles = self.completed_cycles.clone();
+        let baseline = *cycles.borrow();
+        tokio::time::timeout(timeout, async move {
+            loop {
+                cycles
+                    .changed()
+                    .await
+                    .map_err(|_| AuditProjectorError::Join)?;
+                if *cycles.borrow() > baseline {
+                    return Ok(());
+                }
+            }
+        })
+        .await
+        .map_err(|_| AuditProjectorError::ShutdownTimeout)?
     }
 
     pub async fn shutdown(

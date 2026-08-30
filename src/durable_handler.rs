@@ -1641,16 +1641,23 @@ impl RequestHandler for DurableRequestHandler {
                 Some(&task.context_id),
                 None,
             );
-            telemetry.durable_event(
-                crate::telemetry::EventName::CancellationStopped,
-                "canceled",
-                "cooperative_stop",
-                "cancel_task",
-                Some(&task.id),
-                Some(&task.context_id),
-                None,
-            );
+            if !immediate_cancel {
+                telemetry.durable_event(
+                    crate::telemetry::EventName::CancellationStopped,
+                    "canceled",
+                    "cooperative_stop",
+                    "cancel_task",
+                    Some(&task.id),
+                    Some(&task.context_id),
+                    None,
+                );
+            }
             if immediate_cancel {
+                let message_id = task
+                    .history
+                    .as_deref()
+                    .and_then(|history| history.first())
+                    .map(|message| message.message_id.as_str());
                 telemetry.durable_event(
                     crate::telemetry::EventName::TaskTerminal,
                     "canceled",
@@ -1658,7 +1665,7 @@ impl RequestHandler for DurableRequestHandler {
                     "terminal_commit",
                     Some(&task.id),
                     Some(&task.context_id),
-                    None,
+                    message_id,
                 );
             }
         }

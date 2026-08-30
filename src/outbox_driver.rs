@@ -706,6 +706,7 @@ fn spawn_durable_driver_inner(
                     committed_progress,
                     clock.now(),
                 );
+                let committed_state = task.status.state.clone();
                 let result = SendMessageResponse::Task(task.clone());
                 if authority
                     .commit_delivery(&lease, task, result, &public_transcript, clock.now())
@@ -713,14 +714,26 @@ fn spawn_durable_driver_inner(
                     == TransitionOutcome::Applied
                 {
                     if let Some(telemetry) = &telemetry {
-                        telemetry.dispatch_event(
-                            crate::telemetry::EventName::TaskTerminal,
+                        let task_state = telemetry_task_state(&committed_state);
+                        let terminal = matches!(termination, DurableReceiverTermination::Success)
+                            && committed_state.is_terminal();
+                        telemetry.dispatch_event_with_task_state(
+                            if terminal {
+                                crate::telemetry::EventName::TaskTerminal
+                            } else {
+                                crate::telemetry::EventName::TaskTransitioned
+                            },
                             "ok",
                             "committed",
-                            "terminal_commit",
+                            if terminal {
+                                "terminal_commit"
+                            } else {
+                                "task_transition"
+                            },
                             &lease.dispatch_id,
                             Some(&lease.task_id),
                             Some(&lease.request.context_id),
+                            Some(task_state),
                         );
                     }
                     #[cfg(test)]
@@ -751,6 +764,20 @@ fn spawn_durable_driver_inner(
         control,
         shutdown_requested,
         join: Some(AbortOnDropJoin::new(join)),
+    }
+}
+
+fn telemetry_task_state(state: &TaskState) -> &'static str {
+    match state {
+        TaskState::Submitted => "submitted",
+        TaskState::Working => "working",
+        TaskState::InputRequired => "input_required",
+        TaskState::AuthRequired => "auth_required",
+        TaskState::Completed => "completed",
+        TaskState::Failed => "failed",
+        TaskState::Canceled => "canceled",
+        TaskState::Rejected => "rejected",
+        TaskState::Unspecified => "unknown",
     }
 }
 

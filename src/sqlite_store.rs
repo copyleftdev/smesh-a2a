@@ -611,6 +611,15 @@ impl SqliteTaskStore {
         Self::open_inner(path, max_tasks, None, true, true).await
     }
 
+    /// Open a store, bind legacy records, and enable connection-scoped audit projection.
+    pub async fn open_with_legacy_binding_and_audit_projection(
+        path: impl AsRef<Path>,
+        max_tasks: usize,
+        binding: LegacyTenantBinding,
+    ) -> Result<Self, SqliteStoreError> {
+        Self::open_inner(path, max_tasks, Some(binding), false, true).await
+    }
+
     /// Open a store and explicitly bind any legacy v1-v4 records to one validated owner.
     pub async fn open_with_legacy_binding(
         path: impl AsRef<Path>,

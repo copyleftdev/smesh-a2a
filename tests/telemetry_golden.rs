@@ -102,6 +102,7 @@ async fn normalized_golden_is_captured_from_the_live_production_sqlite_path() {
             .unwrap();
         assert!(response.status().is_success());
     }
+    gateway.shutdown().await.unwrap();
     let mut normalized: Vec<_> = receiver.try_iter().map(|record| {
         let signal = match record.signal() { Signal::Log => "log", Signal::Span => "span", Signal::Metric => "metric" };
         let mut attributes: Vec<_> = record.attributes().iter()
@@ -124,6 +125,5 @@ async fn normalized_golden_is_captured_from_the_live_production_sqlite_path() {
         "live normalized telemetry changed; inspect and update {}",
         fixture.display()
     );
-    gateway.shutdown().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -765,13 +765,20 @@ fn audit_projector_config() -> Result<AuditProjectorConfig, Box<dyn std::error::
         .map(|v| v.parse())
         .transpose()?
         .unwrap_or(100_usize);
-    let owner = std::env::var("SMESH_A2A_REPLICA_ID")
-        .unwrap_or_else(|_| "smesh-audit-projector".to_owned());
-    Ok(AuditProjectorConfig::new(
-        owner,
-        std::time::Duration::from_millis(poll),
-        batch,
-    )?)
+    let poll_interval = std::time::Duration::from_millis(poll);
+    if let Ok(replica_id) = std::env::var("SMESH_A2A_REPLICA_ID") {
+        Ok(AuditProjectorConfig::for_replica_id(
+            &replica_id,
+            poll_interval,
+            batch,
+        )?)
+    } else {
+        Ok(AuditProjectorConfig::new(
+            "smesh-audit-projector",
+            poll_interval,
+            batch,
+        )?)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -791,7 +798,17 @@ async fn run_durable_loopback_gateway(
         return Err("durable production authentication and tenant authorization must be configured together".into());
     }
     let store = if let Some(binding) = legacy_binding {
-        SqliteTaskStore::open_with_legacy_binding(sqlite_path, config.max_tasks, binding).await?
+        if telemetry.is_some() {
+            SqliteTaskStore::open_with_legacy_binding_and_audit_projection(
+                sqlite_path,
+                config.max_tasks,
+                binding,
+            )
+            .await?
+        } else {
+            SqliteTaskStore::open_with_legacy_binding(sqlite_path, config.max_tasks, binding)
+                .await?
+        }
     } else if telemetry.is_some() {
         SqliteTaskStore::open_with_audit_projection(sqlite_path, config.max_tasks).await?
     } else {
@@ -821,8 +838,10 @@ async fn run_durable_loopback_gateway(
             telemetry.clone(),
         )?
     };
-    if let Some(handle) = telemetry.clone() {
-        let _started = gateway.start_audit_projector(handle, audit_projector_config()?)?;
+    if let Some(handle) = telemetry.clone()
+        && !gateway.start_audit_projector(handle, audit_projector_config()?)?
+    {
+        return Err("telemetry requested but audit projection worker is unavailable".into());
     }
     let ticker = SystemClockTicker::spawn(clock);
     let app = gateway.router();
@@ -870,8 +889,10 @@ async fn run_postgres_durable_loopback_gateway(
         policy,
         telemetry.clone(),
     )?;
-    if let Some(handle) = telemetry.clone() {
-        let _started = gateway.start_audit_projector(handle, audit_projector_config()?)?;
+    if let Some(handle) = telemetry.clone()
+        && !gateway.start_audit_projector(handle, audit_projector_config()?)?
+    {
+        return Err("telemetry requested but audit projection worker is unavailable".into());
     }
     let ticker = SystemClockTicker::spawn(clock);
     let app = gateway.router();

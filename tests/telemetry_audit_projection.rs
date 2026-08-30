@@ -21,6 +21,7 @@ struct ProjectionFake {
     delivered: Mutex<Vec<String>>,
     failed: Mutex<Vec<String>>,
     cleanup_calls: Mutex<u64>,
+    claimed_owners: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -33,10 +34,11 @@ impl AuditProjectionAuthority for ProjectionFake {
     }
     async fn claim_audit_projection(
         &self,
-        _owner: &str,
+        owner: &str,
         _lease_duration_ms: i64,
         limit: usize,
     ) -> Result<Vec<AuditProjectionLease>, A2AError> {
+        self.claimed_owners.lock().unwrap().push(owner.to_owned());
         let mut rows = self.rows.lock().unwrap();
         Ok((0..limit).filter_map(|_| rows.pop_front()).collect())
     }
@@ -89,6 +91,43 @@ impl AuthorityIdentity for Authority {
     fn audit_projection_authority(&self) -> Option<&dyn AuditProjectionAuthority> {
         Some(self.0.as_ref())
     }
+}
+
+#[tokio::test]
+async fn replica_ids_are_mapped_to_bounded_distinct_projector_owners() {
+    let prefix = "r".repeat(64);
+    let replica_ids = [format!("{prefix}a"), format!("{prefix}b"), "z".repeat(128)];
+    let mut owners = Vec::new();
+    for replica_id in replica_ids {
+        let fake = Arc::new(ProjectionFake::default());
+        let authority: Arc<dyn AuthorityIdentity> = Arc::new(Authority(Arc::clone(&fake)));
+        let (telemetry, _receiver) =
+            smesh_a2a::telemetry::TelemetryHandle::multisignal_capture_for_test(16, 0.0);
+        let config =
+            AuditProjectorConfig::for_replica_id(&replica_id, Duration::from_millis(10), 1)
+                .unwrap();
+        let worker = AuditProjectorWorker::spawn(authority, telemetry, config).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fake.claimed_owners.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.shutdown(Duration::from_secs(1)).await.unwrap();
+        let owner = fake.claimed_owners.lock().unwrap()[0].clone();
+        assert!(owner.len() <= 64);
+        assert!(owner.is_ascii());
+        owners.push(owner);
+    }
+    assert_ne!(owners[0], owners[1], "similar long IDs must not collide");
+    assert_eq!(
+        owners.len(),
+        owners
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    );
 }
 
 #[test]
@@ -355,11 +394,32 @@ async fn sqlite_worker_exports_one_decoded_projection_log_and_does_not_duplicate
     .await
     .unwrap();
     worker.shutdown(Duration::from_secs(1)).await.unwrap();
+    let delivered_before: (String, i64) = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT state, attempts FROM audit_projection_outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
 
     let authority: Arc<dyn AuthorityIdentity> = store.clone();
     let second = AuditProjectorWorker::spawn(authority, owner.handle(), projector_config).unwrap();
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    second
+        .wait_for_completed_cycle(Duration::from_secs(1))
+        .await
+        .unwrap();
     second.shutdown(Duration::from_secs(1)).await.unwrap();
+    let delivered_after: (String, i64) = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT state, attempts FROM audit_projection_outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(delivered_after, delivered_before);
+    assert_eq!(delivered_after.0, "delivered");
     assert!(
         receiver.try_recv().is_err(),
         "delivered row was exported twice"

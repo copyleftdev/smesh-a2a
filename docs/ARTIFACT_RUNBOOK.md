@@ -8,7 +8,8 @@ never grants access. Normal task rendering and replay never dereference URL part
 
 ## Prerequisites
 
-1. PostgreSQL revision 5 must pass startup catalog validation with forced tenant RLS.
+1. PostgreSQL revision 6 must pass the exact startup catalog-manifest validation, including forced
+   tenant RLS policy definitions, grants, role attributes, and membership.
 2. Configure an absolute artifact root owned by the gateway UID with mode 0700. The root itself
    must not be a symlink. Object files are 0600.
 3. Configure an explicit 32-byte AES-256 key generation through the server keyring hook. Protected
