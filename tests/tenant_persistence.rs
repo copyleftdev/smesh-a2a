@@ -130,7 +130,7 @@ async fn admit_v2(store: &SqliteTaskStore, task_id: &str) {
 }
 
 #[tokio::test]
-async fn fresh_database_is_v8_with_immutable_ownership_and_append_only_audit() {
+async fn fresh_database_is_v9_with_immutable_ownership_and_append_only_audit() {
     let path = path("fresh");
     let store = SqliteTaskStore::open(&path, 8).await.unwrap();
     drop(store);
@@ -138,7 +138,7 @@ async fn fresh_database_is_v8_with_immutable_ownership_and_append_only_audit() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     let task_columns: Vec<String> = db
         .prepare("SELECT name FROM pragma_table_info('tasks') ORDER BY cid")

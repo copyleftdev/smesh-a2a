@@ -30,7 +30,8 @@ use crate::{
     canonical_send_message_digest_v2, content_digest, durable_authority::valid_bounded_identity,
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
+const V8_SCHEMA_VERSION: i64 = 8;
 const V7_SCHEMA_VERSION: i64 = 7;
 const V6_SCHEMA_VERSION: i64 = 6;
 const V5_SCHEMA_VERSION: i64 = 5;
@@ -53,6 +54,11 @@ pub use crate::TRUSTED_SINGLE_TENANT_SCOPE;
 pub const DEV_ONLY_ACCOUNT_ID: &str = "smesh-dev-only-account";
 const LEGACY_V4_SENTINEL_SCOPE: &str = "smesh:trusted-single-tenant:v1";
 const MAX_AUTHORIZATION_DECISIONS: usize = 65_536;
+const MAX_AUTHORIZATION_BYTES: usize = MAX_STORE_JSON_BYTES;
+const AUTHORIZATION_ACCOUNTING_SELECT_SQL: &str =
+    "SELECT decision_count,encoded_bytes FROM authorization_decision_accounting WHERE singleton=1";
+const AUTHORIZATION_COUNT_SELECT_SQL: &str =
+    "SELECT decision_count FROM authorization_decision_accounting WHERE singleton=1";
 const PAGE_TOKEN_VERSION: i64 = 1;
 const PAGE_TOKEN_KEY_GENERATION: i64 = 1;
 const MAX_PAGE_TOKEN_BYTES: usize = 4096;
@@ -189,6 +195,39 @@ CREATE TRIGGER audit_projection_callback_dead AFTER UPDATE OF state ON callback_
  WHEN smesh_audit_projection_enabled()=1 AND OLD.state<>NEW.state AND NEW.state='dead' BEGIN
  INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
  VALUES(NEW.tenant_scope,smesh_projection_digest('callback_deliveries',NEW.tenant_scope,NEW.event_id||':'||NEW.config_id,NEW.attempt_count*10+4),'callback_deliveries',smesh_projection_pk_digest('callback_deliveries',NEW.tenant_scope,NEW.event_id||':'||NEW.config_id,NEW.attempt_count*10+4),'callback_dead',NEW.updated_at,NEW.updated_at); END;";
+
+const V9_AUTHORIZATION_ACCOUNTING_TABLE_SQL: &str =
+    "CREATE TABLE authorization_decision_accounting (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ decision_count INTEGER NOT NULL CHECK(decision_count BETWEEN 0 AND 65536),
+ encoded_bytes INTEGER NOT NULL CHECK(encoded_bytes BETWEEN 0 AND 67108864)
+);";
+const V9_AUTHORIZATION_ACCOUNTING_TRIGGERS_SQL: &str = "CREATE TRIGGER authorization_decision_accounting_no_insert BEFORE INSERT ON authorization_decision_accounting
+ WHEN EXISTS(SELECT 1 FROM authorization_decision_accounting WHERE singleton=1)
+ BEGIN SELECT RAISE(ABORT,'authorization decision accounting is singleton'); END;
+CREATE TRIGGER authorization_decision_accounting_no_delete BEFORE DELETE ON authorization_decision_accounting
+ BEGIN SELECT RAISE(ABORT,'authorization decision accounting is durable'); END;
+CREATE TRIGGER authorization_decision_accounting_monotonic BEFORE UPDATE ON authorization_decision_accounting
+ WHEN NEW.singleton<>OLD.singleton OR NEW.decision_count<>OLD.decision_count+1 OR NEW.encoded_bytes<=OLD.encoded_bytes
+ BEGIN SELECT RAISE(ABORT,'invalid authorization decision accounting update'); END;
+CREATE TRIGGER authorization_decisions_capacity BEFORE INSERT ON authorization_decisions
+ WHEN (SELECT decision_count FROM authorization_decision_accounting WHERE singleton=1)>=65536
+   OR (SELECT encoded_bytes FROM authorization_decision_accounting WHERE singleton=1)
+      +length(CAST(NEW.decision_id AS BLOB))+length(CAST(NEW.tenant_scope AS BLOB))
+      +length(CAST(NEW.actor_account_id AS BLOB))+length(CAST(NEW.policy_id AS BLOB))
+      +length(CAST(NEW.policy_digest AS BLOB))+length(CAST(NEW.operation AS BLOB))
+      +length(CAST(NEW.reason AS BLOB))+length(CAST(NEW.resource_kind AS BLOB))
+      +length(CAST(NEW.resource_digest AS BLOB))+COALESCE(length(CAST(NEW.task_id AS BLOB)),0)>67108864
+ BEGIN SELECT RAISE(ABORT,'authorization audit capacity reached'); END;
+CREATE TRIGGER authorization_decisions_account AFTER INSERT ON authorization_decisions
+ BEGIN UPDATE authorization_decision_accounting
+ SET decision_count=decision_count+1,
+     encoded_bytes=encoded_bytes+length(CAST(NEW.decision_id AS BLOB))+length(CAST(NEW.tenant_scope AS BLOB))
+      +length(CAST(NEW.actor_account_id AS BLOB))+length(CAST(NEW.policy_id AS BLOB))
+      +length(CAST(NEW.policy_digest AS BLOB))+length(CAST(NEW.operation AS BLOB))
+      +length(CAST(NEW.reason AS BLOB))+length(CAST(NEW.resource_kind AS BLOB))
+      +length(CAST(NEW.resource_digest AS BLOB))+COALESCE(length(CAST(NEW.task_id AS BLOB)),0)
+ WHERE singleton=1; END;";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyTenantBinding {
@@ -926,7 +965,6 @@ impl SqliteTaskStore {
             ).map_err(|_| A2AError::internal("scoped event append failed"))?;
             insert_authorization_audit(&tx, &audit)?;
             ensure_atomic_capacity(&tx)?;
-            ensure_authorization_capacity(&tx)?;
             tx.commit().map_err(|_| A2AError::internal("scoped create commit failed"))?;
             Ok(1)
         }).await
@@ -1000,7 +1038,6 @@ impl SqliteTaskStore {
                 )
             };
             insert_authorization_audit(&tx, &decision)?;
-            ensure_authorization_capacity(&tx)?;
             tx.commit()
                 .map_err(|_| A2AError::internal("authorized task lookup commit failed"))?;
             Ok(task)
@@ -1083,7 +1120,6 @@ impl SqliteTaskStore {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("authorization audit transaction failed"))?;
             insert_authorization_audit(&tx, &audit)?;
-            ensure_authorization_capacity(&tx)?;
             tx.commit()
                 .map_err(|_| A2AError::internal("authorization audit commit failed"))
         })
@@ -1106,7 +1142,6 @@ impl SqliteTaskStore {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("authorization audit transaction failed"))?;
             insert_authorization_audit(&tx, &audit)?;
-            ensure_authorization_capacity(&tx)?;
             tx.commit()
                 .map_err(|_| A2AError::internal("authorization audit commit failed"))
         })
@@ -1116,7 +1151,7 @@ impl SqliteTaskStore {
     pub async fn authorization_decision_count(&self) -> Result<u64, A2AError> {
         self.run(|connection| {
             connection
-                .query_row("SELECT COUNT(*) FROM authorization_decisions", [], |row| {
+                .query_row(AUTHORIZATION_COUNT_SELECT_SQL, [], |row| {
                     row.get::<_, u64>(0)
                 })
                 .map_err(|_| A2AError::internal("authorization audit count failed"))
@@ -1245,7 +1280,6 @@ impl SqliteTaskStore {
                 None,
             );
             insert_authorization_audit(&tx, &decision)?;
-            ensure_authorization_capacity(&tx)?;
             tx.commit()
                 .map_err(|_| A2AError::internal("authorized replay commit failed"))?;
             Ok(Some(replay))
@@ -1625,7 +1659,6 @@ impl SqliteTaskStore {
                     None,
                 );
                 insert_authorization_audit(&transaction, &decision)?;
-                ensure_authorization_capacity(&transaction)?;
             }
             ensure_atomic_capacity(&transaction)?;
             ensure_stream_capacity(&transaction)?;
@@ -1783,7 +1816,6 @@ impl SqliteTaskStore {
                     let decision = audit.clone().decided(AuthorizationDecisionEffect::Allow,
                         "continuation_replay", None);
                     insert_authorization_audit(&tx, &decision)?;
-                    ensure_authorization_capacity(&tx)?;
                     tx.commit().map_err(|_| A2AError::internal("continuation replay commit failed"))?;
                 }
                 return Ok(replay);
@@ -1898,7 +1930,6 @@ impl SqliteTaskStore {
                     None,
                 );
                 insert_authorization_audit(&tx, &decision)?;
-                ensure_authorization_capacity(&tx)?;
             }
             ensure_atomic_capacity(&tx)?;
             ensure_stream_capacity(&tx)?;
@@ -2716,7 +2747,6 @@ impl SqliteTaskStore {
                     let decision = audit.clone().decided(AuthorizationDecisionEffect::Allow,
                         "cancellation_requested", None);
                     insert_authorization_audit(&tx, &decision)?;
-                    ensure_authorization_capacity(&tx)?;
                 }
                 tx.commit().map_err(|_| A2AError::internal("cancellation intent transaction failed"))?;
                 return Ok(CancellationOutcome::AwaitReceiver { dispatch_id, message_id });
@@ -2785,7 +2815,6 @@ impl SqliteTaskStore {
                     None,
                 );
                 insert_authorization_audit(&tx, &decision)?;
-                ensure_authorization_capacity(&tx)?;
             }
             ensure_atomic_capacity(&tx)?;
             ensure_stream_capacity(&tx)?;
@@ -4481,7 +4510,6 @@ fn ensure_atomic_capacity(connection: &Connection) -> Result<(), A2AError> {
         "SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB)) + length(CAST(message_id AS BLOB)) + length(CAST(request_digest AS BLOB)) + length(CAST(task_id AS BLOB)) + length(CAST(state AS BLOB)) + length(CAST(admission_result_json AS BLOB)) + COALESCE(length(CAST(final_result_json AS BLOB)), 0)), 0) FROM idempotency_records",
         "SELECT COALESCE(SUM(length(CAST(dispatch_id AS BLOB)) + length(CAST(tenant_scope AS BLOB)) + length(CAST(task_id AS BLOB)) + length(CAST(payload_json AS BLOB)) + length(CAST(payload_digest AS BLOB)) + length(CAST(state AS BLOB)) + COALESCE(length(CAST(lease_owner AS BLOB)), 0) + COALESCE(length(CAST(lease_token AS BLOB)), 0) + COALESCE(length(CAST(last_error AS BLOB)), 0)), 0) FROM outbox",
         "SELECT COALESCE(SUM(length(CAST(lease_token AS BLOB)) + COALESCE(length(CAST(outcome AS BLOB)), 0) + COALESCE(length(CAST(error AS BLOB)), 0)), 0) FROM outbox_attempts",
-        "SELECT COALESCE(SUM(length(CAST(decision_id AS BLOB)) + length(CAST(tenant_scope AS BLOB)) + length(CAST(actor_account_id AS BLOB)) + length(CAST(policy_id AS BLOB)) + length(CAST(policy_digest AS BLOB)) + length(CAST(operation AS BLOB)) + length(CAST(reason AS BLOB)) + length(CAST(resource_kind AS BLOB)) + length(CAST(resource_digest AS BLOB)) + COALESCE(length(CAST(task_id AS BLOB)), 0)), 0) FROM authorization_decisions",
     ] {
         let bytes: i64 = connection
             .query_row(expression, [], |row| row.get(0))
@@ -4740,6 +4768,7 @@ fn open_database(
             | V5_SCHEMA_VERSION
             | V6_SCHEMA_VERSION
             | V7_SCHEMA_VERSION
+            | V8_SCHEMA_VERSION
             | SCHEMA_VERSION
     ) {
         return Err(SqliteStoreError::InvalidSchema);
@@ -4802,7 +4831,8 @@ fn open_database(
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
             migrate_v5_to_v6(&mut connection)?;
             migrate_v6_to_v7(&mut connection)?;
-            migrate_v7_to_v8(&mut connection)
+            migrate_v7_to_v8(&mut connection)?;
+            migrate_v8_to_v9(&mut connection)
         }
         V2_SCHEMA_VERSION => {
             migrate_v2_to_v3(&mut connection, max_tasks)?;
@@ -4810,31 +4840,40 @@ fn open_database(
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
             migrate_v5_to_v6(&mut connection)?;
             migrate_v6_to_v7(&mut connection)?;
-            migrate_v7_to_v8(&mut connection)
+            migrate_v7_to_v8(&mut connection)?;
+            migrate_v8_to_v9(&mut connection)
         }
         V3_SCHEMA_VERSION => {
             migrate_v3_to_v4(&mut connection, max_tasks)?;
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
             migrate_v5_to_v6(&mut connection)?;
             migrate_v6_to_v7(&mut connection)?;
-            migrate_v7_to_v8(&mut connection)
+            migrate_v7_to_v8(&mut connection)?;
+            migrate_v8_to_v9(&mut connection)
         }
         V4_SCHEMA_VERSION => {
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
             migrate_v5_to_v6(&mut connection)?;
             migrate_v6_to_v7(&mut connection)?;
-            migrate_v7_to_v8(&mut connection)
+            migrate_v7_to_v8(&mut connection)?;
+            migrate_v8_to_v9(&mut connection)
         }
         V5_SCHEMA_VERSION => {
             migrate_v5_to_v6(&mut connection)?;
             migrate_v6_to_v7(&mut connection)?;
-            migrate_v7_to_v8(&mut connection)
+            migrate_v7_to_v8(&mut connection)?;
+            migrate_v8_to_v9(&mut connection)
         }
         V6_SCHEMA_VERSION => {
             migrate_v6_to_v7(&mut connection)?;
-            migrate_v7_to_v8(&mut connection)
+            migrate_v7_to_v8(&mut connection)?;
+            migrate_v8_to_v9(&mut connection)
         }
-        V7_SCHEMA_VERSION => migrate_v7_to_v8(&mut connection),
+        V7_SCHEMA_VERSION => {
+            migrate_v7_to_v8(&mut connection)?;
+            migrate_v8_to_v9(&mut connection)
+        }
+        V8_SCHEMA_VERSION => migrate_v8_to_v9(&mut connection),
         SCHEMA_VERSION => validate_schema(&connection),
         _ => Err(SqliteStoreError::InvalidSchema),
     }?;
@@ -5259,7 +5298,6 @@ fn validate_atomic_records(connection: &Connection) -> Result<(), SqliteStoreErr
         "SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB)) + length(CAST(message_id AS BLOB)) + length(CAST(request_digest AS BLOB)) + length(CAST(task_id AS BLOB)) + length(CAST(state AS BLOB)) + length(CAST(admission_result_json AS BLOB)) + COALESCE(length(CAST(final_result_json AS BLOB)), 0)), 0) FROM idempotency_records",
         "SELECT COALESCE(SUM(length(CAST(dispatch_id AS BLOB)) + length(CAST(tenant_scope AS BLOB)) + length(CAST(task_id AS BLOB)) + length(CAST(payload_json AS BLOB)) + length(CAST(payload_digest AS BLOB)) + length(CAST(state AS BLOB)) + COALESCE(length(CAST(lease_owner AS BLOB)), 0) + COALESCE(length(CAST(lease_token AS BLOB)), 0) + COALESCE(length(CAST(last_error AS BLOB)), 0)), 0) FROM outbox",
         "SELECT COALESCE(SUM(length(CAST(lease_token AS BLOB)) + COALESCE(length(CAST(outcome AS BLOB)), 0) + COALESCE(length(CAST(error AS BLOB)), 0)), 0) FROM outbox_attempts",
-        "SELECT COALESCE(SUM(length(CAST(decision_id AS BLOB)) + length(CAST(tenant_scope AS BLOB)) + length(CAST(actor_account_id AS BLOB)) + length(CAST(policy_id AS BLOB)) + length(CAST(policy_digest AS BLOB)) + length(CAST(operation AS BLOB)) + length(CAST(reason AS BLOB)) + length(CAST(resource_kind AS BLOB)) + length(CAST(resource_digest AS BLOB)) + COALESCE(length(CAST(task_id AS BLOB)), 0)), 0) FROM authorization_decisions",
     ] {
         let bytes: i64 = connection
             .query_row(expression, [], |row| row.get(0))
@@ -5927,7 +5965,7 @@ fn initialize_schema(
     }
     let cursor_key: [u8; 32] = rand::random();
     let receipt_key: [u8; 32] = rand::random();
-    let migration_hash = schema_v8_hash();
+    let migration_hash = schema_v9_hash();
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| SqliteStoreError::Initialization)?;
@@ -5970,6 +6008,19 @@ fn initialize_schema(
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
         .execute_batch(CALLBACK_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(V9_AUTHORIZATION_ACCOUNTING_TABLE_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute(
+            "INSERT INTO authorization_decision_accounting(singleton,decision_count,encoded_bytes)
+             VALUES(1,0,0)",
+            [],
+        )
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(V9_AUTHORIZATION_ACCOUNTING_TRIGGERS_SQL)
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction.execute(
         "INSERT INTO store_identity(singleton, tenant_scope, owner_account_id, policy_id, policy_revision, policy_digest)
@@ -6324,6 +6375,18 @@ fn schema_v8_hash() -> String {
     )
 }
 
+fn schema_v9_hash() -> String {
+    content_digest(
+        [
+            schema_v8_hash().as_bytes(),
+            V9_AUTHORIZATION_ACCOUNTING_TABLE_SQL.as_bytes(),
+            V9_AUTHORIZATION_ACCOUNTING_TRIGGERS_SQL.as_bytes(),
+        ]
+        .concat()
+        .as_slice(),
+    )
+}
+
 const CALLBACK_OBJECTS: &[&str] = &[
     "callback_policy_snapshots",
     "callback_enrollments",
@@ -6366,6 +6429,15 @@ const CALLBACK_OBJECTS: &[&str] = &[
     "audit_projection_callback_dead",
 ];
 
+const AUTHORIZATION_ACCOUNTING_OBJECTS: &[&str] = &[
+    "authorization_decision_accounting",
+    "authorization_decision_accounting_no_insert",
+    "authorization_decision_accounting_no_delete",
+    "authorization_decision_accounting_monotonic",
+    "authorization_decisions_capacity",
+    "authorization_decisions_account",
+];
+
 #[allow(clippy::too_many_lines)]
 fn validate_schema_version(
     connection: &Connection,
@@ -6396,7 +6468,9 @@ fn validate_schema_version(
             .or_else(|| expected_schema_sql(V5_SCHEMA_SQL, object_name))
             .or_else(|| expected_schema_sql(V6_SCHEMA_SQL, object_name))
             .or_else(|| expected_schema_sql(V7_SCHEMA_SQL, object_name))
-            .or_else(|| expected_schema_sql(CALLBACK_SCHEMA_SQL, object_name));
+            .or_else(|| expected_schema_sql(CALLBACK_SCHEMA_SQL, object_name))
+            .or_else(|| expected_schema_sql(V9_AUTHORIZATION_ACCOUNTING_TABLE_SQL, object_name))
+            .or_else(|| expected_schema_sql(V9_AUTHORIZATION_ACCOUNTING_TRIGGERS_SQL, object_name));
         let actual = normalize_schema_sql(&actual);
         let matches_expected = if version >= V5_SCHEMA_VERSION && *object_name == "tasks" {
             let base = expected_schema_sql(V2_SCHEMA_SQL, "tasks").expect("v2 tasks schema");
@@ -6460,7 +6534,8 @@ fn validate_schema_version(
         )
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
     let expected_hash = match version {
-        SCHEMA_VERSION => schema_v8_hash(),
+        SCHEMA_VERSION => schema_v9_hash(),
+        V8_SCHEMA_VERSION => schema_v8_hash(),
         V7_SCHEMA_VERSION => schema_v7_hash(),
         V6_SCHEMA_VERSION => schema_v6_hash(),
         V5_SCHEMA_VERSION => schema_v5_hash(),
@@ -6482,8 +6557,13 @@ fn validate_schema_version(
         || object_count
             != i64::try_from(
                 objects.len()
-                    + if version == SCHEMA_VERSION {
+                    + if version >= V8_SCHEMA_VERSION {
                         CALLBACK_OBJECTS.len()
+                    } else {
+                        0
+                    }
+                    + if version == SCHEMA_VERSION {
+                        AUTHORIZATION_ACCOUNTING_OBJECTS.len()
                     } else {
                         0
                     },
@@ -6503,9 +6583,12 @@ fn validate_schema_version(
     Ok((key, receipt_key))
 }
 
-fn validate_schema(connection: &Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
-    let keys = validate_schema_version(connection, SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
-    for object in CALLBACK_OBJECTS {
+fn validate_schema_objects(
+    connection: &Connection,
+    schema: &str,
+    objects: &[&str],
+) -> Result<(), SqliteStoreError> {
+    for object in objects {
         let actual: String = connection
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE name=?1",
@@ -6513,12 +6596,61 @@ fn validate_schema(connection: &Connection) -> Result<([u8; 32], [u8; 32]), Sqli
                 |row| row.get(0),
             )
             .map_err(|_| SqliteStoreError::InvalidSchema)?;
-        let expected = expected_schema_sql(CALLBACK_SCHEMA_SQL, object)
-            .ok_or(SqliteStoreError::InvalidSchema)?;
+        let expected =
+            expected_schema_sql(schema, object).ok_or(SqliteStoreError::InvalidSchema)?;
         if normalize_schema_sql(&actual) != expected {
             return Err(SqliteStoreError::InvalidSchema);
         }
     }
+    Ok(())
+}
+
+fn validate_schema_v8(connection: &Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_version(connection, V8_SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
+    validate_schema_objects(connection, CALLBACK_SCHEMA_SQL, CALLBACK_OBJECTS)?;
+    Ok(keys)
+}
+
+fn validate_authorization_accounting(connection: &Connection) -> Result<(), SqliteStoreError> {
+    let accounted: (i64, i64) = connection
+        .query_row(AUTHORIZATION_ACCOUNTING_SELECT_SQL, [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let actual: (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(decision_id AS BLOB))+length(CAST(tenant_scope AS BLOB))+
+             length(CAST(actor_account_id AS BLOB))+length(CAST(policy_id AS BLOB))+length(CAST(policy_digest AS BLOB))+
+             length(CAST(operation AS BLOB))+length(CAST(reason AS BLOB))+length(CAST(resource_kind AS BLOB))+
+             length(CAST(resource_digest AS BLOB))+COALESCE(length(CAST(task_id AS BLOB)),0)),0)
+             FROM authorization_decisions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if accounted != actual
+        || usize::try_from(actual.0).unwrap_or(usize::MAX) > MAX_AUTHORIZATION_DECISIONS
+        || usize::try_from(actual.1).unwrap_or(usize::MAX) > MAX_AUTHORIZATION_BYTES
+    {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    Ok(())
+}
+
+fn validate_schema(connection: &Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_version(connection, SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
+    validate_schema_objects(connection, CALLBACK_SCHEMA_SQL, CALLBACK_OBJECTS)?;
+    validate_schema_objects(
+        connection,
+        V9_AUTHORIZATION_ACCOUNTING_TABLE_SQL,
+        &AUTHORIZATION_ACCOUNTING_OBJECTS[..1],
+    )?;
+    validate_schema_objects(
+        connection,
+        V9_AUTHORIZATION_ACCOUNTING_TRIGGERS_SQL,
+        &AUTHORIZATION_ACCOUNTING_OBJECTS[1..],
+    )?;
+    validate_authorization_accounting(connection)?;
     Ok(keys)
 }
 
@@ -6913,7 +7045,49 @@ fn migrate_v7_to_v8(connection: &mut Connection) -> Result<([u8; 32], [u8; 32]),
     transaction
         .execute(
             "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
-            params![SCHEMA_VERSION, schema_v8_hash()],
+            params![V8_SCHEMA_VERSION, schema_v8_hash()],
+        )
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .pragma_update(None, "user_version", V8_SCHEMA_VERSION)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    let validated = validate_schema_v8(&transaction)?;
+    if validated != keys {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    validate_foreign_keys(&transaction)?;
+    transaction
+        .commit()
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    Ok(validated)
+}
+
+fn migrate_v8_to_v9(connection: &mut Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_v8(connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(V9_AUTHORIZATION_ACCOUNTING_TABLE_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute(
+            "INSERT INTO authorization_decision_accounting(singleton,decision_count,encoded_bytes)
+             SELECT 1,COUNT(*),COALESCE(SUM(length(CAST(decision_id AS BLOB))+length(CAST(tenant_scope AS BLOB))+
+             length(CAST(actor_account_id AS BLOB))+length(CAST(policy_id AS BLOB))+length(CAST(policy_digest AS BLOB))+
+             length(CAST(operation AS BLOB))+length(CAST(reason AS BLOB))+length(CAST(resource_kind AS BLOB))+
+             length(CAST(resource_digest AS BLOB))+COALESCE(length(CAST(task_id AS BLOB)),0)),0)
+             FROM authorization_decisions",
+            [],
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    transaction
+        .execute_batch(V9_AUTHORIZATION_ACCOUNTING_TRIGGERS_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute(
+            "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
+            params![SCHEMA_VERSION, schema_v9_hash()],
         )
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
@@ -6923,7 +7097,6 @@ fn migrate_v7_to_v8(connection: &mut Connection) -> Result<([u8; 32], [u8; 32]),
     if validated != keys {
         return Err(SqliteStoreError::InvalidSchema);
     }
-    validate_foreign_keys(&transaction)?;
     transaction
         .commit()
         .map_err(|_| SqliteStoreError::Initialization)?;
@@ -7500,6 +7673,7 @@ fn insert_authorization_audit(
     transaction: &rusqlite::Transaction<'_>,
     audit: &AuthorizationAuditInput,
 ) -> Result<(), A2AError> {
+    preflight_authorization_capacity(transaction, audit)?;
     transaction.execute(
         "INSERT INTO authorization_decisions(decision_id,tenant_scope,actor_account_id,policy_id,
          policy_revision,policy_digest,operation,effect,reason,resource_kind,resource_digest,task_id,decided_at)
@@ -7508,18 +7682,75 @@ fn insert_authorization_audit(
             audit.policy_revision, audit.policy_digest, audit.operation,
             match audit.effect { AuthorizationDecisionEffect::Allow => "allow", AuthorizationDecisionEffect::Deny => "deny" },
             audit.reason, audit.resource_kind, audit.resource_digest, audit.task_id, audit.decided_at],
-    ).map_err(|_| A2AError::internal("authorization audit append failed"))?;
+    )
+    .map_err(|_| A2AError::internal("authorization audit append failed"))?;
+    Ok(())
+}
+
+fn authorization_audit_encoded_bytes(audit: &AuthorizationAuditInput) -> Result<usize, A2AError> {
+    [
+        audit.decision_id.len(),
+        audit.tenant_scope.len(),
+        audit.actor_account_id.len(),
+        audit.policy_id.len(),
+        audit.policy_digest.len(),
+        audit.operation.len(),
+        audit.reason.len(),
+        audit.resource_kind.len(),
+        audit.resource_digest.len(),
+        audit.task_id.as_ref().map_or(0, String::len),
+    ]
+    .into_iter()
+    .try_fold(0_usize, usize::checked_add)
+    .ok_or_else(|| A2AError::internal("authorization audit size overflow"))
+}
+
+fn preflight_authorization_capacity(
+    connection: &Connection,
+    audit: &AuthorizationAuditInput,
+) -> Result<(), A2AError> {
+    let (count, bytes): (i64, i64) = connection
+        .query_row(AUTHORIZATION_ACCOUNTING_SELECT_SQL, [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(|_| A2AError::internal("authorization audit capacity check failed"))?;
+    let count = usize::try_from(count).unwrap_or(usize::MAX);
+    let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+    let next_bytes = bytes.saturating_add(authorization_audit_encoded_bytes(audit)?);
+    if count >= MAX_AUTHORIZATION_DECISIONS || next_bytes > MAX_AUTHORIZATION_BYTES {
+        return Err(A2AError::internal("authorization audit capacity reached"));
+    }
     Ok(())
 }
 
 fn ensure_authorization_capacity(connection: &Connection) -> Result<(), A2AError> {
-    let (count, bytes): (i64, i64) = connection.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(length(CAST(decision_id AS BLOB))+length(CAST(tenant_scope AS BLOB))+
-         length(CAST(actor_account_id AS BLOB))+length(CAST(policy_id AS BLOB))+length(CAST(policy_digest AS BLOB))+
-         length(CAST(operation AS BLOB))+length(CAST(reason AS BLOB))+length(CAST(resource_kind AS BLOB))+
-         length(CAST(resource_digest AS BLOB))+COALESCE(length(CAST(task_id AS BLOB)),0)),0)
-         FROM authorization_decisions", [], |row| Ok((row.get(0)?, row.get(1)?)),
-    ).map_err(|_| A2AError::internal("authorization audit capacity check failed"))?;
+    let has_accounting: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type='table' AND name='authorization_decision_accounting')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| A2AError::internal("authorization audit capacity check failed"))?;
+    let (count, bytes): (i64, i64) = if has_accounting {
+        connection
+            .query_row(AUTHORIZATION_ACCOUNTING_SELECT_SQL, [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|_| A2AError::internal("authorization audit capacity check failed"))?
+    } else {
+        connection
+            .query_row(
+                "SELECT COUNT(*),COALESCE(SUM(length(CAST(decision_id AS BLOB))+length(CAST(tenant_scope AS BLOB))+
+                 length(CAST(actor_account_id AS BLOB))+length(CAST(policy_id AS BLOB))+length(CAST(policy_digest AS BLOB))+
+                 length(CAST(operation AS BLOB))+length(CAST(reason AS BLOB))+length(CAST(resource_kind AS BLOB))+
+                 length(CAST(resource_digest AS BLOB))+COALESCE(length(CAST(task_id AS BLOB)),0)),0)
+                 FROM authorization_decisions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| A2AError::internal("authorization audit capacity check failed"))?
+    };
     if usize::try_from(count).unwrap_or(usize::MAX) > MAX_AUTHORIZATION_DECISIONS
         || usize::try_from(bytes).unwrap_or(usize::MAX) > MAX_STORE_JSON_BYTES
     {
@@ -8037,7 +8268,6 @@ fn frozen_list_transaction(
     };
     if let Some(audit) = audit {
         insert_authorization_audit(&tx, audit)?;
-        ensure_authorization_capacity(&tx)?;
     }
     tx.commit()
         .map_err(|_| A2AError::internal("task snapshot commit failed"))?;
@@ -9328,6 +9558,272 @@ crate::impl_unsupported_artifact_authority!(SqliteTaskStore);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn register_disabled_projection_functions(connection: &Connection) {
+        let flags = FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS;
+        connection
+            .create_scalar_function("smesh_audit_projection_enabled", 0, flags, |_| Ok(0_i64))
+            .unwrap();
+        for name in ["smesh_projection_digest", "smesh_projection_pk_digest"] {
+            connection
+                .create_scalar_function(name, 4, flags, |_| Ok(content_digest(b"test-projection")))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn authorization_accounting_uses_singleton_lookups_without_decision_scans() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT decision_count, encoded_bytes
+                     FROM authorization_decision_accounting WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (0, 0)
+        );
+        for sql in [
+            AUTHORIZATION_ACCOUNTING_SELECT_SQL,
+            AUTHORIZATION_COUNT_SELECT_SQL,
+        ] {
+            let plan = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" ");
+            assert!(
+                plan.contains("SEARCH authorization_decision_accounting USING INTEGER PRIMARY KEY"),
+                "{sql}: {plan}"
+            );
+            assert!(!plan.contains("authorization_decisions"), "{sql}: {plan}");
+        }
+    }
+
+    #[test]
+    fn authorization_preflight_accepts_exact_boundary_and_rejects_before_insert() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
+        let audit = AuthorizationAuditInput::new(
+            "boundary-decision",
+            "boundary-tenant",
+            "boundary-actor",
+            "boundary-policy",
+            1,
+            "boundary-policy-digest",
+            "TaskGet",
+            AuthorizationDecisionEffect::Deny,
+            "selector_denied",
+            "selector_digest",
+            "hmac-sha256:boundary",
+            None,
+            1,
+        )
+        .unwrap();
+        let row_bytes = authorization_audit_encoded_bytes(&audit).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER authorization_decision_accounting_monotonic")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE authorization_decision_accounting
+                 SET encoded_bytes=?1 WHERE singleton=1",
+                [i64::try_from(MAX_AUTHORIZATION_BYTES - row_bytes).unwrap()],
+            )
+            .unwrap();
+        assert!(preflight_authorization_capacity(&connection, &audit).is_ok());
+        connection
+            .execute(
+                "UPDATE authorization_decision_accounting
+                 SET encoded_bytes=encoded_bytes+1 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        assert!(preflight_authorization_capacity(&connection, &audit).is_err());
+        connection
+            .execute(
+                "UPDATE authorization_decision_accounting
+                 SET decision_count=?1,encoded_bytes=0 WHERE singleton=1",
+                [i64::try_from(MAX_AUTHORIZATION_DECISIONS - 1).unwrap()],
+            )
+            .unwrap();
+        assert!(preflight_authorization_capacity(&connection, &audit).is_ok());
+        connection
+            .execute(
+                "UPDATE authorization_decision_accounting
+                 SET decision_count=decision_count+1 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        assert!(preflight_authorization_capacity(&connection, &audit).is_err());
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(insert_authorization_audit(&transaction, &audit).is_err());
+        assert_eq!(
+            transaction
+                .query_row("SELECT COUNT(*) FROM authorization_decisions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn v8_migration_backfills_exact_authorization_accounting() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
+        register_disabled_projection_functions(&connection);
+        let audits = [
+            AuthorizationAuditInput::new(
+                "migrate-one",
+                "tenant-a",
+                "actor-a",
+                "policy-a",
+                1,
+                "digest-a",
+                "TaskGet",
+                AuthorizationDecisionEffect::Deny,
+                "拒否",
+                "selector",
+                "hmac-sha256:first",
+                None,
+                10,
+            )
+            .unwrap(),
+            AuthorizationAuditInput::new(
+                "migrate-two",
+                "tenant-a",
+                "actor-a",
+                "policy-a",
+                1,
+                "digest-a",
+                "TaskGet",
+                AuthorizationDecisionEffect::Deny,
+                "ambiguous_selector",
+                "selector",
+                "hmac-sha256:second",
+                None,
+                11,
+            )
+            .unwrap(),
+        ];
+        {
+            let transaction = connection.transaction().unwrap();
+            for audit in &audits {
+                insert_authorization_audit(&transaction, audit).unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        connection
+            .execute_batch(
+                "DROP TRIGGER authorization_decision_accounting_no_insert;
+                 DROP TRIGGER authorization_decision_accounting_no_delete;
+                 DROP TRIGGER authorization_decision_accounting_monotonic;
+                 DROP TRIGGER authorization_decisions_capacity;
+                 DROP TRIGGER authorization_decisions_account;
+                 DROP TABLE authorization_decision_accounting;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
+                params![V8_SCHEMA_VERSION, schema_v8_hash()],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", V8_SCHEMA_VERSION)
+            .unwrap();
+
+        migrate_v8_to_v9(&mut connection).unwrap();
+        let accounted: (i64, i64) = connection
+            .query_row(
+                "SELECT decision_count,encoded_bytes FROM authorization_decision_accounting",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let expected_bytes = audits
+            .iter()
+            .map(|audit| authorization_audit_encoded_bytes(audit).unwrap())
+            .sum::<usize>();
+        assert_eq!(accounted, (2, i64::try_from(expected_bytes).unwrap()));
+    }
+
+    #[test]
+    fn authorization_accounting_survives_reopen_and_rejects_value_tamper() {
+        let path = std::env::temp_dir().join(format!(
+            "smesh-authorization-accounting-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let audit = AuthorizationAuditInput::new(
+            "reopen-decision",
+            "tenant-a",
+            "actor-a",
+            "policy-a",
+            1,
+            "digest-a",
+            "TaskGet",
+            AuthorizationDecisionEffect::Deny,
+            "selector_denied",
+            "selector",
+            "hmac-sha256:reopen",
+            None,
+            10,
+        )
+        .unwrap();
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
+            register_disabled_projection_functions(&connection);
+            let transaction = connection.transaction().unwrap();
+            insert_authorization_audit(&transaction, &audit).unwrap();
+            transaction.commit().unwrap();
+        }
+        let connection = Connection::open(&path).unwrap();
+        validate_schema(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT decision_count,encoded_bytes FROM authorization_decision_accounting",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (
+                1,
+                i64::try_from(authorization_audit_encoded_bytes(&audit).unwrap()).unwrap()
+            )
+        );
+        connection
+            .execute(
+                "UPDATE authorization_decision_accounting
+                 SET decision_count=decision_count+1,encoded_bytes=encoded_bytes+1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let reopened = Connection::open(&path).unwrap();
+        assert!(matches!(
+            validate_schema(&reopened),
+            Err(SqliteStoreError::InvalidSchema)
+        ));
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn expected_schema_lookup_does_not_confuse_table_with_prefixed_index() {

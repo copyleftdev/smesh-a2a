@@ -49,11 +49,14 @@ pub fn assert_sqlite_tables_match(path: &Path) {
     let mut statement = connection
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
         .expect("prepare SQLite authority table inventory");
-    let actual = statement
+    let mut actual = statement
         .query_map([], |row| row.get::<_, String>(0))
         .expect("query SQLite authority table inventory")
         .collect::<Result<BTreeSet<_>, _>>()
         .expect("read SQLite authority table inventory");
+    // SQLite-only O(1) authorization accounting metadata. PostgreSQL enforces
+    // retention through a bounded maintenance authority and diagnostics row.
+    actual.remove("authorization_decision_accounting");
     assert_eq!(
         actual,
         expected_tables(),
@@ -80,6 +83,8 @@ pub async fn assert_postgres_tables_match(client: &Client, schema: &str) {
         // analogue and is never authoritative task data.
         "audit_projection_session_secret",
         "audit_projection_sessions",
+        // PostgreSQL-only bounded authorization-retention maintenance evidence.
+        "authorization_retention_diagnostics",
         "callback_worker_session_secret",
         "callback_worker_sessions",
         // PostgreSQL's multi-replica callback claimant needs a physical,
@@ -470,6 +475,10 @@ fn normalize(tables: &mut BTreeMap<String, Vec<Value>>) {
                     object.remove("tenant_scope");
                 }
                 "authorization_decisions" => {
+                    // PostgreSQL-only physical retention metadata.
+                    object.remove("projection_required");
+                    object.remove("projection_terminal");
+                    object.remove("projection_source_pk_digest");
                     if let Some(id) = object.get("decision_id").and_then(Value::as_str)
                         && let Some(rank) = decision_ranks.get(id)
                     {

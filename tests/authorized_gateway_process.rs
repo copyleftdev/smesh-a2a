@@ -456,7 +456,7 @@ async fn production_mtls_gateway_migrates_restarts_and_serves_both_protocols() {
         reopened
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     drop(reopened);
 

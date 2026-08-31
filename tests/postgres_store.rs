@@ -656,7 +656,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
     let source = include_str!("../src/postgres_store.rs");
     assert_eq!(
         source.matches(".transaction()").count() + source.matches(".build_transaction()").count(),
-        16,
+        17,
         "new direct transaction site must be routed through the bounded runner or explicitly reviewed"
     );
     assert_eq!(
@@ -680,6 +680,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
         "artifact orphan claim persists before unlink",
         "artifact orphan finalize fences exact ownership",
         "read-only tenant/key-generation snapshot before atomic reload",
+        "operator-only bounded authorization retention transaction",
     ] {
         assert!(
             source.contains(reason),
@@ -2991,7 +2992,7 @@ postgres_test!(
         // row_retained_bytes includes jsonb field names and numeric columns. Keep
         // enough exact-encoding headroom for one audit, but not two.
         let frozen_bytes =
-            64 * 1024 * 1024 - audit_bytes - snapshot_overhead - entry_overhead - 900;
+            64 * 1024 * 1024 - audit_bytes - snapshot_overhead - entry_overhead - 1_050;
         let frozen_bytes_i64 = i64::try_from(frozen_bytes).unwrap();
         let snapshot = [7_u8; 32];
         let metadata = [9_u8; 32];
