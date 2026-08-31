@@ -44,17 +44,19 @@ Observed results:
 
 Append-only migration revision 9 adds:
 
-- `cleanup_authorization_decisions(retention_ms,max_rows)` with fixed `pg_catalog` search path;
+- `cleanup_authorization_decisions(tenant,retention_ms,max_rows)` with fixed `pg_catalog` search path;
 - maximum batch size 1,000;
 - database-time cutoff and maximum retention horizon validation;
-- tenant context enforcement;
-- projection obligation check: pending/leased rows block source deletion;
-- terminal `delivered`/`dead` or absent projections permit deletion;
+- operator-only migrator authority; the shared runtime role cannot invoke cleanup even with forged tenant/retention GUCs;
+- explicit source-side projection obligation and terminal-state markers;
+- pending/leased/missing-required evidence blocks source deletion;
+- terminal `delivered`/`dead` evidence, or explicit disabled-at-insert state, permits deletion;
 - per-tenant bounded diagnostics;
-- explicit PUBLIC revocation and runtime-role execution grant;
+- explicit PUBLIC/runtime revocation and migrator-only execution grant;
 - revision/checksum/catalog sealing and privilege-tamper detection.
+- populated exact-main revision-8 migration with forced-RLS backfill, retained-counter rebaseline, rollback safety, revision-9 reopen, and source preservation.
 
-The deterministic matrix seeds eight tenants with old terminal, absent, pending, and live decisions. Repeated limit-1 cleanup deletes exactly two eligible rows per tenant, preserves pending/live rows, never changes another tenant, survives restart, and records exact diagnostics.
+The deterministic matrix seeds eight tenants with an older blocked pending decision followed by delivered, dead, projection-disabled, and live decisions. Repeated limit-1 cleanup skips the blocked prefix, deletes exactly three eligible rows per tenant, preserves pending/live rows, never changes another tenant, survives restart, and records exact bounded diagnostics.
 
 Focused commands:
 

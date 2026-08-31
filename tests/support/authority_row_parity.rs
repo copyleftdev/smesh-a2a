@@ -477,6 +477,7 @@ fn normalize(tables: &mut BTreeMap<String, Vec<Value>>) {
                 "authorization_decisions" => {
                     // PostgreSQL-only physical retention metadata.
                     object.remove("projection_required");
+                    object.remove("projection_terminal");
                     object.remove("projection_source_pk_digest");
                     if let Some(id) = object.get("decision_id").and_then(Value::as_str)
                         && let Some(rank) = decision_ranks.get(id)

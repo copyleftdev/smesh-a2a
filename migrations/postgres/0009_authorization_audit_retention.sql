@@ -8,8 +8,15 @@ ALTER TABLE __SCHEMA__.store_metadata ADD CONSTRAINT store_metadata_schema_versi
 
 ALTER TABLE __SCHEMA__.authorization_decisions
  ADD COLUMN projection_required boolean NOT NULL DEFAULT false,
+ ADD COLUMN projection_terminal boolean NOT NULL DEFAULT false,
  ADD COLUMN projection_source_pk_digest text;
+CREATE POLICY authorization_retention_migration ON __SCHEMA__.authorization_decisions
+ TO __MIGRATOR__
+ USING(current_setting('smesh.authorization_retention',true)='migrate-v1')
+ WITH CHECK(current_setting('smesh.authorization_retention',true)='migrate-v1');
+SELECT set_config('smesh.authorization_retention','migrate-v1',true);
 ALTER TABLE __SCHEMA__.authorization_decisions DISABLE TRIGGER authorization_decisions_no_update;
+ALTER TABLE __SCHEMA__.authorization_decisions DISABLE TRIGGER retained_authority_accounting;
 UPDATE __SCHEMA__.authorization_decisions SET projection_source_pk_digest=
    'sha256:'||encode(sha256(convert_to(
      'pk'||chr(31)||'smesh-audit-projection/v1'||chr(31)||'authorization_decisions'||chr(31)||
@@ -29,7 +36,17 @@ WHERE EXISTS(
  WHERE p.tenant_scope=d.tenant_scope AND p.source='authorization_decisions'
    AND p.source_pk_digest=d.projection_source_pk_digest
 );
+UPDATE __SCHEMA__.authorization_decisions d SET projection_terminal=true
+WHERE EXISTS(
+ SELECT 1 FROM __SCHEMA__.audit_projection_outbox p
+ WHERE p.tenant_scope=d.tenant_scope AND p.source='authorization_decisions'
+   AND p.source_pk_digest=d.projection_source_pk_digest
+   AND p.state IN ('delivered','dead')
+);
+ALTER TABLE __SCHEMA__.authorization_decisions ENABLE TRIGGER retained_authority_accounting;
 ALTER TABLE __SCHEMA__.authorization_decisions ENABLE TRIGGER authorization_decisions_no_update;
+DROP POLICY authorization_retention_migration ON __SCHEMA__.authorization_decisions;
+SELECT set_config('smesh.authorization_retention','',true);
 
 CREATE FUNCTION __SCHEMA__.mark_authorization_projection_requirement() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $fn$
@@ -41,11 +58,50 @@ BEGIN
  NEW.projection_required :=
    (SELECT enabled FROM __SCHEMA__.audit_projection_control WHERE singleton=1)
    AND __SCHEMA__.audit_projection_session_valid();
+ NEW.projection_terminal := false;
  RETURN NEW;
 END $fn$;
 CREATE TRIGGER authorization_projection_requirement
  BEFORE INSERT ON __SCHEMA__.authorization_decisions FOR EACH ROW
  EXECUTE FUNCTION __SCHEMA__.mark_authorization_projection_requirement();
+
+CREATE FUNCTION __SCHEMA__.guard_authorization_decision_update() RETURNS trigger
+LANGUAGE plpgsql SET search_path=pg_catalog AS $fn$
+BEGIN
+ IF current_user='__MIGRATOR__'
+    AND current_setting('smesh.internal_global',true)='audit-projector-v1'
+    AND NOT OLD.projection_terminal AND NEW.projection_terminal
+    AND (to_jsonb(NEW)-'projection_terminal')=(to_jsonb(OLD)-'projection_terminal')
+ THEN RETURN NEW; END IF;
+ RAISE EXCEPTION 'authorization audit is immutable';
+END $fn$;
+DROP TRIGGER authorization_decisions_no_update ON __SCHEMA__.authorization_decisions;
+CREATE TRIGGER authorization_decisions_no_update BEFORE UPDATE ON __SCHEMA__.authorization_decisions
+ FOR EACH ROW EXECUTE FUNCTION __SCHEMA__.guard_authorization_decision_update();
+CREATE POLICY authorization_projection_terminal_update ON __SCHEMA__.authorization_decisions
+ FOR UPDATE TO __MIGRATOR__
+ USING(current_setting('smesh.internal_global',true)='audit-projector-v1')
+ WITH CHECK(current_setting('smesh.internal_global',true)='audit-projector-v1');
+CREATE POLICY authorization_projection_retained_accounting ON __SCHEMA__.retained_authority_usage
+ TO __MIGRATOR__
+ USING(current_setting('smesh.internal_global',true)='audit-projector-v1')
+ WITH CHECK(current_setting('smesh.internal_global',true)='audit-projector-v1');
+
+CREATE FUNCTION __SCHEMA__.mark_authorization_projection_terminal() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $fn$
+BEGIN
+ IF NEW.source='authorization_decisions' AND NEW.state IN ('delivered','dead') THEN
+  PERFORM set_config('smesh.internal_global','audit-projector-v1',true);
+  UPDATE __SCHEMA__.authorization_decisions d SET projection_terminal=true
+  WHERE d.tenant_scope=NEW.tenant_scope
+    AND d.projection_source_pk_digest=NEW.source_pk_digest
+    AND NOT d.projection_terminal;
+ END IF;
+ RETURN NEW;
+END $fn$;
+CREATE TRIGGER authorization_projection_terminal
+ AFTER INSERT OR UPDATE OF state ON __SCHEMA__.audit_projection_outbox FOR EACH ROW
+ EXECUTE FUNCTION __SCHEMA__.mark_authorization_projection_terminal();
 
 CREATE TABLE __SCHEMA__.authorization_retention_diagnostics(
  tenant_scope text PRIMARY KEY,
@@ -68,6 +124,12 @@ CREATE POLICY authorization_retention_internal ON __SCHEMA__.authorization_reten
  WITH CHECK(current_setting('smesh.authorization_retention',true)='cleanup-v1');
 CREATE INDEX audit_projection_authorization_source
  ON __SCHEMA__.audit_projection_outbox(tenant_scope,source,source_pk_digest,state);
+CREATE INDEX authorization_decisions_retention_due
+ ON __SCHEMA__.authorization_decisions(tenant_scope,decided_at,decision_order)
+ WHERE NOT projection_required OR projection_terminal;
+CREATE INDEX authorization_decisions_retention_blocked
+ ON __SCHEMA__.authorization_decisions(tenant_scope,decided_at,decision_order)
+ WHERE projection_required AND NOT projection_terminal;
 CREATE POLICY authorization_retention_projection ON __SCHEMA__.audit_projection_outbox
  FOR ALL TO __MIGRATOR__
  USING(source='authorization_decisions' AND current_setting('smesh.authorization_retention',true)='cleanup-v1')
@@ -108,28 +170,28 @@ BEGIN
  PERFORM set_config('smesh.internal_global','claim-v1',true);
  PERFORM set_config('smesh.authorization_retention','cleanup-v1',true);
 
- WITH candidates AS MATERIALIZED (
+ SELECT count(*) INTO blocked FROM (
+   SELECT 1 FROM __SCHEMA__.authorization_decisions d
+   WHERE d.tenant_scope=tenant AND d.decided_at<=cutoff_ms
+     AND d.projection_required AND NOT d.projection_terminal
+   ORDER BY d.decided_at,d.decision_order LIMIT max_rows
+ ) blocked_rows;
+
+ WITH eligible AS MATERIALIZED (
    SELECT d.ctid,d.tenant_scope,d.projection_source_pk_digest,d.projection_required,
-          p.event_id,p.state AS projection_state
+          p.event_id
    FROM __SCHEMA__.authorization_decisions d
    LEFT JOIN LATERAL (
-     SELECT o.event_id,o.state FROM __SCHEMA__.audit_projection_outbox o
+     SELECT o.event_id FROM __SCHEMA__.audit_projection_outbox o
      WHERE o.tenant_scope=d.tenant_scope AND o.source='authorization_decisions'
        AND o.source_pk_digest=d.projection_source_pk_digest
+       AND o.state IN ('delivered','dead')
      ORDER BY o.event_id LIMIT 1
    ) p ON true
    WHERE d.tenant_scope=tenant AND d.decided_at<=cutoff_ms
+     AND (NOT d.projection_required OR d.projection_terminal)
    ORDER BY d.decided_at,d.decision_order
    FOR UPDATE OF d SKIP LOCKED LIMIT max_rows
- ), measured AS MATERIALIZED (
-   SELECT COALESCE(sum(CASE WHEN projection_required
-                                  AND projection_state IS DISTINCT FROM 'delivered'
-                                  AND projection_state IS DISTINCT FROM 'dead'
-                            THEN 1 ELSE 0 END),0)::bigint AS blocked
-   FROM candidates
- ), eligible AS MATERIALIZED (
-   SELECT * FROM candidates
-   WHERE NOT projection_required OR projection_state IN ('delivered','dead')
  ), removed_projection AS (
    DELETE FROM __SCHEMA__.audit_projection_outbox o USING eligible e
    WHERE e.projection_required AND o.tenant_scope=e.tenant_scope
@@ -143,23 +205,18 @@ BEGIN
      AND (NOT e.projection_required OR EXISTS(SELECT 1 FROM removed_projection p WHERE p.event_id=e.event_id))
    RETURNING d.ctid
  )
- SELECT (SELECT COALESCE(sum(1),0)::bigint FROM removed_source),measured.blocked
- INTO changed,blocked FROM measured;
+ SELECT COALESCE(sum(1),0)::bigint INTO changed FROM removed_source;
 
  SELECT EXISTS(
-   SELECT 1 FROM (
-     SELECT d.projection_required,p.state AS projection_state
-     FROM __SCHEMA__.authorization_decisions d
-     LEFT JOIN LATERAL (
-       SELECT o.state FROM __SCHEMA__.audit_projection_outbox o
+   SELECT 1 FROM __SCHEMA__.authorization_decisions d
+   WHERE d.tenant_scope=tenant AND d.decided_at<=cutoff_ms
+     AND (NOT d.projection_required OR (d.projection_terminal AND EXISTS(
+       SELECT 1 FROM __SCHEMA__.audit_projection_outbox o
        WHERE o.tenant_scope=d.tenant_scope AND o.source='authorization_decisions'
          AND o.source_pk_digest=d.projection_source_pk_digest
-       ORDER BY o.event_id LIMIT 1
-     ) p ON true
-     WHERE d.tenant_scope=tenant AND d.decided_at<=cutoff_ms
-     ORDER BY d.decided_at,d.decision_order LIMIT max_rows
-   ) next_batch
-   WHERE NOT projection_required OR projection_state IN ('delivered','dead')
+         AND o.state IN ('delivered','dead')
+     )))
+   LIMIT 1
  ) INTO more;
  SELECT d.decided_at INTO oldest FROM __SCHEMA__.authorization_decisions d
  WHERE d.tenant_scope=tenant ORDER BY d.decided_at,d.decision_order LIMIT 1;
@@ -209,6 +266,6 @@ BEGIN
  GET DIAGNOSTICS changed=ROW_COUNT; RETURN changed;
 END $fn$;
 
-REVOKE ALL ON FUNCTION __SCHEMA__.mark_authorization_projection_requirement(),__SCHEMA__.guard_authorization_decision_retention(),__SCHEMA__.cleanup_authorization_decisions(text,bigint,integer) FROM PUBLIC,__ROLE__;
+REVOKE ALL ON FUNCTION __SCHEMA__.mark_authorization_projection_requirement(),__SCHEMA__.mark_authorization_projection_terminal(),__SCHEMA__.guard_authorization_decision_update(),__SCHEMA__.guard_authorization_decision_retention(),__SCHEMA__.cleanup_authorization_decisions(text,bigint,integer) FROM PUBLIC,__ROLE__;
 GRANT EXECUTE ON FUNCTION __SCHEMA__.cleanup_authorization_decisions(text,bigint,integer) TO __MIGRATOR__;
 REVOKE ALL ON __SCHEMA__.authorization_retention_diagnostics FROM PUBLIC,__ROLE__;

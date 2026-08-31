@@ -49,8 +49,8 @@ fn revision_nine_is_narrow_fixed_path_and_explicitly_privileged() {
     assert!(sql.contains("max_rows IS NULL"));
     assert!(sql.contains("max_rows>1000"));
     assert!(sql.contains("projection_required boolean NOT NULL"));
-    assert!(!sql.to_ascii_lowercase().contains("count(*)"));
     assert!(!sql.to_ascii_lowercase().contains("min(decided_at)"));
+    assert!(sql.contains("LIMIT max_rows"));
     assert!(sql.contains("authorization_retention_diagnostics"));
     assert!(sql.contains("REVOKE ALL ON FUNCTION"));
     assert!(sql.contains("GRANT EXECUTE ON FUNCTION __SCHEMA__.cleanup_authorization_decisions(text,bigint,integer) TO __MIGRATOR__"));
@@ -90,10 +90,10 @@ async fn bounded_cleanup_is_tenant_projection_and_live_window_safe_across_restar
             client.execute("SELECT set_config('smesh.internal_global','audit-projector-v1',false),set_config('smesh.tenant_scope',$1,false)", &[&tenant]).await.unwrap();
             seed_client.execute("SELECT set_config('smesh.tenant_scope',$1,false)", &[&tenant]).await.unwrap();
             for (kind, decided_at) in [
+                ("pending", old - 1),
                 ("terminal", old),
                 ("absent", old),
                 ("dead", old),
-                ("pending", old),
                 ("live", live),
             ] {
                 let projection_required = matches!(kind, "terminal" | "dead" | "pending");
@@ -126,16 +126,17 @@ async fn bounded_cleanup_is_tenant_projection_and_live_window_safe_across_restar
             let tenant = format!("tenant-{tenant_no}");
             client.execute("SELECT set_config('smesh.tenant_scope',$1,false),set_config('smesh.internal_global','diag-v1',false),set_config('smesh.authorization_retention','cleanup-v1',false)", &[&tenant]).await.unwrap();
             let obligation_row = client.query_one(
-                &format!("SELECT sum(projection_required::int)::bigint,sum((p.event_id IS NOT NULL)::int)::bigint FROM {schema}.authorization_decisions d LEFT JOIN {schema}.audit_projection_outbox p ON p.tenant_scope=d.tenant_scope AND p.source='authorization_decisions' AND p.source_pk_digest=d.projection_source_pk_digest WHERE d.tenant_scope=$1"),
+                &format!("SELECT sum(projection_required::int)::bigint,sum(projection_terminal::int)::bigint,sum((p.event_id IS NOT NULL)::int)::bigint FROM {schema}.authorization_decisions d LEFT JOIN {schema}.audit_projection_outbox p ON p.tenant_scope=d.tenant_scope AND p.source='authorization_decisions' AND p.source_pk_digest=d.projection_source_pk_digest WHERE d.tenant_scope=$1"),
                 &[&tenant],
             ).await.unwrap();
-            assert_eq!((obligation_row.get::<_, i64>(0), obligation_row.get::<_, i64>(1)), (3, 3));
+            assert_eq!((obligation_row.get::<_, i64>(0), obligation_row.get::<_, i64>(1), obligation_row.get::<_, i64>(2)), (3, 2, 3));
             let before_other_tenants: i64 = client.query_one(
                 &format!("SELECT count(*) FROM {schema}.authorization_decisions WHERE tenant_scope<>$1"),
                 &[&tenant],
             ).await.unwrap().get(0);
             let first = PostgresTaskStore::cleanup_authorization_decisions(&config, &tenant, 50_000, 1).await.unwrap();
             assert_eq!(first.deleted, 1, "each call must honor its bound");
+            assert_eq!(first.projection_blocked, 1, "an older blocked prefix must not starve eligible rows");
             assert!(first.has_more);
             let second = PostgresTaskStore::cleanup_authorization_decisions(&config, &tenant, 50_000, 1).await.unwrap();
             assert_eq!(second.deleted, 1);

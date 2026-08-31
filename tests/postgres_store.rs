@@ -2992,7 +2992,7 @@ postgres_test!(
         // row_retained_bytes includes jsonb field names and numeric columns. Keep
         // enough exact-encoding headroom for one audit, but not two.
         let frozen_bytes =
-            64 * 1024 * 1024 - audit_bytes - snapshot_overhead - entry_overhead - 900;
+            64 * 1024 * 1024 - audit_bytes - snapshot_overhead - entry_overhead - 1_050;
         let frozen_bytes_i64 = i64::try_from(frozen_bytes).unwrap();
         let snapshot = [7_u8; 32];
         let metadata = [9_u8; 32];

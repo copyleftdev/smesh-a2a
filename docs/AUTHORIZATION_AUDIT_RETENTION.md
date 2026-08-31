@@ -13,7 +13,7 @@ Cleanup is tenant-scoped and requires:
 - source decision age at or before the database-time cutoff;
 - projection was explicitly disabled when the source was inserted, or terminal projection evidence exists.
 
-A projection row in `delivered` or `dead` state is terminal. Revision 9 records `projection_required` at insert, so an absent row is safe only when projection was disabled then. Pending, leased, or missing required evidence blocks source cleanup. Generic projection retention preserves terminal authorization evidence while its source exists; operator cleanup deletes the terminal projection and source atomically.
+A projection row in `delivered` or `dead` state is terminal. Revision 9 records `projection_required` at insert and transactionally marks `projection_terminal` when export becomes terminal, so an absent row is safe only when projection was disabled then. Pending, leased, or missing required evidence blocks source cleanup. Generic projection retention preserves terminal authorization evidence while its source exists; operator cleanup deletes the terminal projection and source atomically. Partial indexes let cleanup skip an arbitrarily old blocked prefix and select only a bounded eligible batch.
 
 The maintenance API is an in-process operator boundary. It is not exposed as an A2A, REST, or JSON-RPC operation and must not be wired to caller-controlled tenant input without a separate administrative authorization policy.
 
@@ -79,6 +79,7 @@ Required evidence:
 - v8-to-v9 multibyte counter backfill is exact;
 - malformed and duplicate selector floods preserve healthy-tenant progress and contain no raw canaries;
 - PostgreSQL cleanup is batch-bounded, tenant-isolated, projection-safe, restart-safe, and catalog-sealed;
+- populated revision-8 authorities backfill projection digests/obligations under a migration-only RLS policy, rebaseline retained counters, and reopen as revision 9;
 - public/runtime mutation attempts fail.
 
 ## Residual risks
