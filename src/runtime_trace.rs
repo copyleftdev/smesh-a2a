@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,9 +16,11 @@ use crate::{
 };
 
 const RUNTIME_TRACE_SCHEMA_V1: &str = "runtime-trace/1";
-const RUNTIME_TRACE_SCHEMA: &str = "runtime-trace/2";
+const RUNTIME_TRACE_SCHEMA_V2: &str = "runtime-trace/2";
+const RUNTIME_TRACE_SCHEMA: &str = "runtime-trace/3";
 const MAX_REPLAY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REPLAY_EVENTS: usize = 100_000;
+const MAX_CAPTURE_EVENTS: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -147,15 +149,27 @@ struct Correlation {
     context_id: String,
 }
 
+struct RetainedRuntimeEvent {
+    event: RuntimeTraceEvent,
+    workload: Option<String>,
+}
+
 struct CaptureState {
     started: Instant,
     next_sequence: u64,
-    required: Vec<RuntimeTraceEvent>,
+
+    required: VecDeque<RetainedRuntimeEvent>,
     optional: Vec<RuntimeTraceEvent>,
     required_capacity: usize,
     optional_capacity: usize,
     dropped_optional: u64,
+    retired_required: u64,
+    per_workload_capacity: usize,
     correlations: HashMap<String, Correlation>,
+    workload_aliases: HashMap<String, String>,
+    seen_hashes: std::collections::HashSet<String>,
+    ambiguous_hashes: std::collections::HashSet<String>,
+    hash_history_saturated: bool,
 }
 
 pub struct RuntimeEventCapture {
@@ -202,16 +216,47 @@ where
 impl RuntimeEventCapture {
     #[must_use]
     pub fn new(required_capacity: usize, optional_capacity: usize) -> Self {
+        Self::new_with_retention(
+            required_capacity,
+            optional_capacity,
+            required_capacity.min(256),
+        )
+    }
+
+    /// Construct a capture with a bounded process window and per-workload share.
+    #[must_use]
+    pub fn new_with_retention(
+        required_capacity: usize,
+        optional_capacity: usize,
+        per_workload_capacity: usize,
+    ) -> Self {
+        let required_capacity = if required_capacity == 0 {
+            0
+        } else {
+            required_capacity.clamp(2, MAX_CAPTURE_EVENTS)
+        };
+        let optional_capacity = optional_capacity.min(MAX_CAPTURE_EVENTS - required_capacity);
         Self {
             state: Mutex::new(CaptureState {
                 started: Instant::now(),
                 next_sequence: 0,
-                required: Vec::new(),
+
+                required: VecDeque::new(),
                 optional: Vec::new(),
                 required_capacity,
                 optional_capacity,
                 dropped_optional: 0,
+                retired_required: 0,
+                per_workload_capacity: if required_capacity == 0 {
+                    0
+                } else {
+                    per_workload_capacity.clamp(2, required_capacity)
+                },
                 correlations: HashMap::new(),
+                workload_aliases: HashMap::new(),
+                seen_hashes: std::collections::HashSet::new(),
+                ambiguous_hashes: std::collections::HashSet::new(),
+                hash_history_saturated: false,
             }),
             failure: CancellationToken::new(),
             telemetry: None,
@@ -242,7 +287,7 @@ impl RuntimeEventCapture {
     ///
     /// # Errors
     ///
-    /// Returns an error for empty/oversized fields or a conflicting existing binding.
+    /// Returns an error for empty/oversized fields, a conflicting binding, or a full active map.
     pub async fn register_correlation(
         &self,
         signal_hash: &str,
@@ -253,45 +298,95 @@ impl RuntimeEventCapture {
             .iter()
             .any(|value| !bounded_public_value(value))
         {
-            return self.fail(RuntimeTraceError::InvalidCorrelation);
+            return Err(RuntimeTraceError::InvalidCorrelation);
         }
         let mut state = self.state.lock().await;
+        if state.required_capacity == 0 {
+            return Err(RuntimeTraceError::ZeroCapacity);
+        }
         let correlation = Correlation {
             task_id: task_id.to_owned(),
             context_id: context_id.to_owned(),
         };
         if let Some(existing) = state.correlations.get(signal_hash) {
-            if existing != &correlation {
-                return self.fail(RuntimeTraceError::CorrelationConflict);
+            if existing.task_id != correlation.task_id
+                || existing.context_id != correlation.context_id
+            {
+                return Err(RuntimeTraceError::CorrelationConflict);
             }
             return Ok(());
         }
         if state.correlations.len() >= state.required_capacity {
-            return self.fail(RuntimeTraceError::RequiredCapacityExhausted);
+            return Err(RuntimeTraceError::RequiredCapacityExhausted);
         }
+        let workload = runtime_workload_key(task_id, context_id);
+        if state
+            .workload_aliases
+            .get(signal_hash)
+            .is_some_and(|existing| existing != &workload)
+        {
+            return Err(RuntimeTraceError::CorrelationConflict);
+        }
+        let reused_hash = state.hash_history_saturated || state.seen_hashes.contains(signal_hash);
+        if state.seen_hashes.len() < MAX_CAPTURE_EVENTS {
+            state.seen_hashes.insert(signal_hash.to_owned());
+        } else {
+            state.hash_history_saturated = true;
+        }
+        if reused_hash {
+            state.ambiguous_hashes.insert(signal_hash.to_owned());
+        }
+        state
+            .workload_aliases
+            .insert(signal_hash.to_owned(), workload.clone());
         state
             .correlations
             .insert(signal_hash.to_owned(), correlation.clone());
-        for event in &mut state.required {
-            if event.signal_hash.as_deref() == Some(signal_hash) {
-                event.task_id = Some(correlation.task_id.clone());
-                event.context_id = Some(correlation.context_id.clone());
+        for retained in &mut state.required {
+            if retained.event.signal_hash.as_deref() == Some(signal_hash) {
+                retained.workload = Some(workload.clone());
+                if retained.event.kind == RuntimeTraceKind::SignalEmitted
+                    && retained.event.task_id.is_none()
+                {
+                    retained.event.task_id = Some(correlation.task_id.clone());
+                    retained.event.context_id = Some(correlation.context_id.clone());
+                }
             }
         }
         for event in &mut state.optional {
-            if event.signal_hash.as_deref() == Some(signal_hash) {
+            if event.kind == RuntimeTraceKind::SignalEmitted
+                && event.signal_hash.as_deref() == Some(signal_hash)
+                && event.task_id.is_none()
+            {
                 event.task_id = Some(correlation.task_id.clone());
                 event.context_id = Some(correlation.context_id.clone());
             }
         }
+        enforce_workload_limit(&mut state, &workload);
         Ok(())
+    }
+
+    #[doc(hidden)]
+    pub async fn correlation_count_for_test(&self) -> usize {
+        self.state.lock().await.correlations.len()
+    }
+
+    #[doc(hidden)]
+    pub async fn retention_stats_for_test(&self) -> (u64, usize, usize, usize) {
+        let state = self.state.lock().await;
+        (
+            state.retired_required,
+            state.required_capacity,
+            state.optional_capacity,
+            state.workload_aliases.len() + state.ambiguous_hashes.len() + state.seen_hashes.len(),
+        )
     }
 
     /// Record one genuine runtime event using only allowlisted, non-payload details.
     ///
     /// # Errors
     ///
-    /// Returns an error rather than sampling when required lifecycle capacity is exhausted.
+    /// Required history retires within the configured process/per-workload RPO window.
     pub async fn record(&self, event: RuntimeEvent) -> Result<(), RuntimeTraceError> {
         let mut state = self.state.lock().await;
         if state.required_capacity == 0 {
@@ -304,23 +399,39 @@ impl RuntimeEventCapture {
         {
             return self.fail(RuntimeTraceError::InvalidCorrelation);
         }
-        if required && state.required.len() >= state.required_capacity {
-            return self.fail(RuntimeTraceError::RequiredCapacityExhausted);
+
+        if required
+            && kind != RuntimeTraceKind::SignalEmitted
+            && signal_hash.as_deref().is_some_and(|hash| {
+                state.hash_history_saturated
+                    || state.ambiguous_hashes.contains(hash)
+                    || state.seen_hashes.contains(hash)
+                        && !state.workload_aliases.contains_key(hash)
+            })
+        {
+            state.retired_required = state.retired_required.saturating_add(1);
+            return Ok(());
         }
+
         if !required && state.optional.len() >= state.optional_capacity {
             state.dropped_optional = state.dropped_optional.saturating_add(1);
             return Ok(());
         }
-        let correlation = signal_hash
-            .as_deref()
-            .and_then(|hash| state.correlations.get(hash));
+        let correlation = (kind == RuntimeTraceKind::SignalEmitted)
+            .then(|| {
+                signal_hash
+                    .as_deref()
+                    .and_then(|hash| state.correlations.get(hash))
+                    .cloned()
+            })
+            .flatten();
         let trace_event = RuntimeTraceEvent {
             sequence: state.next_sequence,
             monotonic_micros: u64::try_from(state.started.elapsed().as_micros())
                 .unwrap_or(u64::MAX),
             kind,
-            task_id: correlation.map(|value| value.task_id.clone()),
-            context_id: correlation.map(|value| value.context_id.clone()),
+            task_id: correlation.as_ref().map(|value| value.task_id.clone()),
+            context_id: correlation.as_ref().map(|value| value.context_id.clone()),
             signal_hash,
             details,
         };
@@ -335,10 +446,11 @@ impl RuntimeEventCapture {
             trace_event.signal_hash.clone(),
         );
         if required {
-            state.required.push(trace_event);
+            push_required(&mut state, trace_event);
         } else {
             state.optional.push(trace_event);
         }
+
         drop(state);
         if let Some(telemetry) = &self.telemetry {
             let (name, reason) = match projection.0 {
@@ -527,11 +639,11 @@ impl RuntimeEventCapture {
             || !bounded_public_value(context_id)
             || !details_are_bounded(&details, false)
         {
-            return self.fail(RuntimeTraceError::InvalidCorrelation);
+            return Err(RuntimeTraceError::InvalidCorrelation);
         }
         let mut state = self.state.lock().await;
-        if state.required.len() >= state.required_capacity {
-            return self.fail(RuntimeTraceError::RequiredCapacityExhausted);
+        if state.required_capacity == 0 {
+            return self.fail(RuntimeTraceError::ZeroCapacity);
         }
         let event = RuntimeTraceEvent {
             sequence: state.next_sequence,
@@ -553,7 +665,12 @@ impl RuntimeEventCapture {
             RuntimeTraceKind::TerminalOutput => crate::telemetry::EventName::RuntimeTerminal,
             _ => crate::telemetry::EventName::RuntimeLifecycle,
         };
-        state.required.push(event);
+        push_required(&mut state, event);
+        if kind == RuntimeTraceKind::TerminalOutput {
+            state.correlations.retain(|_, correlation| {
+                correlation.task_id != task_id || correlation.context_id != context_id
+            });
+        }
         drop(state);
         if let Some(telemetry) = &self.telemetry {
             telemetry.runtime_event(
@@ -574,9 +691,16 @@ impl RuntimeEventCapture {
 
     pub async fn snapshot(&self) -> RuntimeTrace {
         let state = self.state.lock().await;
-        let mut events = state.required.clone();
+        let mut events = state
+            .required
+            .iter()
+            .map(|retained| retained.event.clone())
+            .collect::<Vec<_>>();
         events.extend(state.optional.clone());
         events.sort_by_key(|event| event.sequence);
+        for (sequence, event) in events.iter_mut().enumerate() {
+            event.sequence = u64::try_from(sequence).unwrap_or(u64::MAX);
+        }
         RuntimeTrace {
             schema_version: RUNTIME_TRACE_SCHEMA.to_owned(),
             capture_valid: !self.failure.is_cancelled(),
@@ -631,9 +755,11 @@ impl RuntimeEventCapture {
         let trace: RuntimeTrace = serde_json::from_slice(bytes)
             .map_err(|error| RuntimeTraceError::MalformedReplay(error.to_string()))?;
         let legacy_v1 = trace.schema_version == RUNTIME_TRACE_SCHEMA_V1;
-        if !legacy_v1 && trace.schema_version != RUNTIME_TRACE_SCHEMA {
+        let legacy_v2 = trace.schema_version == RUNTIME_TRACE_SCHEMA_V2;
+        if !legacy_v1 && !legacy_v2 && trace.schema_version != RUNTIME_TRACE_SCHEMA {
             return Err(RuntimeTraceError::UnsupportedSchema);
         }
+
         if !trace.capture_valid {
             return Err(RuntimeTraceError::CaptureInvalid);
         }
@@ -654,6 +780,169 @@ impl RuntimeEventCapture {
         }
         Ok(trace)
     }
+}
+
+fn runtime_workload_key(task_id: &str, context_id: &str) -> String {
+    content_digest(format!("runtime-trace-workload/v1\0{task_id}\0{context_id}").as_bytes())
+}
+
+fn workload_for_event(state: &CaptureState, event: &RuntimeTraceEvent) -> Option<String> {
+    if let Some(hash) = event.signal_hash.as_deref() {
+        return state
+            .workload_aliases
+            .get(hash)
+            .cloned()
+            .or_else(|| Some(hash.to_owned()));
+    }
+    event
+        .task_id
+        .as_deref()
+        .zip(event.context_id.as_deref())
+        .map(|(task, context)| runtime_workload_key(task, context))
+}
+
+fn workload_matches(retained: &RetainedRuntimeEvent, workload: &str) -> bool {
+    retained.workload.as_deref() == Some(workload)
+}
+
+fn is_boundary(retained: &RetainedRuntimeEvent) -> bool {
+    matches!(
+        retained.event.kind,
+        RuntimeTraceKind::SignalEmitted | RuntimeTraceKind::TerminalOutput
+    )
+}
+
+fn workload_is_completed(state: &CaptureState, workload: &str) -> bool {
+    state.required.iter().any(|retained| {
+        workload_matches(retained, workload)
+            && retained.event.kind == RuntimeTraceKind::TerminalOutput
+    })
+}
+
+fn retirement_index(state: &CaptureState, workload: &str) -> Option<usize> {
+    state
+        .required
+        .iter()
+        .position(|retained| workload_matches(retained, workload) && !is_boundary(retained))
+        .or_else(|| {
+            workload_is_completed(state, workload).then(|| {
+                state
+                    .required
+                    .iter()
+                    .position(|retained| workload_matches(retained, workload))
+            })?
+        })
+        .or_else(|| {
+            state
+                .required
+                .iter()
+                .position(|retained| workload_matches(retained, workload))
+        })
+}
+
+fn prune_workload_aliases(state: &mut CaptureState) {
+    let retained_hashes = state
+        .required
+        .iter()
+        .filter_map(|retained| retained.event.signal_hash.clone())
+        .chain(state.correlations.keys().cloned())
+        .collect::<std::collections::HashSet<_>>();
+    state
+        .workload_aliases
+        .retain(|hash, _| retained_hashes.contains(hash));
+    state
+        .ambiguous_hashes
+        .retain(|hash| retained_hashes.contains(hash));
+}
+
+fn enforce_workload_limit(state: &mut CaptureState, workload: &str) {
+    while state
+        .required
+        .iter()
+        .filter(|retained| workload_matches(retained, workload))
+        .count()
+        > state.per_workload_capacity
+    {
+        let Some(index) = retirement_index(state, workload) else {
+            break;
+        };
+        state.required.remove(index);
+        state.retired_required = state.retired_required.saturating_add(1);
+    }
+    prune_workload_aliases(state);
+}
+
+fn push_required(state: &mut CaptureState, event: RuntimeTraceEvent) {
+    if state.required_capacity == 0 {
+        return;
+    }
+    let workload = workload_for_event(state, &event);
+    let retained = RetainedRuntimeEvent { event, workload };
+    if let Some(workload) = retained.workload.as_deref() {
+        let workload_count = state
+            .required
+            .iter()
+            .filter(|existing| workload_matches(existing, workload))
+            .count();
+        let has_retirable_intermediate = state
+            .required
+            .iter()
+            .any(|existing| workload_matches(existing, workload) && !is_boundary(existing));
+        if workload_count >= state.per_workload_capacity
+            && !is_boundary(&retained)
+            && !has_retirable_intermediate
+        {
+            state.retired_required = state.retired_required.saturating_add(1);
+            prune_workload_aliases(state);
+            return;
+        }
+        while state
+            .required
+            .iter()
+            .filter(|existing| workload_matches(existing, workload))
+            .count()
+            >= state.per_workload_capacity
+        {
+            let Some(index) = retirement_index(state, workload) else {
+                break;
+            };
+            state.required.remove(index);
+            state.retired_required = state.retired_required.saturating_add(1);
+        }
+    }
+    while state.required.len() >= state.required_capacity {
+        let completed_workload = state
+            .required
+            .iter()
+            .filter_map(|candidate| candidate.workload.clone())
+            .find(|workload| workload_is_completed(state, workload));
+        if let Some(completed_workload) = completed_workload {
+            let indexes = state
+                .required
+                .iter()
+                .enumerate()
+                .filter_map(|(index, candidate)| {
+                    workload_matches(candidate, &completed_workload).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            for index in indexes.iter().rev() {
+                state.required.remove(*index);
+            }
+            state.retired_required = state
+                .retired_required
+                .saturating_add(u64::try_from(indexes.len()).unwrap_or(u64::MAX));
+            prune_workload_aliases(state);
+            continue;
+        }
+        let non_boundary = state
+            .required
+            .iter()
+            .position(|candidate| !is_boundary(candidate));
+        state.required.remove(non_boundary.unwrap_or(0));
+        state.retired_required = state.retired_required.saturating_add(1);
+    }
+    state.required.push_back(retained);
+    prune_workload_aliases(state);
 }
 
 fn bounded_public_value(value: &str) -> bool {

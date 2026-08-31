@@ -116,7 +116,7 @@ async fn live_sqlite_request_dispatch_and_terminal_commit_emit_one_correlated_ch
         Some(telemetry.clone()),
     )
     .unwrap();
-    let app = instrument_router_with_telemetry(gateway.router(), Some(telemetry));
+    let app = instrument_router_with_telemetry(gateway.router(), Some(telemetry.clone()));
     let response = app
         .clone()
         .oneshot(
@@ -148,6 +148,11 @@ async fn live_sqlite_request_dispatch_and_terminal_commit_emit_one_correlated_ch
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["result"]["task"]["id"].is_string(), "{json}");
+    assert_eq!(
+        telemetry.dispatch_correlation_count_for_test(),
+        0,
+        "completed dispatch retained authoritative identity"
+    );
     let task_id = json["result"]["task"]["id"].as_str().unwrap();
 
     for (id, method, params) in [

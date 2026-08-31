@@ -149,6 +149,10 @@ async fn required_runtime_lifecycle_is_correlated_while_optional_metrics_drop_fi
     unsupported.schema_version = "runtime-trace/999".to_owned();
     assert!(RuntimeEventCapture::replay(&serde_json::to_vec(&unsupported).unwrap()).is_err());
 
+    let mut legacy_v2 = trace.clone();
+    legacy_v2.schema_version = "runtime-trace/2".to_owned();
+    assert!(RuntimeEventCapture::replay(&serde_json::to_vec(&legacy_v2).unwrap()).is_ok());
+
     let mut gapped = trace;
     gapped.events.last_mut().unwrap().sequence += 1;
     assert!(RuntimeEventCapture::replay(&serde_json::to_vec(&gapped).unwrap()).is_err());
@@ -193,28 +197,87 @@ async fn genuine_runtime_emission_enters_captured_correlated_fixture() {
 }
 
 #[tokio::test]
-async fn required_capacity_exhaustion_fails_without_sampling_or_sequence_gap() {
-    let capture = RuntimeEventCapture::new(1, 1);
+async fn required_capacity_retires_oldest_without_invalidating_capture() {
+    let capture = RuntimeEventCapture::new_with_retention(2, 0, 2);
     capture
         .record(RuntimeEvent::SignalEmitted {
             hash: "first-required".to_owned(),
         })
         .await
         .unwrap();
+    capture
+        .record(RuntimeEvent::SignalExpired {
+            hash: "second-required".to_owned(),
+        })
+        .await
+        .unwrap();
+    capture
+        .record(RuntimeEvent::PeerConnected {
+            peer_id: "peer".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert!(!capture.failure_token().is_cancelled());
+    let trace = capture.snapshot().await;
+    assert_eq!(trace.events.len(), 2);
+    assert_eq!(trace.events[0].sequence, 0);
+    assert_eq!(trace.events[1].sequence, 1);
+    assert!(
+        trace
+            .events
+            .iter()
+            .any(|event| event.kind == RuntimeTraceKind::SignalEmitted)
+    );
+    assert!(
+        trace
+            .events
+            .iter()
+            .any(|event| event.kind == RuntimeTraceKind::PeerConnected)
+    );
+    assert_eq!(capture.retention_stats_for_test().await, (1, 2, 0, 0));
+    assert!(trace.capture_valid);
+    assert!(RuntimeEventCapture::replay(&serde_json::to_vec(&trace).unwrap()).is_ok());
+}
+
+#[tokio::test]
+async fn maximum_capture_configuration_serializes_within_replay_byte_limit() {
+    let capture = RuntimeEventCapture::new_with_retention(1_024, 1_024, 2);
+    let artifact_digests = (0..16)
+        .map(|index| content_digest(format!("artifact-{index:02}").as_bytes()))
+        .collect::<Vec<_>>();
+    for index in 0..1_024 {
+        capture
+            .record_terminal(
+                &format!("task-{index:04}-{}", "t".repeat(500)),
+                &format!("context-{index:04}-{}", "c".repeat(497)),
+                RuntimeTerminalState::Completed,
+                artifact_digests.clone(),
+            )
+            .await
+            .unwrap();
+    }
+    let encoded = serde_json::to_vec(&capture.snapshot().await).unwrap();
+    assert!(encoded.len() <= 16 * 1024 * 1024);
+    RuntimeEventCapture::replay(&encoded).unwrap();
+    assert_eq!(capture.retention_stats_for_test().await, (0, 1_024, 0, 0));
+}
+
+#[tokio::test]
+async fn zero_required_capacity_rejects_gateway_terminal_and_invalidates_capture() {
+    let capture = RuntimeEventCapture::new_with_retention(0, 0, 0);
     assert!(
         capture
-            .record(RuntimeEvent::SignalExpired {
-                hash: "second-required".to_owned(),
-            })
+            .record_terminal(
+                "zero-task",
+                "zero-context",
+                RuntimeTerminalState::Completed,
+                Vec::new(),
+            )
             .await
             .is_err()
     );
     assert!(capture.failure_token().is_cancelled());
-    let trace = capture.snapshot().await;
-    assert_eq!(trace.events.len(), 1);
-    assert_eq!(trace.events[0].sequence, 0);
-    assert!(!trace.capture_valid);
-    assert!(RuntimeEventCapture::replay(&serde_json::to_vec(&trace).unwrap()).is_err());
+    assert!(!capture.snapshot().await.capture_valid);
 }
 
 #[tokio::test]
@@ -257,6 +320,335 @@ async fn correlation_registration_backfills_an_already_captured_emission() {
     let trace = capture.snapshot().await;
     assert_eq!(trace.events[0].task_id.as_deref(), Some("late-task"));
     assert_eq!(trace.events[0].context_id.as_deref(), Some("late-context"));
+}
+
+#[tokio::test]
+async fn offender_saturation_retires_only_bounded_history_and_keeps_capture_replayable() {
+    let capture = RuntimeEventCapture::new_with_retention(8, 1, 2);
+    capture
+        .register_correlation("offender-signal", "offender-task", "offender-context")
+        .await
+        .unwrap();
+    capture
+        .register_correlation("healthy-signal", "healthy-task", "healthy-context")
+        .await
+        .unwrap();
+
+    capture
+        .record(RuntimeEvent::SignalEmitted {
+            hash: "offender-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    for count in 1..=64 {
+        capture
+            .record(RuntimeEvent::SignalReinforced {
+                hash: "offender-signal".to_owned(),
+                count,
+            })
+            .await
+            .unwrap();
+    }
+    capture
+        .record_terminal(
+            "offender-task",
+            "offender-context",
+            RuntimeTerminalState::Failed,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    capture
+        .record(RuntimeEvent::SignalEmitted {
+            hash: "healthy-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+    capture
+        .record_terminal(
+            "healthy-task",
+            "healthy-context",
+            RuntimeTerminalState::Completed,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    capture
+        .record(RuntimeEvent::SignalExpired {
+            hash: "offender-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+    capture
+        .record(RuntimeEvent::SignalExpired {
+            hash: "healthy-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert!(!capture.failure_token().is_cancelled());
+    assert_eq!(capture.correlation_count_for_test().await, 0);
+    let trace = capture.snapshot().await;
+    assert!(trace.events.len() <= 8);
+    assert!(capture.retention_stats_for_test().await.0 >= 62);
+    assert!(capture.retention_stats_for_test().await.3 <= 8);
+    assert!(
+        trace
+            .events
+            .iter()
+            .filter(|event| {
+                event.task_id.as_deref() == Some("offender-task")
+                    || event.signal_hash.as_deref() == Some("offender-signal")
+            })
+            .count()
+            <= 2
+    );
+    assert!(trace.events.iter().any(|event| {
+        event.kind == RuntimeTraceKind::TerminalOutput
+            && event.task_id.as_deref() == Some("healthy-task")
+    }));
+    assert!(trace.events.iter().any(|event| {
+        event.kind == RuntimeTraceKind::SignalEmitted
+            && event.task_id.as_deref() == Some("healthy-task")
+    }));
+    let replayed = RuntimeEventCapture::replay(&serde_json::to_vec(&trace).unwrap()).unwrap();
+    assert_eq!(replayed, trace);
+}
+
+#[tokio::test]
+async fn late_expiry_after_hash_reuse_is_unattributed_and_cannot_retire_new_work() {
+    let capture = RuntimeEventCapture::new(2, 1);
+    capture
+        .register_correlation("same-signal", "old-task", "old-context")
+        .await
+        .unwrap();
+    capture
+        .record(RuntimeEvent::SignalEmitted {
+            hash: "same-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+    capture
+        .record_terminal(
+            "old-task",
+            "old-context",
+            RuntimeTerminalState::Completed,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(capture.correlation_count_for_test().await, 0);
+    assert_eq!(
+        capture
+            .register_correlation("same-signal", "new-task", "new-context")
+            .await,
+        Err(RuntimeTraceError::CorrelationConflict)
+    );
+
+    capture
+        .register_correlation("turnover-signal", "turnover-task", "turnover-context")
+        .await
+        .unwrap();
+    capture
+        .record(RuntimeEvent::SignalEmitted {
+            hash: "turnover-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+    capture
+        .register_correlation("same-signal", "new-task", "new-context")
+        .await
+        .unwrap();
+    capture
+        .record(RuntimeEvent::SignalEmitted {
+            hash: "same-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+    let retired_before = capture.retention_stats_for_test().await.0;
+    capture
+        .record(RuntimeEvent::SignalReinforced {
+            hash: "same-signal".to_owned(),
+            count: 1,
+        })
+        .await
+        .unwrap();
+    capture
+        .record(RuntimeEvent::SignalExpired {
+            hash: "same-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert!(capture.retention_stats_for_test().await.0 >= retired_before + 2);
+    assert_eq!(capture.correlation_count_for_test().await, 2);
+    capture
+        .record_terminal(
+            "new-task",
+            "new-context",
+            RuntimeTerminalState::Completed,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(capture.correlation_count_for_test().await, 1);
+
+    let trace = capture.snapshot().await;
+    assert!(trace.events.iter().any(|event| {
+        event.kind == RuntimeTraceKind::SignalEmitted
+            && event.signal_hash.as_deref() == Some("same-signal")
+            && event.task_id.as_deref() == Some("new-task")
+            && event.context_id.as_deref() == Some("new-context")
+    }));
+    assert!(trace.events.iter().all(|event| {
+        event.signal_hash.as_deref() != Some("same-signal")
+            || !matches!(
+                event.kind,
+                RuntimeTraceKind::SignalReinforced | RuntimeTraceKind::SignalExpired
+            )
+    }));
+}
+
+#[tokio::test]
+async fn completed_anchor_pair_retires_atomically_on_global_turnover() {
+    let capture = RuntimeEventCapture::new_with_retention(2, 0, 2);
+    capture
+        .register_correlation("first-signal", "first-task", "first-context")
+        .await
+        .unwrap();
+    capture
+        .record(RuntimeEvent::SignalEmitted {
+            hash: "first-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+    capture
+        .record_terminal(
+            "first-task",
+            "first-context",
+            RuntimeTerminalState::Completed,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    capture
+        .register_correlation("second-signal", "second-task", "second-context")
+        .await
+        .unwrap();
+    capture
+        .record(RuntimeEvent::SignalEmitted {
+            hash: "second-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+    let trace = capture.snapshot().await;
+    assert!(trace.events.iter().all(|event| {
+        event.task_id.as_deref() != Some("first-task")
+            && event.signal_hash.as_deref() != Some("first-signal")
+    }));
+    assert!(trace.events.iter().any(|event| {
+        event.task_id.as_deref() == Some("second-task")
+            && event.kind == RuntimeTraceKind::SignalEmitted
+    }));
+}
+
+#[tokio::test]
+async fn delayed_event_after_alias_retirement_cannot_evict_healthy_admissions() {
+    let capture = RuntimeEventCapture::new_with_retention(2, 0, 2);
+    capture
+        .register_correlation("retired-signal", "retired-task", "retired-context")
+        .await
+        .unwrap();
+    capture
+        .record(RuntimeEvent::SignalEmitted {
+            hash: "retired-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+    capture
+        .record_terminal(
+            "retired-task",
+            "retired-context",
+            RuntimeTerminalState::Completed,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    for healthy in ["healthy-1", "healthy-2"] {
+        let context = format!("{healthy}-context");
+        let signal = format!("{healthy}-signal");
+        capture
+            .register_correlation(&signal, healthy, &context)
+            .await
+            .unwrap();
+        capture
+            .record(RuntimeEvent::SignalEmitted { hash: signal })
+            .await
+            .unwrap();
+    }
+    let retired_before = capture.retention_stats_for_test().await.0;
+    capture
+        .record(RuntimeEvent::SignalExpired {
+            hash: "retired-signal".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        capture.retention_stats_for_test().await.0,
+        retired_before + 1
+    );
+    let trace = capture.snapshot().await;
+    for healthy in ["healthy-1", "healthy-2"] {
+        assert!(trace.events.iter().any(|event| {
+            event.kind == RuntimeTraceKind::SignalEmitted
+                && event.task_id.as_deref() == Some(healthy)
+        }));
+    }
+    assert!(
+        trace
+            .events
+            .iter()
+            .all(|event| { event.signal_hash.as_deref() != Some("retired-signal") })
+    );
+}
+
+#[tokio::test]
+async fn identical_task_ids_in_distinct_contexts_have_independent_retention_shares() {
+    let capture = RuntimeEventCapture::new_with_retention(8, 0, 2);
+    for (signal, context) in [("signal-a", "context-a"), ("signal-b", "context-b")] {
+        capture
+            .register_correlation(signal, "shared-task", context)
+            .await
+            .unwrap();
+        capture
+            .record(RuntimeEvent::SignalEmitted {
+                hash: signal.to_owned(),
+            })
+            .await
+            .unwrap();
+        capture
+            .record(RuntimeEvent::SignalReinforced {
+                hash: signal.to_owned(),
+                count: 1,
+            })
+            .await
+            .unwrap();
+    }
+    let trace = capture.snapshot().await;
+    for (signal, context) in [("signal-a", "context-a"), ("signal-b", "context-b")] {
+        assert_eq!(
+            trace
+                .events
+                .iter()
+                .filter(|event| event.signal_hash.as_deref() == Some(signal))
+                .count(),
+            2
+        );
+        assert!(trace.events.iter().any(|event| {
+            event.signal_hash.as_deref() == Some(signal)
+                && event.context_id.as_deref() == Some(context)
+        }));
+    }
 }
 
 #[tokio::test]
@@ -464,7 +856,7 @@ async fn canonical_trace_represents_every_gateway_terminal_state() {
         .await
         .unwrap();
     let trace = capture.snapshot().await;
-    assert_eq!(trace.schema_version, "runtime-trace/2");
+    assert_eq!(trace.schema_version, "runtime-trace/3");
     assert_eq!(trace.events.len(), 5);
     assert!(trace.events.iter().all(|event| {
         event.kind == RuntimeTraceKind::TerminalOutput

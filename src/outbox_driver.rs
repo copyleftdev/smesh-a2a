@@ -384,15 +384,26 @@ fn spawn_durable_driver_inner(
                     .await
                     .ok()
                     .flatten();
-                if let (Some(telemetry), Some(correlation)) = (&telemetry, correlation) {
-                    telemetry.remember_dispatch_correlation(&lease.dispatch_id, correlation);
-                }
+                let _correlation_guard = if let (Some(telemetry), Some(correlation)) =
+                    (&telemetry, correlation)
+                {
+                    telemetry.remember_dispatch_correlation(
+                        &lease.tenant_scope,
+                        &lease.lease_token,
+                        &lease.dispatch_id,
+                        correlation,
+                    )
+                } else {
+                    None
+                };
                 if let Some(telemetry) = &telemetry {
                     telemetry.dispatch_event(
                         crate::telemetry::EventName::DispatchClaimed,
                         "ok",
                         "claimed",
                         "outbox_claim",
+                        &lease.tenant_scope,
+                        &lease.lease_token,
                         &lease.dispatch_id,
                         Some(&lease.task_id),
                         Some(&lease.request.context_id),
@@ -458,6 +469,8 @@ fn spawn_durable_driver_inner(
                                             "ok",
                                             "renewed",
                                             "outbox_renew",
+                                            &current.tenant_scope,
+                                            &current.lease_token,
                                             &current.dispatch_id,
                                             Some(&current.task_id),
                                             Some(&current.request.context_id),
@@ -472,6 +485,8 @@ fn spawn_durable_driver_inner(
                                             "stale",
                                             "lost",
                                             "outbox_renew",
+                                            &current.tenant_scope,
+                                            &current.lease_token,
                                             &current.dispatch_id,
                                             Some(&current.task_id),
                                             Some(&current.request.context_id),
@@ -486,6 +501,8 @@ fn spawn_durable_driver_inner(
                                             "failed",
                                             "fatal",
                                             "outbox_renew",
+                                            &current.tenant_scope,
+                                            &current.lease_token,
                                             &current.dispatch_id,
                                             Some(&current.task_id),
                                             Some(&current.request.context_id),
@@ -500,6 +517,8 @@ fn spawn_durable_driver_inner(
                                             "timeout",
                                             "fatal",
                                             "outbox_renew",
+                                            &current.tenant_scope,
+                                            &current.lease_token,
                                             &current.dispatch_id,
                                             Some(&current.task_id),
                                             Some(&current.request.context_id),
@@ -520,6 +539,8 @@ fn spawn_durable_driver_inner(
                         "ok",
                         "execute",
                         "outbox_attempt",
+                        &lease.tenant_scope,
+                        &lease.lease_token,
                         &lease.dispatch_id,
                         Some(&lease.task_id),
                         Some(&lease.request.context_id),
@@ -529,6 +550,7 @@ fn spawn_durable_driver_inner(
                 let dispatch_future = endpoint.dispatch_once(
                     Arc::clone(&authority),
                     envelope,
+                    &lease.lease_token,
                     &clock,
                     &replica_id,
                     &dispatch_cancel,
@@ -601,6 +623,8 @@ fn spawn_durable_driver_inner(
                             "failed",
                             "fatal",
                             "outbox_renew",
+                            &lease.tenant_scope,
+                            &lease.lease_token,
                             &lease.dispatch_id,
                             Some(&lease.task_id),
                             Some(&lease.request.context_id),
@@ -637,6 +661,8 @@ fn spawn_durable_driver_inner(
                                     "failed",
                                     "attempts_exhausted",
                                     "outbox_attempt",
+                                    &lease.tenant_scope,
+                                    &lease.lease_token,
                                     &lease.dispatch_id,
                                     Some(&lease.task_id),
                                     Some(&lease.request.context_id),
@@ -649,6 +675,8 @@ fn spawn_durable_driver_inner(
                                 "retry",
                                 "busy",
                                 "outbox_attempt",
+                                &lease.tenant_scope,
+                                &lease.lease_token,
                                 &lease.dispatch_id,
                                 Some(&lease.task_id),
                                 Some(&lease.request.context_id),
@@ -678,6 +706,8 @@ fn spawn_durable_driver_inner(
                                     "failed",
                                     "permanent",
                                     "outbox_attempt",
+                                    &lease.tenant_scope,
+                                    &lease.lease_token,
                                     &lease.dispatch_id,
                                     Some(&lease.task_id),
                                     Some(&lease.request.context_id),
@@ -730,6 +760,8 @@ fn spawn_durable_driver_inner(
                             } else {
                                 "task_transition"
                             },
+                            &lease.tenant_scope,
+                            &lease.lease_token,
                             &lease.dispatch_id,
                             Some(&lease.task_id),
                             Some(&lease.request.context_id),

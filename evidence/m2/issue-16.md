@@ -64,10 +64,12 @@ URLs after projection row-parity was added.
 
 ## Authority and outage truth
 
-Durable task/outbox/receiver/quota/artifact/authorization records and `runtime-trace/2` remain the
+Durable task/outbox/receiver/quota/artifact/authorization records and the current `runtime-trace/3` remain the
 required authority. OTLP is bounded and lossy even for lifecycle classes that bypass ordinary trace
 sampling. Queue exhaustion or collector loss increments bounded reason counters and drops the newest
 optional copy; it never consumes required runtime-trace capacity or enters an authority transaction.
+Issue #73 supersedes the earlier process-lifetime trace buffer with an explicit bounded recent-window
+RPO and attempt-scoped dispatch-correlation retirement.
 
 ## Explicit limitations
 
@@ -75,8 +77,9 @@ The durable projection is at-least-once between queue acceptance and downstream 
 stable `event.id` is the dedupe key. Exporter loss after queue acceptance is an optional telemetry gap,
 not authoritative data loss. No external telemetry backend retention or tenant ACL configuration is
 claimed, and audit read remains OTLP-only.
-Audit-denial storage DoS and hostile use of process-global required runtime-trace capacity remain
-tracked under #18; required evidence was not weakened to hide those risks.
+Authorization-denial storage and process-global runtime-trace capacity abuse are closed by issues #72
+and #73. Protocol fuzzing plus the remaining hostile-load/chaos matrix continue under #18; required
+evidence was not weakened to hide those risks.
 
 The process test does not claim a live OIDC issuer/bearer-verifier process, artifact publication from
 that same two-gateway fixture, or kill-after-downstream-accept ambiguity. Those production paths are
