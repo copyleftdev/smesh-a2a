@@ -138,8 +138,8 @@ pub use policy::{
     content_digest,
 };
 pub use postgres_store::{
-    ArtifactMigrationOutcome, ArtifactPublicationTestFault, PostgresStoreConfig,
-    PostgresStoreError, PostgresTaskStore, PostgresTransactionTestFault,
+    ArtifactMigrationOutcome, ArtifactPublicationTestFault, AuthorizationAuditCleanup,
+    PostgresStoreConfig, PostgresStoreError, PostgresTaskStore, PostgresTransactionTestFault,
 };
 pub use quota::{
     ExecutionBudget, QuotaAlgorithm, QuotaCharge, QuotaDimension, QuotaExceeded, QuotaIntent,

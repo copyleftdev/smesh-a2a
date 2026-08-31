@@ -74,8 +74,11 @@ const CALLBACK_MIGRATION_NAME: &str = "0007_callback_authority";
 const CALLBACK_POLICY_FENCE_MIGRATION_SQL: &str =
     include_str!("../migrations/postgres/0008_callback_policy_fence.sql");
 const CALLBACK_POLICY_FENCE_MIGRATION_NAME: &str = "0008_callback_policy_fence";
+const AUTHORIZATION_RETENTION_MIGRATION_SQL: &str =
+    include_str!("../migrations/postgres/0009_authorization_audit_retention.sql");
+const AUTHORIZATION_RETENTION_MIGRATION_NAME: &str = "0009_authorization_audit_retention";
 const LOGICAL_SCHEMA_VERSION: i64 = 6;
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 const MAX_CONFIG_BYTES: usize = 4096;
 const ACTIVE_CALLBACK_ENROLLMENT_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM __S__.callback_enrollments WHERE tenant_scope=$1 AND enrollment_id=$2 AND enrollment_generation=$3 AND canonical_url=$4 AND url_digest=$5 AND policy_id=$6 AND policy_revision=$7 AND policy_revision=(SELECT max(policy_revision) FROM __S__.callback_policy_snapshots))";
 const CALLBACK_POLICY_FENCE_LOCK: i64 = 6_001_136_200_065;
@@ -151,6 +154,7 @@ pub(crate) const EXPECTED_TABLES: &[&str] = &[
     "audit_projection_session_secret",
     "audit_projection_sessions",
     "authorization_decisions",
+    "authorization_retention_diagnostics",
     "callback_attempts",
     "callback_audits",
     "callback_configs",
@@ -217,6 +221,7 @@ const TENANT_TABLES: &[&str] = &[
     "artifact_tombstones",
     "audit_projection_outbox",
     "authorization_decisions",
+    "authorization_retention_diagnostics",
     "callback_attempts",
     "callback_audits",
     "callback_configs",
@@ -272,6 +277,7 @@ const EXPECTED_CUSTOM_INDEXES: &[&str] = &[
     "artifact_references_resolve",
     "artifact_restore_one_enabled_identity",
     "artifact_retention_holds_active",
+    "audit_projection_authorization_source",
     "audit_projection_claim",
     "audit_projection_tenant_claim",
     "authorization_decisions_actor_time",
@@ -323,6 +329,15 @@ const EXPECTED_CUSTOM_INDEXES: &[&str] = &[
     "tasks_tenant_time_v6",
     "upload_intents_due",
 ];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizationAuditCleanup {
+    pub deleted: u64,
+    pub projection_blocked: u64,
+    pub live_rows: u64,
+    pub oldest_remaining: Option<i64>,
+    pub cutoff: i64,
+}
 
 #[derive(Clone)]
 pub struct PostgresStoreConfig {
@@ -5050,9 +5065,7 @@ async fn migrate(
     let callback_fence_row = tx.query_opt(&format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=8"), &[])
         .await.map_err(|_| PostgresStoreError::InvalidSchema)?;
     if let Some(row) = callback_fence_row {
-        if row.get::<_, i64>(0) != CURRENT_SCHEMA_VERSION
-            || row.get::<_, String>(1) != callback_fence_checksum
-        {
+        if row.get::<_, i64>(0) != 8 || row.get::<_, String>(1) != callback_fence_checksum {
             return Err(PostgresStoreError::InvalidSchema);
         }
     } else {
@@ -5093,6 +5106,69 @@ async fn migrate(
         .map_err(|_| PostgresStoreError::Initialization)?;
         tx.execute(&format!("UPDATE {schema}.store_metadata SET schema_version=8,catalog_hash=$1 WHERE singleton=1"), &[&catalog])
             .await.map_err(|_| PostgresStoreError::Initialization)?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    }
+    let authorization_retention_checksum =
+        content_digest(AUTHORIZATION_RETENTION_MIGRATION_SQL.as_bytes());
+    let authorization_retention_row = tx
+        .query_opt(
+            &format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=9"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if let Some(row) = authorization_retention_row {
+        if row.get::<_, i64>(0) != CURRENT_SCHEMA_VERSION
+            || row.get::<_, String>(1) != authorization_retention_checksum
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    } else {
+        let metadata = tx
+            .query_one(
+                &format!("SELECT schema_version,catalog_hash FROM {schema}.store_metadata WHERE singleton=1"),
+                &[],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        let sealed_catalog: String = metadata.get(1);
+        if metadata.get::<_, i64>(0) != 8 || sealed_catalog != catalog_digest(&tx, schema).await? {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+        let sql = AUTHORIZATION_RETENTION_MIGRATION_SQL
+            .replace("__SCHEMA__", schema)
+            .replace("__ROLE__", &format!("{schema}_runtime"))
+            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        tx.batch_execute(&sql)
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {schema}.schema_migrations VALUES(9,9,$1,$2,{schema}.db_millis())"
+            ),
+            &[
+                &AUTHORIZATION_RETENTION_MIGRATION_NAME,
+                &authorization_retention_checksum,
+            ],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        let catalog = catalog_digest(&tx, schema).await?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata DISABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!("UPDATE {schema}.store_metadata SET schema_version=9,catalog_hash=$1 WHERE singleton=1"),
+            &[&catalog],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
         tx.batch_execute(&format!(
             "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
         ))
@@ -5775,6 +5851,7 @@ async fn validate_catalog(
             "claim_callback_deliveries",
             "claim_outbox_bounded",
             "cleanup_audit_projection",
+            "cleanup_authorization_decisions",
             "commit_audit_projection",
             "enqueue_audit_projection",
             "enqueue_callback_audit_projection",
@@ -5894,6 +5971,11 @@ async fn validate_catalog(
             CALLBACK_POLICY_FENCE_MIGRATION_NAME,
             content_digest(CALLBACK_POLICY_FENCE_MIGRATION_SQL.as_bytes()),
         ),
+        (
+            9_i64,
+            AUTHORIZATION_RETENTION_MIGRATION_NAME,
+            content_digest(AUTHORIZATION_RETENTION_MIGRATION_SQL.as_bytes()),
+        ),
     ];
     if migration_rows.len() != expected_migrations.len()
         || migration_rows
@@ -5904,7 +5986,8 @@ async fn validate_catalog(
                     || row.get::<_, i64>(1)
                         != match expected.0 {
                             7 => 7,
-                            8 => CURRENT_SCHEMA_VERSION,
+                            8 => 8,
+                            9 => CURRENT_SCHEMA_VERSION,
                             _ => LOGICAL_SCHEMA_VERSION,
                         }
                     || row.get::<_, &str>(2) != expected.1
@@ -7000,6 +7083,49 @@ impl crate::CallbackAuthority for PostgresTaskStore {
 }
 
 impl PostgresTaskStore {
+    /// Deletes one bounded tenant-local batch outside the live audit window.
+    /// Decisions with a non-terminal durable projection remain immutable.
+    pub async fn cleanup_authorization_decisions(
+        &self,
+        tenant_scope: &str,
+        retention_ms: i64,
+        limit: usize,
+    ) -> Result<AuthorizationAuditCleanup, A2AError> {
+        if !crate::durable_authority::valid_bounded_identity(tenant_scope)
+            || !(0..=315_576_000_000).contains(&retention_ms)
+            || !(1..=1_000).contains(&limit)
+        {
+            return Err(A2AError::invalid_request(
+                "invalid authorization retention cleanup",
+            ));
+        }
+        let tenant = tenant_scope.to_owned();
+        self.run_retryable_transaction(&tenant, None, |store, tx| {
+            Box::pin(async move {
+                let row = tx
+                    .query_one(
+                        &store.q("SELECT * FROM __S__.cleanup_authorization_decisions($1,$2)"),
+                        &[&retention_ms, &i32::try_from(limit).unwrap_or(1_000)],
+                    )
+                    .await
+                    .map_err(|error| {
+                        Self::transaction_body_error(
+                            &error,
+                            A2AError::internal("authorization retention cleanup failed"),
+                        )
+                    })?;
+                Ok(AuthorizationAuditCleanup {
+                    deleted: u64::try_from(row.get::<_, i64>(0)).unwrap_or(0),
+                    projection_blocked: u64::try_from(row.get::<_, i64>(1)).unwrap_or(0),
+                    live_rows: u64::try_from(row.get::<_, i64>(2)).unwrap_or(0),
+                    oldest_remaining: row.get(3),
+                    cutoff: row.get(4),
+                })
+            })
+        })
+        .await
+    }
+
     async fn finish_postgres_callback(
         &self,
         fence: &crate::DeliveryFence,

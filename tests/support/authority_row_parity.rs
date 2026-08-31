@@ -80,6 +80,8 @@ pub async fn assert_postgres_tables_match(client: &Client, schema: &str) {
         // analogue and is never authoritative task data.
         "audit_projection_session_secret",
         "audit_projection_sessions",
+        // PostgreSQL-only bounded authorization-retention maintenance evidence.
+        "authorization_retention_diagnostics",
         "callback_worker_session_secret",
         "callback_worker_sessions",
         // PostgreSQL's multi-replica callback claimant needs a physical,
