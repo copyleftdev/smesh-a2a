@@ -413,53 +413,53 @@ async fn selector_denials_append_digest_only_durable_audits() {
     ] {
         assert_eq!(app.clone().oneshot(request).await.unwrap().status(), 403);
     }
+    let barrier = Arc::new(tokio::sync::Barrier::new(129));
+    let mut flood = tokio::task::JoinSet::new();
     for sequence in 0..64 {
-        let malformed = format!("hostile-selector-canary-{sequence}-{}", "x".repeat(65));
-        assert_eq!(
-            app.clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/")
-                        .header("x-smesh-tenant", malformed)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-                .status(),
-            403
-        );
-        assert_eq!(
-            app.clone()
-                .oneshot(
+        for duplicate in [false, true] {
+            let app = app.clone();
+            let barrier = Arc::clone(&barrier);
+            flood.spawn(async move {
+                let request = if duplicate {
                     Request::builder()
                         .uri("/")
                         .header("x-smesh-tenant", "tenant-a")
                         .header("x-smesh-tenant", "tenant-b")
                         .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-                .status(),
-            403
-        );
-        if sequence % 8 == 0 {
-            let healthy = tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                app.clone().oneshot(
+                        .unwrap()
+                } else {
+                    let malformed =
+                        format!("hostile-selector-canary-{sequence}-{}", "x".repeat(65));
                     Request::builder()
                         .uri("/")
-                        .header("x-smesh-tenant", "tenant-a")
+                        .header("x-smesh-tenant", malformed)
                         .body(Body::empty())
-                        .unwrap(),
-                ),
-            )
-            .await
-            .expect("healthy tenant canary exceeded denial-flood watchdog")
-            .unwrap();
-            assert_eq!(healthy.status(), 200);
+                        .unwrap()
+                };
+                barrier.wait().await;
+                app.oneshot(request).await.unwrap().status()
+            });
         }
+    }
+    barrier.wait().await;
+    for _ in 0..8 {
+        let healthy = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            app.clone().oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-smesh-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("healthy tenant canary exceeded concurrent denial-flood watchdog")
+        .unwrap();
+        assert_eq!(healthy.status(), 200);
+    }
+    while let Some(result) = flood.join_next().await {
+        assert_eq!(result.unwrap(), 403);
     }
     let unenrolled = Arc::new(
         Principal::bearer_for_verifier(

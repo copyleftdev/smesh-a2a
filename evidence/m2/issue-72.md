@@ -8,7 +8,7 @@ Parent qualification gate: #18
 - Count and encoded UTF-8 byte limits reject before source-row mutation.
 - PostgreSQL authorization decisions have a tenant-scoped, age-gated, projection-safe, batch-bounded maintenance authority.
 - Runtime roles cannot directly update/delete decisions or mutate retention diagnostics.
-- Malformed and duplicate selector floods retain digest-only reasons, omit raw selector canaries, and preserve healthy enrolled-tenant canary progress.
+- Barrier-synchronized malformed and duplicate selector floods retain digest-only reasons, omit raw selector canaries, and preserve healthy enrolled-tenant canary progress.
 
 ## SQLite evidence
 
@@ -23,8 +23,8 @@ Verified invariants:
 - v8-to-v9 migration backfills multibyte rows exactly;
 - reopen rejects schema or accounting-value tamper;
 - startup/reopen performs the only intentional full reconciliation;
-- 128 hostile selector denials plus baseline denials persist exact reason counts with no raw hostile canary;
-- healthy `tenant-a` requests complete inside a 250 ms watchdog throughout the flood.
+- 128 concurrent hostile selector denials plus baseline denials persist exact reason counts with no raw hostile canary;
+- eight healthy `tenant-a` requests complete inside a 250 ms watchdog while the synchronized flood is active.
 
 Focused commands:
 
@@ -81,7 +81,7 @@ cargo +1.88.0 check --all-targets --all-features
 git diff --check
 ```
 
-Focused formatter, Clippy, and diff hygiene passed before integration. Full exact-tree gates and independent reviews are recorded on the pull request.
+Focused formatter, Clippy, and diff hygiene passed before integration. Full exact-tree gates and independent review evidence must pass before the pull request is opened.
 
 ## Residual risks
 
