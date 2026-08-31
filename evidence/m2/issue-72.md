@@ -54,7 +54,7 @@ Append-only migration revision 9 adds:
 - per-tenant bounded diagnostics;
 - explicit PUBLIC/runtime revocation and migrator-only execution grant;
 - revision/checksum/catalog sealing and privilege-tamper detection.
-- populated exact-main revision-8 migration with pending, delivered, and dead projection rows; migration-only forced-RLS backfill preserves required/terminal state, rebaselines retained counters, rolls back safely on failure, reopens at revision 9, and preserves every source decision.
+- populated exact-main revision-8 migration with absent, pending, delivered, and dead projection states; migration-only forced-RLS backfill conservatively marks every ambiguous historical source required, preserves terminal evidence where present, rebaselines retained counters, rolls back safely on failure, reopens at revision 9, and preserves every source decision.
 
 The deterministic matrix seeds eight tenants with an older blocked pending decision followed by delivered, dead, projection-disabled, and live decisions. Repeated limit-1 cleanup skips the blocked prefix, deletes exactly three eligible rows per tenant, preserves pending/live rows, never changes another tenant, survives restart, and records exact bounded diagnostics.
 

@@ -31,14 +31,10 @@ ALTER TABLE __SCHEMA__.authorization_decisions
 CREATE INDEX authorization_decisions_projection_source
  ON __SCHEMA__.authorization_decisions(tenant_scope,projection_source_pk_digest);
 
--- A populated v8 catalog has no obligation bit. Existing durable projection evidence is
--- the only safe proof that projection was enabled when that source was inserted.
-UPDATE __SCHEMA__.authorization_decisions d SET projection_required=true
-WHERE EXISTS(
- SELECT 1 FROM __SCHEMA__.audit_projection_outbox p
- WHERE p.tenant_scope=d.tenant_scope AND p.source='authorization_decisions'
-   AND p.source_pk_digest=d.projection_source_pk_digest
-);
+-- A populated v8 catalog has no durable disabled-at-insert marker. Missing projection
+-- rows are ambiguous because revision-8 retention may already have removed terminal
+-- evidence, so every historical source is conservatively retained as required.
+UPDATE __SCHEMA__.authorization_decisions SET projection_required=true;
 UPDATE __SCHEMA__.authorization_decisions d SET projection_terminal=true
 WHERE EXISTS(
  SELECT 1 FROM __SCHEMA__.audit_projection_outbox p

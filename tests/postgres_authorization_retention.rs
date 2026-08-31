@@ -543,7 +543,7 @@ async fn populated_revision_eight_upgrades_authorization_projection_evidence_tra
             assert_eq!(
                 rows,
                 vec![
-                    ("absent".into(), false, false, true, false),
+                    ("absent".into(), true, false, true, false),
                     ("pending".into(), true, false, true, true),
                     ("delivered".into(), true, true, true, true),
                     ("dead".into(), true, true, true, true),
