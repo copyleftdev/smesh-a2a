@@ -32,7 +32,7 @@ When the limit is reached, authorization fails closed with no audit-table or acc
 
 ## PostgreSQL operation
 
-Call cleanup repeatedly until `deleted` is zero:
+Call cleanup repeatedly while `has_more` is true. A batch can report zero deletions while eligible rows are temporarily locked, so `deleted == 0` alone is not a termination condition:
 
 ```rust
 let result = PostgresTaskStore

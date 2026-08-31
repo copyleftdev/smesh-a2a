@@ -252,21 +252,15 @@ BEGIN
  THEN RAISE EXCEPTION 'invalid audit projection cleanup'; END IF;
  PERFORM set_config('smesh.internal_global','audit-projector-v1',true);
  WITH candidates AS MATERIALIZED (
-   SELECT o.ctid,o.tenant_scope,o.source,o.source_pk_digest
+   SELECT o.ctid
    FROM __SCHEMA__.audit_projection_outbox o
-   WHERE (o.state='delivered' AND o.delivered_at<=now_ms-retention_ms)
-      OR (o.state='dead' AND o.dead_at<=now_ms-retention_ms)
+   WHERE o.source<>'authorization_decisions'
+     AND ((o.state='delivered' AND o.delivered_at<=now_ms-retention_ms)
+       OR (o.state='dead' AND o.dead_at<=now_ms-retention_ms))
    ORDER BY COALESCE(o.delivered_at,o.dead_at),o.tenant_scope,o.event_id
    FOR UPDATE OF o SKIP LOCKED LIMIT max_rows
- ), doomed AS (
-   SELECT c.ctid FROM candidates c
-   WHERE c.source<>'authorization_decisions' OR NOT EXISTS(
-     SELECT 1 FROM __SCHEMA__.authorization_decisions d
-     WHERE d.tenant_scope=c.tenant_scope
-       AND d.projection_source_pk_digest=c.source_pk_digest LIMIT 1
-   )
  )
- DELETE FROM __SCHEMA__.audit_projection_outbox o USING doomed d WHERE o.ctid=d.ctid;
+ DELETE FROM __SCHEMA__.audit_projection_outbox o USING candidates c WHERE o.ctid=c.ctid;
  GET DIAGNOSTICS changed=ROW_COUNT; RETURN changed;
 END $fn$;
 

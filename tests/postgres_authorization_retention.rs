@@ -121,8 +121,16 @@ async fn bounded_cleanup_is_tenant_projection_and_live_window_safe_across_restar
             }
         }
         client.execute(&format!("UPDATE {schema}.audit_projection_control SET enabled=true WHERE singleton=1"), &[]).await.unwrap();
+        let generic_event = smesh_a2a::content_digest(b"retention-generic-terminal");
+        let generic_source = smesh_a2a::content_digest(b"retention-generic-source");
+        client.execute(
+            &format!("INSERT INTO {schema}.audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,state,available_at,delivered_at) VALUES('tenant-7',$1,'task_events',$2,'task_terminal',$3,'delivered',$3,$3)"),
+            &[&generic_event, &generic_source, &old],
+        ).await.unwrap();
+        assert_eq!(store.cleanup_audit_projection(0, 1).await.unwrap(), 1,
+            "a protected authorization prefix must not starve later generic projection cleanup");
         assert_eq!(store.cleanup_audit_projection(0, 1_000).await.unwrap(), 0,
-            "generic projection retention must preserve terminal source evidence");
+            "generic projection retention must preserve terminal authorization evidence");
 
         for tenant_no in 0..8 {
             let tenant = format!("tenant-{tenant_no}");
