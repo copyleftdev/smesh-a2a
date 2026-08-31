@@ -49,11 +49,14 @@ pub fn assert_sqlite_tables_match(path: &Path) {
     let mut statement = connection
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
         .expect("prepare SQLite authority table inventory");
-    let actual = statement
+    let mut actual = statement
         .query_map([], |row| row.get::<_, String>(0))
         .expect("query SQLite authority table inventory")
         .collect::<Result<BTreeSet<_>, _>>()
         .expect("read SQLite authority table inventory");
+    // SQLite-only O(1) authorization accounting metadata. PostgreSQL enforces
+    // retention through a bounded maintenance authority and diagnostics row.
+    actual.remove("authorization_decision_accounting");
     assert_eq!(
         actual,
         expected_tables(),

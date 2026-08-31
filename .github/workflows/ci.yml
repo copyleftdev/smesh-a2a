@@ -142,7 +142,7 @@ jobs:
           SQL
       - name: Callback authority, plans, reconciliation, and process recovery
         run: |
-          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test callback_authority -- --test-threads=1
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test callback_authority --test postgres_authorization_retention -- --test-threads=1
           timeout --signal=TERM --kill-after=15s 10m cargo test --locked --test postgres_push_process -- --test-threads=1
 
   observability:

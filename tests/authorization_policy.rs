@@ -444,6 +444,22 @@ async fn selector_denials_append_digest_only_durable_audits() {
                 .status(),
             403
         );
+        if sequence % 8 == 0 {
+            let healthy = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                app.clone().oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header("x-smesh-tenant", "tenant-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("healthy tenant canary exceeded denial-flood watchdog")
+            .unwrap();
+            assert_eq!(healthy.status(), 200);
+        }
     }
     let unenrolled = Arc::new(
         Principal::bearer_for_verifier(
