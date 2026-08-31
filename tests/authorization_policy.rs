@@ -413,6 +413,38 @@ async fn selector_denials_append_digest_only_durable_audits() {
     ] {
         assert_eq!(app.clone().oneshot(request).await.unwrap().status(), 403);
     }
+    for sequence in 0..64 {
+        let malformed = format!("hostile-selector-canary-{sequence}-{}", "x".repeat(65));
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header("x-smesh-tenant", malformed)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header("x-smesh-tenant", "tenant-a")
+                        .header("x-smesh-tenant", "tenant-b")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
     let unenrolled = Arc::new(
         Principal::bearer_for_verifier(
             "https://issuer.example".into(),
@@ -433,11 +465,11 @@ async fn selector_denials_append_digest_only_durable_audits() {
             .status(),
         403
     );
-    assert_eq!(store.authorization_decision_count().await.unwrap(), 4);
+    assert_eq!(store.authorization_decision_count().await.unwrap(), 132);
     store.shutdown_shared().await.unwrap();
     let database = rusqlite::Connection::open(&db_path).unwrap();
     let reasons = database
-        .prepare("SELECT reason FROM authorization_decisions ORDER BY decision_order")
+        .prepare("SELECT reason FROM authorization_decisions ORDER BY decision_order LIMIT 3")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
@@ -449,15 +481,48 @@ async fn selector_denials_append_digest_only_durable_audits() {
             "malformed_selector",
             "selector_denied",
             "ambiguous_selector",
-            "selector_denied",
         ]
     );
+    let reason_counts = database
+        .prepare(
+            "SELECT reason,COUNT(*) FROM authorization_decisions GROUP BY reason ORDER BY reason",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        reason_counts,
+        [
+            ("ambiguous_selector".to_owned(), 65),
+            ("malformed_selector".to_owned(), 65),
+            ("selector_denied".to_owned(), 2),
+        ]
+    );
+    let accounting: (i64, i64) = database
+        .query_row(
+            "SELECT decision_count,encoded_bytes
+             FROM authorization_decision_accounting WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(accounting.0, 132);
+    assert!((0..=64 * 1024 * 1024).contains(&accounting.1));
     drop(database);
     let bytes = std::fs::read(&db_path).unwrap();
     assert!(
         !bytes
             .windows("tenant-secret-canary".len())
             .any(|window| { window == "tenant-secret-canary".as_bytes() })
+    );
+    assert!(
+        !bytes
+            .windows("hostile-selector-canary".len())
+            .any(|window| { window == "hostile-selector-canary".as_bytes() })
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
