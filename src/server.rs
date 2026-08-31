@@ -19,7 +19,9 @@ use crate::{
     PolicyError, RuntimeEventCapture, SmeshExecutor, SqliteTaskStore, VersionedCompletionPolicy,
     auth::{AuthState, authenticate_request},
     authorization::{AuthorizationMiddlewareState, AuthorizationPolicy, authorize_request},
-    build_agent_card, build_secured_agent_card_with_policy, content_digest,
+    build_agent_card, build_secured_agent_card_with_policy,
+    card::LiveAgentCard,
+    content_digest,
     durable_authority::DurableAuthorityParts,
     durable_handler::DurableRequestHandler,
     guard::GuardedRequestHandler,
@@ -371,6 +373,8 @@ impl GatewayConfig {
 pub struct DurableGateway {
     router: Option<Router>,
     projector: Option<crate::telemetry::AuditProjectorWorker>,
+    callback_worker: Option<crate::CallbackWorkerHandle>,
+    push_readiness: Arc<crate::push::PushReadiness>,
     driver: Option<DurableDriverHandle>,
     promoter: Option<ArtifactPromoterHandle>,
     gc: Option<ArtifactGcHandle>,
@@ -379,6 +383,27 @@ pub struct DurableGateway {
 }
 
 impl DurableGateway {
+    #[must_use]
+    pub fn push_readiness(&self) -> Arc<crate::push::PushReadiness> {
+        Arc::clone(&self.push_readiness)
+    }
+
+    /// Transfer ownership of the required production callback worker.
+    ///
+    /// # Errors
+    /// Returns an error if a worker is already owned or the readiness generation differs.
+    pub fn own_callback_worker(
+        &mut self,
+        worker: crate::CallbackWorkerHandle,
+    ) -> Result<(), A2AError> {
+        if self.callback_worker.is_some() || !Arc::ptr_eq(worker.readiness(), &self.push_readiness)
+        {
+            return Err(A2AError::internal("callback worker ownership mismatch"));
+        }
+        self.callback_worker = Some(worker);
+        Ok(())
+    }
+
     /// Start the optional projector after both the authority and OTLP owner exist.
     ///
     /// # Errors
@@ -455,6 +480,15 @@ impl DurableGateway {
     ///
     /// Returns an internal protocol error if the owned driver fails or panics.
     pub async fn shutdown(mut self) -> Result<(), A2AError> {
+        let callback_result = if let Some(worker) = self.callback_worker.take() {
+            worker.shutdown(Duration::from_secs(5)).await
+        } else {
+            Ok(())
+        };
+        if callback_result.is_err() {
+            self.push_readiness.mark_fatal();
+            eprintln!("smesh.callback.shutdown_failed category=worker");
+        }
         let projector_result = if let Some(projector) = self.projector.take() {
             projector.shutdown(Duration::from_secs(5)).await
         } else {
@@ -491,6 +525,11 @@ impl DurableGateway {
         // SQLite and the process ownership lock before shutdown returns.
         let authority_result = authority.shutdown().await;
         self.router.take();
+        // A callback panic is already contained: readiness stays fatal, every
+        // callback task has been joined, and no further callback mutation can
+        // be admitted. Preserve that health evidence without converting an
+        // otherwise graceful process shutdown into failure.
+        drop(callback_result);
         driver_result?;
         promoter_result?;
         gc_result?;
@@ -508,6 +547,7 @@ impl Drop for DurableGateway {
         // Tokio reaper. Closing the authority then rejects new work and closes
         // durable pools; explicit shutdown remains authoritative and joins inline.
         self.projector.take();
+        self.callback_worker.take();
         self.driver.take();
         self.promoter.take();
         self.gc.take();
@@ -669,6 +709,7 @@ fn build_durable_gateway_inner(
     } else {
         spawn_durable_driver(Arc::clone(&authority), endpoint, clock.clone())
     };
+    let push_readiness = Arc::new(crate::push::PushReadiness::new());
     let jsonrpc_handler = Arc::new(
         DurableRequestHandler::new_with_local(
             Arc::clone(&authority),
@@ -677,7 +718,8 @@ fn build_durable_gateway_inner(
             clock.clone(),
             input_limits,
         )
-        .with_telemetry(telemetry.clone()),
+        .with_telemetry(telemetry.clone())
+        .with_push_readiness(Arc::clone(&push_readiness)),
     );
     let rest_handler = Arc::new(
         DurableRequestHandler::new_with_local(
@@ -688,7 +730,8 @@ fn build_durable_gateway_inner(
             input_limits,
         )
         .with_errors_before_stream()
-        .with_telemetry(telemetry.clone()),
+        .with_telemetry(telemetry.clone())
+        .with_push_readiness(Arc::clone(&push_readiness)),
     );
     let mut durable_card = if let Some(auth) = auth.as_ref() {
         build_secured_agent_card_with_policy(
@@ -705,7 +748,10 @@ fn build_durable_gateway_inner(
     for skill in &mut durable_card.skills {
         skill.output_modes = Some(vec!["application/json".to_owned()]);
     }
-    let card = Arc::new(StaticAgentCard::new(durable_card));
+    let card = Arc::new(LiveAgentCard::new(
+        durable_card,
+        Arc::clone(&push_readiness),
+    ));
     let protocol = if let Some(auth) = auth {
         let jsonrpc = auth.wrap_handler(jsonrpc_handler);
         let rest = auth.wrap_handler(rest_handler);
@@ -749,6 +795,8 @@ fn build_durable_gateway_inner(
     DurableGateway {
         router: Some(router),
         projector: None,
+        callback_worker: None,
+        push_readiness,
         driver: Some(driver),
         promoter,
         gc,

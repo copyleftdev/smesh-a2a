@@ -275,6 +275,9 @@ closed_names!(EventName {
     ArtifactPromoted => "smesh.artifact.promoted",
     ArtifactResolved => "smesh.artifact.resolved",
     ArtifactCorruptionDetected => "smesh.artifact.corruption_detected",
+    PushConfigChanged => "smesh.push.config.changed",
+    PushDelivery => "smesh.push.delivery",
+    PushPolicyReconciled => "smesh.push.policy.reconciled",
     LeaseRenewed => "smesh.lease.renewed",
     WorkerState => "smesh.worker.state",
     TelemetryDropped => "smesh.telemetry.dropped",
@@ -293,6 +296,7 @@ closed_names!(MetricName {
     QuotaDecision => "smesh.a2a.quota.decision",
     ArtifactResolve => "smesh.a2a.artifact.resolve",
     ArtifactCorruption => "smesh.a2a.artifact.corruption",
+    PushDelivery => "smesh.a2a.push.delivery",
     AuditProjectionLag => "smesh.a2a.audit.projection.lag",
     AuditProjectionFailure => "smesh.a2a.audit.projection.failure",
     TelemetryExport => "smesh.a2a.telemetry.export",
@@ -501,6 +505,7 @@ fn validate_value(key: AttributeKey, value: &str) -> Result<(), TelemetrySchemaE
             "committed",
             "contradiction",
             "cooperative_stop",
+            "fatal",
             "durable_ack",
             "encrypted",
             "execute",
@@ -514,14 +519,18 @@ fn validate_value(key: AttributeKey, value: &str) -> Result<(), TelemetrySchemaE
             "published",
             "quarantined",
             "read",
+            "ready",
             "renewed",
             "replay",
             "role_denied",
             "served",
+            "shutdown",
             "terminal",
             "timeout",
             "unavailable",
+            "unexpected_exit",
             "verified",
+            "worker_panic",
         ]),
         AttributeKey::Operation => closed(&[
             "artifact_backup_completed",
@@ -536,6 +545,15 @@ fn validate_value(key: AttributeKey, value: &str) -> Result<(), TelemetrySchemaE
             "artifact_stage",
             "authorize",
             "authorization_decision",
+            "callback_config_created",
+            "callback_config_deleted",
+            "callback_delivery_attempted",
+            "callback_delivered",
+            "callback_event_enqueued",
+            "callback_dead",
+            "callback_policy_reconciled",
+            "callback_retry_scheduled",
+            "callback_worker",
             "cancel",
             "cancel_task",
             "get",
@@ -581,6 +599,7 @@ fn validate_value(key: AttributeKey, value: &str) -> Result<(), TelemetrySchemaE
             "runtime",
             "artifact_promoter",
             "audit_projector",
+            "callback",
             "other",
         ]),
         AttributeKey::LeaseKind => closed(&[
@@ -629,6 +648,11 @@ fn validate_value(key: AttributeKey, value: &str) -> Result<(), TelemetrySchemaE
             "artifact_backup_jobs",
             "artifact_restore_jobs",
             "artifact_key_rotation_plans",
+            "callback_policy_snapshots",
+            "callback_configs",
+            "callback_events",
+            "callback_deliveries",
+            "callback_attempts",
         ]),
         AttributeKey::RequestId => {
             if value.len() == 32
@@ -829,6 +853,9 @@ fn validate_log_shape(
         EventName::ArtifactPromoted => (ARTIFACT, ARTIFACT_REQUIRED),
         EventName::ArtifactResolved => (ARTIFACT, ARTIFACT_REQUIRED),
         EventName::ArtifactCorruptionDetected => (ARTIFACT, ARTIFACT_REQUIRED),
+        EventName::PushConfigChanged
+        | EventName::PushDelivery
+        | EventName::PushPolicyReconciled => (ORO, ORO),
         EventName::LeaseRenewed => (DISPATCH, DISPATCH_CORRELATION),
         EventName::WorkerState => (WORKER, &[K::Outcome, K::Worker]),
         EventName::TelemetryDropped => (DROP, &[K::Outcome, K::Signal, K::DropReason]),
@@ -3744,7 +3771,44 @@ const fn audit_projection_operation(
             | S::QuotaOverride
             | S::QuotaReconciliation
             | S::ArtifactCorruption
-            | S::ArtifactKey => None,
+            | S::ArtifactKey
+            | S::CallbackPolicy
+            | S::CallbackConfig
+            | S::CallbackEvent
+            | S::CallbackDelivery
+            | S::CallbackAttempt => None,
+        },
+        K::CallbackPolicyReconciled => match source {
+            S::CallbackPolicy => Some("callback_policy_reconciled"),
+            _ => None,
+        },
+        K::CallbackConfigCreated => match source {
+            S::CallbackConfig => Some("callback_config_created"),
+            _ => None,
+        },
+        K::CallbackConfigDeleted => match source {
+            S::CallbackConfig => Some("callback_config_deleted"),
+            _ => None,
+        },
+        K::CallbackEventEnqueued => match source {
+            S::CallbackEvent => Some("callback_event_enqueued"),
+            _ => None,
+        },
+        K::CallbackDeliveryAttempted => match source {
+            S::CallbackDelivery | S::CallbackAttempt => Some("callback_delivery_attempted"),
+            _ => None,
+        },
+        K::CallbackDelivered => match source {
+            S::CallbackDelivery | S::CallbackAttempt => Some("callback_delivered"),
+            _ => None,
+        },
+        K::CallbackRetryScheduled => match source {
+            S::CallbackDelivery | S::CallbackAttempt => Some("callback_retry_scheduled"),
+            _ => None,
+        },
+        K::CallbackDead => match source {
+            S::CallbackDelivery | S::CallbackAttempt => Some("callback_dead"),
+            _ => None,
         },
     }
 }
@@ -3802,6 +3866,58 @@ mod audit_projection_mapping_tests {
                 S::ArtifactKeyRotation,
                 "artifact_rotation_completed",
             ),
+            (
+                K::CallbackPolicyReconciled,
+                S::CallbackPolicy,
+                "callback_policy_reconciled",
+            ),
+            (
+                K::CallbackConfigCreated,
+                S::CallbackConfig,
+                "callback_config_created",
+            ),
+            (
+                K::CallbackConfigDeleted,
+                S::CallbackConfig,
+                "callback_config_deleted",
+            ),
+            (
+                K::CallbackEventEnqueued,
+                S::CallbackEvent,
+                "callback_event_enqueued",
+            ),
+            (
+                K::CallbackDeliveryAttempted,
+                S::CallbackDelivery,
+                "callback_delivery_attempted",
+            ),
+            (
+                K::CallbackDeliveryAttempted,
+                S::CallbackAttempt,
+                "callback_delivery_attempted",
+            ),
+            (
+                K::CallbackDelivered,
+                S::CallbackDelivery,
+                "callback_delivered",
+            ),
+            (
+                K::CallbackDelivered,
+                S::CallbackAttempt,
+                "callback_delivered",
+            ),
+            (
+                K::CallbackRetryScheduled,
+                S::CallbackDelivery,
+                "callback_retry_scheduled",
+            ),
+            (
+                K::CallbackRetryScheduled,
+                S::CallbackAttempt,
+                "callback_retry_scheduled",
+            ),
+            (K::CallbackDead, S::CallbackDelivery, "callback_dead"),
+            (K::CallbackDead, S::CallbackAttempt, "callback_dead"),
         ];
         for (kind, source, expected) in cases {
             assert_eq!(audit_projection_operation(kind, source), Some(expected));

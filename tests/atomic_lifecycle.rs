@@ -1871,8 +1871,8 @@ fn canonical_digest_binds_semantics_not_caller_tenant_or_transport() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)] // Keep the complete v1-to-v7 migration fixture auditable together.
-async fn exact_v1_schema_migrates_to_v7_with_explicit_binding_preserving_keys_and_task() {
+#[allow(clippy::too_many_lines)] // Keep the complete v1-to-v8 migration fixture auditable together.
+async fn exact_v1_schema_migrates_to_v8_with_explicit_binding_preserving_keys_and_task() {
     const V1: &str = "CREATE TABLE store_metadata (
      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
      schema_version INTEGER NOT NULL,
@@ -1975,7 +1975,7 @@ async fn exact_v1_schema_migrates_to_v7_with_explicit_binding_preserving_keys_an
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert_eq!(event_kind, "migration_snapshot");
 }
 

@@ -51,6 +51,7 @@ tokio-util = "0.7"
 tower-http = { version = "0.6", features = ["limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.9"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 mime = "0.3"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs"] }
@@ -69,7 +70,10 @@ x509-parser = "0.18"
 [dev-dependencies]
 a2a-client = { package = "a2a-client-lf", version = "0.2.2" }
 http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 proptest = "1"
+rcgen = "0.13"
 tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
 wait-timeout = "0.2"

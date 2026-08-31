@@ -1,9 +1,12 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     str::FromStr as _,
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+#[cfg(debug_assertions)]
+use std::collections::BTreeMap;
 
 use a2a::A2AError;
 use async_trait::async_trait;
@@ -152,6 +155,50 @@ fn event_identity_is_stable_digest_only_and_types_are_closed() {
     );
     assert!(!a.event_id().contains("tenant-digest"));
     assert_eq!(a.source(), AuditProjectionSource::AuthorizationDecision);
+}
+
+#[test]
+fn callback_projection_types_are_distinct_and_closed() {
+    let sources = [
+        AuditProjectionSource::CallbackPolicy,
+        AuditProjectionSource::CallbackConfig,
+        AuditProjectionSource::CallbackEvent,
+        AuditProjectionSource::CallbackDelivery,
+        AuditProjectionSource::CallbackAttempt,
+    ];
+    assert_eq!(
+        sources.map(AuditProjectionSource::as_str),
+        [
+            "callback_policy_snapshots",
+            "callback_configs",
+            "callback_events",
+            "callback_deliveries",
+            "callback_attempts",
+        ]
+    );
+    let kinds = [
+        AuditProjectionEventKind::CallbackPolicyReconciled,
+        AuditProjectionEventKind::CallbackConfigCreated,
+        AuditProjectionEventKind::CallbackConfigDeleted,
+        AuditProjectionEventKind::CallbackEventEnqueued,
+        AuditProjectionEventKind::CallbackDeliveryAttempted,
+        AuditProjectionEventKind::CallbackDelivered,
+        AuditProjectionEventKind::CallbackRetryScheduled,
+        AuditProjectionEventKind::CallbackDead,
+    ];
+    assert_eq!(
+        kinds.map(AuditProjectionEventKind::as_str),
+        [
+            "callback_policy_reconciled",
+            "callback_config_created",
+            "callback_config_deleted",
+            "callback_event_enqueued",
+            "callback_delivery_attempted",
+            "callback_delivered",
+            "callback_retry_scheduled",
+            "callback_dead",
+        ]
+    );
 }
 
 #[tokio::test]

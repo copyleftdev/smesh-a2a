@@ -418,6 +418,14 @@ impl QuotaIntent {
         &self.policy_digest
     }
     #[must_use]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+    #[must_use]
+    pub fn principal_scope(&self) -> &str {
+        &self.principal_scope
+    }
+    #[must_use]
     pub const fn operation(&self) -> QuotaOperation {
         self.operation
     }

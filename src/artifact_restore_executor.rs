@@ -16,6 +16,37 @@ use std::{
 use tokio::io::AsyncWriteExt as _;
 use tokio_postgres::{Client, Transaction};
 
+fn restore_lock_error_code(code: Option<&str>) -> PostgresStoreError {
+    if code == Some("55P03") {
+        PostgresStoreError::ArtifactMigrationBusy
+    } else {
+        PostgresStoreError::Unavailable
+    }
+}
+
+fn restore_lock_error(error: &tokio_postgres::Error) -> PostgresStoreError {
+    restore_lock_error_code(error.code().map(tokio_postgres::error::SqlState::code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_lock_error_maps_only_lock_not_available_to_busy() {
+        assert!(matches!(
+            restore_lock_error_code(Some("55P03")),
+            PostgresStoreError::ArtifactMigrationBusy
+        ));
+        for code in [Some("57014"), Some("XX000"), None] {
+            assert!(matches!(
+                restore_lock_error_code(code),
+                PostgresStoreError::Unavailable
+            ));
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ArtifactRestoreOutcome {
     pub objects: u64,
@@ -626,6 +657,27 @@ async fn assert_target_empty_or_resume(
         return Err(PostgresStoreError::ArtifactMigrationBusy);
     }
     client
+        .batch_execute("SELECT set_config('smesh.internal_global','callback-worker-v1',false)")
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    let active_callback_worker: bool = client
+        .query_one(
+            &format!(
+                "SELECT EXISTS(
+                    SELECT 1 FROM {schema}.callback_worker_sessions s
+                    JOIN pg_catalog.pg_stat_get_backend_idset() b
+                      ON pg_catalog.pg_stat_get_backend_pid(b)=s.backend_pid
+                )"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?
+        .get(0);
+    if active_callback_worker {
+        return Err(PostgresStoreError::ArtifactMigrationBusy);
+    }
+    client
         .batch_execute("SELECT set_config('smesh.internal_global','claim-v1',false)")
         .await
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
@@ -701,6 +753,8 @@ async fn assert_target_empty_or_resume(
                     | "audit_projection_outbox"
                     | "audit_projection_session_secret"
                     | "audit_projection_sessions"
+                    | "callback_worker_session_secret"
+                    | "callback_worker_sessions"
             )
         })
     {
@@ -730,6 +784,8 @@ async fn assert_target_empty(client: &Client, schema: &str) -> Result<(), Postgr
                     | "audit_projection_outbox"
                     | "audit_projection_session_secret"
                     | "audit_projection_sessions"
+                    | "callback_worker_session_secret"
+                    | "callback_worker_sessions"
             )
         })
     {
@@ -761,6 +817,73 @@ async fn commit_restore_journal(
         .transaction()
         .await
         .map_err(|_| PostgresStoreError::Unavailable)?;
+    // Callback worker sessions and their proof are bootstrap capabilities, not
+    // backup authority. Fence registration and every callback mutation before
+    // proving that no callback authority exists. The proof rotation and stale
+    // session cleanup then commit atomically with the restore journal.
+    tx.batch_execute(
+        "SET LOCAL lock_timeout='1s'; SET LOCAL smesh.internal_global='callback-worker-v1'",
+    )
+    .await
+    .map_err(|_| PostgresStoreError::Unavailable)?;
+    tx.batch_execute(&format!(
+        "LOCK TABLE
+            {schema}.callback_attempts,
+            {schema}.callback_audits,
+            {schema}.callback_configs,
+            {schema}.callback_deliveries,
+            {schema}.callback_enrollments,
+            {schema}.callback_events,
+            {schema}.callback_policy_snapshots,
+            {schema}.callback_worker_sessions,
+            {schema}.callback_worker_session_secret
+         IN ACCESS EXCLUSIVE MODE"
+    ))
+    .await
+    .map_err(|error| restore_lock_error(&error))?;
+    let callback_state = tx
+        .query_one(
+            &format!(
+                "SELECT
+                EXISTS(
+                    SELECT 1 FROM {schema}.callback_worker_sessions s
+                    JOIN pg_catalog.pg_stat_get_backend_idset() b
+                      ON pg_catalog.pg_stat_get_backend_pid(b)=s.backend_pid
+                ),
+                EXISTS(SELECT 1 FROM {schema}.callback_policy_snapshots)
+                 OR EXISTS(SELECT 1 FROM {schema}.callback_enrollments)
+                 OR EXISTS(SELECT 1 FROM {schema}.callback_configs)
+                 OR EXISTS(SELECT 1 FROM {schema}.callback_events)
+                 OR EXISTS(SELECT 1 FROM {schema}.callback_deliveries)
+                 OR EXISTS(SELECT 1 FROM {schema}.callback_attempts)
+                 OR EXISTS(SELECT 1 FROM {schema}.callback_audits)"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if callback_state.get::<_, bool>(0) {
+        return Err(PostgresStoreError::ArtifactMigrationBusy);
+    }
+    if callback_state.get::<_, bool>(1) {
+        return Err(PostgresStoreError::ArtifactRestoreTargetNotEmpty);
+    }
+    tx.execute(
+        &format!("DELETE FROM {schema}.callback_worker_sessions"),
+        &[],
+    )
+    .await
+    .map_err(|_| PostgresStoreError::Unavailable)?;
+    let rotated = tx
+        .execute(
+            &format!("UPDATE {schema}.callback_worker_session_secret SET proof=encode(sha256(convert_to(gen_random_uuid()::text||gen_random_uuid()::text,'UTF8')),'hex') WHERE singleton=1"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Unavailable)?;
+    if rotated != 1 {
+        return Err(PostgresStoreError::InvalidSchema);
+    }
     // Fence claims before resetting optional projection state. Holding the
     // outbox table lock and control-row lock through journal creation makes the
     // reset and the authoritative restore fence one atomic transition.
@@ -771,7 +894,7 @@ async fn commit_restore_journal(
         "LOCK TABLE {schema}.audit_projection_outbox IN ACCESS EXCLUSIVE MODE"
     ))
     .await
-    .map_err(|_| PostgresStoreError::Unavailable)?;
+    .map_err(|error| restore_lock_error(&error))?;
     tx.query_one(
         &format!(
             "SELECT enabled FROM {schema}.audit_projection_control WHERE singleton=1 FOR UPDATE"

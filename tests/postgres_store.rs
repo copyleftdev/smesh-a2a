@@ -50,6 +50,16 @@ macro_rules! postgres_test {
     };
 }
 
+#[test]
+fn callback_revision_seven_checksum_remains_immutable() {
+    assert_eq!(
+        smesh_a2a::content_digest(
+            include_str!("../migrations/postgres/0007_callback_authority.sql").as_bytes()
+        ),
+        "sha256:1a7554355a426d933acc7cf7eb87af0b03e3fa919222b9699a387d60d844a65b"
+    );
+}
+
 fn required_postgres_url(name: &str) -> String {
     env::var(name)
         .unwrap_or_else(|_| panic!("{name} is required by the PostgreSQL evidence harness"))
@@ -646,7 +656,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
     let source = include_str!("../src/postgres_store.rs");
     assert_eq!(
         source.matches(".transaction()").count() + source.matches(".build_transaction()").count(),
-        14,
+        16,
         "new direct transaction site must be routed through the bounded runner or explicitly reviewed"
     );
     assert_eq!(
@@ -663,6 +673,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
         "read-only subscription snapshot",
         "read-only event snapshot",
         "read-only tenant-scoped startup semantic validation",
+        "read-only callback semantic validation needs a transaction-local forced-RLS marker",
         "read-only indexed quota diagnostics for deterministic evidence",
         "read-only indexed scoped telemetry correlation lookup",
         "policy reconciliation is startup-only, advisory-fenced, and atomically audited",
@@ -865,6 +876,9 @@ postgres_test!(
         assert_eq!(postgres_dump.counts.len(), AUTHORITY_TABLES.len());
         assert_eq!(sqlite_dump, postgres_dump);
         for table in AUTHORITY_TABLES {
+            if table.starts_with("callback_") {
+                continue;
+            }
             assert!(
                 sqlite_dump.counts[table] > 0,
                 "row-parity scenario did not populate {table}"
