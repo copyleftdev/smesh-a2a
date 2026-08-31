@@ -4,16 +4,16 @@ This runbook defines the bounded authorization-audit maintenance boundary introd
 
 ## Security model
 
-Authorization decisions remain append-only during their live retention window. Public and normal runtime SQL roles cannot update or delete source decisions. PostgreSQL cleanup is available only through the fixed-search-path `cleanup_authorization_decisions` security-definer routine and the typed `PostgresTaskStore::cleanup_authorization_decisions` maintenance API.
+Authorization decisions remain append-only during their live retention window. Public and normal runtime SQL roles cannot execute cleanup, update, or delete source decisions, even if they forge tenant or retention GUCs. PostgreSQL cleanup is an operator-only fixed-search-path routine executable by the migrator and reached through the static `PostgresTaskStore::cleanup_authorization_decisions(&PostgresStoreConfig, ...)` API.
 
 Cleanup is tenant-scoped and requires:
 
 - a retention horizon from 0 through 315,576,000,000 milliseconds;
 - a batch size from 1 through 1,000 rows;
 - source decision age at or before the database-time cutoff;
-- no non-terminal audit projection row for the source decision.
+- projection was explicitly disabled when the source was inserted, or terminal projection evidence exists.
 
-A projection row in `delivered` or `dead` state is terminal. An absent projection row means projection was disabled at insertion or its terminal row was already removed by projection retention. Pending or leased projection rows block source cleanup.
+A projection row in `delivered` or `dead` state is terminal. Revision 9 records `projection_required` at insert, so an absent row is safe only when projection was disabled then. Pending, leased, or missing required evidence blocks source cleanup. Generic projection retention preserves terminal authorization evidence while its source exists; operator cleanup deletes the terminal projection and source atomically.
 
 The maintenance API is an in-process operator boundary. It is not exposed as an A2A, REST, or JSON-RPC operation and must not be wired to caller-controlled tenant input without a separate administrative authorization policy.
 
@@ -35,8 +35,8 @@ When the limit is reached, authorization fails closed with no audit-table or acc
 Call cleanup repeatedly until `deleted` is zero:
 
 ```rust
-let result = store
-    .cleanup_authorization_decisions("tenant-a", retention_ms, 1_000)
+let result = PostgresTaskStore
+    ::cleanup_authorization_decisions(&postgres_config, "tenant-a", retention_ms, 1_000)
     .await?;
 ```
 
@@ -44,11 +44,11 @@ The result reports:
 
 - rows deleted in this call;
 - rows blocked by non-terminal projection;
-- remaining live rows;
+- whether another bounded batch can currently make progress;
 - oldest remaining decision time;
 - database-time cutoff.
 
-Per-tenant diagnostics retain run count, total deleted rows, last bounded batch, blocked count, live count, cutoff, and run time. Direct runtime access to diagnostics and source deletion remains denied.
+Per-tenant diagnostics retain run count, total deleted rows, last bounded batch, blocked count, `has_more`, oldest remaining time, cutoff, and run time. Counts and minima over the tenant relation are forbidden: candidates, projection probes, `has_more`, and oldest diagnostics are all bounded by batch limits or `LIMIT 1`. Direct runtime access remains denied.
 
 ## Scheduling
 
@@ -57,7 +57,7 @@ Revision 9 intentionally does not create an automatic scheduler. The deployment 
 - retention horizon: at least the organization audit requirement;
 - batch size: 1,000;
 - cadence: frequent enough that arrival rate multiplied by cadence cannot exceed the retained-row budget;
-- alert when repeated runs delete the maximum batch or `projection_blocked` remains non-zero.
+- continue while `has_more` is true; alert when repeated runs delete the maximum batch or `projection_blocked` remains non-zero.
 
 Do not shorten retention merely to satisfy storage pressure. Increase maintenance frequency or durable storage capacity instead.
 

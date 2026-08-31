@@ -281,6 +281,7 @@ const EXPECTED_CUSTOM_INDEXES: &[&str] = &[
     "audit_projection_claim",
     "audit_projection_tenant_claim",
     "authorization_decisions_actor_time",
+    "authorization_decisions_projection_source",
     "authorization_decisions_resource_time",
     "authorization_decisions_tenant_time",
     "callback_audits_tenant_time",
@@ -334,7 +335,8 @@ const EXPECTED_CUSTOM_INDEXES: &[&str] = &[
 pub struct AuthorizationAuditCleanup {
     pub deleted: u64,
     pub projection_blocked: u64,
-    pub live_rows: u64,
+    /// True when at least one cutoff-eligible source row remains after this batch.
+    pub has_more: bool,
     pub oldest_remaining: Option<i64>,
     pub cutoff: i64,
 }
@@ -5145,7 +5147,11 @@ async fn migrate(
             .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
         tx.batch_execute(&sql)
             .await
+            .inspect_err(|error| {
+                eprintln!("smesh.postgres.migration_failed revision=9 error={error:?}");
+            })
             .map_err(|_| PostgresStoreError::Initialization)?;
+        reconcile_callback_retained_usage(&tx, schema).await?;
         tx.execute(
             &format!(
                 "INSERT INTO {schema}.schema_migrations VALUES(9,9,$1,$2,{schema}.db_millis())"
@@ -5860,6 +5866,7 @@ async fn validate_catalog(
             "fail_audit_projection",
             "finish_callback_delivery",
             "gc_quota_authority_bounded",
+            "mark_authorization_projection_requirement",
             "record_callback_audit",
             "register_audit_projection_session",
             "register_callback_worker_session",
@@ -7082,11 +7089,59 @@ impl crate::CallbackAuthority for PostgresTaskStore {
     }
 }
 
+async fn run_authorization_retention_operator(
+    client: &mut tokio_postgres::Client,
+    config: &PostgresStoreConfig,
+    tenant_scope: &str,
+    retention_ms: i64,
+    limit: usize,
+) -> Result<AuthorizationAuditCleanup, A2AError> {
+    // ALLOWLIST: operator-only bounded authorization retention transaction.
+    validate_catalog(client, &config.schema)
+        .await
+        .map_err(|_| A2AError::internal("authorization retention catalog invalid"))?;
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|_| A2AError::internal("authorization retention transaction failed"))?;
+    tx.batch_execute("SET LOCAL statement_timeout='15s'; SET LOCAL lock_timeout='5s'")
+        .await
+        .map_err(|_| A2AError::internal("authorization retention transaction failed"))?;
+    let row = tx
+        .query_one(
+            &format!(
+                "SELECT * FROM {}.cleanup_authorization_decisions($1,$2,$3)",
+                config.schema
+            ),
+            &[
+                &tenant_scope,
+                &retention_ms,
+                &i32::try_from(limit).unwrap_or(1_000),
+            ],
+        )
+        .await
+        .map_err(|_| A2AError::internal("authorization retention cleanup failed"))?;
+    let result = AuthorizationAuditCleanup {
+        deleted: u64::try_from(row.get::<_, i64>(0)).unwrap_or(0),
+        projection_blocked: u64::try_from(row.get::<_, i64>(1)).unwrap_or(0),
+        has_more: row.get(2),
+        oldest_remaining: row.get(3),
+        cutoff: row.get(4),
+    };
+    tx.commit()
+        .await
+        .map_err(|_| A2AError::internal("authorization retention commit failed"))?;
+    Ok(result)
+}
+
 impl PostgresTaskStore {
-    /// Deletes one bounded tenant-local batch outside the live audit window.
-    /// Decisions with a non-terminal durable projection remain immutable.
+    /// Deletes one bounded tenant batch through the migrator-only operator boundary.
+    ///
+    /// This is an operator boundary, not a method on a shared runtime store. A
+    /// projection-required decision is removed only with terminal projection
+    /// evidence, and both rows are deleted in the same transaction.
     pub async fn cleanup_authorization_decisions(
-        &self,
+        config: &PostgresStoreConfig,
         tenant_scope: &str,
         retention_ms: i64,
         limit: usize,
@@ -7099,31 +7154,55 @@ impl PostgresTaskStore {
                 "invalid authorization retention cleanup",
             ));
         }
-        let tenant = tenant_scope.to_owned();
-        self.run_retryable_transaction(&tenant, None, |store, tx| {
-            Box::pin(async move {
-                let row = tx
-                    .query_one(
-                        &store.q("SELECT * FROM __S__.cleanup_authorization_decisions($1,$2)"),
-                        &[&retention_ms, &i32::try_from(limit).unwrap_or(1_000)],
-                    )
+        let insecure = validate_tls(config)
+            .map_err(|_| A2AError::internal("authorization retention configuration invalid"))?;
+        let pg = tokio_postgres::Config::from_str(&config.migrator_url)
+            .map_err(|_| A2AError::internal("authorization retention configuration invalid"))?;
+        if insecure {
+            let (mut client, connection) =
+                tokio::time::timeout(config.connect_timeout, pg.connect(NoTls))
                     .await
-                    .map_err(|error| {
-                        Self::transaction_body_error(
-                            &error,
-                            A2AError::internal("authorization retention cleanup failed"),
-                        )
-                    })?;
-                Ok(AuthorizationAuditCleanup {
-                    deleted: u64::try_from(row.get::<_, i64>(0)).unwrap_or(0),
-                    projection_blocked: u64::try_from(row.get::<_, i64>(1)).unwrap_or(0),
-                    live_rows: u64::try_from(row.get::<_, i64>(2)).unwrap_or(0),
-                    oldest_remaining: row.get(3),
-                    cutoff: row.get(4),
-                })
-            })
-        })
-        .await
+                    .map_err(|_| {
+                        A2AError::internal("authorization retention connection timed out")
+                    })?
+                    .map_err(|_| A2AError::internal("authorization retention connection failed"))?;
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let result = run_authorization_retention_operator(
+                &mut client,
+                config,
+                tenant_scope,
+                retention_ms,
+                limit,
+            )
+            .await;
+            driver.abort();
+            result
+        } else {
+            let connector = native_tls_connector()
+                .map_err(|_| A2AError::internal("authorization retention TLS invalid"))?;
+            let (mut client, connection) =
+                tokio::time::timeout(config.connect_timeout, pg.connect(connector))
+                    .await
+                    .map_err(|_| {
+                        A2AError::internal("authorization retention connection timed out")
+                    })?
+                    .map_err(|_| A2AError::internal("authorization retention connection failed"))?;
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let result = run_authorization_retention_operator(
+                &mut client,
+                config,
+                tenant_scope,
+                retention_ms,
+                limit,
+            )
+            .await;
+            driver.abort();
+            result
+        }
     }
 
     async fn finish_postgres_callback(

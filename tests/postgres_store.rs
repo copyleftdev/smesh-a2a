@@ -656,7 +656,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
     let source = include_str!("../src/postgres_store.rs");
     assert_eq!(
         source.matches(".transaction()").count() + source.matches(".build_transaction()").count(),
-        16,
+        17,
         "new direct transaction site must be routed through the bounded runner or explicitly reviewed"
     );
     assert_eq!(
@@ -680,6 +680,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
         "artifact orphan claim persists before unlink",
         "artifact orphan finalize fences exact ownership",
         "read-only tenant/key-generation snapshot before atomic reload",
+        "operator-only bounded authorization retention transaction",
     ] {
         assert!(
             source.contains(reason),
