@@ -400,3 +400,37 @@ Superseding SHA-256 values:
 - `tests/callback_authority.rs` — `4f4156168d17a78172e7ea4fff68d7fd065908cacb3a56c6f88a058a0caae11e`
 - `tests/postgres_push_process.rs` — `700538eb6bbb8a1b774d2174725df4d49996c1164f94581a14fbc89a60dd49eb`
 - `tests/artifact_migration.rs` — `2b714a5a60c9fd6ee4408715df7596b9ad937862e3fb6d18660004847db0a3c9`
+
+## Active-policy and restart validation closure — 2026-08-30
+
+The final two PR review findings are closed on both durable backends:
+
+- PostgreSQL restore contention maps only SQLSTATE `55P03` to `ArtifactMigrationBusy`; query cancellation (`57014`) remains `Unavailable`.
+- Standalone and inline callback enrollment creation use one active-enrollment predicate that requires the process policy ID/revision to equal the latest durable policy revision.
+- A shared PostgreSQL advisory transaction fence serializes policy installation with standalone and inline callback creation; concurrent same-policy openers are idempotent.
+- Overlapping PostgreSQL replicas and an externally advanced SQLite policy prove stale processes cannot resolve or create against historical enrollments.
+- PostgreSQL callback catalog validation checks task ownership tenant-by-tenant under forced RLS instead of granting global task visibility.
+- Append-only PostgreSQL revision 8 preserves the exact published revision-7 checksum, validates the sealed revision-7 catalog before DDL, transactionally rebaselines retained tenant/account/principal counters under the corrected attribution, adds bounded callback scope enumeration, and explicitly closes oracle privileges.
+- Failure-safe schema cleanup covers the new PostgreSQL regression, and missing callback-only principal counters fail startup.
+
+Focused live PostgreSQL evidence:
+
+- callback authority: **23/23 passed** with PostgreSQL required;
+- PostgreSQL store: **62/62 passed** with PostgreSQL required;
+- PostgreSQL callback crash/failover process restart regression: **passed**;
+- exact revision-7 to revision-8 upgrade probe using the pushed `c682f31` tree with a callback config, delivery, completed attempt, and callback-only principal: **passed** with post-upgrade counter parity and reopen;
+- exact active-policy PostgreSQL and SQLite stale-replica regressions: **passed**;
+- exact restore SQLSTATE regression: **passed**;
+- format, Clippy (`-D warnings`), and diff hygiene: **passed**.
+
+Superseding SHA-256 values:
+
+- `migrations/postgres/0007_callback_authority.sql` — `1a7554355a426d933acc7cf7eb87af0b03e3fa919222b9699a387d60d844a65b`
+- `migrations/postgres/0008_callback_policy_fence.sql` — `7a981d11fbe81d34745adeb44ad69d43d1cd667e96614f96b60a867b469325c2`
+- `src/artifact_restore_executor.rs` — `2ced8e8e3b875cde2b777b14623a368649439946b0ca9576b7e42e8920b9eaba`
+- `src/postgres_store.rs` — `59344b2721399d5116b3214a769ab22efddd537857cb409dbe8b85083f336fee`
+- `src/sqlite_store.rs` — `8cf389b61aff5b647b11eae23bb2ca52a0456fe92b414e7494d46f8abd5d17eb`
+- `tests/callback_authority.rs` — `75638bd0dea3f9f9a8a7a874a4521ad9b05705a1b43e2b2bdc167e2549c9f0fd`
+- `tests/postgres_push_process.rs` — `133555a67899ee813fd0a08431917557ebde7b23b67b2be209fa2b3deedd1d62`
+- `tests/postgres_store.rs` — `78183b6ef72412b3859f9c0f2fde7b8af78dd17c3e55755134a559d57f7d1354`
+- `tests/artifact_migration.rs` — `96f046bf58b9d374dd490f5e80b1e0e0dffc04f8bd038da7ba06074b5b5e1e3a`

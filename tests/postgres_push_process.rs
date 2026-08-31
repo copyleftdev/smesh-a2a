@@ -36,7 +36,7 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject as _},
 };
 use smesh_a2a::{
-    PostgresStoreConfig, PostgresTaskStore, QuotaPolicy,
+    AuthorityShutdown, PostgresStoreConfig, PostgresTaskStore, QuotaPolicy,
     push::{CallbackSigner, PushPolicy},
 };
 use tokio_rustls::TlsAcceptor;
@@ -801,6 +801,13 @@ mtls_key_file = "{}"
         let active_sessions: i64 = db.query_one(&format!("SELECT count(*) FROM {schema}.callback_worker_sessions s JOIN pg_stat_activity a ON a.pid=s.backend_pid"), &[]).await.unwrap().get(0);
         assert_eq!(active_sessions, 0, "graceful shutdown must release callback worker sessions");
         drop(db); db_driver.abort(); let _ = db_driver.await;
+        let restart_config = PostgresStoreConfig::new(&admin, &runtime, &schema).unwrap()
+            .with_test_only_insecure_loopback(true)
+            .with_test_only_parent_managed_cleanup()
+            .with_quota_policy(Arc::new(QuotaPolicy::load(&quota).unwrap()))
+            .with_push_policy(PushPolicy::load(&push).unwrap());
+        let restarted = PostgresTaskStore::open(restart_config).await.unwrap();
+        restarted.shutdown().await.unwrap();
         schema_guard.cleanup().await;
 
         // Both primary gateways are now reaped and their telemetry owners have

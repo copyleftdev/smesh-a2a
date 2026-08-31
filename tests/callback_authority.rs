@@ -1,15 +1,20 @@
-use std::sync::Arc;
+use std::{
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
-use a2a::{Task, TaskState, TaskStatus};
+use a2a::{Message, Part, Role, SendMessageRequest, Task, TaskState, TaskStatus};
 use a2a_server::TaskStore;
 use async_trait::async_trait;
 use smesh_a2a::{
-    AuditProjectionAuthority, AuthorityCapabilities, AuthorityIdentity, CallbackAuthority,
+    AdmissionOutcome, AuditProjectionAuthority, AuthorityCapabilities, AuthorityIdentity,
+    AuthorityShutdown, AuthorizationAuditInput, AuthorizationDecisionEffect, CallbackAuthority,
     CallbackCapabilities, CallbackConfigId, CallbackConfigState, CallbackDeliveryCategory,
     CallbackDeliveryDisposition, CallbackDeliveryState, CallbackFailCommand, CallbackLease,
     CallbackPolicySnapshot, CallbackReadiness, ConfigCreateCommand, ConfigDeleteCommand,
     ConfigGetCommand, ConfigListCommand, ConfigPageSize, DeliveryClaimCommand, DeliveryFence,
-    LeaseDurationMillis, OwnedTaskScope, VisibilityScope,
+    InputLimits, LeaseDurationMillis, OwnedTaskScope, SendMessageAdmission, TaskAdmission,
+    VisibilityScope,
 };
 
 fn postgres_urls() -> Option<(String, String)> {
@@ -28,8 +33,45 @@ fn postgres_urls() -> Option<(String, String)> {
     Some((admin.ok()?, runtime.ok()?))
 }
 
+struct SchemaGuard(Option<smesh_a2a::PostgresStoreConfig>);
+const SCHEMA_GUARD_TIMEOUT: Duration = Duration::from_secs(20);
+
+impl SchemaGuard {
+    async fn cleanup(mut self) {
+        let config = self.0.take().expect("schema guard is armed");
+        tokio::time::timeout(
+            SCHEMA_GUARD_TIMEOUT,
+            smesh_a2a::PostgresTaskStore::drop_test_schema(&config),
+        )
+        .await
+        .expect("schema cleanup watchdog expired")
+        .unwrap();
+    }
+}
+
+impl Drop for SchemaGuard {
+    fn drop(&mut self) {
+        let Some(config) = self.0.take() else {
+            return;
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .and_then(|runtime| {
+                    runtime
+                        .block_on(smesh_a2a::PostgresTaskStore::drop_test_schema(&config))
+                        .map_err(std::io::Error::other)
+                });
+            let _ = sender.send(result);
+        });
+        let _ = receiver.recv_timeout(SCHEMA_GUARD_TIMEOUT);
+    }
+}
+
 #[tokio::test]
-async fn postgres_v7_enabled_policy_is_persisted_before_runtime_pool_and_exposed() {
+async fn postgres_v8_enabled_policy_is_persisted_before_runtime_pool_and_exposed() {
     let Some((admin, runtime)) = postgres_urls() else {
         return;
     };
@@ -48,6 +90,33 @@ async fn postgres_v7_enabled_policy_is_persisted_before_runtime_pool_and_exposed
         store.callback_policy_snapshot().unwrap().policy_digest(),
         enabled_policy().policy_digest()
     );
+}
+
+#[tokio::test]
+async fn postgres_concurrent_same_policy_openers_share_the_durable_fence() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let schema = format!("smesh_callback_concurrent_{:016x}", rand::random::<u64>());
+    let config = smesh_a2a::PostgresStoreConfig::new(&admin, &runtime, &schema)
+        .unwrap()
+        .with_test_only_insecure_loopback(true)
+        .with_test_only_parent_managed_cleanup()
+        .with_push_policy(enabled_policy());
+    let guard = SchemaGuard(Some(config.clone()));
+    let (first, second) = tokio::join!(
+        smesh_a2a::PostgresTaskStore::open(config.clone()),
+        smesh_a2a::PostgresTaskStore::open(config.clone())
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(
+        first.callback_policy_snapshot(),
+        second.callback_policy_snapshot()
+    );
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
+    guard.cleanup().await;
 }
 
 fn enabled_policy() -> smesh_a2a::push::PushPolicy {
@@ -215,6 +284,243 @@ async fn sqlite_higher_policy_removal_revokes_config_and_cancels_pending_atomica
         .unwrap();
     assert_eq!((state.as_str(), delivery.as_str()), ("revoked", "canceled"));
     drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn sqlite_active_policy_snapshot_hides_historical_enrollments_from_resolve_and_create() {
+    let root = std::env::temp_dir().join(format!(
+        "smesh-callback-active-policy-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = root.join("store.db");
+    let old_url = "https://example.com:443/events";
+    let old = versioned_policy(1, "endpoint", old_url, '1');
+    let store = smesh_a2a::SqliteTaskStore::open_with_push_policy(&path, 10, &old)
+        .await
+        .unwrap();
+    store
+        .create(Task {
+            id: "historical-task".into(),
+            context_id: "historical-context".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: Some(chrono::Utc::now()),
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        })
+        .await
+        .unwrap();
+    let scope = OwnedTaskScope::new(
+        "smesh-dev-only-tenant",
+        "smesh-dev-only-account",
+        VisibilityScope::Tenant,
+    )
+    .unwrap();
+    assert!(
+        store
+            .resolve_callback_enrollment(&scope, old_url)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    store
+        .create_callback_config(
+            ConfigCreateCommand::new(
+                scope.clone(),
+                "historical-task",
+                Some(CallbackConfigId::new("historical-config").unwrap()),
+                "endpoint",
+                1,
+                old_url,
+                smesh_a2a::content_digest(old_url.as_bytes()),
+                1,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(store);
+    let replacement_url = "https://replacement.example:443/events";
+    let replacement = versioned_policy(2, "replacement", replacement_url, '2');
+    let reopened = smesh_a2a::SqliteTaskStore::open_with_push_policy(&path, 10, &replacement)
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .get_callback_config(
+                ConfigGetCommand::new(
+                    scope.clone(),
+                    "historical-task",
+                    CallbackConfigId::new("historical-config").unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reopened
+            .resolve_callback_enrollment(&scope, old_url)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reopened
+            .resolve_callback_enrollment(&scope, replacement_url)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let historical_error = reopened
+        .create_callback_config(
+            ConfigCreateCommand::new(
+                scope.clone(),
+                "historical-task",
+                Some(CallbackConfigId::new("historical-recreate").unwrap()),
+                "endpoint",
+                1,
+                old_url,
+                smesh_a2a::content_digest(old_url.as_bytes()),
+                2,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    let unknown_error = reopened
+        .create_callback_config(
+            ConfigCreateCommand::new(
+                scope,
+                "historical-task",
+                Some(CallbackConfigId::new("unknown-create").unwrap()),
+                "never-enrolled",
+                1,
+                old_url,
+                smesh_a2a::content_digest(old_url.as_bytes()),
+                2,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(historical_error.code, a2a::error_code::INVALID_REQUEST);
+    assert_eq!(
+        (historical_error.code, historical_error.message),
+        (unknown_error.code, unknown_error.message)
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_stale_replica_is_fenced_by_newer_durable_policy_revision() {
+    let root = std::env::temp_dir().join(format!(
+        "smesh-callback-stale-replica-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = root.join("store.db");
+    let old_url = "https://example.com:443/events";
+    let old = versioned_policy(1, "endpoint", old_url, '1');
+    let store = smesh_a2a::SqliteTaskStore::open_with_push_policy(&path, 10, &old)
+        .await
+        .unwrap();
+    store
+        .create(Task {
+            id: "stale-task".into(),
+            context_id: "stale-context".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: Some(chrono::Utc::now()),
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        })
+        .await
+        .unwrap();
+    let scope = OwnedTaskScope::new(
+        "smesh-dev-only-tenant",
+        "smesh-dev-only-account",
+        VisibilityScope::Tenant,
+    )
+    .unwrap();
+    assert!(
+        store
+            .resolve_callback_enrollment(&scope, old_url)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let replacement = versioned_policy(
+        2,
+        "replacement",
+        "https://replacement.example:443/events",
+        '2',
+    );
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "INSERT INTO callback_policy_snapshots(policy_id,policy_revision,policy_digest,max_configs_per_task,max_configs_per_tenant,max_pending,max_payload_bytes,max_attempts,max_delivery_age_ms,created_at) VALUES(?1,?2,?3,?4,?5,?6,262144,?7,?8,2)",
+        rusqlite::params![
+            replacement.policy_id(),
+            i64::try_from(replacement.policy_revision()).unwrap(),
+            replacement.policy_digest(),
+            i64::from(replacement.max_configs_per_task()),
+            i64::from(replacement.max_configs_per_tenant()),
+            i64::from(replacement.max_pending()),
+            i64::from(replacement.max_attempts()),
+            i64::try_from(replacement.max_delivery_age_ms()).unwrap(),
+        ],
+    )
+    .unwrap();
+    drop(db);
+
+    assert!(
+        store
+            .resolve_callback_enrollment(&scope, old_url)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let error = store
+        .create_callback_config(
+            ConfigCreateCommand::new(
+                scope,
+                "stale-task",
+                Some(CallbackConfigId::new("stale-create").unwrap()),
+                "endpoint",
+                1,
+                old_url,
+                smesh_a2a::content_digest(old_url.as_bytes()),
+                2,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, a2a::error_code::INVALID_REQUEST);
+    drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -414,6 +720,241 @@ async fn sqlite_terminal_callback_fault_matrix_rolls_back_and_retries_exactly_on
             std::fs::remove_dir_all(root).unwrap();
         }
     }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn postgres_active_policy_snapshot_hides_historical_enrollments_from_resolve_and_create() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let schema = format!(
+        "smesh_callback_active_policy_{:016x}",
+        rand::random::<u64>()
+    );
+    let old_url = "https://example.com:443/events";
+    let old_config = smesh_a2a::PostgresStoreConfig::new(&admin, &runtime, &schema)
+        .unwrap()
+        .with_test_only_insecure_loopback(true)
+        .with_test_only_parent_managed_cleanup()
+        .with_push_policy(versioned_policy(1, "endpoint", old_url, '1'));
+    let schema_guard = SchemaGuard(Some(old_config.clone()));
+    let store = smesh_a2a::PostgresTaskStore::open(old_config.clone())
+        .await
+        .unwrap();
+    let scope = OwnedTaskScope::new_with_principal(
+        "smesh-dev-only-tenant",
+        "smesh-dev-only-account",
+        "callback-only-principal",
+        VisibilityScope::Tenant,
+    )
+    .unwrap();
+    let mut message = Message::new(Role::User, vec![Part::text("historical callback")]);
+    message.message_id = "historical-message".into();
+    let request = SendMessageRequest {
+        message: message.clone(),
+        configuration: None,
+        metadata: None,
+        tenant: None,
+    };
+    let task = Task {
+        id: "historical-task".into(),
+        context_id: "historical-context".into(),
+        status: TaskStatus {
+            state: TaskState::Submitted,
+            message: None,
+            timestamp: None,
+        },
+        artifacts: None,
+        history: Some(vec![message]),
+        metadata: None,
+    };
+    let outcome = store
+        .authorize_and_admit(
+            &scope,
+            SendMessageAdmission {
+                request,
+                streaming: false,
+                task: task.clone(),
+                original_result: a2a::SendMessageResponse::Task(task),
+                input_limits: InputLimits::default(),
+                now: 1,
+                max_attempts: 3,
+            },
+            AuthorizationAuditInput::new(
+                "decision-historical-task",
+                "smesh-dev-only-tenant",
+                "smesh-dev-only-account",
+                "test-policy",
+                1,
+                "sha256:test-policy",
+                "task.create",
+                AuthorizationDecisionEffect::Allow,
+                "policy_result",
+                "task",
+                "sha256:historical-task",
+                Some("historical-task".into()),
+                1,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AdmissionOutcome::Admitted(_)));
+    assert!(
+        store
+            .resolve_callback_enrollment(&scope, old_url)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    store
+        .create_callback_config(
+            ConfigCreateCommand::new(
+                scope.clone(),
+                "historical-task",
+                Some(CallbackConfigId::new("historical-config").unwrap()),
+                "endpoint",
+                1,
+                old_url,
+                smesh_a2a::content_digest(old_url.as_bytes()),
+                1,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let replacement_url = "https://replacement.example:443/events";
+    let replacement_config = smesh_a2a::PostgresStoreConfig::new(&admin, &runtime, &schema)
+        .unwrap()
+        .with_test_only_insecure_loopback(true)
+        .with_test_only_parent_managed_cleanup()
+        .with_push_policy(versioned_policy(2, "replacement", replacement_url, '2'));
+    let reopened = smesh_a2a::PostgresTaskStore::open(replacement_config.clone())
+        .await
+        .unwrap();
+    assert!(
+        store
+            .resolve_callback_enrollment(&scope, old_url)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let stale_replica_error = store
+        .create_callback_config(
+            ConfigCreateCommand::new(
+                scope.clone(),
+                "historical-task",
+                Some(CallbackConfigId::new("stale-replica-create").unwrap()),
+                "endpoint",
+                1,
+                old_url,
+                smesh_a2a::content_digest(old_url.as_bytes()),
+                2,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        reopened
+            .get_callback_config(
+                ConfigGetCommand::new(
+                    scope.clone(),
+                    "historical-task",
+                    CallbackConfigId::new("historical-config").unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reopened
+            .resolve_callback_enrollment(&scope, old_url)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reopened
+            .resolve_callback_enrollment(&scope, replacement_url)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let historical_error = reopened
+        .create_callback_config(
+            ConfigCreateCommand::new(
+                scope.clone(),
+                "historical-task",
+                Some(CallbackConfigId::new("historical-recreate").unwrap()),
+                "endpoint",
+                1,
+                old_url,
+                smesh_a2a::content_digest(old_url.as_bytes()),
+                2,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    let unknown_error = reopened
+        .create_callback_config(
+            ConfigCreateCommand::new(
+                scope,
+                "historical-task",
+                Some(CallbackConfigId::new("unknown-create").unwrap()),
+                "never-enrolled",
+                1,
+                old_url,
+                smesh_a2a::content_digest(old_url.as_bytes()),
+                2,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(historical_error.code, a2a::error_code::INVALID_REQUEST);
+    assert_eq!(
+        (stale_replica_error.code, stale_replica_error.message),
+        (unknown_error.code, unknown_error.message.clone())
+    );
+    assert_eq!(
+        (historical_error.code, historical_error.message),
+        (unknown_error.code, unknown_error.message)
+    );
+
+    reopened.shutdown().await.unwrap();
+    store.shutdown().await.unwrap();
+    let superuser =
+        std::env::var("SMESH_TEST_POSTGRES_SUPERUSER_URL").unwrap_or_else(|_| admin.clone());
+    let (tamper, connection) = tokio_postgres::connect(&superuser, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let driver = tokio::spawn(connection);
+    tamper
+        .batch_execute("SELECT set_config('smesh.internal_global','callback-worker-v1',false)")
+        .await
+        .unwrap();
+    tamper
+        .execute(
+            &format!("DELETE FROM {schema}.retained_authority_usage WHERE tenant_scope='smesh-dev-only-tenant' AND scope_kind='principal' AND scope_id='callback-only-principal'"),
+            &[],
+        )
+        .await
+        .unwrap();
+    drop(tamper);
+    driver.abort();
+    let _ = driver.await;
+    assert!(matches!(
+        smesh_a2a::PostgresTaskStore::open(replacement_config).await,
+        Err(smesh_a2a::PostgresStoreError::InvalidSchema)
+    ));
+    schema_guard.cleanup().await;
 }
 
 #[tokio::test]

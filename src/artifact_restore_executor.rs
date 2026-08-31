@@ -16,14 +16,34 @@ use std::{
 use tokio::io::AsyncWriteExt as _;
 use tokio_postgres::{Client, Transaction};
 
-fn restore_lock_error(error: &tokio_postgres::Error) -> PostgresStoreError {
-    if error
-        .code()
-        .is_some_and(|code| matches!(code.code(), "55P03" | "57014"))
-    {
+fn restore_lock_error_code(code: Option<&str>) -> PostgresStoreError {
+    if code == Some("55P03") {
         PostgresStoreError::ArtifactMigrationBusy
     } else {
         PostgresStoreError::Unavailable
+    }
+}
+
+fn restore_lock_error(error: &tokio_postgres::Error) -> PostgresStoreError {
+    restore_lock_error_code(error.code().map(tokio_postgres::error::SqlState::code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_lock_error_maps_only_lock_not_available_to_busy() {
+        assert!(matches!(
+            restore_lock_error_code(Some("55P03")),
+            PostgresStoreError::ArtifactMigrationBusy
+        ));
+        for code in [Some("57014"), Some("XX000"), None] {
+            assert!(matches!(
+                restore_lock_error_code(code),
+                PostgresStoreError::Unavailable
+            ));
+        }
     }
 }
 

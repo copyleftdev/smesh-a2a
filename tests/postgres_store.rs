@@ -50,6 +50,16 @@ macro_rules! postgres_test {
     };
 }
 
+#[test]
+fn callback_revision_seven_checksum_remains_immutable() {
+    assert_eq!(
+        smesh_a2a::content_digest(
+            include_str!("../migrations/postgres/0007_callback_authority.sql").as_bytes()
+        ),
+        "sha256:1a7554355a426d933acc7cf7eb87af0b03e3fa919222b9699a387d60d844a65b"
+    );
+}
+
 fn required_postgres_url(name: &str) -> String {
     env::var(name)
         .unwrap_or_else(|_| panic!("{name} is required by the PostgreSQL evidence harness"))

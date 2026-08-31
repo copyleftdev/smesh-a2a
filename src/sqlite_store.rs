@@ -59,6 +59,7 @@ const MAX_PAGE_TOKEN_BYTES: usize = 4096;
 const SNAPSHOT_TTL_MILLIS: i64 = 5 * 60 * 1_000;
 const MAX_ACTIVE_SNAPSHOTS: i64 = 128;
 const MAX_SNAPSHOT_BYTES: i64 = 64 * 1024 * 1024;
+const ACTIVE_CALLBACK_ENROLLMENT_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM callback_enrollments WHERE tenant_scope=?1 AND enrollment_id=?2 AND enrollment_generation=?3 AND canonical_url=?4 AND url_digest=?5 AND policy_id=?6 AND policy_revision=?7 AND policy_revision=(SELECT max(policy_revision) FROM callback_policy_snapshots))";
 type PageTokenRow = (Vec<u8>, i64, String, String, i64, i64, i64, i64, i64);
 type PersistedCallbackEnrollment = (
     String,
@@ -1453,6 +1454,7 @@ impl SqliteTaskStore {
                 .map_err(|_| A2AError::internal("failed to digest initial stream frame"))?,
         );
         let max_tasks = self.max_tasks;
+        let callback_policy = self.callback_policy.clone();
         self.run(move |connection| {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1532,7 +1534,9 @@ impl SqliteTaskStore {
                 )
                 .map_err(|_| A2AError::internal("atomic event append failed"))?;
             if let Some(intent)=callback_intent.as_ref() {
-                let enrolled:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM callback_enrollments WHERE tenant_scope=?1 AND enrollment_id=?2 AND enrollment_generation=?3 AND canonical_url=?4 AND url_digest=?5)",params![tenant_scope,intent.enrollment.enrollment_id(),i64::try_from(intent.enrollment.enrollment_generation()).unwrap_or(-1),intent.enrollment.canonical_url(),intent.enrollment.url_digest()],|r|r.get(0)).map_err(|_|A2AError::internal("inline callback enrollment lookup failed"))?;
+                let policy=callback_policy.as_ref().ok_or_else(A2AError::push_notification_not_supported)?;
+                let policy_revision=i64::try_from(policy.policy_revision()).map_err(|_|A2AError::internal("callback policy corrupt"))?;
+                let enrolled:bool=transaction.query_row(ACTIVE_CALLBACK_ENROLLMENT_EXISTS_SQL,params![tenant_scope,intent.enrollment.enrollment_id(),i64::try_from(intent.enrollment.enrollment_generation()).unwrap_or(-1),intent.enrollment.canonical_url(),intent.enrollment.url_digest(),policy.policy_id(),policy_revision],|r|r.get(0)).map_err(|_|A2AError::internal("inline callback enrollment lookup failed"))?;
                 if !enrolled{return Err(A2AError::invalid_params("callback enrollment is not authorized"));}
                 let max:i64=transaction.query_row("SELECT max_configs_per_task FROM callback_policy_snapshots ORDER BY policy_revision DESC LIMIT 1",[],|r|r.get(0)).map_err(|_|A2AError::internal("inline callback policy lookup failed"))?;let tenant_max:i64=transaction.query_row("SELECT max_configs_per_tenant FROM callback_policy_snapshots ORDER BY policy_revision DESC LIMIT 1",[],|r|r.get(0)).map_err(|_|A2AError::internal("inline callback tenant policy lookup failed"))?;let tenant_count:i64=transaction.query_row("SELECT COUNT(*) FROM callback_configs WHERE tenant_scope=?1 AND state<>'revoked'",params![tenant_scope],|r|r.get(0)).map_err(|_|A2AError::internal("inline callback tenant count failed"))?;if tenant_count>=tenant_max{return Err(A2AError::invalid_params("callback tenant config capacity reached"));}
                 let count:i64=transaction.query_row("SELECT COUNT(*) FROM callback_configs WHERE tenant_scope=?1 AND task_id=?2 AND state<>'revoked'",params![tenant_scope,task.id],|r|r.get(0)).map_err(|_|A2AError::internal("inline callback count failed"))?;
@@ -8139,14 +8143,18 @@ impl crate::CallbackAuthority for SqliteTaskStore {
         scope: &OwnedTaskScope,
         exact_url: &str,
     ) -> Result<Option<crate::CallbackEnrollmentBinding>, A2AError> {
-        if self.callback_policy.is_none() {
-            return Err(A2AError::push_notification_not_supported());
-        }
+        let policy = self
+            .callback_policy
+            .clone()
+            .ok_or_else(A2AError::push_notification_not_supported)?;
         let tenant = scope.tenant_scope.clone();
         let url = exact_url.to_owned();
+        let policy_id = policy.policy_id().to_owned();
+        let policy_revision = i64::try_from(policy.policy_revision())
+            .map_err(|_| A2AError::internal("callback policy corrupt"))?;
         self.run(move|c|{let row:Option<(String,i64,String)>=c.query_row(
-            "SELECT enrollment_id,enrollment_generation,url_digest FROM callback_enrollments WHERE tenant_scope=?1 AND canonical_url=?2 ORDER BY enrollment_generation DESC LIMIT 1",
-            params![tenant,url],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_|A2AError::internal("callback enrollment lookup failed"))?;
+            "SELECT enrollment_id,enrollment_generation,url_digest FROM callback_enrollments WHERE tenant_scope=?1 AND canonical_url=?2 AND policy_id=?3 AND policy_revision=?4 AND policy_revision=(SELECT max(policy_revision) FROM callback_policy_snapshots) ORDER BY enrollment_generation DESC LIMIT 1",
+            params![tenant,url,policy_id,policy_revision],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_|A2AError::internal("callback enrollment lookup failed"))?;
             row.map(|(id,g,d)|crate::CallbackEnrollmentBinding::new(id,u64::try_from(g).map_err(|_|A2AError::internal("callback enrollment corrupt"))?,url,d)).transpose()}).await
     }
 
@@ -8171,6 +8179,9 @@ impl crate::CallbackAuthority for SqliteTaskStore {
         let digest = command.url_digest().to_owned();
         let created = command.created_at();
         let authorization_audit = command.authorization_audit().cloned();
+        let policy_id = policy.policy_id().to_owned();
+        let policy_revision = i64::try_from(policy.policy_revision())
+            .map_err(|_| A2AError::internal("callback policy corrupt"))?;
         self.run(move |connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("callback config transaction failed"))?;
@@ -8180,8 +8191,8 @@ impl crate::CallbackAuthority for SqliteTaskStore {
             ).map_err(|_| A2AError::internal("callback parent lookup failed"))?;
             if !visible { return Err(A2AError::task_not_found("resource")); }
             let enrolled: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM callback_enrollments WHERE tenant_scope=?1 AND enrollment_id=?2 AND enrollment_generation=?3 AND canonical_url=?4 AND url_digest=?5)",
-                params![tenant,enrollment,generation,url,digest], |r| r.get(0),
+                ACTIVE_CALLBACK_ENROLLMENT_EXISTS_SQL,
+                params![tenant,enrollment,generation,url,digest,policy_id,policy_revision], |r| r.get(0),
             ).map_err(|_| A2AError::internal("callback enrollment lookup failed"))?;
             if !enrolled { return Err(A2AError::invalid_request("callback enrollment is not authorized")); }
             let config_id = supplied_id.unwrap_or_else(|| format!("callback-{}", &content_digest(&rand::random::<[u8;32]>())[7..39]));

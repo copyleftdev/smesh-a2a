@@ -1619,8 +1619,8 @@ async fn empty_backup_restore_is_sealed_retryable_and_requires_a_truly_empty_tar
     .expect("callback worker backend did not leave pg_stat_activity");
 
     // Callback policy/config authority is not represented in this backup format.
-    // Forced-RLS semantic validation sees these manually injected rows before
-    // the empty-target fence, and refusal preserves all protected state exactly.
+    // These rows are internally coherent, so semantic validation accepts them;
+    // the empty-target fence must then reject the occupied authority without mutation.
     let callback_digest = smesh_a2a::content_digest(b"restore-callback-policy");
     let callback_url_digest = smesh_a2a::content_digest(b"https://callback.invalid/restore");
     client
@@ -1642,7 +1642,7 @@ async fn empty_backup_restore_is_sealed_retryable_and_requires_a_truly_empty_tar
     assert!(
         matches!(
             callback_authority_restore,
-            Err(PostgresStoreError::InvalidSchema)
+            Err(PostgresStoreError::ArtifactRestoreTargetNotEmpty)
         ),
         "callback authority restore outcome: {callback_authority_restore:?}"
     );

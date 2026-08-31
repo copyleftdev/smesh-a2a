@@ -71,9 +71,14 @@ const AUDIT_PROJECTION_MIGRATION_NAME: &str = "0006_audit_projection";
 const CALLBACK_MIGRATION_SQL: &str =
     include_str!("../migrations/postgres/0007_callback_authority.sql");
 const CALLBACK_MIGRATION_NAME: &str = "0007_callback_authority";
+const CALLBACK_POLICY_FENCE_MIGRATION_SQL: &str =
+    include_str!("../migrations/postgres/0008_callback_policy_fence.sql");
+const CALLBACK_POLICY_FENCE_MIGRATION_NAME: &str = "0008_callback_policy_fence";
 const LOGICAL_SCHEMA_VERSION: i64 = 6;
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 const MAX_CONFIG_BYTES: usize = 4096;
+const ACTIVE_CALLBACK_ENROLLMENT_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM __S__.callback_enrollments WHERE tenant_scope=$1 AND enrollment_id=$2 AND enrollment_generation=$3 AND canonical_url=$4 AND url_digest=$5 AND policy_id=$6 AND policy_revision=$7 AND policy_revision=(SELECT max(policy_revision) FROM __S__.callback_policy_snapshots))";
+const CALLBACK_POLICY_FENCE_LOCK: i64 = 6_001_136_200_065;
 const PAGE_TOKEN_VERSION: i64 = 1;
 const PAGE_TOKEN_KEY_GENERATION: i64 = 1;
 const MAX_PAGE_TOKEN_BYTES: usize = 4096;
@@ -2193,7 +2198,7 @@ impl PostgresTaskStore {
             }
             let retained = validation
                 .query_one(
-                    &format!("SELECT COALESCE((SELECT retained_bytes FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='tenant' AND scope_id=$1),-1),{}.retained_authority_oracle($1,NULL)+{}.artifact_retained_oracle($1,NULL)", config.schema, config.schema, config.schema),
+                    &format!("SELECT COALESCE((SELECT retained_bytes FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='tenant' AND scope_id=$1),-1),{}.retained_authority_oracle($1,NULL)+{}.artifact_retained_oracle($1,NULL)+{}.callback_retained_oracle($1,NULL)", config.schema, config.schema, config.schema, config.schema),
                     &[&tenant],
                 )
                 .await
@@ -2207,7 +2212,7 @@ impl PostgresTaskStore {
             }
             let account_rows = validation
                 .query(
-                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_account_oracle($1,scopes.scope_id)+{}.artifact_retained_account_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'account') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='account') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='account' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema, config.schema),
+                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_account_oracle($1,scopes.scope_id)+{}.artifact_retained_account_oracle($1,scopes.scope_id)+{}.callback_retained_account_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'account') scope_id UNION SELECT DISTINCT {}.callback_retained_scopes_bounded($1,'account') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='account') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='account' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema, config.schema, config.schema, config.schema),
                     &[&tenant],
                 )
                 .await
@@ -2222,7 +2227,7 @@ impl PostgresTaskStore {
             }
             let principal_rows = validation
                 .query(
-                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_oracle($1,scopes.scope_id)+{}.artifact_retained_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'principal') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='principal') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='principal' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema, config.schema),
+                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_oracle($1,scopes.scope_id)+{}.artifact_retained_oracle($1,scopes.scope_id)+{}.callback_retained_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'principal') scope_id UNION SELECT DISTINCT {}.callback_retained_scopes_bounded($1,'principal') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='principal') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='principal' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema, config.schema, config.schema, config.schema),
                     &[&tenant],
                 )
                 .await
@@ -4022,32 +4027,65 @@ async fn reconcile_callback_policy(
         tx.batch_execute("SELECT set_config('smesh.internal_global','callback-worker-v1',true)")
             .await
             .map_err(|_| PostgresStoreError::Initialization)?;
-        tx.execute(&format!("INSERT INTO {schema}.callback_policy_snapshots VALUES($1,$2,$3,$4,$5,$6,262144,$7,$8,{schema}.db_millis())"), &[&policy.policy_id(),&revision,&policy.policy_digest(),&i32::from(policy.max_configs_per_task()),&i64::from(policy.max_configs_per_tenant()),&i64::from(policy.max_pending()),&i32::from(policy.max_attempts()),&i64::try_from(policy.max_delivery_age_ms()).map_err(|_|PostgresStoreError::InvalidConfig)?])
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&CALLBACK_POLICY_FENCE_LOCK],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        let locked_latest = tx.query_opt(&format!("SELECT policy_id,policy_revision,policy_digest,max_configs_per_task,max_configs_per_tenant,max_pending,max_payload_bytes,max_attempts,max_delivery_age_ms FROM {schema}.callback_policy_snapshots ORDER BY policy_revision DESC LIMIT 1"), &[])
+            .await.map_err(|_| PostgresStoreError::InvalidSchema)?;
+        let install = if let Some(row) = locked_latest {
+            let locked_revision: i64 = row.get(1);
+            if row.get::<_, &str>(0) != policy.policy_id() || locked_revision > revision {
+                return Err(PostgresStoreError::InvalidSchema);
+            }
+            if locked_revision == revision {
+                if row.get::<_, &str>(2) != policy.policy_digest()
+                    || row.get::<_, i32>(3) != i32::from(policy.max_configs_per_task())
+                    || row.get::<_, i64>(4) != i64::from(policy.max_configs_per_tenant())
+                    || row.get::<_, i64>(5) != i64::from(policy.max_pending())
+                    || row.get::<_, i32>(6) != 262_144
+                    || row.get::<_, i32>(7) != i32::from(policy.max_attempts())
+                    || row.get::<_, i64>(8)
+                        != i64::try_from(policy.max_delivery_age_ms()).unwrap_or(-1)
+                {
+                    return Err(PostgresStoreError::InvalidSchema);
+                }
+                false
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+        if install {
+            tx.execute(&format!("INSERT INTO {schema}.callback_policy_snapshots VALUES($1,$2,$3,$4,$5,$6,262144,$7,$8,{schema}.db_millis())"), &[&policy.policy_id(),&revision,&policy.policy_digest(),&i32::from(policy.max_configs_per_task()),&i64::from(policy.max_configs_per_tenant()),&i64::from(policy.max_pending()),&i32::from(policy.max_attempts()),&i64::try_from(policy.max_delivery_age_ms()).map_err(|_|PostgresStoreError::InvalidConfig)?])
             .await.map_err(|_| PostgresStoreError::Initialization)?;
-        for enrollment in policy.enrollments() {
-            let url = enrollment.url().as_str();
-            let url_digest = content_digest(url.as_bytes());
-            let secret = enrollment.secret_file().to_string_lossy().into_owned();
-            let ca = enrollment
-                .ca_file()
-                .map(|p| p.to_string_lossy().into_owned());
-            let cert = enrollment
-                .mtls_files()
-                .map(|v| v.0.to_string_lossy().into_owned());
-            let key = enrollment
-                .mtls_files()
-                .map(|v| v.1.to_string_lossy().into_owned());
-            tx.execute(&format!("INSERT INTO {schema}.callback_enrollments VALUES($1,$2,$3,$4,$2,$5,$6,$7,$8,$9,$10,$11)"), &[&policy.policy_id(),&revision,&enrollment.tenant(),&enrollment.endpoint_id(),&url,&url_digest,&enrollment.key_generation(),&secret,&ca,&cert,&key])
+            for enrollment in policy.enrollments() {
+                let url = enrollment.url().as_str();
+                let url_digest = content_digest(url.as_bytes());
+                let secret = enrollment.secret_file().to_string_lossy().into_owned();
+                let ca = enrollment
+                    .ca_file()
+                    .map(|p| p.to_string_lossy().into_owned());
+                let cert = enrollment
+                    .mtls_files()
+                    .map(|v| v.0.to_string_lossy().into_owned());
+                let key = enrollment
+                    .mtls_files()
+                    .map(|v| v.1.to_string_lossy().into_owned());
+                tx.execute(&format!("INSERT INTO {schema}.callback_enrollments VALUES($1,$2,$3,$4,$2,$5,$6,$7,$8,$9,$10,$11)"), &[&policy.policy_id(),&revision,&enrollment.tenant(),&enrollment.endpoint_id(),&url,&url_digest,&enrollment.key_generation(),&secret,&ca,&cert,&key])
                 .await.map_err(|_| PostgresStoreError::Initialization)?;
-        }
-        // A higher policy revision may remove or replace enrollments. Reconcile
-        // before startup can advertise readiness. Live leases are never revoked:
-        // they make startup fail until database-time expiry; all other retained
-        // work is atomically canceled and its config revoked.
-        let removed_predicate = format!(
-            "NOT EXISTS(SELECT 1 FROM {schema}.callback_enrollments n WHERE n.policy_id=$1 AND n.policy_revision=$2 AND n.tenant_scope=c.tenant_scope AND n.enrollment_id=c.enrollment_id AND n.enrollment_generation=c.enrollment_generation AND n.canonical_url=c.canonical_url)"
-        );
-        let active_removed_lease = tx
+            }
+            // A higher policy revision may remove or replace enrollments. Reconcile
+            // before startup can advertise readiness. Live leases are never revoked:
+            // they make startup fail until database-time expiry; all other retained
+            // work is atomically canceled and its config revoked.
+            let removed_predicate = format!(
+                "NOT EXISTS(SELECT 1 FROM {schema}.callback_enrollments n WHERE n.policy_id=$1 AND n.policy_revision=$2 AND n.tenant_scope=c.tenant_scope AND n.enrollment_id=c.enrollment_id AND n.enrollment_generation=c.enrollment_generation AND n.canonical_url=c.canonical_url)"
+            );
+            let active_removed_lease = tx
             .query_one(
                 &format!("SELECT EXISTS(SELECT 1 FROM {schema}.callback_configs c JOIN {schema}.callback_deliveries d USING(tenant_scope,task_id,config_id) WHERE {removed_predicate} AND d.state='leased' AND d.lease_until>{schema}.db_millis())"),
                 &[&policy.policy_id(), &revision],
@@ -4055,21 +4093,22 @@ async fn reconcile_callback_policy(
             .await
             .map_err(|_| PostgresStoreError::Initialization)?
             .get::<_, bool>(0);
-        if active_removed_lease {
-            return Err(PostgresStoreError::Initialization);
-        }
-        tx.execute(
+            if active_removed_lease {
+                return Err(PostgresStoreError::Initialization);
+            }
+            tx.execute(
             &format!("UPDATE {schema}.callback_deliveries d SET state='canceled',lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at={schema}.db_millis() FROM {schema}.callback_configs c WHERE d.tenant_scope=c.tenant_scope AND d.task_id=c.task_id AND d.config_id=c.config_id AND {removed_predicate} AND (d.state IN ('pending','retry') OR (d.state='leased' AND d.lease_until<={schema}.db_millis()))"),
             &[&policy.policy_id(), &revision],
         )
         .await
         .map_err(|_| PostgresStoreError::Initialization)?;
-        tx.execute(
+            tx.execute(
             &format!("UPDATE {schema}.callback_configs c SET state='revoked',updated_at={schema}.db_millis() WHERE {removed_predicate} AND c.state IN ('active','draining','terminal_closed')"),
             &[&policy.policy_id(), &revision],
         )
         .await
         .map_err(|_| PostgresStoreError::Initialization)?;
+        }
         tx.commit()
             .await
             .map_err(|_| PostgresStoreError::Initialization)?;
@@ -4425,6 +4464,188 @@ async fn validate_runtime_login(
         }
     }
     Ok(())
+}
+
+async fn callback_retained_oracle_total(
+    tx: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    tenant: &str,
+    scope_kind: &str,
+    scope_id: &str,
+) -> Result<i64, PostgresStoreError> {
+    let (base, artifact, callback, argument): (&str, &str, &str, Option<&str>) = match scope_kind {
+        "tenant" => (
+            "retained_authority_oracle",
+            "artifact_retained_oracle",
+            "callback_retained_oracle",
+            None,
+        ),
+        "account" => (
+            "retained_authority_account_oracle",
+            "artifact_retained_account_oracle",
+            "callback_retained_account_oracle",
+            Some(scope_id),
+        ),
+        "principal" => (
+            "retained_authority_oracle",
+            "artifact_retained_oracle",
+            "callback_retained_oracle",
+            Some(scope_id),
+        ),
+        _ => return Err(PostgresStoreError::InvalidSchema),
+    };
+    tx.batch_execute("SET LOCAL smesh.internal_global='diag-v1'")
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    let base: i64 = tx
+        .query_one(
+            &format!("SELECT {schema}.{base}($1,$2)"),
+            &[&tenant, &argument],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?
+        .get(0);
+    tx.batch_execute("SET LOCAL smesh.internal_global='claim-v1'")
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    let artifact: i64 = tx
+        .query_one(
+            &format!("SELECT {schema}.{artifact}($1,$2)"),
+            &[&tenant, &argument],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?
+        .get(0);
+    tx.batch_execute("SET LOCAL smesh.internal_global='callback-worker-v1'")
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    let callback: i64 = tx
+        .query_one(
+            &format!("SELECT {schema}.{callback}($1,$2)"),
+            &[&tenant, &argument],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?
+        .get(0);
+    base.checked_add(artifact)
+        .and_then(|value| value.checked_add(callback))
+        .ok_or(PostgresStoreError::InvalidSchema)
+}
+
+async fn reconcile_callback_retained_usage(
+    tx: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+) -> Result<(), PostgresStoreError> {
+    let tenants = tx
+        .query(
+            &format!("SELECT * FROM {schema}.authority_tenants_bounded()"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    for row in tenants {
+        let tenant: String = row.get(0);
+        tx.query_one(
+            "SELECT set_config('smesh.tenant_scope',$1,true)",
+            &[&tenant],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        let mut accounts = BTreeSet::new();
+        let mut principals = BTreeSet::new();
+        tx.batch_execute("SET LOCAL smesh.internal_global='diag-v1'")
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        for scope in tx
+            .query(
+                &format!("SELECT * FROM {schema}.authority_retained_scopes_bounded($1,'account')"),
+                &[&tenant],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?
+        {
+            accounts.insert(scope.get::<_, String>(0));
+        }
+        for scope in tx
+            .query(
+                &format!(
+                    "SELECT * FROM {schema}.authority_retained_scopes_bounded($1,'principal')"
+                ),
+                &[&tenant],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?
+        {
+            principals.insert(scope.get::<_, String>(0));
+        }
+        tx.batch_execute("SET LOCAL smesh.internal_global='callback-worker-v1'")
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        for scope in tx
+            .query(
+                &format!("SELECT * FROM {schema}.callback_retained_scopes_bounded($1,'account')"),
+                &[&tenant],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?
+        {
+            accounts.insert(scope.get::<_, String>(0));
+        }
+        for scope in tx
+            .query(
+                &format!("SELECT * FROM {schema}.callback_retained_scopes_bounded($1,'principal')"),
+                &[&tenant],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?
+        {
+            principals.insert(scope.get::<_, String>(0));
+        }
+        for row in tx
+            .query(
+                &format!("SELECT scope_kind,scope_id FROM {schema}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind IN ('account','principal')"),
+                &[&tenant],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?
+        {
+            match row.get::<_, &str>(0) {
+                "account" => {
+                    accounts.insert(row.get::<_, String>(1));
+                }
+                "principal" => {
+                    principals.insert(row.get::<_, String>(1));
+                }
+                _ => return Err(PostgresStoreError::InvalidSchema),
+            }
+        }
+        let upsert = format!(
+            "INSERT INTO {schema}.retained_authority_usage(tenant_scope,scope_kind,scope_id,retained_bytes,updated_at) VALUES($1,$2,$3,$4,{schema}.db_millis()) ON CONFLICT(tenant_scope,scope_kind,scope_id) DO UPDATE SET retained_bytes=EXCLUDED.retained_bytes,updated_at=EXCLUDED.updated_at"
+        );
+        let tenant_total =
+            callback_retained_oracle_total(tx, schema, &tenant, "tenant", &tenant).await?;
+        tx.execute(&upsert, &[&tenant, &"tenant", &tenant, &tenant_total])
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        for account in accounts {
+            let total =
+                callback_retained_oracle_total(tx, schema, &tenant, "account", &account).await?;
+            tx.execute(&upsert, &[&tenant, &"account", &account, &total])
+                .await
+                .map_err(|_| PostgresStoreError::Initialization)?;
+        }
+        for principal in principals {
+            let total =
+                callback_retained_oracle_total(tx, schema, &tenant, "principal", &principal)
+                    .await?;
+            tx.execute(&upsert, &[&tenant, &"principal", &principal, &total])
+                .await
+                .map_err(|_| PostgresStoreError::Initialization)?;
+        }
+    }
+    tx.batch_execute("SET LOCAL smesh.internal_global=''; SET LOCAL smesh.tenant_scope='' ")
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)
 }
 
 async fn migrate(
@@ -4792,9 +5013,7 @@ async fn migrate(
     let callback_row = tx.query_opt(&format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=7"), &[])
         .await.map_err(|_| PostgresStoreError::InvalidSchema)?;
     if let Some(row) = callback_row {
-        if row.get::<_, i64>(0) != CURRENT_SCHEMA_VERSION
-            || row.get::<_, String>(1) != callback_checksum
-        {
+        if row.get::<_, i64>(0) != 7 || row.get::<_, String>(1) != callback_checksum {
             return Err(PostgresStoreError::InvalidSchema);
         }
     } else {
@@ -4820,6 +5039,59 @@ async fn migrate(
         .await
         .map_err(|_| PostgresStoreError::Initialization)?;
         tx.execute(&format!("UPDATE {schema}.store_metadata SET schema_version=7,catalog_hash=$1 WHERE singleton=1"), &[&catalog])
+            .await.map_err(|_| PostgresStoreError::Initialization)?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    }
+    let callback_fence_checksum = content_digest(CALLBACK_POLICY_FENCE_MIGRATION_SQL.as_bytes());
+    let callback_fence_row = tx.query_opt(&format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=8"), &[])
+        .await.map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if let Some(row) = callback_fence_row {
+        if row.get::<_, i64>(0) != CURRENT_SCHEMA_VERSION
+            || row.get::<_, String>(1) != callback_fence_checksum
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    } else {
+        let metadata = tx
+            .query_one(
+                &format!("SELECT schema_version,catalog_hash FROM {schema}.store_metadata WHERE singleton=1"),
+                &[],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        let sealed_catalog: String = metadata.get(1);
+        if metadata.get::<_, i64>(0) != 7 || sealed_catalog != catalog_digest(&tx, schema).await? {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+        let sql = CALLBACK_POLICY_FENCE_MIGRATION_SQL
+            .replace("__SCHEMA__", schema)
+            .replace("__ROLE__", &format!("{schema}_runtime"));
+        tx.batch_execute(&sql)
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        reconcile_callback_retained_usage(&tx, schema).await?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {schema}.schema_migrations VALUES(8,8,$1,$2,{schema}.db_millis())"
+            ),
+            &[
+                &CALLBACK_POLICY_FENCE_MIGRATION_NAME,
+                &callback_fence_checksum,
+            ],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        let catalog = catalog_digest(&tx, schema).await?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata DISABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(&format!("UPDATE {schema}.store_metadata SET schema_version=8,catalog_hash=$1 WHERE singleton=1"), &[&catalog])
             .await.map_err(|_| PostgresStoreError::Initialization)?;
         tx.batch_execute(&format!(
             "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
@@ -5358,6 +5630,46 @@ async fn validate_callback_semantics(
         )
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
     }
+    let callback_tenants = tx
+        .query(
+            &format!(
+                "SELECT DISTINCT tenant_scope FROM {schema}.callback_configs ORDER BY tenant_scope"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    for row in callback_tenants {
+        let tenant: String = row.get(0);
+        tx.execute(
+            "SELECT set_config('smesh.tenant_scope',$1,true)",
+            &[&tenant],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        let invalid_task_owner: i64 = tx
+            .query_one(
+                &format!(
+                    "SELECT
+                     (SELECT count(*) FROM {schema}.callback_configs c
+                        LEFT JOIN {schema}.tasks t ON t.tenant_scope=c.tenant_scope AND t.task_id=c.task_id
+                       WHERE c.tenant_scope=$1 AND (t.task_id IS NULL OR c.owner_account_id<>t.owner_account_id))
+                     +(SELECT count(*) FROM {schema}.callback_events e
+                        LEFT JOIN {schema}.tasks t ON t.tenant_scope=e.tenant_scope AND t.task_id=e.task_id
+                       WHERE e.tenant_scope=$1 AND t.task_id IS NULL)"
+                ),
+                &[&tenant],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?
+            .get(0);
+        if invalid_task_owner != 0 {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    }
+    tx.batch_execute("SET LOCAL smesh.tenant_scope=''")
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
     let invalid: i64 = tx
         .query_one(
             &format!(
@@ -5367,13 +5679,10 @@ async fn validate_callback_semantics(
                    WHERE p.policy_id IS NULL OR p.policy_digest IS NULL OR e.enrollment_generation<>e.policy_revision
                       OR e.url_digest<>'sha256:'||encode(sha256(convert_to(e.canonical_url,'UTF8')),'hex'))
                  +(SELECT count(*) FROM {schema}.callback_configs c
-                    LEFT JOIN {schema}.tasks t ON t.tenant_scope=c.tenant_scope AND t.task_id=c.task_id
                     LEFT JOIN {schema}.callback_enrollments e ON e.tenant_scope=c.tenant_scope AND e.enrollment_id=c.enrollment_id AND e.enrollment_generation=c.enrollment_generation
-                   WHERE t.task_id IS NULL OR e.enrollment_id IS NULL OR c.owner_account_id<>t.owner_account_id
-                      OR c.canonical_url<>e.canonical_url OR c.url_digest<>e.url_digest)
+                   WHERE e.enrollment_id IS NULL OR c.canonical_url<>e.canonical_url OR c.url_digest<>e.url_digest)
                  +(SELECT count(*) FROM {schema}.callback_events e
-                    LEFT JOIN {schema}.tasks t ON t.tenant_scope=e.tenant_scope AND t.task_id=e.task_id
-                   WHERE t.task_id IS NULL OR e.payload_digest<>'sha256:'||encode(sha256(e.payload),'hex')
+                   WHERE e.payload_digest<>'sha256:'||encode(sha256(e.payload),'hex')
                       OR e.created_at<=0 OR e.expires_at<e.created_at)
                  +(SELECT count(*) FROM {schema}.callback_deliveries d
                     LEFT JOIN {schema}.callback_events e ON e.tenant_scope=d.tenant_scope AND e.event_id=d.event_id
@@ -5580,6 +5889,11 @@ async fn validate_catalog(
             CALLBACK_MIGRATION_NAME,
             content_digest(CALLBACK_MIGRATION_SQL.as_bytes()),
         ),
+        (
+            8_i64,
+            CALLBACK_POLICY_FENCE_MIGRATION_NAME,
+            content_digest(CALLBACK_POLICY_FENCE_MIGRATION_SQL.as_bytes()),
+        ),
     ];
     if migration_rows.len() != expected_migrations.len()
         || migration_rows
@@ -5588,10 +5902,10 @@ async fn validate_catalog(
             .any(|(row, expected)| {
                 row.get::<_, i64>(0) != expected.0
                     || row.get::<_, i64>(1)
-                        != if expected.0 == 7 {
-                            CURRENT_SCHEMA_VERSION
-                        } else {
-                            LOGICAL_SCHEMA_VERSION
+                        != match expected.0 {
+                            7 => 7,
+                            8 => CURRENT_SCHEMA_VERSION,
+                            _ => LOGICAL_SCHEMA_VERSION,
                         }
                     || row.get::<_, &str>(2) != expected.1
                     || row.get::<_, &str>(3) != expected.2
@@ -6454,12 +6768,16 @@ impl crate::CallbackAuthority for PostgresTaskStore {
         scope: &OwnedTaskScope,
         exact_url: &str,
     ) -> Result<Option<crate::CallbackEnrollmentBinding>, A2AError> {
-        if self.callback_policy.is_none() {
-            return Err(A2AError::push_notification_not_supported());
-        }
+        let policy = self
+            .callback_policy
+            .clone()
+            .ok_or_else(A2AError::push_notification_not_supported)?;
         let tenant = scope.tenant_scope.clone();
         let url = exact_url.to_owned();
-        self.run_retryable_transaction(&tenant,None,|store,tx|{let tenant=tenant.clone();let url=url.clone();Box::pin(async move{let q=store.q("SELECT enrollment_id,enrollment_generation,url_digest FROM __S__.callback_enrollments WHERE tenant_scope=$1 AND canonical_url=$2 ORDER BY enrollment_generation DESC LIMIT 1");let row=tx.query_opt(&q,&[&tenant,&url]).await.map_err(|_|A2AError::internal("callback enrollment lookup failed"))?;row.map(|r|crate::CallbackEnrollmentBinding::new(r.get::<_,String>(0),u64::try_from(r.get::<_,i64>(1)).map_err(|_|A2AError::internal("callback enrollment corrupt"))?,url,r.get::<_,String>(2))).transpose()})}).await
+        let policy_id = policy.policy_id().to_owned();
+        let policy_revision = i64::try_from(policy.policy_revision())
+            .map_err(|_| A2AError::internal("callback policy corrupt"))?;
+        self.run_retryable_transaction(&tenant,None,|store,tx|{let tenant=tenant.clone();let url=url.clone();let policy_id=policy_id.clone();Box::pin(async move{let q=store.q("SELECT enrollment_id,enrollment_generation,url_digest FROM __S__.callback_enrollments WHERE tenant_scope=$1 AND canonical_url=$2 AND policy_id=$3 AND policy_revision=$4 AND policy_revision=(SELECT max(policy_revision) FROM __S__.callback_policy_snapshots) ORDER BY enrollment_generation DESC LIMIT 1");let row=tx.query_opt(&q,&[&tenant,&url,&policy_id,&policy_revision]).await.map_err(|_|A2AError::internal("callback enrollment lookup failed"))?;row.map(|r|crate::CallbackEnrollmentBinding::new(r.get::<_,String>(0),u64::try_from(r.get::<_,i64>(1)).map_err(|_|A2AError::internal("callback enrollment corrupt"))?,url,r.get::<_,String>(2))).transpose()})}).await
     }
     async fn create_callback_config(
         &self,
@@ -6490,7 +6808,10 @@ impl crate::CallbackAuthority for PostgresTaskStore {
         let digest = command.url_digest().to_owned();
         let created = command.created_at();
         let authorization_audit = command.authorization_audit().cloned();
-        self.run_retryable_transaction(&tenant,Some(&owner),|store,tx|{let tenant=tenant.clone();let owner=owner.clone();let principal=principal.clone();let task=task.clone();let id=id.clone();let enrollment=enrollment.clone();let url=url.clone();let digest=digest.clone();let policy=policy.clone();let authorization_audit=authorization_audit.clone();Box::pin(async move{let visible=store.q("SELECT EXISTS(SELECT 1 FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 AND (NOT $3 OR owner_account_id=$4) AND state NOT IN ('\"TASK_STATE_COMPLETED\"','\"TASK_STATE_FAILED\"','\"TASK_STATE_CANCELED\"','\"TASK_STATE_REJECTED\"'))");if !tx.query_one(&visible,&[&tenant,&task,&own,&owner]).await.map_err(|_|A2AError::internal("callback parent lookup failed"))?.get::<_,bool>(0){return Err(A2AError::task_not_found("resource"));}let enrolled=store.q("SELECT EXISTS(SELECT 1 FROM __S__.callback_enrollments WHERE tenant_scope=$1 AND enrollment_id=$2 AND enrollment_generation=$3 AND canonical_url=$4 AND url_digest=$5)");if !tx.query_one(&enrolled,&[&tenant,&enrollment,&generation,&url,&digest]).await.map_err(|_|A2AError::internal("callback enrollment lookup failed"))?.get::<_,bool>(0){return Err(A2AError::invalid_request("callback enrollment is not authorized"));}let lookup=store.q("SELECT config_id,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at FROM __S__.callback_configs WHERE tenant_scope=$1 AND task_id=$2 AND config_id=$3");if let Some(row)=tx.query_opt(&lookup,&[&tenant,&task,&id]).await.map_err(|_|A2AError::internal("callback idempotency lookup failed"))?{if row.get::<_,&str>(1)!=enrollment||row.get::<_,i64>(2)!=generation||row.get::<_,&str>(3)!=url||row.get::<_,&str>(4)!=digest{return Err(A2AError::invalid_request("callback config id is already bound to different semantics"));}let config=postgres_callback_config(&row,&tenant,&task)?;if let Some(audit)=authorization_audit.clone(){store.insert_audit(tx,audit).await?;}return Ok(config);}let scheduler_lock=store.q("SELECT pg_advisory_xact_lock(hashtextextended($1,17))");tx.query_one(&scheduler_lock,&[&tenant]).await.map_err(|_|A2AError::internal("callback tenant capacity lock failed"))?;let tenant_count=store.q("SELECT count(*) FROM __S__.callback_configs WHERE tenant_scope=$1 AND state<>'revoked'");if tx.query_one(&tenant_count,&[&tenant]).await.map_err(|_|A2AError::internal("callback tenant config count failed"))?.get::<_,i64>(0)>=i64::from(policy.max_configs_per_tenant()){return Err(A2AError::invalid_params("callback tenant config capacity reached"));}let count=store.q("SELECT count(*) FROM __S__.callback_configs WHERE tenant_scope=$1 AND task_id=$2 AND state<>'revoked'");if tx.query_one(&count,&[&tenant,&task]).await.map_err(|_|A2AError::internal("callback config count failed"))?.get::<_,i64>(0)>=i64::from(policy.max_configs_per_task()){return Err(A2AError::invalid_request("callback config capacity reached"));}let insert=store.q("INSERT INTO __S__.callback_configs(tenant_scope,task_id,config_id,owner_account_id,principal_scope,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$10) RETURNING config_id,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at");let row=tx.query_one(&insert,&[&tenant,&task,&id,&owner,&principal,&enrollment,&generation,&url,&digest,&created]).await.map_err(|_|A2AError::internal("callback config insert failed"))?;let config=postgres_callback_config(&row,&tenant,&task)?;if let Some(audit)=authorization_audit{store.insert_audit(tx,audit).await?;}Ok(config)})}).await
+        let policy_id = policy.policy_id().to_owned();
+        let policy_revision = i64::try_from(policy.policy_revision())
+            .map_err(|_| A2AError::internal("callback policy corrupt"))?;
+        self.run_retryable_transaction(&tenant,Some(&owner),|store,tx|{let tenant=tenant.clone();let owner=owner.clone();let principal=principal.clone();let task=task.clone();let id=id.clone();let enrollment=enrollment.clone();let url=url.clone();let digest=digest.clone();let policy=policy.clone();let policy_id=policy_id.clone();let authorization_audit=authorization_audit.clone();Box::pin(async move{tx.query_one("SELECT pg_advisory_xact_lock($1)",&[&CALLBACK_POLICY_FENCE_LOCK]).await.map_err(|_|A2AError::internal("callback policy fence failed"))?;let visible=store.q("SELECT EXISTS(SELECT 1 FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 AND (NOT $3 OR owner_account_id=$4) AND state NOT IN ('\"TASK_STATE_COMPLETED\"','\"TASK_STATE_FAILED\"','\"TASK_STATE_CANCELED\"','\"TASK_STATE_REJECTED\"'))");if !tx.query_one(&visible,&[&tenant,&task,&own,&owner]).await.map_err(|_|A2AError::internal("callback parent lookup failed"))?.get::<_,bool>(0){return Err(A2AError::task_not_found("resource"));}let enrolled=store.q(ACTIVE_CALLBACK_ENROLLMENT_EXISTS_SQL);if !tx.query_one(&enrolled,&[&tenant,&enrollment,&generation,&url,&digest,&policy_id,&policy_revision]).await.map_err(|_|A2AError::internal("callback enrollment lookup failed"))?.get::<_,bool>(0){return Err(A2AError::invalid_request("callback enrollment is not authorized"));}let lookup=store.q("SELECT config_id,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at FROM __S__.callback_configs WHERE tenant_scope=$1 AND task_id=$2 AND config_id=$3");if let Some(row)=tx.query_opt(&lookup,&[&tenant,&task,&id]).await.map_err(|_|A2AError::internal("callback idempotency lookup failed"))?{if row.get::<_,&str>(1)!=enrollment||row.get::<_,i64>(2)!=generation||row.get::<_,&str>(3)!=url||row.get::<_,&str>(4)!=digest{return Err(A2AError::invalid_request("callback config id is already bound to different semantics"));}let config=postgres_callback_config(&row,&tenant,&task)?;if let Some(audit)=authorization_audit.clone(){store.insert_audit(tx,audit).await?;}return Ok(config);}let scheduler_lock=store.q("SELECT pg_advisory_xact_lock(hashtextextended($1,17))");tx.query_one(&scheduler_lock,&[&tenant]).await.map_err(|_|A2AError::internal("callback tenant capacity lock failed"))?;let tenant_count=store.q("SELECT count(*) FROM __S__.callback_configs WHERE tenant_scope=$1 AND state<>'revoked'");if tx.query_one(&tenant_count,&[&tenant]).await.map_err(|_|A2AError::internal("callback tenant config count failed"))?.get::<_,i64>(0)>=i64::from(policy.max_configs_per_tenant()){return Err(A2AError::invalid_params("callback tenant config capacity reached"));}let count=store.q("SELECT count(*) FROM __S__.callback_configs WHERE tenant_scope=$1 AND task_id=$2 AND state<>'revoked'");if tx.query_one(&count,&[&tenant,&task]).await.map_err(|_|A2AError::internal("callback config count failed"))?.get::<_,i64>(0)>=i64::from(policy.max_configs_per_task()){return Err(A2AError::invalid_request("callback config capacity reached"));}let insert=store.q("INSERT INTO __S__.callback_configs(tenant_scope,task_id,config_id,owner_account_id,principal_scope,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$10) RETURNING config_id,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at");let row=tx.query_one(&insert,&[&tenant,&task,&id,&owner,&principal,&enrollment,&generation,&url,&digest,&created]).await.map_err(|_|A2AError::internal("callback config insert failed"))?;let config=postgres_callback_config(&row,&tenant,&task)?;if let Some(audit)=authorization_audit{store.insert_audit(tx,audit).await?;}Ok(config)})}).await
     }
     async fn get_callback_config(
         &self,
@@ -7243,9 +7564,12 @@ impl TaskAdmission for PostgresTaskStore {
         .await
         .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("atomic event append failed")))?;
         if let Some(intent)=callback_intent.as_ref(){
+            tx.query_one("SELECT pg_advisory_xact_lock($1)",&[&CALLBACK_POLICY_FENCE_LOCK]).await.map_err(|error|Self::transaction_body_error(&error,A2AError::internal("inline callback policy fence failed")))?;
             let generation=i64::try_from(intent.enrollment.enrollment_generation()).map_err(|_|A2AError::invalid_request("invalid callback enrollment generation"))?;
-            let enrolled=store.q("SELECT EXISTS(SELECT 1 FROM __S__.callback_enrollments WHERE tenant_scope=$1 AND enrollment_id=$2 AND enrollment_generation=$3 AND canonical_url=$4 AND url_digest=$5)");
-            if !tx.query_one(&enrolled,&[&tenant,&intent.enrollment.enrollment_id(),&generation,&intent.enrollment.canonical_url(),&intent.enrollment.url_digest()]).await.map_err(|error|Self::transaction_body_error(&error,A2AError::internal("inline callback enrollment lookup failed")))?.get::<_,bool>(0){return Err(A2AError::invalid_params("callback enrollment is not authorized"));}
+            let policy=store.callback_policy.as_ref().ok_or_else(A2AError::push_notification_not_supported)?;
+            let policy_revision=i64::try_from(policy.policy_revision()).map_err(|_|A2AError::internal("callback policy corrupt"))?;
+            let enrolled=store.q(ACTIVE_CALLBACK_ENROLLMENT_EXISTS_SQL);
+            if !tx.query_one(&enrolled,&[&tenant,&intent.enrollment.enrollment_id(),&generation,&intent.enrollment.canonical_url(),&intent.enrollment.url_digest(),&policy.policy_id(),&policy_revision]).await.map_err(|error|Self::transaction_body_error(&error,A2AError::internal("inline callback enrollment lookup failed")))?.get::<_,bool>(0){return Err(A2AError::invalid_params("callback enrollment is not authorized"));}
             let max=store.callback_policy.as_ref().map_or(0,|p|p.max_configs_per_task());let tenant_max=store.callback_policy.as_ref().map_or(0,|p|p.max_configs_per_tenant());let scheduler_lock=store.q("SELECT pg_advisory_xact_lock(hashtextextended($1,17))");tx.query_one(&scheduler_lock,&[&tenant]).await.map_err(|error|Self::transaction_body_error(&error,A2AError::internal("inline callback tenant capacity lock failed")))?;let tenant_count=store.q("SELECT count(*) FROM __S__.callback_configs WHERE tenant_scope=$1 AND state<>'revoked'");if tx.query_one(&tenant_count,&[&tenant]).await.map_err(|error|Self::transaction_body_error(&error,A2AError::internal("inline callback tenant count failed")))?.get::<_,i64>(0)>=i64::from(tenant_max){return Err(A2AError::invalid_params("callback tenant config capacity reached"));}
             let count=store.q("SELECT count(*) FROM __S__.callback_configs WHERE tenant_scope=$1 AND task_id=$2 AND state<>'revoked'");
             if tx.query_one(&count,&[&tenant,&command.task.id]).await.map_err(|error|Self::transaction_body_error(&error,A2AError::internal("inline callback count failed")))?.get::<_,i64>(0)>=i64::from(max){return Err(A2AError::invalid_params("callback config capacity reached"));}
