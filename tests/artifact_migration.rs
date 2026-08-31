@@ -1552,11 +1552,125 @@ async fn empty_backup_restore_is_sealed_retryable_and_requires_a_truly_empty_tar
         .await
         .unwrap();
 
+    let callback_proof_before = client
+        .query_one(
+            &format!(
+                "SELECT proof FROM {target_schema}.callback_worker_session_secret WHERE singleton=1"
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0);
+
+    // A live callback worker capability is non-authoritative bootstrap state, but
+    // restore must refuse to reset it while the owning backend is still active.
+    let (callback_worker, callback_worker_connection) =
+        pg.connect(tokio_postgres::NoTls).await.unwrap();
+    let callback_worker_driver = tokio::spawn(callback_worker_connection);
+    callback_worker
+        .query_one(
+            &format!("SELECT {target_schema}.register_callback_worker_session($1)"),
+            &[&callback_proof_before],
+        )
+        .await
+        .unwrap();
+    let active_callback_restore =
+        PostgresTaskStore::restore_artifacts(target_config.clone(), &restore).await;
+    assert!(
+        matches!(
+            active_callback_restore,
+            Err(PostgresStoreError::ArtifactMigrationBusy)
+        ),
+        "active callback worker restore outcome: {active_callback_restore:?}"
+    );
+    assert_eq!(
+        client
+            .query_one(
+                &format!("SELECT proof,(SELECT count(*) FROM {target_schema}.callback_worker_sessions) FROM {target_schema}.callback_worker_session_secret WHERE singleton=1"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        callback_proof_before
+    );
+    drop(callback_worker);
+    callback_worker_driver.await.unwrap().unwrap();
+
+    // Callback policy/config authority is not represented in this backup format.
+    // It must block restore, and refusal must preserve all callback/protected state exactly.
+    let callback_digest = smesh_a2a::content_digest(b"restore-callback-policy");
+    client
+        .batch_execute(&format!(
+            "SET session_replication_role=replica;
+             INSERT INTO {target_schema}.callback_policy_snapshots VALUES('restore-policy',1,'{callback_digest}',4,100,100,4096,4,60000,1);
+             INSERT INTO {target_schema}.callback_enrollments VALUES('restore-policy',1,'tenant-callback','restore-enrollment',1,'https://callback.invalid/restore','{callback_digest}','key-1','secret-ref',NULL,NULL,NULL);
+             INSERT INTO {target_schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES('tenant-callback','callback-task','callback-context','\"TASK_STATE_SUBMITTED\"',1,'{{}}','callback-account');
+             INSERT INTO {target_schema}.callback_configs VALUES('tenant-callback','callback-task','callback-config','callback-account','account:callback-account','restore-enrollment',1,'https://callback.invalid/restore','{callback_digest}','active',NULL,1,1);
+             SET session_replication_role=origin;"
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        PostgresTaskStore::restore_artifacts(target_config.clone(), &restore).await,
+        Err(PostgresStoreError::ArtifactRestoreTargetNotEmpty)
+    ));
+    let callback_refusal = client
+        .query_one(
+            &format!("SELECT
+                (SELECT count(*) FROM {target_schema}.callback_policy_snapshots),
+                (SELECT count(*) FROM {target_schema}.callback_enrollments),
+                (SELECT count(*) FROM {target_schema}.callback_configs),
+                (SELECT count(*) FROM {target_schema}.callback_worker_sessions),
+                (SELECT proof FROM {target_schema}.callback_worker_session_secret WHERE singleton=1),
+                (SELECT count(*) FROM {target_schema}.audit_projection_outbox),
+                (SELECT enabled FROM {target_schema}.audit_projection_control WHERE singleton=1)"),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            callback_refusal.get::<_, i64>(0),
+            callback_refusal.get::<_, i64>(1),
+            callback_refusal.get::<_, i64>(2),
+            callback_refusal.get::<_, i64>(3),
+            callback_refusal.get::<_, String>(4),
+            callback_refusal.get::<_, i64>(5),
+            callback_refusal.get::<_, bool>(6),
+        ),
+        (1, 1, 1, 1, callback_proof_before.clone(), 1, true)
+    );
+    client
+        .batch_execute(&format!(
+            "SET session_replication_role=replica;
+             DELETE FROM {target_schema}.callback_configs;
+             DELETE FROM {target_schema}.tasks;
+             DELETE FROM {target_schema}.callback_enrollments;
+             DELETE FROM {target_schema}.callback_policy_snapshots;
+             SET session_replication_role=origin;"
+        ))
+        .await
+        .unwrap();
+
     let restored = PostgresTaskStore::restore_artifacts(target_config.clone(), &restore)
         .await
         .unwrap();
     assert_eq!(restored.objects, 0);
     assert!(restored.enabled);
+    let callback_bootstrap_after = client
+        .query_one(
+            &format!("SELECT proof,(SELECT count(*) FROM {target_schema}.callback_worker_sessions) FROM {target_schema}.callback_worker_session_secret WHERE singleton=1"),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        callback_bootstrap_after.get::<_, String>(0),
+        callback_proof_before
+    );
+    assert_eq!(callback_bootstrap_after.get::<_, i64>(1), 0);
     assert_eq!(
         client
             .query_one(

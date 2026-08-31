@@ -73,6 +73,78 @@ jobs:
           cargo run --quiet --bin lifeline-trace -- /tmp/lifeline.trace.jsonl
           cmp /tmp/lifeline.trace.jsonl demo/lifeline.trace.jsonl
 
+  push-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Disabled-card and callback security corpus
+        run: |
+          timeout --signal=TERM --kill-after=10s 5m cargo test --locked --test agent_card --test push_security
+
+  push-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: smesh-ci-postgres
+          POSTGRES_DB: smesh_test
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SMESH_TEST_POSTGRES_SUPERUSER_URL: postgresql://postgres:smesh-ci-postgres@127.0.0.1:55432/smesh_test
+      SMESH_TEST_POSTGRES_ADMIN_URL: postgresql://smesh_migrator:smesh-ci-migrator@127.0.0.1:55432/smesh_test
+      SMESH_TEST_POSTGRES_RUNTIME_URL: postgresql://smesh_test_runtime:smesh-ci-runtime@127.0.0.1:55432/smesh_test
+      SMESH_POSTGRES_TEST_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Assert raw push PostgreSQL fixture credentials
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          raw = Path('.github/workflows/ci.yml').read_text()
+          block = raw.split('  push-postgres:', 1)[1].split('\n  observability:', 1)[0]
+          fixtures = (
+              ('postgres', 'smesh-ci-postgres'),
+              ('smesh_migrator', 'smesh-ci-migrator'),
+              ('smesh_test_runtime', 'smesh-ci-runtime'),
+          )
+          for role, password in fixtures:
+              expected = f'postgresql://{role}:{password}@127.0.0.1:55432/smesh_test'
+              assert expected in block, f'missing exact raw push fixture URL for {role}'
+          assert ':' + '***@' not in raw, 'redacted display placeholder was committed to raw YAML'
+          PY
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Provision explicit PostgreSQL push roles
+        env:
+          PGPASSWORD: smesh-ci-postgres
+        run: |
+          pg_isready -h 127.0.0.1 -p 55432 -U postgres -d smesh_test
+          psql -h 127.0.0.1 -p 55432 -U postgres -d smesh_test -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE smesh_migrator LOGIN PASSWORD 'smesh-ci-migrator' NOSUPERUSER NOBYPASSRLS NOCREATEDB CREATEROLE NOREPLICATION NOINHERIT;
+          CREATE ROLE smesh_test_runtime LOGIN PASSWORD 'smesh-ci-runtime' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT;
+          GRANT CREATE ON DATABASE smesh_test TO smesh_migrator;
+          SQL
+      - name: Callback authority, plans, reconciliation, and process recovery
+        run: |
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test callback_authority -- --test-threads=1
+          timeout --signal=TERM --kill-after=15s 10m cargo test --locked --test postgres_push_process -- --test-threads=1
+
   observability:
     runs-on: ubuntu-latest
     timeout-minutes: 15

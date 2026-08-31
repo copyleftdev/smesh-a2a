@@ -310,17 +310,23 @@ fn role_grant(role: TenantRole, operation: Operation) -> Option<VisibilityScope>
             | ExtendedCard,
         )
         | (TaskAgent, ExtendedCard) => Some(VisibilityScope::Tenant),
+        (TenantAdmin | TaskOperator, PushCreate | PushGet | PushList | PushDelete) => {
+            Some(VisibilityScope::Tenant)
+        }
         (
             TaskAgent,
             TaskCreate | TaskContinue | TaskGet | TaskList | TaskSubscribe | TaskCancel
-            | HistoryRead | ArtifactRead | ArtifactResolve,
+            | HistoryRead | ArtifactRead | ArtifactResolve | PushCreate | PushGet | PushList
+            | PushDelete,
         ) => Some(VisibilityScope::Own),
-        (_, PushCreate | PushGet | PushList | PushDelete)
+        (
+            TaskViewer | Auditor | ServiceReader,
+            PushCreate | PushGet | PushList | PushDelete | TaskCreate | TaskContinue | TaskCancel,
+        )
         | (
             TaskOperator | TaskViewer | Auditor | TaskAgent | ServiceReader,
             AuditRead | AuthorizationAdmin,
         )
-        | (TaskViewer | Auditor | ServiceReader, TaskCreate | TaskContinue | TaskCancel)
         | (Auditor, TaskSubscribe) => None,
     }
 }

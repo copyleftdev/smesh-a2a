@@ -4,6 +4,31 @@ use a2a::{
     TRANSPORT_PROTOCOL_JSONRPC,
 };
 
+use a2a_server::AgentCardProducer;
+
+/// Dynamic card producer backed by the gateway generation's sticky readiness.
+pub struct LiveAgentCard {
+    base: AgentCard,
+    readiness: std::sync::Arc<crate::push::PushReadiness>,
+}
+
+impl LiveAgentCard {
+    #[must_use]
+    pub fn new(base: AgentCard, readiness: std::sync::Arc<crate::push::PushReadiness>) -> Self {
+        Self { base, readiness }
+    }
+}
+
+impl AgentCardProducer for LiveAgentCard {
+    fn card(&self) -> AgentCard {
+        let mut card = self.base.clone();
+        let ready = self.readiness.is_ready();
+        card.capabilities.push_notifications = Some(ready);
+        card.capabilities.extended_agent_card = Some(false);
+        card
+    }
+}
+
 /// Build the public A2A v1 card for a SMESH swarm gateway.
 #[must_use]
 pub fn build_agent_card(base_url: &str) -> AgentCard {
@@ -22,7 +47,7 @@ pub fn build_agent_card(base_url: &str) -> AgentCard {
             streaming: Some(true),
             push_notifications: Some(false),
             extensions: None,
-            extended_agent_card: None,
+            extended_agent_card: Some(false),
         },
         default_input_modes: vec!["text/plain".to_owned()],
         default_output_modes: vec!["text/plain".to_owned(), "application/json".to_owned()],
@@ -56,6 +81,20 @@ pub fn build_agent_card(base_url: &str) -> AgentCard {
         security_requirements: None,
         signatures: None,
     }
+}
+
+/// Build a card whose push capability reflects the complete live callback
+/// subsystem readiness snapshot.
+#[must_use]
+pub fn build_agent_card_with_push_readiness(
+    base_url: &str,
+    readiness: &crate::push::PushReadiness,
+) -> AgentCard {
+    let mut card = build_agent_card(base_url);
+    let ready = readiness.is_ready();
+    card.capabilities.push_notifications = Some(ready);
+    card.capabilities.extended_agent_card = Some(false);
+    card
 }
 
 /// Build a public discovery card whose advertised interfaces require OIDC bearer JWTs.

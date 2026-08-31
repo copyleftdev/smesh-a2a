@@ -30,13 +30,16 @@ use crate::{
     canonical_send_message_digest_v2, content_digest, durable_authority::valid_bounded_identity,
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
+const V7_SCHEMA_VERSION: i64 = 7;
 const V6_SCHEMA_VERSION: i64 = 6;
 const V5_SCHEMA_VERSION: i64 = 5;
 const V4_SCHEMA_VERSION: i64 = 4;
 const V2_SCHEMA_VERSION: i64 = 2;
 const V3_SCHEMA_VERSION: i64 = 3;
 const APPLICATION_ID: i64 = 0x534D_4132;
+static SQLITE_CALLBACK_TERMINAL_TEST_FAULT: Mutex<Option<crate::CallbackTerminalTestFault>> =
+    Mutex::new(None);
 const MAX_TASK_JSON_BYTES: usize = 1024 * 1024;
 const MAX_STORE_JSON_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATOMIC_JSON_BYTES: usize = 1024 * 1024;
@@ -57,6 +60,134 @@ const SNAPSHOT_TTL_MILLIS: i64 = 5 * 60 * 1_000;
 const MAX_ACTIVE_SNAPSHOTS: i64 = 128;
 const MAX_SNAPSHOT_BYTES: i64 = 64 * 1024 * 1024;
 type PageTokenRow = (Vec<u8>, i64, String, String, i64, i64, i64, i64, i64);
+type PersistedCallbackEnrollment = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+const CALLBACK_SCHEMA_SQL: &str = "CREATE TABLE callback_policy_snapshots (
+ policy_id TEXT NOT NULL, policy_revision INTEGER NOT NULL CHECK(policy_revision > 0),
+ policy_digest TEXT NOT NULL CHECK(length(CAST(policy_digest AS BLOB))=71),
+ max_configs_per_task INTEGER NOT NULL CHECK(max_configs_per_task BETWEEN 1 AND 32),
+ max_configs_per_tenant INTEGER NOT NULL CHECK(max_configs_per_tenant BETWEEN 1 AND 1000000),
+ max_pending INTEGER NOT NULL CHECK(max_pending BETWEEN 1 AND 1000000),
+ max_payload_bytes INTEGER NOT NULL CHECK(max_payload_bytes BETWEEN 1 AND 262144),
+ max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 32),
+ max_delivery_age_ms INTEGER NOT NULL CHECK(max_delivery_age_ms BETWEEN 1 AND 604800000),
+ created_at INTEGER NOT NULL CHECK(created_at > 0), PRIMARY KEY(policy_id,policy_revision));
+CREATE TABLE callback_enrollments (
+ policy_id TEXT NOT NULL, policy_revision INTEGER NOT NULL,
+ tenant_scope TEXT NOT NULL CHECK(length(CAST(tenant_scope AS BLOB)) BETWEEN 1 AND 128),
+ enrollment_id TEXT NOT NULL CHECK(length(CAST(enrollment_id AS BLOB)) BETWEEN 1 AND 128),
+ enrollment_generation INTEGER NOT NULL CHECK(enrollment_generation > 0),
+ canonical_url TEXT NOT NULL CHECK(length(CAST(canonical_url AS BLOB)) BETWEEN 1 AND 2048),
+ url_digest TEXT NOT NULL CHECK(length(CAST(url_digest AS BLOB))=71),
+ key_generation TEXT NOT NULL CHECK(length(CAST(key_generation AS BLOB)) BETWEEN 1 AND 128),
+ secret_reference TEXT NOT NULL CHECK(length(CAST(secret_reference AS BLOB)) BETWEEN 1 AND 4096),
+ ca_reference TEXT, mtls_cert_reference TEXT, mtls_key_reference TEXT,
+ PRIMARY KEY(tenant_scope,enrollment_id,enrollment_generation),
+ FOREIGN KEY(policy_id,policy_revision) REFERENCES callback_policy_snapshots(policy_id,policy_revision) ON DELETE RESTRICT);
+CREATE UNIQUE INDEX callback_enrollments_url ON callback_enrollments(tenant_scope,canonical_url,enrollment_generation);
+CREATE TABLE callback_configs (
+ tenant_scope TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+ config_id TEXT NOT NULL CHECK(length(CAST(config_id AS BLOB)) BETWEEN 1 AND 128),
+ owner_account_id TEXT NOT NULL CHECK(length(CAST(owner_account_id AS BLOB)) BETWEEN 1 AND 128),
+ principal_scope TEXT NOT NULL CHECK(length(CAST(principal_scope AS BLOB)) BETWEEN 1 AND 256),
+ enrollment_id TEXT NOT NULL, enrollment_generation INTEGER NOT NULL,
+ canonical_url TEXT NOT NULL, url_digest TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('active','draining','revoked','terminal_closed')),
+ causative_message_id TEXT, created_at INTEGER NOT NULL CHECK(created_at > 0),
+ updated_at INTEGER NOT NULL CHECK(updated_at >= created_at), PRIMARY KEY(tenant_scope,task_id,config_id),
+ FOREIGN KEY(tenant_scope,enrollment_id,enrollment_generation) REFERENCES callback_enrollments(tenant_scope,enrollment_id,enrollment_generation) ON DELETE RESTRICT);
+CREATE INDEX callback_configs_task_state ON callback_configs(tenant_scope,task_id,state,created_at,config_id);
+CREATE TABLE callback_events (
+ tenant_scope TEXT NOT NULL, event_id TEXT NOT NULL,
+ task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+ causative_revision INTEGER NOT NULL CHECK(causative_revision > 0),
+ payload BLOB NOT NULL CHECK(length(payload) BETWEEN 1 AND 262144),
+ payload_digest TEXT NOT NULL CHECK(length(CAST(payload_digest AS BLOB))=71),
+ created_at INTEGER NOT NULL CHECK(created_at > 0), expires_at INTEGER NOT NULL CHECK(expires_at >= created_at),
+ PRIMARY KEY(tenant_scope,event_id));
+CREATE TABLE callback_deliveries (
+ tenant_scope TEXT NOT NULL, event_id TEXT NOT NULL, task_id TEXT NOT NULL, config_id TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('pending','leased','delivered','retry','dead','canceled')),
+ attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count BETWEEN 0 AND 32), available_at INTEGER NOT NULL,
+ lease_owner TEXT, lease_token TEXT, lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK(lease_epoch >= 0), lease_until INTEGER,
+ created_at INTEGER NOT NULL CHECK(created_at > 0), updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+ PRIMARY KEY(tenant_scope,event_id,config_id),
+ FOREIGN KEY(tenant_scope,event_id) REFERENCES callback_events(tenant_scope,event_id) ON DELETE RESTRICT,
+ FOREIGN KEY(tenant_scope,task_id,config_id) REFERENCES callback_configs(tenant_scope,task_id,config_id) ON DELETE RESTRICT);
+CREATE INDEX callback_deliveries_due ON callback_deliveries(state,available_at,lease_until,tenant_scope,event_id,config_id);
+CREATE INDEX callback_deliveries_tenant_due ON callback_deliveries(tenant_scope,state,available_at,event_id,config_id);
+CREATE TABLE callback_attempts (
+ tenant_scope TEXT NOT NULL, event_id TEXT NOT NULL, config_id TEXT NOT NULL,
+ attempt_no INTEGER NOT NULL CHECK(attempt_no BETWEEN 1 AND 32), lease_epoch INTEGER NOT NULL CHECK(lease_epoch > 0),
+ started_at INTEGER NOT NULL, finished_at INTEGER, outcome TEXT CHECK(outcome IN ('delivered','retry','dead','canceled')),
+ category TEXT, evidence_digest TEXT CHECK(evidence_digest IS NULL OR length(CAST(evidence_digest AS BLOB))=71),
+ PRIMARY KEY(tenant_scope,event_id,config_id,attempt_no),
+ FOREIGN KEY(tenant_scope,event_id,config_id) REFERENCES callback_deliveries(tenant_scope,event_id,config_id) ON DELETE RESTRICT);
+CREATE TABLE callback_audits (
+ audit_order INTEGER PRIMARY KEY AUTOINCREMENT, tenant_scope TEXT NOT NULL, event_kind TEXT NOT NULL,
+ source_kind TEXT NOT NULL CHECK(source_kind IN ('callback_enrollments','callback_configs','callback_events','callback_deliveries')),
+ source_pk_digest TEXT NOT NULL CHECK(length(CAST(source_pk_digest AS BLOB))=71), occurred_at INTEGER NOT NULL,
+ UNIQUE(tenant_scope,event_kind,source_pk_digest));
+CREATE INDEX callback_audits_tenant_time ON callback_audits(tenant_scope,occurred_at,audit_order);
+CREATE TRIGGER callback_audit_policy AFTER INSERT ON callback_enrollments BEGIN INSERT INTO callback_audits(tenant_scope,event_kind,source_kind,source_pk_digest,occurred_at) VALUES(NEW.tenant_scope,'callback_policy_reconciled','callback_enrollments',smesh_callback_audit_digest('callback_policy_reconciled',NEW.tenant_scope,'',NEW.enrollment_id,'',NEW.enrollment_generation,0),CAST(unixepoch('subsec')*1000 AS INTEGER)); END;
+CREATE TRIGGER callback_audit_config_create AFTER INSERT ON callback_configs BEGIN INSERT INTO callback_audits(tenant_scope,event_kind,source_kind,source_pk_digest,occurred_at) VALUES(NEW.tenant_scope,'callback_config_created','callback_configs',smesh_callback_audit_digest('callback_config_created',NEW.tenant_scope,NEW.task_id,NEW.config_id,'',NEW.enrollment_generation,0),NEW.created_at); END;
+CREATE TRIGGER callback_audit_config_delete AFTER UPDATE OF state ON callback_configs WHEN OLD.state<>NEW.state AND OLD.state IN ('active','terminal_closed') AND NEW.state IN ('draining','revoked') BEGIN INSERT INTO callback_audits(tenant_scope,event_kind,source_kind,source_pk_digest,occurred_at) VALUES(NEW.tenant_scope,'callback_config_deleted','callback_configs',smesh_callback_audit_digest('callback_config_deleted',NEW.tenant_scope,NEW.task_id,NEW.config_id,'',NEW.enrollment_generation,0),NEW.updated_at); END;
+CREATE TRIGGER callback_audit_event AFTER INSERT ON callback_events BEGIN INSERT INTO callback_audits(tenant_scope,event_kind,source_kind,source_pk_digest,occurred_at) VALUES(NEW.tenant_scope,'callback_event_enqueued','callback_events',smesh_callback_audit_digest('callback_event_enqueued',NEW.tenant_scope,NEW.task_id,'',NEW.event_id,NEW.causative_revision,0),NEW.created_at); END;
+CREATE TRIGGER callback_audit_attempt AFTER UPDATE OF state ON callback_deliveries WHEN OLD.state<>NEW.state AND NEW.state='leased' BEGIN INSERT INTO callback_audits(tenant_scope,event_kind,source_kind,source_pk_digest,occurred_at) VALUES(NEW.tenant_scope,'callback_delivery_attempted','callback_deliveries',smesh_callback_audit_digest('callback_delivery_attempted',NEW.tenant_scope,NEW.task_id,NEW.config_id,NEW.event_id,0,NEW.attempt_count),NEW.updated_at); END;
+CREATE TRIGGER callback_audit_delivered AFTER UPDATE OF state ON callback_deliveries WHEN OLD.state<>NEW.state AND NEW.state='delivered' BEGIN INSERT INTO callback_audits(tenant_scope,event_kind,source_kind,source_pk_digest,occurred_at) VALUES(NEW.tenant_scope,'callback_delivered','callback_deliveries',smesh_callback_audit_digest('callback_delivered',NEW.tenant_scope,NEW.task_id,NEW.config_id,NEW.event_id,0,NEW.attempt_count),NEW.updated_at); END;
+CREATE TRIGGER callback_audit_retry AFTER UPDATE OF state ON callback_deliveries WHEN OLD.state<>NEW.state AND NEW.state='retry' BEGIN INSERT INTO callback_audits(tenant_scope,event_kind,source_kind,source_pk_digest,occurred_at) VALUES(NEW.tenant_scope,'callback_retry_scheduled','callback_deliveries',smesh_callback_audit_digest('callback_retry_scheduled',NEW.tenant_scope,NEW.task_id,NEW.config_id,NEW.event_id,0,NEW.attempt_count),NEW.updated_at); END;
+CREATE TRIGGER callback_audit_dead AFTER UPDATE OF state ON callback_deliveries WHEN OLD.state<>NEW.state AND NEW.state='dead' BEGIN INSERT INTO callback_audits(tenant_scope,event_kind,source_kind,source_pk_digest,occurred_at) VALUES(NEW.tenant_scope,'callback_dead','callback_deliveries',smesh_callback_audit_digest('callback_dead',NEW.tenant_scope,NEW.task_id,NEW.config_id,NEW.event_id,0,NEW.attempt_count),NEW.updated_at); END;
+CREATE TRIGGER callback_audits_no_update BEFORE UPDATE ON callback_audits BEGIN SELECT RAISE(ABORT,'immutable callback audit'); END;
+CREATE TRIGGER callback_audits_no_delete BEFORE DELETE ON callback_audits BEGIN SELECT RAISE(ABORT,'immutable callback audit'); END;
+CREATE TRIGGER callback_policy_no_update BEFORE UPDATE ON callback_policy_snapshots BEGIN SELECT RAISE(ABORT,'immutable callback policy'); END;
+CREATE TRIGGER callback_policy_no_delete BEFORE DELETE ON callback_policy_snapshots BEGIN SELECT RAISE(ABORT,'immutable callback policy'); END;
+CREATE TRIGGER callback_enrollments_no_update BEFORE UPDATE ON callback_enrollments BEGIN SELECT RAISE(ABORT,'immutable callback enrollment'); END;
+CREATE TRIGGER callback_enrollments_no_delete BEFORE DELETE ON callback_enrollments BEGIN SELECT RAISE(ABORT,'immutable callback enrollment'); END;
+CREATE TRIGGER callback_events_no_update BEFORE UPDATE ON callback_events BEGIN SELECT RAISE(ABORT,'immutable callback event'); END;
+CREATE TRIGGER callback_events_no_delete BEFORE DELETE ON callback_events BEGIN SELECT RAISE(ABORT,'immutable callback event'); END;
+CREATE TRIGGER callback_configs_identity_immutable BEFORE UPDATE OF tenant_scope,task_id,config_id,enrollment_id,enrollment_generation,canonical_url,url_digest,causative_message_id,created_at ON callback_configs BEGIN SELECT RAISE(ABORT,'immutable callback config identity'); END;
+CREATE TRIGGER callback_attempts_no_update BEFORE UPDATE ON callback_attempts BEGIN SELECT RAISE(ABORT,'immutable callback attempt'); END;
+CREATE TRIGGER callback_attempts_no_delete BEFORE DELETE ON callback_attempts BEGIN SELECT RAISE(ABORT,'immutable callback attempt'); END;
+CREATE TRIGGER audit_projection_callback_policy AFTER INSERT ON callback_enrollments
+ WHEN smesh_audit_projection_enabled()=1 BEGIN
+ INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
+ VALUES(NEW.tenant_scope,smesh_projection_digest('callback_policy_snapshots',NEW.tenant_scope,NEW.enrollment_id,NEW.policy_revision),'callback_policy_snapshots',smesh_projection_pk_digest('callback_policy_snapshots',NEW.tenant_scope,NEW.enrollment_id,NEW.policy_revision),'callback_policy_reconciled',CAST(unixepoch('subsec')*1000 AS INTEGER),CAST(unixepoch('subsec')*1000 AS INTEGER)); END;
+CREATE TRIGGER audit_projection_callback_config_create AFTER INSERT ON callback_configs
+ WHEN smesh_audit_projection_enabled()=1 BEGIN
+ INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
+ VALUES(NEW.tenant_scope,smesh_projection_digest('callback_configs',NEW.tenant_scope,NEW.task_id||':'||NEW.config_id,NEW.enrollment_generation),'callback_configs',smesh_projection_pk_digest('callback_configs',NEW.tenant_scope,NEW.task_id||':'||NEW.config_id,NEW.enrollment_generation),'callback_config_created',NEW.created_at,NEW.created_at); END;
+CREATE TRIGGER audit_projection_callback_config_delete AFTER UPDATE OF state ON callback_configs
+ WHEN smesh_audit_projection_enabled()=1 AND OLD.state<>NEW.state AND NEW.state IN ('draining','revoked') BEGIN
+ INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
+ VALUES(NEW.tenant_scope,smesh_projection_digest('callback_configs',NEW.tenant_scope,NEW.task_id||':'||NEW.config_id,-NEW.enrollment_generation),'callback_configs',smesh_projection_pk_digest('callback_configs',NEW.tenant_scope,NEW.task_id||':'||NEW.config_id,-NEW.enrollment_generation),'callback_config_deleted',NEW.updated_at,NEW.updated_at); END;
+CREATE TRIGGER audit_projection_callback_event AFTER INSERT ON callback_events
+ WHEN smesh_audit_projection_enabled()=1 BEGIN
+ INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
+ VALUES(NEW.tenant_scope,smesh_projection_digest('callback_events',NEW.tenant_scope,NEW.event_id,NEW.causative_revision),'callback_events',smesh_projection_pk_digest('callback_events',NEW.tenant_scope,NEW.event_id,NEW.causative_revision),'callback_event_enqueued',NEW.created_at,NEW.created_at); END;
+CREATE TRIGGER audit_projection_callback_attempt AFTER UPDATE OF state ON callback_deliveries
+ WHEN smesh_audit_projection_enabled()=1 AND OLD.state<>NEW.state AND NEW.state='leased' BEGIN
+ INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
+ VALUES(NEW.tenant_scope,smesh_projection_digest('callback_deliveries',NEW.tenant_scope,NEW.event_id||':'||NEW.config_id,NEW.attempt_count*10+1),'callback_deliveries',smesh_projection_pk_digest('callback_deliveries',NEW.tenant_scope,NEW.event_id||':'||NEW.config_id,NEW.attempt_count*10+1),'callback_delivery_attempted',NEW.updated_at,NEW.updated_at); END;
+CREATE TRIGGER audit_projection_callback_delivered AFTER UPDATE OF state ON callback_deliveries
+ WHEN smesh_audit_projection_enabled()=1 AND OLD.state<>NEW.state AND NEW.state='delivered' BEGIN
+ INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
+ VALUES(NEW.tenant_scope,smesh_projection_digest('callback_deliveries',NEW.tenant_scope,NEW.event_id||':'||NEW.config_id,NEW.attempt_count*10+2),'callback_deliveries',smesh_projection_pk_digest('callback_deliveries',NEW.tenant_scope,NEW.event_id||':'||NEW.config_id,NEW.attempt_count*10+2),'callback_delivered',NEW.updated_at,NEW.updated_at); END;
+CREATE TRIGGER audit_projection_callback_retry AFTER UPDATE OF state ON callback_deliveries
+ WHEN smesh_audit_projection_enabled()=1 AND OLD.state<>NEW.state AND NEW.state='retry' BEGIN
+ INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
+ VALUES(NEW.tenant_scope,smesh_projection_digest('callback_deliveries',NEW.tenant_scope,NEW.event_id||':'||NEW.config_id,NEW.attempt_count*10+3),'callback_deliveries',smesh_projection_pk_digest('callback_deliveries',NEW.tenant_scope,NEW.event_id||':'||NEW.config_id,NEW.attempt_count*10+3),'callback_retry_scheduled',NEW.updated_at,NEW.updated_at); END;
+CREATE TRIGGER audit_projection_callback_dead AFTER UPDATE OF state ON callback_deliveries
+ WHEN smesh_audit_projection_enabled()=1 AND OLD.state<>NEW.state AND NEW.state='dead' BEGIN
+ INSERT OR IGNORE INTO audit_projection_outbox(tenant_scope,event_id,source,source_pk_digest,event_kind,occurred_at,available_at)
+ VALUES(NEW.tenant_scope,smesh_projection_digest('callback_deliveries',NEW.tenant_scope,NEW.event_id||':'||NEW.config_id,NEW.attempt_count*10+4),'callback_deliveries',smesh_projection_pk_digest('callback_deliveries',NEW.tenant_scope,NEW.event_id||':'||NEW.config_id,NEW.attempt_count*10+4),'callback_dead',NEW.updated_at,NEW.updated_at); END;";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyTenantBinding {
@@ -531,9 +662,9 @@ const V6_SCHEMA_SQL: &str = "CREATE TABLE list_snapshots (
 const V7_SCHEMA_SQL: &str = "CREATE TABLE audit_projection_outbox (
  tenant_scope TEXT NOT NULL,
  event_id TEXT NOT NULL UNIQUE CHECK(length(CAST(event_id AS BLOB))=71 AND substr(event_id,1,7)='sha256:' AND substr(event_id,8) NOT GLOB '*[^0-9a-f]*'),
- source TEXT NOT NULL CHECK(source IN ('authorization_decisions','task_events','cancellation_intents')),
+ source TEXT NOT NULL CHECK(source IN ('authorization_decisions','task_events','cancellation_intents','callback_policy_snapshots','callback_configs','callback_events','callback_deliveries','callback_attempts')),
  source_pk_digest TEXT NOT NULL CHECK(length(CAST(source_pk_digest AS BLOB))=71 AND substr(source_pk_digest,1,7)='sha256:' AND substr(source_pk_digest,8) NOT GLOB '*[^0-9a-f]*'),
- event_kind TEXT NOT NULL CHECK(event_kind IN ('authorization_decided','task_terminal','task_canceled')),
+ event_kind TEXT NOT NULL CHECK(event_kind IN ('authorization_decided','task_terminal','task_canceled','callback_policy_reconciled','callback_config_created','callback_config_deleted','callback_event_enqueued','callback_delivery_attempted','callback_delivered','callback_retry_scheduled','callback_dead')),
  occurred_at INTEGER NOT NULL,
  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','leased','delivered','dead')),
  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 10),
@@ -590,17 +721,34 @@ pub struct SqliteTaskStore {
     default_scope: Arc<str>,
     default_account: Arc<str>,
     audit_projection_enabled: bool,
+    callback_policy: Option<Arc<crate::CallbackPolicySnapshot>>,
 }
 
 #[allow(clippy::missing_errors_doc)]
 impl SqliteTaskStore {
-    /// Open or create a versioned SQLite task store.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for symbolic-link paths, unknown/corrupt schemas, or initialization failure.
+    /// Arms one named terminal-enqueue fault; consumed only at the exact checkpoint.
+    #[doc(hidden)]
+    pub fn set_callback_terminal_test_fault(
+        &self,
+        fault: crate::CallbackTerminalTestFault,
+    ) -> Result<(), A2AError> {
+        *SQLITE_CALLBACK_TERMINAL_TEST_FAULT
+            .lock()
+            .map_err(|_| A2AError::internal("callback terminal fault lock failed"))? = Some(fault);
+        Ok(())
+    }
+
+    /// Open or create a versioned SQLite task store with callbacks disabled.
     pub async fn open(path: impl AsRef<Path>, max_tasks: usize) -> Result<Self, SqliteStoreError> {
-        Self::open_inner(path, max_tasks, None, true, false).await
+        Self::open_inner(path, max_tasks, None, true, false, None).await
+    }
+
+    pub async fn open_with_push_policy(
+        path: impl AsRef<Path>,
+        max_tasks: usize,
+        policy: &crate::push::PushPolicy,
+    ) -> Result<Self, SqliteStoreError> {
+        Self::open_inner(path, max_tasks, None, true, false, Some(policy.clone())).await
     }
 
     /// Open with connection-scoped trigger projection enabled. Existing rows are not backfilled.
@@ -608,25 +756,65 @@ impl SqliteTaskStore {
         path: impl AsRef<Path>,
         max_tasks: usize,
     ) -> Result<Self, SqliteStoreError> {
-        Self::open_inner(path, max_tasks, None, true, true).await
+        Self::open_inner(path, max_tasks, None, true, true, None).await
     }
 
-    /// Open a store, bind legacy records, and enable connection-scoped audit projection.
+    pub async fn open_with_push_policy_and_audit_projection(
+        path: impl AsRef<Path>,
+        max_tasks: usize,
+        policy: &crate::push::PushPolicy,
+    ) -> Result<Self, SqliteStoreError> {
+        Self::open_inner(path, max_tasks, None, true, true, Some(policy.clone())).await
+    }
+
     pub async fn open_with_legacy_binding_and_audit_projection(
         path: impl AsRef<Path>,
         max_tasks: usize,
         binding: LegacyTenantBinding,
     ) -> Result<Self, SqliteStoreError> {
-        Self::open_inner(path, max_tasks, Some(binding), false, true).await
+        Self::open_inner(path, max_tasks, Some(binding), false, true, None).await
     }
 
-    /// Open a store and explicitly bind any legacy v1-v4 records to one validated owner.
     pub async fn open_with_legacy_binding(
         path: impl AsRef<Path>,
         max_tasks: usize,
         binding: LegacyTenantBinding,
     ) -> Result<Self, SqliteStoreError> {
-        Self::open_inner(path, max_tasks, Some(binding), false, false).await
+        Self::open_inner(path, max_tasks, Some(binding), false, false, None).await
+    }
+
+    pub async fn open_with_legacy_binding_and_push_policy(
+        path: impl AsRef<Path>,
+        max_tasks: usize,
+        binding: LegacyTenantBinding,
+        policy: &crate::push::PushPolicy,
+    ) -> Result<Self, SqliteStoreError> {
+        Self::open_inner(
+            path,
+            max_tasks,
+            Some(binding),
+            false,
+            false,
+            Some(policy.clone()),
+        )
+        .await
+    }
+
+    pub async fn open_with_legacy_binding_push_policy_and_audit_projection(
+        path: impl AsRef<Path>,
+        max_tasks: usize,
+        binding: LegacyTenantBinding,
+        policy: &crate::push::PushPolicy,
+    ) -> Result<Self, SqliteStoreError> {
+        Self::open_inner(
+            path,
+            max_tasks,
+            Some(binding),
+            false,
+            true,
+            Some(policy.clone()),
+        )
+        .await
     }
 
     async fn open_inner(
@@ -635,6 +823,7 @@ impl SqliteTaskStore {
         binding: Option<LegacyTenantBinding>,
         dev_new_only: bool,
         audit_projection_enabled: bool,
+        push_policy: Option<crate::push::PushPolicy>,
     ) -> Result<Self, SqliteStoreError> {
         #[cfg(not(unix))]
         {
@@ -644,6 +833,7 @@ impl SqliteTaskStore {
                 binding,
                 dev_new_only,
                 audit_projection_enabled,
+                push_policy,
             );
             Err(SqliteStoreError::UnsupportedPlatform)
         }
@@ -654,18 +844,25 @@ impl SqliteTaskStore {
             prepare_secure_path(&path)?;
             let ownership_lock = acquire_ownership_lock(&path)?;
             let capacity = max_tasks.max(1);
-            let (connection, cursor_key, receipt_key, default_scope, default_account) =
-                tokio::task::spawn_blocking(move || {
-                    open_database(
-                        &path,
-                        capacity,
-                        binding,
-                        dev_new_only,
-                        audit_projection_enabled,
-                    )
-                })
-                .await
-                .map_err(|_| SqliteStoreError::Initialization)??;
+            let (
+                connection,
+                cursor_key,
+                receipt_key,
+                default_scope,
+                default_account,
+                callback_policy,
+            ) = tokio::task::spawn_blocking(move || {
+                open_database(
+                    &path,
+                    capacity,
+                    binding,
+                    dev_new_only,
+                    audit_projection_enabled,
+                    push_policy,
+                )
+            })
+            .await
+            .map_err(|_| SqliteStoreError::Initialization)??;
             secure_permissions(&connection)?;
             Ok(Self {
                 connection: Arc::new(Mutex::new(Some(connection))),
@@ -677,6 +874,7 @@ impl SqliteTaskStore {
                 default_scope: Arc::from(default_scope),
                 default_account: Arc::from(default_account),
                 audit_projection_enabled,
+                callback_policy,
             })
         }
     }
@@ -1058,7 +1256,7 @@ impl SqliteTaskStore {
         &self,
         command: SendMessageAdmission,
     ) -> Result<AdmissionOutcome, A2AError> {
-        self.admit_send_message_inner(command, None).await
+        self.admit_send_message_inner(command, None, None).await
     }
 
     /// Authorize and atomically admit a new task with immutable ownership and
@@ -1077,7 +1275,7 @@ impl SqliteTaskStore {
                 "authorized admission scope mismatch",
             ));
         }
-        self.admit_send_message_inner(command, Some((scope.clone(), audit)))
+        self.admit_send_message_inner(command, Some((scope.clone(), audit)), None)
             .await
     }
 
@@ -1085,6 +1283,7 @@ impl SqliteTaskStore {
         &self,
         command: SendMessageAdmission,
         authorization: Option<(OwnedTaskScope, AuthorizationAuditInput)>,
+        callback_intent: Option<crate::callback_authority::CallbackIntent>,
     ) -> Result<AdmissionOutcome, A2AError> {
         let history_matches =
             command.task.history.as_deref() == Some(std::slice::from_ref(&command.request.message));
@@ -1139,6 +1338,7 @@ impl SqliteTaskStore {
             command.streaming,
             causative_request,
             authorization,
+            callback_intent,
         )
         .await
     }
@@ -1161,15 +1361,23 @@ impl SqliteTaskStore {
         streaming: bool,
         causative_request: SendMessageRequest,
         authorization: Option<(OwnedTaskScope, AuthorizationAuditInput)>,
+        callback_intent: Option<crate::callback_authority::CallbackIntent>,
     ) -> Result<AdmissionOutcome, A2AError> {
-        let (tenant_scope, owner_account_id) = authorization.as_ref().map_or_else(
+        let (tenant_scope, owner_account_id, principal_scope) = authorization.as_ref().map_or_else(
             || {
                 (
                     self.default_scope.to_string(),
                     self.default_account.to_string(),
+                    self.default_account.to_string(),
                 )
             },
-            |(scope, _)| (scope.tenant_scope.clone(), scope.owner_account_id.clone()),
+            |(scope, _)| {
+                (
+                    scope.tenant_scope.clone(),
+                    scope.owner_account_id.clone(),
+                    scope.principal_scope.clone(),
+                )
+            },
         );
         let authorization_audit = authorization.map(|(_, audit)| audit);
         let identity_version = if authorization_audit.is_some() { 2 } else { 1 };
@@ -1318,6 +1526,15 @@ impl SqliteTaskStore {
                     params![tenant_scope, task.id, state, encoded_task, now],
                 )
                 .map_err(|_| A2AError::internal("atomic event append failed"))?;
+            if let Some(intent)=callback_intent.as_ref() {
+                let enrolled:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM callback_enrollments WHERE tenant_scope=?1 AND enrollment_id=?2 AND enrollment_generation=?3 AND canonical_url=?4 AND url_digest=?5)",params![tenant_scope,intent.enrollment.enrollment_id(),i64::try_from(intent.enrollment.enrollment_generation()).unwrap_or(-1),intent.enrollment.canonical_url(),intent.enrollment.url_digest()],|r|r.get(0)).map_err(|_|A2AError::internal("inline callback enrollment lookup failed"))?;
+                if !enrolled{return Err(A2AError::invalid_params("callback enrollment is not authorized"));}
+                let max:i64=transaction.query_row("SELECT max_configs_per_task FROM callback_policy_snapshots ORDER BY policy_revision DESC LIMIT 1",[],|r|r.get(0)).map_err(|_|A2AError::internal("inline callback policy lookup failed"))?;let tenant_max:i64=transaction.query_row("SELECT max_configs_per_tenant FROM callback_policy_snapshots ORDER BY policy_revision DESC LIMIT 1",[],|r|r.get(0)).map_err(|_|A2AError::internal("inline callback tenant policy lookup failed"))?;let tenant_count:i64=transaction.query_row("SELECT COUNT(*) FROM callback_configs WHERE tenant_scope=?1 AND state<>'revoked'",params![tenant_scope],|r|r.get(0)).map_err(|_|A2AError::internal("inline callback tenant count failed"))?;if tenant_count>=tenant_max{return Err(A2AError::invalid_params("callback tenant config capacity reached"));}
+                let count:i64=transaction.query_row("SELECT COUNT(*) FROM callback_configs WHERE tenant_scope=?1 AND task_id=?2 AND state<>'revoked'",params![tenant_scope,task.id],|r|r.get(0)).map_err(|_|A2AError::internal("inline callback count failed"))?;
+                if count>=max{return Err(A2AError::invalid_params("callback config capacity reached"));}
+                let config_id=intent.config_id.as_ref().map_or_else(||format!("callback-{}",&content_digest(&rand::random::<[u8;32]>())[7..39]),|v|v.as_str().to_owned());
+                transaction.execute("INSERT INTO callback_configs(tenant_scope,task_id,config_id,owner_account_id,principal_scope,enrollment_id,enrollment_generation,canonical_url,url_digest,state,causative_message_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'active',?10,?11,?11)",params![tenant_scope,task.id,config_id,owner_account_id,principal_scope,intent.enrollment.enrollment_id(),i64::try_from(intent.enrollment.enrollment_generation()).unwrap_or(-1),intent.enrollment.canonical_url(),intent.enrollment.url_digest(),raw_message_id,now]).map_err(|_|A2AError::internal("inline callback config insert failed"))?;
+            }
             transaction
                 .execute(
                     "INSERT INTO idempotency_records(
@@ -2320,6 +2537,7 @@ impl SqliteTaskStore {
                     .map_err(|_| A2AError::internal("idempotency completion failed"))?;
             }
             if task.status.state.is_terminal() {
+                enqueue_terminal_callbacks(&transaction, TRUSTED_SINGLE_TENANT_SCOPE, &task, next_revision, now)?;
                 transaction
                     .execute(
                         "UPDATE outbox_attempts SET finished_at = ?2, outcome = 'superseded'
@@ -2529,6 +2747,7 @@ impl SqliteTaskStore {
                 params![tenant_scope, task_id, event_seq, next_revision,
                     previous_state, canceled_state, canceled_json, now],
             ).map_err(|_| A2AError::internal("cancellation event append failed"))?;
+            enqueue_terminal_callbacks(&tx,&tenant_scope,&task,u64::try_from(next_revision).map_err(|_|A2AError::internal("persistent task revision corrupt"))?,now)?;
             append_canceled_public_terminal(&tx, &tenant_scope, &dispatch_id, &task, now)?;
             let final_json = serde_json::to_string(&SendMessageResponse::Task(task.clone()))
                 .map_err(|_| A2AError::internal("failed to encode cancellation result"))?;
@@ -3551,6 +3770,7 @@ impl SqliteTaskStore {
                 ],
             )
             .map_err(|_| A2AError::internal("durable delivery event append failed"))?;
+            enqueue_terminal_callbacks(&tx,&lease.tenant_scope,&task,u64::try_from(next_revision).map_err(|_|A2AError::internal("persistent task revision corrupt"))?,now)?;
             if let Some((message_id, persisted_count)) = stream_message_id {
                 for (index, frame) in transcript_frames.iter().enumerate().skip(persisted_count) {
                     let sequence = i64::try_from(index + 1)
@@ -4387,6 +4607,7 @@ fn dead_letter_task(
             ],
         )
         .map_err(|_| A2AError::internal("dead-letter event append failed"))?;
+    enqueue_terminal_callbacks(transaction, &tenant_scope, &task, next_revision, now)?;
     let final_json = serde_json::to_string(&SendMessageResponse::Task(task))
         .map_err(|_| A2AError::internal("dead-letter result encoding failed"))?;
     transaction
@@ -4419,13 +4640,25 @@ fn dead_letter_task(
 }
 
 #[allow(clippy::too_many_lines, clippy::type_complexity)]
+#[allow(clippy::needless_pass_by_value)]
 fn open_database(
     path: &Path,
     max_tasks: usize,
     binding: Option<LegacyTenantBinding>,
     dev_new_only: bool,
     audit_projection_enabled: bool,
-) -> Result<(Connection, [u8; 32], [u8; 32], String, String), SqliteStoreError> {
+    push_policy: Option<crate::push::PushPolicy>,
+) -> Result<
+    (
+        Connection,
+        [u8; 32],
+        [u8; 32],
+        String,
+        String,
+        Option<Arc<crate::CallbackPolicySnapshot>>,
+    ),
+    SqliteStoreError,
+> {
     let mut connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -4438,6 +4671,24 @@ fn open_database(
     connection
         .create_scalar_function("smesh_audit_projection_enabled", 0, flags, move |_| {
             Ok(i64::from(audit_projection_enabled))
+        })
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    connection
+        .create_scalar_function("smesh_callback_audit_digest", 7, flags, |ctx| {
+            let kind: String = ctx.get(0)?;
+            let tenant: String = ctx.get(1)?;
+            let task: String = ctx.get(2)?;
+            let config: String = ctx.get(3)?;
+            let event: String = ctx.get(4)?;
+            let revision: i64 = ctx.get(5)?;
+            let attempt: i64 = ctx.get(6)?;
+            let kind =
+                crate::callback_authority::CallbackAuditKind::parse(&kind).ok_or_else(|| {
+                    rusqlite::Error::UserFunctionError("invalid callback audit kind".into())
+                })?;
+            Ok(crate::callback_authority::callback_audit_digest(
+                kind, &tenant, &task, &config, &event, revision, attempt,
+            ))
         })
         .map_err(|_| SqliteStoreError::Initialization)?;
     connection
@@ -4469,6 +4720,7 @@ fn open_database(
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
+
     if !matches!(
         version,
         0 | 1
@@ -4477,6 +4729,7 @@ fn open_database(
             | V4_SCHEMA_VERSION
             | V5_SCHEMA_VERSION
             | V6_SCHEMA_VERSION
+            | V7_SCHEMA_VERSION
             | SCHEMA_VERSION
     ) {
         return Err(SqliteStoreError::InvalidSchema);
@@ -4538,34 +4791,44 @@ fn open_database(
             migrate_v3_to_v4(&mut connection, max_tasks)?;
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
             migrate_v5_to_v6(&mut connection)?;
-            migrate_v6_to_v7(&mut connection)
+            migrate_v6_to_v7(&mut connection)?;
+            migrate_v7_to_v8(&mut connection)
         }
         V2_SCHEMA_VERSION => {
             migrate_v2_to_v3(&mut connection, max_tasks)?;
             migrate_v3_to_v4(&mut connection, max_tasks)?;
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
             migrate_v5_to_v6(&mut connection)?;
-            migrate_v6_to_v7(&mut connection)
+            migrate_v6_to_v7(&mut connection)?;
+            migrate_v7_to_v8(&mut connection)
         }
         V3_SCHEMA_VERSION => {
             migrate_v3_to_v4(&mut connection, max_tasks)?;
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
             migrate_v5_to_v6(&mut connection)?;
-            migrate_v6_to_v7(&mut connection)
+            migrate_v6_to_v7(&mut connection)?;
+            migrate_v7_to_v8(&mut connection)
         }
         V4_SCHEMA_VERSION => {
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
             migrate_v5_to_v6(&mut connection)?;
-            migrate_v6_to_v7(&mut connection)
+            migrate_v6_to_v7(&mut connection)?;
+            migrate_v7_to_v8(&mut connection)
         }
         V5_SCHEMA_VERSION => {
             migrate_v5_to_v6(&mut connection)?;
-            migrate_v6_to_v7(&mut connection)
+            migrate_v6_to_v7(&mut connection)?;
+            migrate_v7_to_v8(&mut connection)
         }
-        V6_SCHEMA_VERSION => migrate_v6_to_v7(&mut connection),
+        V6_SCHEMA_VERSION => {
+            migrate_v6_to_v7(&mut connection)?;
+            migrate_v7_to_v8(&mut connection)
+        }
+        V7_SCHEMA_VERSION => migrate_v7_to_v8(&mut connection),
         SCHEMA_VERSION => validate_schema(&connection),
         _ => Err(SqliteStoreError::InvalidSchema),
     }?;
+
     validate_foreign_keys(&connection)?;
     validate_snapshot_chains(&connection, None)?;
     validate_persisted_records(&connection, max_tasks)?;
@@ -4575,6 +4838,8 @@ fn open_database(
     validate_cancellation_records(&connection)?;
     validate_tenant_authorization_records(&connection)?;
     recover_orphaned_tasks(&mut connection)?;
+
+    let callback_policy = reconcile_callback_policy(&mut connection, push_policy.as_ref())?;
     let identity: (String, String) = connection
         .query_row(
             "SELECT tenant_scope, owner_account_id FROM store_identity WHERE singleton = 1",
@@ -4582,7 +4847,14 @@ fn open_database(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
-    Ok((connection, cursor_key, receipt_key, identity.0, identity.1))
+    Ok((
+        connection,
+        cursor_key,
+        receipt_key,
+        identity.0,
+        identity.1,
+        callback_policy,
+    ))
 }
 
 fn validate_foreign_keys(connection: &Connection) -> Result<(), SqliteStoreError> {
@@ -5645,7 +5917,7 @@ fn initialize_schema(
     }
     let cursor_key: [u8; 32] = rand::random();
     let receipt_key: [u8; 32] = rand::random();
-    let migration_hash = schema_v7_hash();
+    let migration_hash = schema_v8_hash();
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| SqliteStoreError::Initialization)?;
@@ -5685,6 +5957,9 @@ fn initialize_schema(
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
         .execute_batch(V7_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(CALLBACK_SCHEMA_SQL)
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction.execute(
         "INSERT INTO store_identity(singleton, tenant_scope, owner_account_id, policy_id, policy_revision, policy_digest)
@@ -6031,6 +6306,56 @@ fn schema_v7_hash() -> String {
     )
 }
 
+fn schema_v8_hash() -> String {
+    content_digest(
+        [schema_v7_hash().as_bytes(), CALLBACK_SCHEMA_SQL.as_bytes()]
+            .concat()
+            .as_slice(),
+    )
+}
+
+const CALLBACK_OBJECTS: &[&str] = &[
+    "callback_policy_snapshots",
+    "callback_enrollments",
+    "callback_enrollments_url",
+    "callback_configs",
+    "callback_configs_task_state",
+    "callback_events",
+    "callback_deliveries",
+    "callback_deliveries_due",
+    "callback_deliveries_tenant_due",
+    "callback_attempts",
+    "callback_audits",
+    "callback_audits_tenant_time",
+    "callback_audit_policy",
+    "callback_audit_config_create",
+    "callback_audit_config_delete",
+    "callback_audit_event",
+    "callback_audit_attempt",
+    "callback_audit_delivered",
+    "callback_audit_retry",
+    "callback_audit_dead",
+    "callback_audits_no_update",
+    "callback_audits_no_delete",
+    "callback_policy_no_update",
+    "callback_policy_no_delete",
+    "callback_enrollments_no_update",
+    "callback_enrollments_no_delete",
+    "callback_events_no_update",
+    "callback_events_no_delete",
+    "callback_configs_identity_immutable",
+    "callback_attempts_no_update",
+    "callback_attempts_no_delete",
+    "audit_projection_callback_policy",
+    "audit_projection_callback_config_create",
+    "audit_projection_callback_config_delete",
+    "audit_projection_callback_event",
+    "audit_projection_callback_attempt",
+    "audit_projection_callback_delivered",
+    "audit_projection_callback_retry",
+    "audit_projection_callback_dead",
+];
+
 #[allow(clippy::too_many_lines)]
 fn validate_schema_version(
     connection: &Connection,
@@ -6060,7 +6385,8 @@ fn validate_schema_version(
             .or_else(|| expected_schema_sql(CANCELLATION_SCHEMA_SQL, object_name))
             .or_else(|| expected_schema_sql(V5_SCHEMA_SQL, object_name))
             .or_else(|| expected_schema_sql(V6_SCHEMA_SQL, object_name))
-            .or_else(|| expected_schema_sql(V7_SCHEMA_SQL, object_name));
+            .or_else(|| expected_schema_sql(V7_SCHEMA_SQL, object_name))
+            .or_else(|| expected_schema_sql(CALLBACK_SCHEMA_SQL, object_name));
         let actual = normalize_schema_sql(&actual);
         let matches_expected = if version >= V5_SCHEMA_VERSION && *object_name == "tasks" {
             let base = expected_schema_sql(V2_SCHEMA_SQL, "tasks").expect("v2 tasks schema");
@@ -6124,7 +6450,8 @@ fn validate_schema_version(
         )
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
     let expected_hash = match version {
-        SCHEMA_VERSION => schema_v7_hash(),
+        SCHEMA_VERSION => schema_v8_hash(),
+        V7_SCHEMA_VERSION => schema_v7_hash(),
         V6_SCHEMA_VERSION => schema_v6_hash(),
         V5_SCHEMA_VERSION => schema_v5_hash(),
         V4_SCHEMA_VERSION => schema_v4_hash(),
@@ -6143,7 +6470,15 @@ fn validate_schema_version(
             }
         || actual_index_columns != "context_id,state,status_timestamp,task_id"
         || object_count
-            != i64::try_from(objects.len()).map_err(|_| SqliteStoreError::InvalidSchema)?
+            != i64::try_from(
+                objects.len()
+                    + if version == SCHEMA_VERSION {
+                        CALLBACK_OBJECTS.len()
+                    } else {
+                        0
+                    },
+            )
+            .map_err(|_| SqliteStoreError::InvalidSchema)?
     {
         return Err(SqliteStoreError::InvalidSchema);
     }
@@ -6159,7 +6494,22 @@ fn validate_schema_version(
 }
 
 fn validate_schema(connection: &Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
-    validate_schema_version(connection, SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)
+    let keys = validate_schema_version(connection, SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
+    for object in CALLBACK_OBJECTS {
+        let actual: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name=?1",
+                [object],
+                |row| row.get(0),
+            )
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        let expected = expected_schema_sql(CALLBACK_SCHEMA_SQL, object)
+            .ok_or(SqliteStoreError::InvalidSchema)?;
+        if normalize_schema_sql(&actual) != expected {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+    }
+    Ok(keys)
 }
 
 fn migrate_v1_to_v2(
@@ -6525,14 +6875,14 @@ fn migrate_v6_to_v7(connection: &mut Connection) -> Result<([u8; 32], [u8; 32]),
     transaction
         .execute(
             "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
-            params![SCHEMA_VERSION, schema_v7_hash()],
+            params![V7_SCHEMA_VERSION, schema_v7_hash()],
         )
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
-        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .pragma_update(None, "user_version", V7_SCHEMA_VERSION)
         .map_err(|_| SqliteStoreError::Initialization)?;
     let validated =
-        validate_schema_version(&transaction, SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
+        validate_schema_version(&transaction, V7_SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
     if validated != keys {
         return Err(SqliteStoreError::InvalidSchema);
     }
@@ -6540,6 +6890,263 @@ fn migrate_v6_to_v7(connection: &mut Connection) -> Result<([u8; 32], [u8; 32]),
         .commit()
         .map_err(|_| SqliteStoreError::Initialization)?;
     Ok(validated)
+}
+
+fn migrate_v7_to_v8(connection: &mut Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_version(connection, V7_SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(CALLBACK_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute(
+            "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
+            params![SCHEMA_VERSION, schema_v8_hash()],
+        )
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    let validated = validate_schema(&transaction)?;
+    if validated != keys {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    validate_foreign_keys(&transaction)?;
+    transaction
+        .commit()
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    Ok(validated)
+}
+
+#[allow(clippy::too_many_lines, clippy::type_complexity)]
+fn reconcile_callback_policy(
+    connection: &mut Connection,
+    policy: Option<&crate::push::PushPolicy>,
+) -> Result<Option<Arc<crate::CallbackPolicySnapshot>>, SqliteStoreError> {
+    let enabled = policy.filter(|value| value.enabled());
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM callback_policy_snapshots",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let Some(policy) = enabled else {
+        return if count == 0 {
+            Ok(None)
+        } else {
+            Err(SqliteStoreError::InvalidSchema)
+        };
+    };
+    let latest: Option<(String, i64, String, i64, i64, i64, i64, i64, i64)> = connection.query_row(
+        "SELECT policy_id,policy_revision,policy_digest,max_configs_per_task,max_configs_per_tenant,max_pending,max_payload_bytes,max_attempts,max_delivery_age_ms FROM callback_policy_snapshots ORDER BY policy_revision DESC LIMIT 1",
+        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+    ).optional().map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let revision =
+        i64::try_from(policy.policy_revision()).map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if let Some((
+        id,
+        old_revision,
+        digest,
+        configs,
+        tenant_configs,
+        pending,
+        payload,
+        attempts,
+        age,
+    )) = latest
+    {
+        if id != policy.policy_id() || old_revision > revision {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+        if old_revision == revision
+            && (digest != policy.policy_digest()
+                || configs != i64::from(policy.max_configs_per_task())
+                || tenant_configs != i64::from(policy.max_configs_per_tenant())
+                || pending != i64::from(policy.max_pending())
+                || payload != 262_144
+                || attempts != i64::from(policy.max_attempts())
+                || age != i64::try_from(policy.max_delivery_age_ms()).unwrap_or(-1))
+        {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+    }
+    if count == 0 || connection.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM callback_policy_snapshots WHERE policy_id=?1 AND policy_revision=?2)",
+        params![policy.policy_id(), revision], |row| row.get::<_, bool>(0),
+    ).map_err(|_| SqliteStoreError::InvalidSchema)? {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| SqliteStoreError::Initialization)?;
+        let now = chrono::Utc::now().timestamp_millis().max(1);
+        tx.execute(
+            "INSERT INTO callback_policy_snapshots(policy_id,policy_revision,policy_digest,max_configs_per_task,max_configs_per_tenant,max_pending,max_payload_bytes,max_attempts,max_delivery_age_ms,created_at) VALUES(?1,?2,?3,?4,?5,?6,262144,?7,?8,?9)",
+            params![policy.policy_id(),revision,policy.policy_digest(),policy.max_configs_per_task(),policy.max_configs_per_tenant(),policy.max_pending(),policy.max_attempts(),policy.max_delivery_age_ms(),now],
+        ).map_err(|_| SqliteStoreError::Initialization)?;
+        for enrollment in policy.enrollments() {
+            tx.execute(
+                "INSERT INTO callback_enrollments(policy_id,policy_revision,tenant_scope,enrollment_id,enrollment_generation,canonical_url,url_digest,key_generation,secret_reference,ca_reference,mtls_cert_reference,mtls_key_reference) VALUES(?1,?2,?3,?4,?2,?5,?6,?7,?8,?9,?10,?11)",
+                params![policy.policy_id(),revision,enrollment.tenant(),enrollment.endpoint_id(),enrollment.url().as_str(),content_digest(enrollment.url().as_str().as_bytes()),enrollment.key_generation(),enrollment.secret_file().to_string_lossy(),enrollment.ca_file().map(|p| p.to_string_lossy().into_owned()),enrollment.mtls_files().map(|v|v.0.to_string_lossy().into_owned()),enrollment.mtls_files().map(|v|v.1.to_string_lossy().into_owned())],
+            ).map_err(|_| SqliteStoreError::Initialization)?;
+        }
+        let now: i64 = tx
+            .query_row("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER)", [], |r| r.get(0))
+            .map_err(|_| SqliteStoreError::Initialization)?;
+        let active_removed_lease: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM callback_configs c JOIN callback_deliveries d USING(tenant_scope,task_id,config_id) WHERE NOT EXISTS(SELECT 1 FROM callback_enrollments n WHERE n.policy_id=?1 AND n.policy_revision=?2 AND n.tenant_scope=c.tenant_scope AND n.enrollment_id=c.enrollment_id AND n.enrollment_generation=c.enrollment_generation AND n.canonical_url=c.canonical_url) AND d.state='leased' AND d.lease_until>?3)",
+                params![policy.policy_id(), revision, now],
+                |row| row.get(0),
+            )
+            .map_err(|_| SqliteStoreError::Initialization)?;
+        if active_removed_lease {
+            return Err(SqliteStoreError::Initialization);
+        }
+        tx.execute(
+            "UPDATE callback_deliveries SET state='canceled',lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at=?3 WHERE rowid IN (SELECT d.rowid FROM callback_deliveries d JOIN callback_configs c USING(tenant_scope,task_id,config_id) WHERE NOT EXISTS(SELECT 1 FROM callback_enrollments n WHERE n.policy_id=?1 AND n.policy_revision=?2 AND n.tenant_scope=c.tenant_scope AND n.enrollment_id=c.enrollment_id AND n.enrollment_generation=c.enrollment_generation AND n.canonical_url=c.canonical_url) AND (d.state IN ('pending','retry') OR (d.state='leased' AND d.lease_until<=?3)))",
+            params![policy.policy_id(), revision, now],
+        ).map_err(|_| SqliteStoreError::Initialization)?;
+        tx.execute(
+            "UPDATE callback_configs AS c SET state='revoked',updated_at=?3 WHERE NOT EXISTS(SELECT 1 FROM callback_enrollments n WHERE n.policy_id=?1 AND n.policy_revision=?2 AND n.tenant_scope=c.tenant_scope AND n.enrollment_id=c.enrollment_id AND n.enrollment_generation=c.enrollment_generation AND n.canonical_url=c.canonical_url) AND c.state IN ('active','draining','terminal_closed')",
+            params![policy.policy_id(), revision, now],
+        ).map_err(|_| SqliteStoreError::Initialization)?;
+        tx.commit().map_err(|_| SqliteStoreError::Initialization)?;
+    }
+    let enrollment_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM callback_enrollments WHERE policy_id=?1 AND policy_revision=?2",
+            params![policy.policy_id(), revision],
+            |r| r.get(0),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if enrollment_count
+        != i64::try_from(policy.enrollments().len()).map_err(|_| SqliteStoreError::InvalidSchema)?
+    {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    for enrollment in policy.enrollments() {
+        let row:Option<PersistedCallbackEnrollment>=connection.query_row("SELECT canonical_url,url_digest,key_generation,secret_reference,ca_reference,mtls_cert_reference,mtls_key_reference FROM callback_enrollments WHERE policy_id=?1 AND policy_revision=?2 AND tenant_scope=?3 AND enrollment_id=?4 AND enrollment_generation=?2",params![policy.policy_id(),revision,enrollment.tenant(),enrollment.endpoint_id()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional().map_err(|_|SqliteStoreError::InvalidSchema)?;
+        let expected = (
+            enrollment.url().as_str().to_owned(),
+            content_digest(enrollment.url().as_str().as_bytes()),
+            enrollment.key_generation().to_owned(),
+            enrollment.secret_file().to_string_lossy().into_owned(),
+            enrollment
+                .ca_file()
+                .map(|p| p.to_string_lossy().into_owned()),
+            enrollment
+                .mtls_files()
+                .map(|v| v.0.to_string_lossy().into_owned()),
+            enrollment
+                .mtls_files()
+                .map(|v| v.1.to_string_lossy().into_owned()),
+        );
+        if row.as_ref() != Some(&expected) {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
+    }
+    validate_callback_records(
+        connection,
+        policy.max_pending(),
+        policy.max_configs_per_task(),
+        policy.max_configs_per_tenant(),
+    )?;
+    crate::CallbackPolicySnapshot::new_with_tenant_cap(
+        policy.policy_id(),
+        policy.policy_revision(),
+        policy.policy_digest(),
+        policy.max_configs_per_task(),
+        policy.max_configs_per_tenant(),
+        policy.max_pending(),
+        262_144,
+        policy.max_attempts(),
+        policy.max_delivery_age_ms(),
+    )
+    .map(Arc::new)
+    .map(Some)
+    .map_err(|_| SqliteStoreError::InvalidSchema)
+}
+
+fn validate_callback_records(
+    connection: &Connection,
+    max_pending: u32,
+    max_configs_per_task: u16,
+    max_configs_per_tenant: u32,
+) -> Result<(), SqliteStoreError> {
+    let invalid: bool = connection.query_row(
+        "SELECT EXISTS(
+          SELECT 1 FROM callback_configs c JOIN callback_enrollments e ON e.tenant_scope=c.tenant_scope AND e.enrollment_id=c.enrollment_id AND e.enrollment_generation=c.enrollment_generation WHERE c.canonical_url!=e.canonical_url OR c.url_digest!=e.url_digest
+          UNION ALL SELECT 1 FROM callback_events e JOIN tasks t ON t.task_id=e.task_id WHERE e.tenant_scope!=t.tenant_scope
+          UNION ALL SELECT 1 FROM callback_deliveries d JOIN callback_events e ON e.tenant_scope=d.tenant_scope AND e.event_id=d.event_id WHERE d.task_id!=e.task_id
+          UNION ALL SELECT 1 FROM callback_deliveries d JOIN callback_configs c ON c.tenant_scope=d.tenant_scope AND c.task_id=d.task_id AND c.config_id=d.config_id WHERE d.state='leased' AND (d.lease_owner IS NULL OR d.lease_token IS NULL OR d.lease_until IS NULL OR d.lease_epoch<=0)
+          UNION ALL SELECT 1 FROM callback_deliveries WHERE state!='leased' AND (lease_owner IS NOT NULL OR lease_token IS NOT NULL OR lease_until IS NOT NULL)
+          UNION ALL SELECT 1 FROM callback_configs WHERE state<>'revoked' GROUP BY tenant_scope HAVING count(*)>?1
+          UNION ALL SELECT 1 FROM callback_configs WHERE state<>'revoked' GROUP BY tenant_scope,task_id HAVING count(*)>?2
+          UNION ALL SELECT 1 FROM callback_audits a WHERE a.occurred_at<=0 OR NOT (
+            (a.event_kind='callback_policy_reconciled' AND a.source_kind='callback_enrollments' AND EXISTS(SELECT 1 FROM callback_enrollments e WHERE e.tenant_scope=a.tenant_scope AND a.source_pk_digest=smesh_callback_audit_digest(a.event_kind,e.tenant_scope,'',e.enrollment_id,'',e.enrollment_generation,0)))
+            OR (a.event_kind IN ('callback_config_created','callback_config_deleted') AND a.source_kind='callback_configs' AND EXISTS(SELECT 1 FROM callback_configs c WHERE c.tenant_scope=a.tenant_scope AND a.source_pk_digest=smesh_callback_audit_digest(a.event_kind,c.tenant_scope,c.task_id,c.config_id,'',c.enrollment_generation,0)))
+            OR (a.event_kind='callback_event_enqueued' AND a.source_kind='callback_events' AND EXISTS(SELECT 1 FROM callback_events e WHERE e.tenant_scope=a.tenant_scope AND a.source_pk_digest=smesh_callback_audit_digest(a.event_kind,e.tenant_scope,e.task_id,'',e.event_id,e.causative_revision,0)))
+            OR (a.event_kind='callback_delivery_attempted' AND a.source_kind='callback_deliveries' AND EXISTS(SELECT 1 FROM callback_deliveries d WHERE d.tenant_scope=a.tenant_scope AND a.source_pk_digest=smesh_callback_audit_digest(a.event_kind,d.tenant_scope,d.task_id,d.config_id,d.event_id,0,d.attempt_count)))
+            OR (a.event_kind='callback_delivery_attempted' AND a.source_kind='callback_deliveries' AND EXISTS(SELECT 1 FROM callback_attempts x JOIN callback_deliveries d ON d.tenant_scope=x.tenant_scope AND d.event_id=x.event_id AND d.config_id=x.config_id WHERE x.tenant_scope=a.tenant_scope AND a.source_pk_digest=smesh_callback_audit_digest(a.event_kind,d.tenant_scope,d.task_id,d.config_id,d.event_id,0,x.attempt_no)))
+            OR (a.event_kind IN ('callback_delivered','callback_retry_scheduled','callback_dead') AND a.source_kind='callback_deliveries' AND EXISTS(SELECT 1 FROM callback_attempts x JOIN callback_deliveries d ON d.tenant_scope=x.tenant_scope AND d.event_id=x.event_id AND d.config_id=x.config_id WHERE x.tenant_scope=a.tenant_scope AND x.outcome=CASE a.event_kind WHEN 'callback_delivered' THEN 'delivered' WHEN 'callback_retry_scheduled' THEN 'retry' ELSE 'dead' END AND a.source_pk_digest=smesh_callback_audit_digest(a.event_kind,d.tenant_scope,d.task_id,d.config_id,d.event_id,0,x.attempt_no)))
+          )
+          UNION ALL SELECT 1 FROM callback_audits GROUP BY tenant_scope,event_kind,source_pk_digest HAVING count(*)<>1)",
+        params![max_configs_per_tenant, max_configs_per_task],
+        |r| r.get(0),
+    ).map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if invalid {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    let incomplete_audit: bool = connection
+        .query_row(
+            "WITH RECURSIVE attempt_numbers(tenant_scope,event_id,task_id,config_id,attempt_no,max_attempt) AS (
+               SELECT tenant_scope,event_id,task_id,config_id,1,attempt_count FROM callback_deliveries WHERE attempt_count>0
+               UNION ALL SELECT tenant_scope,event_id,task_id,config_id,attempt_no+1,max_attempt FROM attempt_numbers WHERE attempt_no<max_attempt
+             ), expected(tenant_scope,event_kind,source_kind,source_pk_digest) AS (
+               SELECT tenant_scope,'callback_policy_reconciled','callback_enrollments',smesh_callback_audit_digest('callback_policy_reconciled',tenant_scope,'',enrollment_id,'',enrollment_generation,0) FROM callback_enrollments
+               UNION SELECT tenant_scope,'callback_config_created','callback_configs',smesh_callback_audit_digest('callback_config_created',tenant_scope,task_id,config_id,'',enrollment_generation,0) FROM callback_configs
+               UNION SELECT tenant_scope,'callback_config_deleted','callback_configs',smesh_callback_audit_digest('callback_config_deleted',tenant_scope,task_id,config_id,'',enrollment_generation,0) FROM callback_configs WHERE state IN ('draining','revoked')
+               UNION SELECT tenant_scope,'callback_event_enqueued','callback_events',smesh_callback_audit_digest('callback_event_enqueued',tenant_scope,task_id,'',event_id,causative_revision,0) FROM callback_events
+               UNION SELECT tenant_scope,'callback_delivery_attempted','callback_deliveries',smesh_callback_audit_digest('callback_delivery_attempted',tenant_scope,task_id,config_id,event_id,0,attempt_no) FROM attempt_numbers
+               UNION SELECT a.tenant_scope,CASE a.outcome WHEN 'delivered' THEN 'callback_delivered' WHEN 'retry' THEN 'callback_retry_scheduled' WHEN 'dead' THEN 'callback_dead' END,'callback_deliveries',smesh_callback_audit_digest(CASE a.outcome WHEN 'delivered' THEN 'callback_delivered' WHEN 'retry' THEN 'callback_retry_scheduled' WHEN 'dead' THEN 'callback_dead' END,a.tenant_scope,d.task_id,a.config_id,a.event_id,0,a.attempt_no) FROM callback_attempts a JOIN callback_deliveries d USING(tenant_scope,event_id,config_id) WHERE a.outcome IN ('delivered','retry','dead')
+               UNION SELECT tenant_scope,CASE state WHEN 'delivered' THEN 'callback_delivered' WHEN 'retry' THEN 'callback_retry_scheduled' WHEN 'dead' THEN 'callback_dead' END,'callback_deliveries',smesh_callback_audit_digest(CASE state WHEN 'delivered' THEN 'callback_delivered' WHEN 'retry' THEN 'callback_retry_scheduled' WHEN 'dead' THEN 'callback_dead' END,tenant_scope,task_id,config_id,event_id,0,attempt_count) FROM callback_deliveries WHERE state IN ('delivered','retry','dead')
+             ), actual AS (SELECT tenant_scope,event_kind,source_kind,source_pk_digest FROM callback_audits)
+             SELECT EXISTS(SELECT * FROM expected EXCEPT SELECT * FROM actual)
+                 OR EXISTS(SELECT * FROM actual EXCEPT SELECT * FROM expected)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if incomplete_audit {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    let retained: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM callback_deliveries WHERE state IN ('pending','retry','leased')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if retained > i64::from(max_pending) {
+        return Err(SqliteStoreError::Capacity);
+    }
+    let mut statement = connection
+        .prepare("SELECT payload,payload_digest FROM callback_events")
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let events = statement
+        .query_map([], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|_| SqliteStoreError::InvalidSchema)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    if events.iter().any(|(payload, digest)| {
+        payload.is_empty() || payload.len() > 256 * 1024 || content_digest(payload) != *digest
+    }) {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    Ok(())
 }
 
 // One transaction intentionally keeps lease reclamation and orphan arbitration indivisible.
@@ -7465,6 +8072,12 @@ impl crate::IntoDurableAuthority for SqliteTaskStore {
 impl crate::QuotaLeaseAuthority for SqliteTaskStore {}
 
 impl crate::AuthorityIdentity for SqliteTaskStore {
+    fn callback_authority(&self) -> Option<&dyn crate::CallbackAuthority> {
+        self.callback_policy
+            .as_ref()
+            .map(|_| self as &dyn crate::CallbackAuthority)
+    }
+
     fn audit_projection_authority(&self) -> Option<&dyn crate::AuditProjectionAuthority> {
         self.audit_projection_enabled.then_some(self)
     }
@@ -7483,6 +8096,469 @@ impl crate::AuthorityIdentity for SqliteTaskStore {
     fn authorization_resource_digest(&self, resource: &str) -> Result<String, A2AError> {
         SqliteTaskStore::authorization_resource_digest(self, resource)
     }
+}
+
+#[async_trait]
+impl crate::CallbackAuthority for SqliteTaskStore {
+    async fn callback_database_time(&self) -> Result<i64, A2AError> {
+        self.run(|connection| {
+            connection
+                .query_row(
+                    "SELECT CAST(unixepoch('subsec')*1000 AS INTEGER)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| A2AError::internal("callback DB clock failed"))
+        })
+        .await
+    }
+    fn callback_capabilities(&self) -> crate::CallbackCapabilities {
+        crate::CallbackCapabilities::sqlite_conformance()
+    }
+
+    fn callback_readiness(&self) -> crate::CallbackReadiness {
+        if self.callback_policy.is_some() {
+            crate::CallbackReadiness::Ready
+        } else {
+            crate::CallbackReadiness::Disabled
+        }
+    }
+
+    fn callback_policy_snapshot(&self) -> Option<Arc<crate::CallbackPolicySnapshot>> {
+        self.callback_policy.clone()
+    }
+
+    async fn resolve_callback_enrollment(
+        &self,
+        scope: &OwnedTaskScope,
+        exact_url: &str,
+    ) -> Result<Option<crate::CallbackEnrollmentBinding>, A2AError> {
+        if self.callback_policy.is_none() {
+            return Err(A2AError::push_notification_not_supported());
+        }
+        let tenant = scope.tenant_scope.clone();
+        let url = exact_url.to_owned();
+        self.run(move|c|{let row:Option<(String,i64,String)>=c.query_row(
+            "SELECT enrollment_id,enrollment_generation,url_digest FROM callback_enrollments WHERE tenant_scope=?1 AND canonical_url=?2 ORDER BY enrollment_generation DESC LIMIT 1",
+            params![tenant,url],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_|A2AError::internal("callback enrollment lookup failed"))?;
+            row.map(|(id,g,d)|crate::CallbackEnrollmentBinding::new(id,u64::try_from(g).map_err(|_|A2AError::internal("callback enrollment corrupt"))?,url,d)).transpose()}).await
+    }
+
+    async fn create_callback_config(
+        &self,
+        command: crate::ConfigCreateCommand,
+    ) -> Result<crate::CallbackConfig, A2AError> {
+        let policy = self
+            .callback_policy
+            .clone()
+            .ok_or_else(A2AError::push_notification_not_supported)?;
+        let tenant = command.scope().tenant_scope.clone();
+        let owner = command.scope().owner_account_id.clone();
+        let principal = command.scope().principal_scope.clone();
+        let own = command.scope().visibility == VisibilityScope::Own;
+        let task = command.task_id().to_owned();
+        let supplied_id = command.config_id().map(|v| v.as_str().to_owned());
+        let enrollment = command.enrollment_id().to_owned();
+        let generation = i64::try_from(command.enrollment_generation())
+            .map_err(|_| A2AError::invalid_request("invalid callback enrollment generation"))?;
+        let url = command.canonical_url().to_owned();
+        let digest = command.url_digest().to_owned();
+        let created = command.created_at();
+        self.run(move |connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| A2AError::internal("callback config transaction failed"))?;
+            let visible: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE tenant_scope=?1 AND task_id=?2 AND (?3=0 OR owner_account_id=?4) AND state NOT IN ('TASK_STATE_COMPLETED','TASK_STATE_FAILED','TASK_STATE_CANCELED','TASK_STATE_REJECTED'))",
+                params![tenant,task,i64::from(own),owner], |r| r.get(0),
+            ).map_err(|_| A2AError::internal("callback parent lookup failed"))?;
+            if !visible { return Err(A2AError::task_not_found("resource")); }
+            let enrolled: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM callback_enrollments WHERE tenant_scope=?1 AND enrollment_id=?2 AND enrollment_generation=?3 AND canonical_url=?4 AND url_digest=?5)",
+                params![tenant,enrollment,generation,url,digest], |r| r.get(0),
+            ).map_err(|_| A2AError::internal("callback enrollment lookup failed"))?;
+            if !enrolled { return Err(A2AError::invalid_request("callback enrollment is not authorized")); }
+            let config_id = supplied_id.unwrap_or_else(|| format!("callback-{}", &content_digest(&rand::random::<[u8;32]>())[7..39]));
+            let prior: Option<(String,i64,String,String,String,i64)> = tx.query_row(
+                "SELECT enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at FROM callback_configs WHERE tenant_scope=?1 AND task_id=?2 AND config_id=?3",
+                params![tenant,task,config_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+            ).optional().map_err(|_| A2AError::internal("callback idempotency lookup failed"))?;
+            if let Some((e,g,u,d,s,c)) = prior {
+                if e != enrollment || g != generation || u != url || d != digest {
+                    return Err(A2AError::invalid_request("callback config id is already bound to different semantics"));
+                }
+                return callback_config_from_parts(&tenant,&task,&config_id,&e,g,&u,&d,&s,c);
+            }
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM callback_configs WHERE tenant_scope=?1 AND task_id=?2 AND state<>'revoked'",
+                params![tenant,task], |r| r.get(0),
+            ).map_err(|_| A2AError::internal("callback config count failed"))?;
+            if count >= i64::from(policy.max_configs_per_task()) { return Err(A2AError::invalid_request("callback config capacity reached")); }
+            let tenant_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM callback_configs WHERE tenant_scope=?1 AND state<>'revoked'",
+                params![tenant], |row| row.get(0),
+            ).map_err(|_| A2AError::internal("callback tenant config count failed"))?;
+            if tenant_count >= i64::from(policy.max_configs_per_tenant()) { return Err(A2AError::invalid_params("callback tenant config capacity reached")); }
+            tx.execute(
+                "INSERT INTO callback_configs(tenant_scope,task_id,config_id,owner_account_id,principal_scope,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'active',?10,?10)",
+                params![tenant,task,config_id,owner,principal,enrollment,generation,url,digest,created],
+            ).map_err(|_| A2AError::internal("callback config insert failed"))?;
+            tx.commit().map_err(|_| A2AError::internal("callback config commit failed"))?;
+            callback_config_from_parts(&tenant,&task,&config_id,&enrollment,generation,&url,&digest,"active",created)
+        }).await
+    }
+
+    async fn get_callback_config(
+        &self,
+        command: crate::ConfigGetCommand,
+    ) -> Result<Option<crate::CallbackConfig>, A2AError> {
+        if self.callback_policy.is_none() {
+            return Err(A2AError::push_notification_not_supported());
+        }
+        let tenant = command.scope().tenant_scope.clone();
+        let owner = command.scope().owner_account_id.clone();
+        let own = command.scope().visibility == VisibilityScope::Own;
+        let task = command.task_id().to_owned();
+        let id = command.config_id().as_str().to_owned();
+        self.run(move |c| {
+            let row: Option<(String,i64,String,String,String,i64)> = c.query_row(
+                "SELECT cc.enrollment_id,cc.enrollment_generation,cc.canonical_url,cc.url_digest,cc.state,cc.created_at FROM callback_configs cc JOIN tasks t ON t.task_id=cc.task_id AND t.tenant_scope=cc.tenant_scope WHERE cc.tenant_scope=?1 AND cc.task_id=?2 AND cc.config_id=?3 AND cc.state!='revoked' AND (?4=0 OR t.owner_account_id=?5)",
+                params![tenant,task,id,i64::from(own),owner], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+            ).optional().map_err(|_| A2AError::internal("callback config lookup failed"))?;
+            row.map(|(e,g,u,d,s,at)| callback_config_from_parts(&tenant,&task,&id,&e,g,&u,&d,&s,at)).transpose()
+        }).await
+    }
+
+    async fn list_callback_configs(
+        &self,
+        command: crate::ConfigListCommand,
+    ) -> Result<crate::CallbackConfigPage, A2AError> {
+        if self.callback_policy.is_none() {
+            return Err(A2AError::push_notification_not_supported());
+        }
+        let tenant = command.scope().tenant_scope.clone();
+        let owner = command.scope().owner_account_id.clone();
+        let own = command.scope().visibility == VisibilityScope::Own;
+        let task = command.task_id().to_owned();
+        let limit = usize::from(command.page_size().get());
+        let cursor_key = *self.cursor_key;
+        let after = command
+            .page_token()
+            .map(|t| parse_callback_page_token(&cursor_key, t, &tenant, &task))
+            .transpose()?;
+        self.run(move |c| {
+            let (after_at,after_id)=after.unwrap_or((0,String::new()));
+            let mut stmt=c.prepare("SELECT cc.config_id,cc.enrollment_id,cc.enrollment_generation,cc.canonical_url,cc.url_digest,cc.state,cc.created_at FROM callback_configs cc JOIN tasks t ON t.task_id=cc.task_id AND t.tenant_scope=cc.tenant_scope WHERE cc.tenant_scope=?1 AND cc.task_id=?2 AND cc.state!='revoked' AND (?3=0 OR t.owner_account_id=?4) AND (cc.created_at>?5 OR (cc.created_at=?5 AND cc.config_id>?6)) ORDER BY cc.created_at,cc.config_id LIMIT ?7")
+                .map_err(|_| A2AError::internal("callback config list failed"))?;
+            let rows=stmt.query_map(params![tenant,task,i64::from(own),owner,after_at,after_id,i64::try_from(limit+1).unwrap_or(101)], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?)))
+                .map_err(|_| A2AError::internal("callback config list failed"))?.collect::<Result<Vec<_>,_>>().map_err(|_| A2AError::internal("callback config list failed"))?;
+            let more=rows.len()>limit; let mut configs=Vec::with_capacity(rows.len().min(limit));
+            for (id,e,g,u,d,s,at) in rows.into_iter().take(limit) { configs.push(callback_config_from_parts(&tenant,&task,&id,&e,g,&u,&d,&s,at)?); }
+            let next=if more { let last=configs.last().expect("nonempty bounded page"); Some(make_callback_page_token(&cursor_key,&tenant,&task,last.created_at(),last.config_id().as_str())?) } else { None };
+            crate::CallbackConfigPage::new(configs,next)
+        }).await
+    }
+
+    async fn delete_callback_config(
+        &self,
+        command: crate::ConfigDeleteCommand,
+    ) -> Result<crate::CallbackDeleteOutcome, A2AError> {
+        if self.callback_policy.is_none() {
+            return Err(A2AError::push_notification_not_supported());
+        }
+        let tenant = command.scope().tenant_scope.clone();
+        let owner = command.scope().owner_account_id.clone();
+        let own = command.scope().visibility == VisibilityScope::Own;
+        let task = command.task_id().to_owned();
+        let id = command.config_id().as_str().to_owned();
+        let requested = command.requested_at();
+        self.run(move |c| { let tx=c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| A2AError::internal("callback delete failed"))?;
+            let visible: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE tenant_scope=?1 AND task_id=?2 AND (?3=0 OR owner_account_id=?4))",params![tenant,task,i64::from(own),owner],|r|r.get(0)).map_err(|_|A2AError::internal("callback parent lookup failed"))?;
+            if !visible{return Err(A2AError::task_not_found("resource"));}
+            let state:Option<String>=tx.query_row("SELECT state FROM callback_configs WHERE tenant_scope=?1 AND task_id=?2 AND config_id=?3",params![tenant,task,id],|r|r.get(0)).optional().map_err(|_|A2AError::internal("callback delete lookup failed"))?;
+            let Some(state)=state else { tx.commit().map_err(|_|A2AError::internal("callback delete commit failed"))?; return Ok(crate::CallbackDeleteOutcome::AlreadyAbsent); };
+            if state=="revoked" { tx.commit().map_err(|_|A2AError::internal("callback delete commit failed"))?; return Ok(crate::CallbackDeleteOutcome::AlreadyAbsent); }
+            let now:i64=tx.query_row("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER)",[],|r|r.get(0)).map_err(|_|A2AError::internal("callback DB clock failed"))?;
+            tx.execute("UPDATE callback_deliveries SET state='canceled',lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at=?4 WHERE tenant_scope=?1 AND task_id=?2 AND config_id=?3 AND (state IN ('pending','retry') OR (state='leased' AND lease_until<=?4))",params![tenant,task,id,now]).map_err(|_|A2AError::internal("callback cancellation failed"))?;
+            let leased:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM callback_deliveries WHERE tenant_scope=?1 AND task_id=?2 AND config_id=?3 AND state='leased' AND lease_until>?4)",params![tenant,task,id,now],|r|r.get(0)).map_err(|_|A2AError::internal("callback lease lookup failed"))?;
+            let next=if leased{"draining"}else{"revoked"}; tx.execute("UPDATE callback_configs SET state=?4,updated_at=?5 WHERE tenant_scope=?1 AND task_id=?2 AND config_id=?3",params![tenant,task,id,next,requested]).map_err(|_|A2AError::internal("callback revoke failed"))?;
+            tx.commit().map_err(|_|A2AError::internal("callback delete commit failed"))?; Ok(if leased{crate::CallbackDeleteOutcome::Draining}else{crate::CallbackDeleteOutcome::Revoked}) }).await
+    }
+
+    async fn claim_callback_deliveries(
+        &self,
+        command: crate::DeliveryClaimCommand,
+    ) -> Result<Vec<crate::CallbackLease>, A2AError> {
+        let policy = self
+            .callback_policy
+            .clone()
+            .ok_or_else(A2AError::push_notification_not_supported)?;
+        let owner = command.owner().to_owned();
+        let duration = command.lease_duration().get();
+        let limit = usize::from(command.batch_limit());
+        self.run(move |c| { let tx=c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_|A2AError::internal("callback claim failed"))?; let now:i64=tx.query_row("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER)",[],|r|r.get(0)).map_err(|_|A2AError::internal("callback DB clock failed"))?;
+            tx.execute("UPDATE callback_deliveries SET state='retry',lease_owner=NULL,lease_token=NULL,lease_until=NULL,available_at=?1,updated_at=?1 WHERE state='leased' AND lease_until<=?1 AND attempt_count<?2",params![now,policy.max_attempts()]).map_err(|_|A2AError::internal("callback reclaim failed"))?;
+            tx.execute("UPDATE callback_deliveries SET state='dead',lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at=?1 WHERE state='leased' AND lease_until<=?1 AND attempt_count>=?2",params![now,policy.max_attempts()]).map_err(|_|A2AError::internal("callback dead transition failed"))?;
+            let mut stmt=tx.prepare("SELECT tenant_scope,event_id,config_id FROM (SELECT d.tenant_scope,d.event_id,d.config_id,ROW_NUMBER() OVER(PARTITION BY d.tenant_scope ORDER BY d.available_at,d.event_id,d.config_id) fair FROM callback_deliveries d JOIN callback_configs c ON c.tenant_scope=d.tenant_scope AND c.task_id=d.task_id AND c.config_id=d.config_id WHERE d.state IN ('pending','retry') AND d.available_at<=?1 AND c.state IN ('active','terminal_closed')) ORDER BY fair,tenant_scope,event_id,config_id LIMIT ?2").map_err(|_|A2AError::internal("callback claim selection failed"))?;
+            let selected=stmt.query_map(params![now,i64::try_from(limit).unwrap_or(1024)],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).map_err(|_|A2AError::internal("callback claim selection failed"))?.collect::<Result<Vec<_>,_>>().map_err(|_|A2AError::internal("callback claim selection failed"))?; drop(stmt);
+            let mut leases=Vec::with_capacity(selected.len()); for (tenant,event,id) in selected { let token=format!("lease-{}",&content_digest(&rand::random::<[u8;32]>())[7..39]); let until=now.checked_add(duration).ok_or_else(||A2AError::internal("callback lease overflow"))?;
+                tx.execute("UPDATE callback_deliveries SET state='leased',attempt_count=attempt_count+1,lease_owner=?4,lease_token=?5,lease_epoch=lease_epoch+1,lease_until=?6,updated_at=?7 WHERE tenant_scope=?1 AND event_id=?2 AND config_id=?3",params![tenant,event,id,owner,token,until,now]).map_err(|_|A2AError::internal("callback claim update failed"))?;
+                let row:(String,String,String,String,String,i64,Vec<u8>,String,i64,i64,String,String,i64,i64)=tx.query_row("SELECT d.task_id,c.canonical_url,c.enrollment_id,c.config_id,d.lease_token,c.enrollment_generation,e.payload,e.payload_digest,d.attempt_count,d.lease_epoch,c.owner_account_id,c.principal_scope,e.created_at,e.expires_at FROM callback_deliveries d JOIN callback_configs c ON c.tenant_scope=d.tenant_scope AND c.task_id=d.task_id AND c.config_id=d.config_id JOIN callback_events e ON e.tenant_scope=d.tenant_scope AND e.event_id=d.event_id WHERE d.tenant_scope=?1 AND d.event_id=?2 AND d.config_id=?3",params![tenant,event,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?))).map_err(|_|A2AError::internal("callback lease projection failed"))?;
+                let fence=crate::DeliveryFence::new(&tenant,&event,&id,&owner,row.4,u64::try_from(row.9).map_err(|_|A2AError::internal("callback fence corrupt"))?)?; leases.push(crate::CallbackLease::new_authoritative(fence,row.0,row.3,row.1,row.2,u64::try_from(row.5).map_err(|_|A2AError::internal("callback enrollment corrupt"))?,row.6,row.7,u16::try_from(row.8).unwrap_or(32),row.12,row.13,until,row.10,row.11)?); }
+            tx.commit().map_err(|_|A2AError::internal("callback claim commit failed"))?; Ok(leases) }).await
+    }
+
+    async fn renew_callback_delivery(
+        &self,
+        fence: &crate::DeliveryFence,
+        duration: crate::LeaseDurationMillis,
+    ) -> Result<Option<i64>, A2AError> {
+        let f = fence.clone();
+        self.run(move|c|{let now:i64=c.query_row("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER)",[],|r|r.get(0)).map_err(|_|A2AError::internal("callback DB clock failed"))?;let until=now.checked_add(duration.get()).ok_or_else(||A2AError::internal("callback lease overflow"))?;let n=c.execute("UPDATE callback_deliveries SET lease_until=?7,updated_at=?6 WHERE tenant_scope=?1 AND event_id=?2 AND config_id=?3 AND lease_owner=?4 AND lease_token=?5 AND lease_epoch=?8 AND state='leased' AND lease_until>?6",params![f.tenant_scope(),f.event_id(),f.config_id(),f.lease_owner(),f.lease_token(),now,until,i64::try_from(f.lease_epoch()).unwrap_or(-1)]).map_err(|_|A2AError::internal("callback renew failed"))?;Ok((n==1).then_some(until))}).await
+    }
+
+    async fn commit_callback_delivery(
+        &self,
+        fence: &crate::DeliveryFence,
+    ) -> Result<bool, A2AError> {
+        finish_callback_delivery(self, fence, "delivered", None, None)
+            .await
+            .map(|s| s == crate::CallbackDeliveryState::Delivered)
+    }
+
+    async fn fail_callback_delivery(
+        &self,
+        command: crate::CallbackFailCommand,
+    ) -> Result<crate::CallbackDeliveryState, A2AError> {
+        let state = match command.disposition() {
+            crate::CallbackDeliveryDisposition::Retry => "retry",
+            crate::CallbackDeliveryDisposition::Dead => "dead",
+        };
+        finish_callback_delivery(
+            self,
+            command.fence(),
+            state,
+            Some(command.category()),
+            Some((command.error_digest(), command.retry_at())),
+        )
+        .await
+    }
+
+    async fn revoke_callback_delivery(
+        &self,
+        fence: &crate::DeliveryFence,
+    ) -> Result<crate::CallbackDeliveryState, A2AError> {
+        finish_callback_delivery(self, fence, "canceled", None, None).await
+    }
+}
+
+fn sqlite_callback_terminal_fault(
+    point: crate::CallbackTerminalTestFault,
+    task_id: &str,
+) -> Result<(), A2AError> {
+    if !task_id.starts_with("fault-") {
+        return Ok(());
+    }
+    let mut armed = SQLITE_CALLBACK_TERMINAL_TEST_FAULT
+        .lock()
+        .map_err(|_| A2AError::internal("callback terminal fault lock failed"))?;
+    if armed.as_ref() == Some(&point) {
+        *armed = None;
+        return Err(A2AError::internal(
+            "injected callback terminal enqueue fault",
+        ));
+    }
+    Ok(())
+}
+
+fn enqueue_terminal_callbacks(
+    tx: &rusqlite::Transaction<'_>,
+    tenant: &str,
+    task: &Task,
+    revision: u64,
+    now: i64,
+) -> Result<(), A2AError> {
+    let revision_i64 = i64::try_from(revision)
+        .map_err(|_| A2AError::internal("callback task revision exhausted"))?;
+    if !task.status.state.is_terminal() {
+        return Ok(());
+    }
+    let active:i64=tx.query_row("SELECT COUNT(*) FROM callback_configs WHERE tenant_scope=?1 AND task_id=?2 AND state='active'",params![tenant,task.id],|r|r.get(0)).map_err(|_|A2AError::internal("callback terminal config lookup failed"))?;
+    if active == 0 {
+        return Ok(());
+    }
+    let terminal = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        task_id: task.id.clone(),
+        context_id: task.context_id.clone(),
+        status: task.status.clone(),
+        metadata: None,
+    });
+    let payload = serde_json::to_vec(&terminal)
+        .map_err(|_| A2AError::internal("callback terminal payload encoding failed"))?;
+    let (max_payload,max_delivery_age):(i64,i64)=tx.query_row("SELECT max_payload_bytes,max_delivery_age_ms FROM callback_policy_snapshots ORDER BY policy_revision DESC LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|A2AError::internal("callback terminal policy lookup failed"))?;
+    if payload.is_empty() || i64::try_from(payload.len()).unwrap_or(i64::MAX) > max_payload {
+        return Err(A2AError::invalid_request(
+            "callback terminal payload exceeds policy",
+        ));
+    }
+    let digest = content_digest(&payload);
+    let event_id = format!(
+        "callback-event-{}",
+        &content_digest(format!("{tenant}\0{}\0{revision}\0{digest}", task.id).as_bytes())[7..39]
+    );
+    let expires = now.saturating_add(max_delivery_age);
+    sqlite_callback_terminal_fault(
+        crate::CallbackTerminalTestFault::BeforeEventInsert,
+        &task.id,
+    )?;
+    tx.execute("INSERT OR IGNORE INTO callback_events(tenant_scope,event_id,task_id,causative_revision,payload,payload_digest,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![tenant,event_id,task.id,revision_i64,payload,digest,now,expires]).map_err(|_|A2AError::internal("callback terminal event insert failed"))?;
+    let max_pending:i64=tx.query_row("SELECT max_pending FROM callback_policy_snapshots ORDER BY policy_revision DESC LIMIT 1",[],|r|r.get(0)).map_err(|_|A2AError::internal("callback terminal policy lookup failed"))?;
+    let pending: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM callback_deliveries WHERE state IN ('pending','retry','leased')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| A2AError::internal("callback retained count failed"))?;
+    if pending.checked_add(active).is_none_or(|v| v > max_pending) {
+        return Err(A2AError::invalid_request(
+            "callback pending capacity reached",
+        ));
+    }
+    let configs = {
+        let mut statement = tx.prepare("SELECT config_id FROM callback_configs WHERE tenant_scope=?1 AND task_id=?2 AND state='active' ORDER BY config_id").map_err(|_|A2AError::internal("callback terminal config lookup failed"))?;
+        statement
+            .query_map(params![tenant, task.id], |row| row.get::<_, String>(0))
+            .map_err(|_| A2AError::internal("callback terminal config lookup failed"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| A2AError::internal("callback terminal config lookup failed"))?
+    };
+    for config_id in configs {
+        sqlite_callback_terminal_fault(
+            crate::CallbackTerminalTestFault::BeforeDeliveryInsert,
+            &task.id,
+        )?;
+        tx.execute("INSERT OR IGNORE INTO callback_deliveries(tenant_scope,event_id,task_id,config_id,state,available_at,created_at,updated_at) VALUES(?1,?2,?3,?4,'pending',?5,?5,?5)",params![tenant,event_id,task.id,config_id,now]).map_err(|_|A2AError::internal("callback terminal delivery insert failed"))?;
+        sqlite_callback_terminal_fault(
+            crate::CallbackTerminalTestFault::AfterDeliveryInsert,
+            &task.id,
+        )?;
+    }
+    sqlite_callback_terminal_fault(
+        crate::CallbackTerminalTestFault::BeforeConfigTerminalClose,
+        &task.id,
+    )?;
+    tx.execute("UPDATE callback_configs SET state='terminal_closed',updated_at=?3 WHERE tenant_scope=?1 AND task_id=?2 AND state='active'",params![tenant,task.id,now]).map_err(|_|A2AError::internal("callback terminal close failed"))?;
+    sqlite_callback_terminal_fault(
+        crate::CallbackTerminalTestFault::AfterCallbackRows,
+        &task.id,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn callback_config_from_parts(
+    tenant: &str,
+    task: &str,
+    id: &str,
+    enrollment: &str,
+    generation: i64,
+    url: &str,
+    digest: &str,
+    state: &str,
+    created: i64,
+) -> Result<crate::CallbackConfig, A2AError> {
+    let state = match state {
+        "active" => crate::CallbackConfigState::Active,
+        "draining" => crate::CallbackConfigState::Draining,
+        "revoked" => crate::CallbackConfigState::Revoked,
+        "terminal_closed" => crate::CallbackConfigState::TerminalClosed,
+        _ => return Err(A2AError::internal("callback config state corrupt")),
+    };
+    crate::CallbackConfig::new(
+        tenant,
+        task,
+        crate::CallbackConfigId::new(id)?,
+        enrollment,
+        u64::try_from(generation).map_err(|_| A2AError::internal("callback generation corrupt"))?,
+        url,
+        digest,
+        state,
+        created,
+    )
+}
+
+fn make_callback_page_token(
+    key: &[u8; 32],
+    tenant: &str,
+    task: &str,
+    created: i64,
+    id: &str,
+) -> Result<String, A2AError> {
+    let payload = format!("1\u{1f}{tenant}\u{1f}{task}\u{1f}{created}\u{1f}{id}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|_| A2AError::internal("callback token failed"))?;
+    mac.update(b"smesh-callback-page-v1\0");
+    mac.update(payload.as_bytes());
+    Ok(format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(payload),
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    ))
+}
+fn parse_callback_page_token(
+    key: &[u8; 32],
+    token: &str,
+    tenant: &str,
+    task: &str,
+) -> Result<(i64, String), A2AError> {
+    let (p, m) = token
+        .split_once('.')
+        .ok_or_else(|| A2AError::invalid_request("invalid callback page token"))?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(p)
+        .map_err(|_| A2AError::invalid_request("invalid callback page token"))?;
+    let supplied = URL_SAFE_NO_PAD
+        .decode(m)
+        .map_err(|_| A2AError::invalid_request("invalid callback page token"))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|_| A2AError::internal("callback token failed"))?;
+    mac.update(b"smesh-callback-page-v1\0");
+    mac.update(&payload);
+    let expected = mac.finalize().into_bytes();
+    if supplied.len() != 32 || !bool::from(expected.as_slice().ct_eq(&supplied)) {
+        return Err(A2AError::invalid_request("invalid callback page token"));
+    }
+    let text = std::str::from_utf8(&payload)
+        .map_err(|_| A2AError::invalid_request("invalid callback page token"))?;
+    let mut parts = text.split('\u{1f}');
+    if parts.next() != Some("1") || parts.next() != Some(tenant) || parts.next() != Some(task) {
+        return Err(A2AError::invalid_request("invalid callback page token"));
+    }
+    let created = parts
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| A2AError::invalid_request("invalid callback page token"))?;
+    let id = parts
+        .next()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| A2AError::invalid_request("invalid callback page token"))?
+        .to_owned();
+    if parts.next().is_some() {
+        return Err(A2AError::invalid_request("invalid callback page token"));
+    }
+    Ok((created, id))
+}
+
+async fn finish_callback_delivery(
+    store: &SqliteTaskStore,
+    fence: &crate::DeliveryFence,
+    next: &'static str,
+    category: Option<crate::CallbackDeliveryCategory>,
+    evidence: Option<(&str, Option<i64>)>,
+) -> Result<crate::CallbackDeliveryState, A2AError> {
+    let f = fence.clone();
+    let evidence = evidence.map(|(d, r)| (d.to_owned(), r));
+    store.run(move|c|{let tx=c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_|A2AError::internal("callback finish failed"))?;let now:i64=tx.query_row("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER)",[],|r|r.get(0)).map_err(|_|A2AError::internal("callback DB clock failed"))?;let retry_at=evidence.as_ref().and_then(|v|v.1).unwrap_or(now);let n=tx.execute("UPDATE callback_deliveries SET state=?7,available_at=?8,lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at=?9 WHERE tenant_scope=?1 AND event_id=?2 AND config_id=?3 AND lease_owner=?4 AND lease_token=?5 AND lease_epoch=?6 AND state='leased' AND lease_until>?9",params![f.tenant_scope(),f.event_id(),f.config_id(),f.lease_owner(),f.lease_token(),i64::try_from(f.lease_epoch()).unwrap_or(-1),next,retry_at,now]).map_err(|_|A2AError::internal("callback finish update failed"))?;if n!=1{return Err(A2AError::invalid_request("stale callback delivery fence"));}let config=f.config_id().to_owned();let category=category.map(|v|format!("{v:?}").to_ascii_lowercase());tx.execute("INSERT INTO callback_attempts(tenant_scope,event_id,config_id,attempt_no,lease_epoch,started_at,finished_at,outcome,category,evidence_digest) SELECT tenant_scope,event_id,config_id,attempt_count,lease_epoch,?4,?4,?5,?6,?7 FROM callback_deliveries WHERE tenant_scope=?1 AND event_id=?2 AND config_id=?3",params![f.tenant_scope(),f.event_id(),config,now,next,category,evidence.as_ref().map(|v|v.0.as_str())]).map_err(|_|A2AError::internal("callback attempt insert failed"))?;tx.execute("UPDATE callback_configs AS c SET state='revoked',updated_at=?4 WHERE c.tenant_scope=?1 AND c.task_id=(SELECT d.task_id FROM callback_deliveries d WHERE d.tenant_scope=?1 AND d.event_id=?2 AND d.config_id=?3) AND c.config_id=?3 AND c.state='draining' AND NOT EXISTS(SELECT 1 FROM callback_deliveries d WHERE d.tenant_scope=c.tenant_scope AND d.task_id=c.task_id AND d.config_id=c.config_id AND d.state='leased')",params![f.tenant_scope(),f.event_id(),config,now]).map_err(|_|A2AError::internal("callback drain finalize failed"))?;tx.commit().map_err(|_|A2AError::internal("callback finish commit failed"))?;Ok(match next{"delivered"=>crate::CallbackDeliveryState::Delivered,"retry"=>crate::CallbackDeliveryState::Retry,"dead"=>crate::CallbackDeliveryState::Dead,_=>crate::CallbackDeliveryState::Canceled})}).await
 }
 
 #[async_trait]
@@ -7662,13 +8738,14 @@ impl crate::TaskAdmission for SqliteTaskStore {
         mutation: crate::AuthorizedMutation<SendMessageAdmission>,
         audit: AuthorizationAuditInput,
     ) -> Result<AdmissionOutcome, A2AError> {
-        let (command, quota, intent) = mutation.into_authority_parts();
+        let (command, quota, intent, callback) = mutation.into_authority_parts();
         if quota.is_some() || intent.is_some() {
             return Err(A2AError::unsupported_operation(
                 "quota reservations are unsupported by SQLite",
             ));
         }
-        SqliteTaskStore::authorize_and_admit(self, scope, command, audit).await
+        self.admit_send_message_inner(command, Some((scope.clone(), audit)), callback)
+            .await
     }
 
     async fn authorize_and_continue_mutation(
@@ -7677,10 +8754,10 @@ impl crate::TaskAdmission for SqliteTaskStore {
         mutation: crate::AuthorizedMutation<SendMessageAdmission>,
         audit: AuthorizationAuditInput,
     ) -> Result<AdmissionOutcome, A2AError> {
-        let (command, quota, intent) = mutation.into_authority_parts();
-        if quota.is_some() || intent.is_some() {
+        let (command, quota, intent, callback) = mutation.into_authority_parts();
+        if quota.is_some() || intent.is_some() || callback.is_some() {
             return Err(A2AError::unsupported_operation(
-                "quota reservations are unsupported by SQLite",
+                "quota or callback continuation intents are unsupported by SQLite",
             ));
         }
         SqliteTaskStore::authorize_and_continue(self, scope, command, audit).await
@@ -7980,6 +9057,7 @@ impl crate::durable_authority::LocalDevelopmentCompatibility for SqliteTaskStore
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl TaskStore for SqliteTaskStore {
     async fn create(&self, task: Task) -> Result<u64, A2AError> {
@@ -8139,6 +9217,13 @@ impl TaskStore for SqliteTaskStore {
                     ],
                 )
                 .map_err(|_| A2AError::internal("persistent task event append failed"))?;
+            enqueue_terminal_callbacks(
+                &transaction,
+                TRUSTED_SINGLE_TENANT_SCOPE,
+                &task,
+                next_revision,
+                chrono::Utc::now().timestamp_millis(),
+            )?;
             ensure_atomic_capacity(&transaction)?;
             transaction
                 .commit()

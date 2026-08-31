@@ -270,6 +270,7 @@ pub(crate) struct DurableRequestHandler {
     input_limits: InputLimits,
     errors_before_stream: bool,
     telemetry: Option<crate::telemetry::TelemetryHandle>,
+    push_readiness: Option<Arc<crate::push::PushReadiness>>,
     #[cfg(test)]
     after_empty_read: Option<(Arc<Notify>, Arc<Notify>)>,
 }
@@ -296,7 +297,12 @@ impl DurableRequestHandler {
             }
             return Err(A2AError::invalid_request("forbidden"));
         };
-        let scope = OwnedTaskScope::new(context.tenant_id(), context.account_id(), visibility)?;
+        let scope = OwnedTaskScope::new_with_principal(
+            context.tenant_id(),
+            context.account_id(),
+            context.principal_scope(),
+            visibility,
+        )?;
         Ok(Some((context, scope)))
     }
 
@@ -494,6 +500,7 @@ impl DurableRequestHandler {
             input_limits,
             errors_before_stream: false,
             telemetry: None,
+            push_readiness: None,
             #[cfg(test)]
             after_empty_read: None,
         }
@@ -515,6 +522,14 @@ impl DurableRequestHandler {
         telemetry: Option<crate::telemetry::TelemetryHandle>,
     ) -> Self {
         self.telemetry = telemetry;
+        self
+    }
+
+    pub(crate) fn with_push_readiness(
+        mut self,
+        readiness: Arc<crate::push::PushReadiness>,
+    ) -> Self {
+        self.push_readiness = Some(readiness);
         self
     }
 
@@ -597,14 +612,6 @@ impl DurableRequestHandler {
         if request
             .configuration
             .as_ref()
-            .and_then(|configuration| configuration.task_push_notification_config.as_ref())
-            .is_some()
-        {
-            return Err(A2AError::push_notification_not_supported());
-        }
-        if request
-            .configuration
-            .as_ref()
             .and_then(|configuration| configuration.accepted_output_modes.as_ref())
             .is_some_and(|modes| !modes.iter().any(|mode| mode == "application/json"))
         {
@@ -623,6 +630,56 @@ impl DurableRequestHandler {
             ));
         }
         Ok(())
+    }
+
+    async fn inline_callback_intent(
+        &self,
+        request: &SendMessageRequest,
+        authorization: Option<&(AuthorizationContext, OwnedTaskScope)>,
+    ) -> Result<Option<crate::callback_authority::CallbackIntent>, A2AError> {
+        let Some(config) = request
+            .configuration
+            .as_ref()
+            .and_then(|c| c.task_push_notification_config.as_ref())
+        else {
+            return Ok(None);
+        };
+        let Some(authority) = self.store.callback_authority() else {
+            return Err(A2AError::push_notification_not_supported());
+        };
+        if self
+            .push_readiness
+            .as_ref()
+            .is_some_and(|readiness| !readiness.is_ready())
+        {
+            return Err(A2AError::internal(
+                "callback delivery worker is unavailable",
+            ));
+        }
+        if request.message.task_id.is_some()
+            || !config.task_id.is_empty()
+            || config.tenant.is_some()
+            || config.token.is_some()
+            || config.authentication.is_some()
+        {
+            return Err(A2AError::invalid_params(
+                "invalid inline callback configuration",
+            ));
+        }
+        let (_, scope) = authorization.ok_or_else(|| A2AError::invalid_request("forbidden"))?;
+        let enrollment = authority
+            .resolve_callback_enrollment(scope, &config.url)
+            .await?
+            .ok_or_else(|| A2AError::invalid_params("callback enrollment is not authorized"))?;
+        let config_id = config
+            .id
+            .as_deref()
+            .map(crate::CallbackConfigId::new)
+            .transpose()?;
+        Ok(Some(crate::callback_authority::CallbackIntent {
+            config_id,
+            enrollment,
+        }))
     }
 
     fn admission_task(
@@ -960,6 +1017,18 @@ fn project_task(mut task: Task, history_length: Option<i32>) -> Task {
 }
 
 #[allow(clippy::too_many_lines)]
+fn public_push_config(config: &crate::CallbackConfig) -> TaskPushNotificationConfig {
+    TaskPushNotificationConfig {
+        url: config.canonical_url().to_owned(),
+        id: Some(config.config_id().as_str().to_owned()),
+        task_id: config.task_id().to_owned(),
+        token: None,
+        authentication: None,
+        tenant: None,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl RequestHandler for DurableRequestHandler {
     async fn send_message(
@@ -979,6 +1048,9 @@ impl RequestHandler for DurableRequestHandler {
         // canonicalization reads followed by any durable mutation.
         self.ensure_driver_healthy()?;
         Self::reject_message_options(&request)?;
+        let callback_intent = self
+            .inline_callback_intent(&request, authorization.as_ref())
+            .await?;
         let continuation_task = self
             .canonicalize_continuation(&mut request, authorization.as_ref())
             .await?;
@@ -1092,14 +1164,18 @@ impl RequestHandler for DurableRequestHandler {
                 max_attempts: 8,
             };
             if let Some((context, scope)) = authorization.as_ref() {
+                let mut mutation = authorized_mutation(
+                    self.store.as_ref(),
+                    command,
+                    crate::QuotaOperation::TaskCreate,
+                )?;
+                if let Some(intent) = callback_intent.clone() {
+                    mutation = mutation.with_callback_intent(intent);
+                }
                 self.store
                     .authorize_and_admit_mutation(
                         scope,
-                        authorized_mutation(
-                            self.store.as_ref(),
-                            command,
-                            crate::QuotaOperation::TaskCreate,
-                        )?,
+                        mutation,
                         self.audit(
                             context,
                             Operation::TaskCreate,
@@ -1209,6 +1285,9 @@ impl RequestHandler for DurableRequestHandler {
         let admitted = async {
             self.ensure_driver_healthy()?;
             Self::reject_message_options(&request)?;
+            let callback_intent = self
+                .inline_callback_intent(&request, authorization.as_ref())
+                .await?;
             let replay = if let Some((context, scope)) = authorization.as_ref()
                 && !self.store.capabilities().quota_reservations
             {
@@ -1278,14 +1357,18 @@ impl RequestHandler for DurableRequestHandler {
                     self.local()?.continue_task(command).await?
                 }
             } else if let Some((context, scope)) = authorization.as_ref() {
+                let mut mutation = authorized_mutation(
+                    self.store.as_ref(),
+                    command,
+                    crate::QuotaOperation::SendStream,
+                )?;
+                if let Some(intent) = callback_intent.clone() {
+                    mutation = mutation.with_callback_intent(intent);
+                }
                 self.store
                     .authorize_and_admit_mutation(
                         scope,
-                        authorized_mutation(
-                            self.store.as_ref(),
-                            command,
-                            crate::QuotaOperation::SendStream,
-                        )?,
+                        mutation,
                         self.audit(
                             context,
                             Operation::TaskCreate,
@@ -1792,9 +1875,63 @@ impl RequestHandler for DurableRequestHandler {
         _params: &ServiceParams,
         request: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.audit_unsupported(Operation::PushCreate, "task", &request.task_id)
-            .await?;
-        Err(A2AError::push_notification_not_supported())
+        if request.task_id.is_empty()
+            || request.tenant.is_some()
+            || request.token.is_some()
+            || request.authentication.is_some()
+        {
+            return Err(A2AError::invalid_params("invalid callback configuration"));
+        }
+        let (_context, scope) = self
+            .authorization_for(Operation::PushCreate, "task", &request.task_id)
+            .await?
+            .ok_or_else(|| A2AError::invalid_request("forbidden"))?;
+        let Some(authority) = self.store.callback_authority() else {
+            self.audit_unsupported(Operation::PushCreate, "task", &request.task_id)
+                .await?;
+            return Err(A2AError::push_notification_not_supported());
+        };
+        if self
+            .push_readiness
+            .as_ref()
+            .is_some_and(|readiness| !readiness.is_ready())
+        {
+            return Err(A2AError::internal(
+                "callback delivery worker is unavailable",
+            ));
+        }
+        let enrollment = authority
+            .resolve_callback_enrollment(&scope, &request.url)
+            .await?
+            .ok_or_else(|| A2AError::invalid_params("callback enrollment is not authorized"))?;
+        let id = request
+            .id
+            .as_deref()
+            .map(crate::CallbackConfigId::new)
+            .transpose()?;
+        let command = crate::ConfigCreateCommand::new(
+            scope,
+            request.task_id.clone(),
+            id,
+            enrollment.enrollment_id(),
+            enrollment.enrollment_generation(),
+            enrollment.canonical_url(),
+            enrollment.url_digest(),
+            self.clock.now(),
+        )?;
+        let config = authority.create_callback_config(command).await?;
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.durable_event(
+                crate::telemetry::EventName::PushConfigChanged,
+                "ok",
+                "committed",
+                "callback_config_created",
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(public_push_config(&config))
     }
 
     async fn get_push_config(
@@ -1802,9 +1939,28 @@ impl RequestHandler for DurableRequestHandler {
         _params: &ServiceParams,
         request: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.audit_unsupported(Operation::PushGet, "task", &request.task_id)
-            .await?;
-        Err(A2AError::push_notification_not_supported())
+        if request.task_id.is_empty() || request.tenant.is_some() {
+            return Err(A2AError::invalid_params("invalid callback request"));
+        }
+        let (_context, scope) = self
+            .authorization_for(Operation::PushGet, "task", &request.task_id)
+            .await?
+            .ok_or_else(|| A2AError::invalid_request("forbidden"))?;
+        let Some(authority) = self.store.callback_authority() else {
+            self.audit_unsupported(Operation::PushGet, "task", &request.task_id)
+                .await?;
+            return Err(A2AError::push_notification_not_supported());
+        };
+        let command = crate::ConfigGetCommand::new(
+            scope,
+            request.task_id,
+            crate::CallbackConfigId::new(request.id)?,
+        )?;
+        authority
+            .get_callback_config(command)
+            .await?
+            .map(|c| public_push_config(&c))
+            .ok_or_else(|| A2AError::task_not_found("resource"))
     }
 
     async fn list_push_configs(
@@ -1812,9 +1968,32 @@ impl RequestHandler for DurableRequestHandler {
         _params: &ServiceParams,
         request: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        self.audit_unsupported(Operation::PushList, "task", &request.task_id)
-            .await?;
-        Err(A2AError::push_notification_not_supported())
+        if request.task_id.is_empty() || request.tenant.is_some() {
+            return Err(A2AError::invalid_params("invalid callback request"));
+        }
+        let (_context, scope) = self
+            .authorization_for(Operation::PushList, "task", &request.task_id)
+            .await?
+            .ok_or_else(|| A2AError::invalid_request("forbidden"))?;
+        let Some(authority) = self.store.callback_authority() else {
+            self.audit_unsupported(Operation::PushList, "task", &request.task_id)
+                .await?;
+            return Err(A2AError::push_notification_not_supported());
+        };
+        let raw = request.page_size.unwrap_or(50);
+        let size = u16::try_from(raw)
+            .map_err(|_| A2AError::invalid_params("invalid callback page size"))?;
+        let command = crate::ConfigListCommand::new(
+            scope,
+            request.task_id,
+            crate::ConfigPageSize::new(size)?,
+            request.page_token,
+        )?;
+        let page = authority.list_callback_configs(command).await?;
+        Ok(ListTaskPushNotificationConfigsResponse {
+            configs: page.configs().iter().map(public_push_config).collect(),
+            next_page_token: page.next_page_token().map(ToOwned::to_owned),
+        })
     }
 
     async fn delete_push_config(
@@ -1822,9 +2001,37 @@ impl RequestHandler for DurableRequestHandler {
         _params: &ServiceParams,
         request: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
-        self.audit_unsupported(Operation::PushDelete, "task", &request.task_id)
-            .await?;
-        Err(A2AError::push_notification_not_supported())
+        if request.task_id.is_empty() || request.tenant.is_some() {
+            return Err(A2AError::invalid_params("invalid callback request"));
+        }
+        let (_context, scope) = self
+            .authorization_for(Operation::PushDelete, "task", &request.task_id)
+            .await?
+            .ok_or_else(|| A2AError::invalid_request("forbidden"))?;
+        let Some(authority) = self.store.callback_authority() else {
+            self.audit_unsupported(Operation::PushDelete, "task", &request.task_id)
+                .await?;
+            return Err(A2AError::push_notification_not_supported());
+        };
+        let command = crate::ConfigDeleteCommand::new(
+            scope,
+            request.task_id,
+            crate::CallbackConfigId::new(request.id)?,
+            self.clock.now(),
+        )?;
+        let _ = authority.delete_callback_config(command).await?;
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.durable_event(
+                crate::telemetry::EventName::PushConfigChanged,
+                "ok",
+                "committed",
+                "callback_config_deleted",
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
     }
 
     async fn get_extended_agent_card(

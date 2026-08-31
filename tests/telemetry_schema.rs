@@ -92,7 +92,10 @@ fn required_event_attributes(event: EventName) -> Vec<Attribute> {
             .into_iter()
             .filter(|attribute| attribute.key() != K::MessageId.as_str())
             .collect(),
-        EventName::TaskTransitioned => oro(),
+        EventName::TaskTransitioned
+        | EventName::PushConfigChanged
+        | EventName::PushDelivery
+        | EventName::PushPolicyReconciled => oro(),
         EventName::DispatchClaimed
         | EventName::DispatchAttempted
         | EventName::DispatchRetried

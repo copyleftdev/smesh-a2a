@@ -15,10 +15,11 @@ use smesh_a2a::transport::{
 use smesh_a2a::{
     ArtifactAuthority, ArtifactBackupPlanFile, ArtifactKeyRotationPlanFile,
     ArtifactMigrationPlanFile, ArtifactRestorePlanFile, ArtifactStoreConfig, AuthorizationPolicy,
-    CorrelatingRuntimeProcessor, DurableLoopbackEndpoint, GatewayConfig, GatewayMode,
-    InjectedClock, LegacyTenantBinding, LoopbackDispatcher, PostgresStoreConfig, PostgresTaskStore,
-    QuotaPolicy, RuntimeAdmissionProcessor, RuntimeEventCapture, RuntimeModeConfig, RuntimeWorker,
-    SqliteTaskStore, SystemClockTicker, build_authenticated_router,
+    CallbackWorkerHandle, CorrelatingRuntimeProcessor, DurableLoopbackEndpoint, GatewayConfig,
+    GatewayMode, InjectedClock, LegacyTenantBinding, LoopbackDispatcher, PostgresStoreConfig,
+    PostgresTaskStore, ProductionCallbackQuotaAuthority, QuotaPolicy, RuntimeAdmissionProcessor,
+    RuntimeEventCapture, RuntimeModeConfig, RuntimeWorker, SecureCallbackSender, SqliteTaskStore,
+    SystemCallbackJitter, SystemClockTicker, build_authenticated_router,
     build_authenticated_router_with_trace,
     build_authorized_durable_loopback_gateway_with_telemetry,
     build_durable_loopback_gateway_with_telemetry, build_router, build_router_with_trace,
@@ -568,6 +569,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quota_policy = std::env::var_os("SMESH_A2A_QUOTA_POLICY_PATH")
         .map(|path| QuotaPolicy::load(std::path::PathBuf::from(path)).map(Arc::new))
         .transpose()?;
+    let push_config_path = smesh_a2a::push::resolve_push_config_path(
+        std::env::var_os("SMESH_A2A_PUSH_CONFIG_PATH"),
+        std::env::var_os("SMESH_A2A_PUSH_POLICY_PATH"),
+    )?;
+    if push_config_path.is_some() && std::env::var_os("SMESH_A2A_PUSH_POLICY_PATH").is_some() {
+        tracing::warn!("SMESH_A2A_PUSH_POLICY_PATH is deprecated; use SMESH_A2A_PUSH_CONFIG_PATH");
+    }
+    let push_policy = push_config_path
+        .map(|path| {
+            smesh_a2a::push::PushPolicy::load(&std::path::PathBuf::from(path)).map(Arc::new)
+        })
+        .transpose()?;
+    let push_enabled = push_policy.as_ref().is_some_and(|policy| policy.enabled());
     let artifact_root = std::env::var_os("SMESH_A2A_ARTIFACT_ROOT");
     let artifact_keyring = std::env::var_os("SMESH_A2A_ARTIFACT_KEYRING_PATH");
     let artifact_store = match (artifact_root, artifact_keyring) {
@@ -588,6 +602,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if artifact_store.is_some() && backend.as_deref() != Some("postgres") {
         return Err("artifact storage requires the PostgreSQL durable authority".into());
+    }
+    if push_enabled
+        && (backend.as_deref() != Some("postgres")
+            || !authentication_enabled
+            || authorization.is_none()
+            || quota_policy.is_none())
+    {
+        return Err("enabled push policy requires PostgreSQL, authentication, authorization, and distributed quota enforcement".into());
     }
     if let Ok(replica_id) = std::env::var("SMESH_A2A_REPLICA_ID")
         && (replica_id.is_empty()
@@ -618,6 +640,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_quota_policy(quota_policy.clone().ok_or(
                 "SMESH_A2A_QUOTA_POLICY_PATH is required for PostgreSQL production authority",
             )?);
+            if let Some(policy) = push_policy.as_ref().filter(|policy| policy.enabled()) {
+                config = config.with_push_policy((**policy).clone());
+            }
             if let Some(artifact_store) = artifact_store.clone() {
                 config = config.with_artifact_store(artifact_store);
                 if let Some(path) = std::env::var_os("SMESH_A2A_ARTIFACT_MIGRATION_PLAN_PATH") {
@@ -712,6 +737,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     authorization.clone(),
                     http_transport.clone(),
                     telemetry_handle.clone(),
+                    push_policy.clone(),
+                    quota_policy.clone(),
                 )
                 .await?;
             } else {
@@ -868,6 +895,8 @@ async fn run_postgres_durable_loopback_gateway(
     authorization: Option<Arc<AuthorizationPolicy>>,
     transport: HttpTransport,
     telemetry: Option<TelemetryHandle>,
+    push_policy: Option<Arc<smesh_a2a::push::PushPolicy>>,
+    quota_policy: Option<Arc<QuotaPolicy>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth = auth.ok_or("PostgreSQL durable authority requires authentication")?;
     let policy =
@@ -882,13 +911,42 @@ async fn run_postgres_durable_loopback_gateway(
     let clock = InjectedClock::new(chrono::Utc::now().timestamp_millis());
     let mut gateway = build_authorized_durable_loopback_gateway_with_telemetry(
         config,
-        store,
+        store.clone(),
         DurableLoopbackEndpoint::new(),
         clock.clone(),
         auth,
         policy,
         telemetry.clone(),
     )?;
+    if let Some(push) = push_policy.filter(|policy| policy.enabled()) {
+        let quota_policy = quota_policy.ok_or("enabled push policy requires quota policy")?;
+        let callback_authority: Arc<dyn smesh_a2a::CallbackAuthority> = Arc::new(store.clone());
+        let durable_authority: Arc<dyn smesh_a2a::DurableAuthority> = Arc::new(store.clone());
+        let sender = Arc::new(SecureCallbackSender::new(
+            smesh_a2a::push::SecureCallbackTransport::from_policy_system(&push)?,
+            usize::try_from(push.max_response_bytes())?,
+        ));
+        let quota = Arc::new(ProductionCallbackQuotaAuthority::new(
+            durable_authority,
+            quota_policy,
+        ));
+        let owner =
+            std::env::var("SMESH_A2A_REPLICA_ID").unwrap_or_else(|_| "smesh-callback".to_owned());
+        let worker = CallbackWorkerHandle::spawn_with_telemetry(
+            callback_authority,
+            push,
+            sender,
+            quota,
+            Arc::new(SystemCallbackJitter),
+            &owner,
+            gateway.push_readiness(),
+            telemetry.clone(),
+        )?;
+        worker
+            .wait_initial_cycle(std::time::Duration::from_secs(5))
+            .await?;
+        gateway.own_callback_worker(worker)?;
+    }
     if let Some(handle) = telemetry.clone()
         && !gateway.start_audit_projector(handle, audit_projector_config()?)?
     {

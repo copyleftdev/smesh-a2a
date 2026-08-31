@@ -9,7 +9,7 @@ use rusqlite::{Connection, types::ValueRef};
 use serde_json::{Map, Value};
 use tokio_postgres::Client;
 
-pub const AUTHORITY_TABLES: [&str; 18] = [
+pub const AUTHORITY_TABLES: [&str; 25] = [
     "store_metadata",
     "store_identity",
     "tasks",
@@ -25,6 +25,13 @@ pub const AUTHORITY_TABLES: [&str; 18] = [
     "cancellation_intents",
     "authorization_decisions",
     "audit_projection_outbox",
+    "callback_policy_snapshots",
+    "callback_enrollments",
+    "callback_configs",
+    "callback_events",
+    "callback_deliveries",
+    "callback_attempts",
+    "callback_audits",
     "list_snapshots",
     "list_snapshot_entries",
     "list_page_tokens",
@@ -73,6 +80,12 @@ pub async fn assert_postgres_tables_match(client: &Client, schema: &str) {
         // analogue and is never authoritative task data.
         "audit_projection_session_secret",
         "audit_projection_sessions",
+        "callback_worker_session_secret",
+        "callback_worker_sessions",
+        // PostgreSQL's multi-replica callback claimant needs a physical,
+        // row-lockable tenant scheduler. SQLite serializes callback claims with
+        // one IMMEDIATE transaction, so the equivalent is semantic, not a row.
+        "callback_tenant_scheduler",
         // PostgreSQL-only artifact authority. SQLite intentionally remains a
         // development compatibility backend and must not claim artifact parity.
         "artifact_backup_inventory",

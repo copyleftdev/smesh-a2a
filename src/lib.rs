@@ -17,6 +17,8 @@ pub mod auth;
 /// Server-owned tenant authorization policy and immutable request context.
 pub mod authorization;
 mod bridge;
+mod callback_authority;
+mod callback_worker;
 mod card;
 mod channel;
 mod durable_authority;
@@ -32,6 +34,8 @@ mod loopback;
 mod outbox_driver;
 mod policy;
 mod postgres_store;
+/// Secure operator-enrolled callback policy, SSRF validation, and signing.
+pub mod push;
 mod quota;
 mod runtime_config;
 mod runtime_trace;
@@ -79,9 +83,23 @@ pub use authorization::{
     current_authorization_context, current_quota_reservation, scope_quota_reservation,
 };
 pub use bridge::{DispatchError, MeshDispatcher, MeshEvent, MeshRequest};
+pub use callback_authority::{
+    CallbackAuthority, CallbackBackend, CallbackCapabilities, CallbackConfig, CallbackConfigId,
+    CallbackConfigPage, CallbackConfigState, CallbackDeleteOutcome, CallbackDeliveryCategory,
+    CallbackDeliveryDisposition, CallbackDeliveryState, CallbackEnrollmentBinding,
+    CallbackFailCommand, CallbackLease, CallbackPolicySnapshot, CallbackReadiness,
+    CallbackTerminalTestFault, ConfigCreateCommand, ConfigDeleteCommand, ConfigGetCommand,
+    ConfigListCommand, ConfigPageSize, DeliveryClaimCommand, DeliveryFence, LeaseDurationMillis,
+};
+pub use callback_worker::{
+    CallbackAttemptSender, CallbackJitter, CallbackQuotaAuthority, CallbackQuotaDecision,
+    CallbackWorkerError, CallbackWorkerHandle, ProductionCallbackQuotaAuthority,
+    SecureCallbackSender, SystemCallbackJitter, callback_quota_semantic_id,
+    callback_request_accounted_bytes,
+};
 pub use card::{
-    build_agent_card, build_authenticated_agent_card, build_secured_agent_card,
-    build_secured_agent_card_with_policy,
+    LiveAgentCard, build_agent_card, build_agent_card_with_push_readiness,
+    build_authenticated_agent_card, build_secured_agent_card, build_secured_agent_card_with_policy,
 };
 pub use channel::{ChannelDispatcher, DispatchCommand};
 pub use durable_authority::{

@@ -139,6 +139,7 @@ pub struct AuthorizedMutation<T> {
     command: T,
     quota_reservation: Option<QuotaReservationInput>,
     quota_intent: Option<crate::QuotaIntent>,
+    callback_intent: Option<crate::callback_authority::CallbackIntent>,
 }
 
 impl<T> AuthorizedMutation<T> {
@@ -148,6 +149,7 @@ impl<T> AuthorizedMutation<T> {
             command,
             quota_reservation: None,
             quota_intent: None,
+            callback_intent: None,
         }
     }
 
@@ -157,6 +159,7 @@ impl<T> AuthorizedMutation<T> {
             command,
             quota_reservation: Some(quota_reservation),
             quota_intent: None,
+            callback_intent: None,
         }
     }
 
@@ -166,6 +169,7 @@ impl<T> AuthorizedMutation<T> {
             command,
             quota_reservation: None,
             quota_intent: Some(quota_intent),
+            callback_intent: None,
         }
     }
 
@@ -198,8 +202,26 @@ impl<T> AuthorizedMutation<T> {
     }
     pub(crate) fn into_authority_parts(
         self,
-    ) -> (T, Option<QuotaReservationInput>, Option<crate::QuotaIntent>) {
-        self.into_quota_parts()
+    ) -> (
+        T,
+        Option<QuotaReservationInput>,
+        Option<crate::QuotaIntent>,
+        Option<crate::callback_authority::CallbackIntent>,
+    ) {
+        (
+            self.command,
+            self.quota_reservation,
+            self.quota_intent,
+            self.callback_intent,
+        )
+    }
+
+    pub(crate) fn with_callback_intent(
+        mut self,
+        intent: crate::callback_authority::CallbackIntent,
+    ) -> Self {
+        self.callback_intent = Some(intent);
+        self
     }
 }
 
@@ -211,6 +233,7 @@ pub(crate) fn valid_bounded_identity(value: &str) -> bool {
 pub struct OwnedTaskScope {
     pub(crate) tenant_scope: String,
     pub(crate) owner_account_id: String,
+    pub(crate) principal_scope: String,
     pub(crate) visibility: VisibilityScope,
 }
 
@@ -221,13 +244,33 @@ impl OwnedTaskScope {
         owner_account_id: impl Into<String>,
         visibility: VisibilityScope,
     ) -> Result<Self, A2AError> {
+        let tenant_scope = tenant_scope.into();
+        let owner_account_id = owner_account_id.into();
+        Self::new_with_principal(
+            tenant_scope,
+            owner_account_id.clone(),
+            owner_account_id,
+            visibility,
+        )
+    }
+
+    pub fn new_with_principal(
+        tenant_scope: impl Into<String>,
+        owner_account_id: impl Into<String>,
+        principal_scope: impl Into<String>,
+        visibility: VisibilityScope,
+    ) -> Result<Self, A2AError> {
         let value = Self {
             tenant_scope: tenant_scope.into(),
             owner_account_id: owner_account_id.into(),
+            principal_scope: principal_scope.into(),
             visibility,
         };
         if !valid_bounded_identity(&value.tenant_scope)
             || !valid_bounded_identity(&value.owner_account_id)
+            || value.principal_scope.is_empty()
+            || value.principal_scope.len() > 256
+            || !value.principal_scope.is_ascii()
         {
             return Err(A2AError::invalid_request("invalid owned task scope"));
         }
@@ -242,6 +285,11 @@ impl OwnedTaskScope {
     #[must_use]
     pub fn owner_account_id(&self) -> &str {
         &self.owner_account_id
+    }
+
+    #[must_use]
+    pub fn principal_scope(&self) -> &str {
+        &self.principal_scope
     }
 
     #[must_use]
@@ -1291,6 +1339,11 @@ pub enum AuditProjectionSource {
     ArtifactBackup,
     ArtifactRestore,
     ArtifactKeyRotation,
+    CallbackPolicy,
+    CallbackConfig,
+    CallbackEvent,
+    CallbackDelivery,
+    CallbackAttempt,
 }
 impl AuditProjectionSource {
     #[must_use]
@@ -1308,6 +1361,11 @@ impl AuditProjectionSource {
             Self::ArtifactBackup => "artifact_backup_jobs",
             Self::ArtifactRestore => "artifact_restore_jobs",
             Self::ArtifactKeyRotation => "artifact_key_rotation_plans",
+            Self::CallbackPolicy => "callback_policy_snapshots",
+            Self::CallbackConfig => "callback_configs",
+            Self::CallbackEvent => "callback_events",
+            Self::CallbackDelivery => "callback_deliveries",
+            Self::CallbackAttempt => "callback_attempts",
         }
     }
     pub(crate) fn parse(value: &str) -> Option<Self> {
@@ -1324,6 +1382,11 @@ impl AuditProjectionSource {
             "artifact_backup_jobs" => Self::ArtifactBackup,
             "artifact_restore_jobs" => Self::ArtifactRestore,
             "artifact_key_rotation_plans" => Self::ArtifactKeyRotation,
+            "callback_policy_snapshots" => Self::CallbackPolicy,
+            "callback_configs" => Self::CallbackConfig,
+            "callback_events" => Self::CallbackEvent,
+            "callback_deliveries" => Self::CallbackDelivery,
+            "callback_attempts" => Self::CallbackAttempt,
             _ => return None,
         })
     }
@@ -1341,6 +1404,14 @@ pub enum AuditProjectionEventKind {
     ArtifactCorruptionDetected,
     ArtifactKeyChanged,
     ArtifactOperatorCompleted,
+    CallbackPolicyReconciled,
+    CallbackConfigCreated,
+    CallbackConfigDeleted,
+    CallbackEventEnqueued,
+    CallbackDeliveryAttempted,
+    CallbackDelivered,
+    CallbackRetryScheduled,
+    CallbackDead,
 }
 impl AuditProjectionEventKind {
     #[must_use]
@@ -1355,6 +1426,14 @@ impl AuditProjectionEventKind {
             Self::ArtifactCorruptionDetected => "artifact_corruption_detected",
             Self::ArtifactKeyChanged => "artifact_key_changed",
             Self::ArtifactOperatorCompleted => "artifact_operator_completed",
+            Self::CallbackPolicyReconciled => "callback_policy_reconciled",
+            Self::CallbackConfigCreated => "callback_config_created",
+            Self::CallbackConfigDeleted => "callback_config_deleted",
+            Self::CallbackEventEnqueued => "callback_event_enqueued",
+            Self::CallbackDeliveryAttempted => "callback_delivery_attempted",
+            Self::CallbackDelivered => "callback_delivered",
+            Self::CallbackRetryScheduled => "callback_retry_scheduled",
+            Self::CallbackDead => "callback_dead",
         }
     }
     pub(crate) fn parse(value: &str) -> Option<Self> {
@@ -1368,6 +1447,14 @@ impl AuditProjectionEventKind {
             "artifact_corruption_detected" => Self::ArtifactCorruptionDetected,
             "artifact_key_changed" => Self::ArtifactKeyChanged,
             "artifact_operator_completed" => Self::ArtifactOperatorCompleted,
+            "callback_policy_reconciled" => Self::CallbackPolicyReconciled,
+            "callback_config_created" => Self::CallbackConfigCreated,
+            "callback_config_deleted" => Self::CallbackConfigDeleted,
+            "callback_event_enqueued" => Self::CallbackEventEnqueued,
+            "callback_delivery_attempted" => Self::CallbackDeliveryAttempted,
+            "callback_delivered" => Self::CallbackDelivered,
+            "callback_retry_scheduled" => Self::CallbackRetryScheduled,
+            "callback_dead" => Self::CallbackDead,
             _ => return None,
         })
     }
@@ -1538,6 +1625,11 @@ pub trait AuthorityIdentity: Send + Sync {
     fn audit_projection_authority(&self) -> Option<&dyn AuditProjectionAuthority> {
         None
     }
+    /// Optional durable callback extension. Existing implementations remain
+    /// source compatible and callback-disabled by default.
+    fn callback_authority(&self) -> Option<&dyn crate::CallbackAuthority> {
+        None
+    }
 }
 
 #[async_trait]
@@ -1615,8 +1707,8 @@ pub trait TaskAdmission: Send + Sync {
         mutation: AuthorizedMutation<SendMessageAdmission>,
         audit: AuthorizationAuditInput,
     ) -> Result<AdmissionOutcome, A2AError> {
-        let (command, quota, intent) = mutation.into_authority_parts();
-        if quota.is_some() || intent.is_some() {
+        let (command, quota, intent, callback) = mutation.into_authority_parts();
+        if quota.is_some() || intent.is_some() || callback.is_some() {
             return Err(A2AError::unsupported_operation(
                 "quota reservations are unsupported",
             ));
@@ -1629,8 +1721,8 @@ pub trait TaskAdmission: Send + Sync {
         mutation: AuthorizedMutation<SendMessageAdmission>,
         audit: AuthorizationAuditInput,
     ) -> Result<AdmissionOutcome, A2AError> {
-        let (command, quota, intent) = mutation.into_authority_parts();
-        if quota.is_some() || intent.is_some() {
+        let (command, quota, intent, callback) = mutation.into_authority_parts();
+        if quota.is_some() || intent.is_some() || callback.is_some() {
             return Err(A2AError::unsupported_operation(
                 "quota reservations are unsupported",
             ));
