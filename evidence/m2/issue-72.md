@@ -70,7 +70,7 @@ cargo test --locked --test telemetry_audit_projection -- --test-threads=1
 
 Observed results:
 
-- authorization retention: 3/3 passed;
+- authorization retention: 4/4 passed, including a checked-in populated exact-v8 upgrade and poisoned-catalog rollback fixture;
 - PostgreSQL store: 62/62 passed after the integrated parity fix;
 - audit projection: 10/10 passed.
 
