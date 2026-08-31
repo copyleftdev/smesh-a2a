@@ -14,6 +14,9 @@ CREATE POLICY authorization_retention_migration ON __SCHEMA__.authorization_deci
  TO __MIGRATOR__
  USING(current_setting('smesh.authorization_retention',true)='migrate-v1')
  WITH CHECK(current_setting('smesh.authorization_retention',true)='migrate-v1');
+CREATE POLICY authorization_projection_migration ON __SCHEMA__.audit_projection_outbox
+ FOR SELECT TO __MIGRATOR__
+ USING(current_setting('smesh.authorization_retention',true)='migrate-v1');
 SELECT set_config('smesh.authorization_retention','migrate-v1',true);
 ALTER TABLE __SCHEMA__.authorization_decisions DISABLE TRIGGER authorization_decisions_no_update;
 ALTER TABLE __SCHEMA__.authorization_decisions DISABLE TRIGGER retained_authority_accounting;
@@ -46,6 +49,7 @@ WHERE EXISTS(
 ALTER TABLE __SCHEMA__.authorization_decisions ENABLE TRIGGER retained_authority_accounting;
 ALTER TABLE __SCHEMA__.authorization_decisions ENABLE TRIGGER authorization_decisions_no_update;
 DROP POLICY authorization_retention_migration ON __SCHEMA__.authorization_decisions;
+DROP POLICY authorization_projection_migration ON __SCHEMA__.audit_projection_outbox;
 SELECT set_config('smesh.authorization_retention','',true);
 
 CREATE FUNCTION __SCHEMA__.mark_authorization_projection_requirement() RETURNS trigger

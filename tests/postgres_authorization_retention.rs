@@ -49,6 +49,8 @@ fn revision_nine_is_narrow_fixed_path_and_explicitly_privileged() {
     assert!(sql.contains("max_rows IS NULL"));
     assert!(sql.contains("max_rows>1000"));
     assert!(sql.contains("projection_required boolean NOT NULL"));
+    assert!(sql.contains("CREATE POLICY authorization_projection_migration"));
+    assert!(sql.contains("DROP POLICY authorization_projection_migration"));
     assert!(!sql.to_ascii_lowercase().contains("min(decided_at)"));
     assert!(sql.contains("LIMIT max_rows"));
     assert!(sql.contains("authorization_retention_diagnostics"));
