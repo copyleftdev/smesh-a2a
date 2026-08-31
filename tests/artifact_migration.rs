@@ -1597,25 +1597,55 @@ async fn empty_backup_restore_is_sealed_retryable_and_requires_a_truly_empty_tar
     );
     drop(callback_worker);
     callback_worker_driver.await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let active: bool = client
+                .query_one(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM {target_schema}.callback_worker_sessions s JOIN pg_catalog.pg_stat_get_backend_idset() b ON pg_catalog.pg_stat_get_backend_pid(b)=s.backend_pid)"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if !active {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("callback worker backend did not leave pg_stat_activity");
 
     // Callback policy/config authority is not represented in this backup format.
-    // It must block restore, and refusal must preserve all callback/protected state exactly.
+    // Forced-RLS semantic validation sees these manually injected rows before
+    // the empty-target fence, and refusal preserves all protected state exactly.
     let callback_digest = smesh_a2a::content_digest(b"restore-callback-policy");
+    let callback_url_digest = smesh_a2a::content_digest(b"https://callback.invalid/restore");
     client
         .batch_execute(&format!(
             "SET session_replication_role=replica;
              INSERT INTO {target_schema}.callback_policy_snapshots VALUES('restore-policy',1,'{callback_digest}',4,100,100,4096,4,60000,1);
-             INSERT INTO {target_schema}.callback_enrollments VALUES('restore-policy',1,'tenant-callback','restore-enrollment',1,'https://callback.invalid/restore','{callback_digest}','key-1','secret-ref',NULL,NULL,NULL);
+             INSERT INTO {target_schema}.callback_enrollments VALUES('restore-policy',1,'tenant-callback','restore-enrollment',1,'https://callback.invalid/restore','{callback_url_digest}','key-1','secret-ref',NULL,NULL,NULL);
              INSERT INTO {target_schema}.tasks(tenant_scope,task_id,context_id,state,revision,task_json,owner_account_id) VALUES('tenant-callback','callback-task','callback-context','\"TASK_STATE_SUBMITTED\"',1,'{{}}','callback-account');
-             INSERT INTO {target_schema}.callback_configs VALUES('tenant-callback','callback-task','callback-config','callback-account','account:callback-account','restore-enrollment',1,'https://callback.invalid/restore','{callback_digest}','active',NULL,1,1);
+             INSERT INTO {target_schema}.callback_configs VALUES('tenant-callback','callback-task','callback-config','callback-account','account:callback-account','restore-enrollment',1,'https://callback.invalid/restore','{callback_url_digest}','active',NULL,1,1);
+             INSERT INTO {target_schema}.callback_audits(tenant_scope,event_kind,source_kind,source_pk_digest,occurred_at) VALUES
+               ('tenant-callback','callback_policy_reconciled','callback_enrollments',{target_schema}.callback_audit_digest('callback_policy_reconciled','tenant-callback','','restore-enrollment','',1,0),1),
+               ('tenant-callback','callback_config_created','callback_configs',{target_schema}.callback_audit_digest('callback_config_created','tenant-callback','callback-task','callback-config','',1,0),1);
              SET session_replication_role=origin;"
         ))
         .await
         .unwrap();
-    assert!(matches!(
-        PostgresTaskStore::restore_artifacts(target_config.clone(), &restore).await,
-        Err(PostgresStoreError::ArtifactRestoreTargetNotEmpty)
-    ));
+    let callback_authority_restore =
+        PostgresTaskStore::restore_artifacts(target_config.clone(), &restore).await;
+    assert!(
+        matches!(
+            callback_authority_restore,
+            Err(PostgresStoreError::InvalidSchema)
+        ),
+        "callback authority restore outcome: {callback_authority_restore:?}"
+    );
     let callback_refusal = client
         .query_one(
             &format!("SELECT
@@ -1645,6 +1675,7 @@ async fn empty_backup_restore_is_sealed_retryable_and_requires_a_truly_empty_tar
     client
         .batch_execute(&format!(
             "SET session_replication_role=replica;
+             DELETE FROM {target_schema}.callback_audits;
              DELETE FROM {target_schema}.callback_configs;
              DELETE FROM {target_schema}.tasks;
              DELETE FROM {target_schema}.callback_enrollments;

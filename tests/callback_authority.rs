@@ -13,10 +13,19 @@ use smesh_a2a::{
 };
 
 fn postgres_urls() -> Option<(String, String)> {
-    Some((
-        std::env::var("SMESH_TEST_POSTGRES_ADMIN_URL").ok()?,
-        std::env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").ok()?,
-    ))
+    let admin = std::env::var("SMESH_TEST_POSTGRES_ADMIN_URL");
+    let runtime = std::env::var("SMESH_TEST_POSTGRES_RUNTIME_URL");
+    if std::env::var("SMESH_POSTGRES_TEST_REQUIRED").as_deref() == Ok("1") {
+        return Some((
+            admin.unwrap_or_else(|error| {
+                panic!("SMESH_TEST_POSTGRES_ADMIN_URL is required: {error}")
+            }),
+            runtime.unwrap_or_else(|error| {
+                panic!("SMESH_TEST_POSTGRES_RUNTIME_URL is required: {error}")
+            }),
+        ));
+    }
+    Some((admin.ok()?, runtime.ok()?))
 }
 
 #[tokio::test]
@@ -312,6 +321,7 @@ async fn sqlite_removed_enrollment_future_lease_blocks_without_mutation_until_ex
 }
 
 #[tokio::test]
+#[cfg(debug_assertions)]
 async fn sqlite_terminal_callback_fault_matrix_rolls_back_and_retries_exactly_once() {
     use smesh_a2a::CallbackTerminalTestFault as F;
     for state in [

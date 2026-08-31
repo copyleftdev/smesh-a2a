@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::io::{BufRead as _, BufReader, Write as IoWrite};
+use std::io::{BufRead as _, BufReader, Read as _, Write as IoWrite};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -785,12 +785,12 @@ mtls_key_file = "{}"
         db.batch_execute("SELECT set_config('smesh.internal_global','callback-worker-v1',false)").await.unwrap();
         db.query_one("SELECT set_config('smesh.tenant_scope',$1,false),set_config('smesh.account_id',$2,false)", &[&TENANT, &ACCOUNT]).await.unwrap();
         let delivery = db.query_one(&format!("SELECT state,attempt_count,(SELECT count(*) FROM {schema}.callback_attempts a WHERE a.tenant_scope=d.tenant_scope AND a.event_id=d.event_id AND a.config_id=d.config_id) FROM {schema}.callback_deliveries d WHERE tenant_scope=$1 AND event_id=$2"), &[&TENANT, &event_id]).await.unwrap();
-        assert_eq!(delivery.get::<_, String>(0), "delivered"); assert_eq!(delivery.get::<_, i32>(1), 3); assert_eq!(delivery.get::<_, i64>(2), 2);
+        assert_eq!(delivery.get::<_, String>(0), "delivered"); assert_eq!(delivery.get::<_, i32>(1), 3); assert_eq!(delivery.get::<_, i64>(2), 3);
         let audits = db.query_one(&format!("SELECT count(*),bool_and(source_pk_digest ~ '^sha256:[0-9a-f]{{64}}$') FROM {schema}.callback_audits WHERE tenant_scope=$1"), &[&TENANT]).await.unwrap();
         assert!(audits.get::<_, i64>(0) >= 4); assert!(audits.get::<_, bool>(1));
         db.query_one("SELECT set_config('smesh.internal_global','audit-projector-v1',false)", &[]).await.unwrap();
         let projection_kinds: Vec<String> = db.query(&format!("SELECT DISTINCT event_kind FROM {schema}.audit_projection_outbox WHERE tenant_scope=$1 AND event_kind LIKE 'callback_%' ORDER BY event_kind"), &[&TENANT]).await.unwrap().into_iter().map(|r| r.get(0)).collect();
-        for expected in ["callback_config_created","callback_delivered","callback_delivery_attempted","callback_event_enqueued","callback_policy_reconciled"] { assert!(projection_kinds.iter().any(|v| v == expected), "missing {expected}: {projection_kinds:?}"); }
+        for expected in ["callback_config_created","callback_delivered","callback_delivery_attempted","callback_event_enqueued","callback_policy_reconciled","callback_retry_scheduled"] { assert!(projection_kinds.iter().any(|v| v == expected), "missing {expected}: {projection_kinds:?}"); }
         let primary_projection_event_id: String = db.query_one(&format!("SELECT event_id FROM {schema}.audit_projection_outbox WHERE tenant_scope=$1 AND event_kind='callback_event_enqueued' ORDER BY occurred_at,event_id LIMIT 1"), &[&TENANT]).await.unwrap().get(0);
         db.query_one("SELECT set_config('smesh.internal_global','callback-worker-v1',false)", &[]).await.unwrap();
         let text_rows: String = db.query_one(&format!("SELECT coalesce(string_agg(to_jsonb(x)::text,' '),'') FROM (SELECT * FROM {schema}.callback_audits UNION ALL SELECT tenant_scope,audit_order,event_kind,source_kind,source_pk_digest,occurred_at FROM {schema}.callback_audits) x"), &[]).await.unwrap().get(0);
@@ -950,6 +950,7 @@ fn conflicting_push_config_names_fail_before_listener_or_network_startup() {
         .env("SMESH_A2A_PUBLIC_URL", format!("http://{address}"))
         .env("SMESH_A2A_PUSH_CONFIG_PATH", "/not/read/canonical.toml")
         .env("SMESH_A2A_PUSH_POLICY_PATH", "/not/read/deprecated.toml")
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let status = child
@@ -957,5 +958,14 @@ fn conflicting_push_config_names_fail_before_listener_or_network_startup() {
         .unwrap()
         .expect("gateway startup watchdog expired");
     assert!(!status.success());
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(stderr.contains("SMESH_A2A_PUSH_CONFIG_PATH"), "{stderr}");
+    assert!(stderr.contains("SMESH_A2A_PUSH_POLICY_PATH"), "{stderr}");
     drop(std::net::TcpListener::bind(address).expect("push config conflict must precede listener"));
 }

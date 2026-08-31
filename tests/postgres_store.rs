@@ -646,7 +646,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
     let source = include_str!("../src/postgres_store.rs");
     assert_eq!(
         source.matches(".transaction()").count() + source.matches(".build_transaction()").count(),
-        15,
+        16,
         "new direct transaction site must be routed through the bounded runner or explicitly reviewed"
     );
     assert_eq!(
@@ -663,6 +663,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
         "read-only subscription snapshot",
         "read-only event snapshot",
         "read-only tenant-scoped startup semantic validation",
+        "read-only callback semantic validation needs a transaction-local forced-RLS marker",
         "read-only indexed quota diagnostics for deterministic evidence",
         "read-only indexed scoped telemetry correlation lookup",
         "policy reconciliation is startup-only, advisory-fenced, and atomically audited",

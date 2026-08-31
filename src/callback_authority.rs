@@ -448,6 +448,7 @@ pub struct ConfigCreateCommand {
     canonical_url: String,
     url_digest: String,
     created_at: i64,
+    authorization_audit: Option<crate::AuthorizationAuditInput>,
 }
 impl ConfigCreateCommand {
     #[allow(clippy::too_many_arguments)]
@@ -470,6 +471,7 @@ impl ConfigCreateCommand {
             canonical_url: canonical_url.into(),
             url_digest: url_digest.into(),
             created_at,
+            authorization_audit: None,
         };
         if !valid_id(&value.task_id)
             || !valid_id(&value.enrollment_id)
@@ -515,6 +517,16 @@ impl ConfigCreateCommand {
     #[must_use]
     pub const fn created_at(&self) -> i64 {
         self.created_at
+    }
+    pub(crate) fn with_authorization_audit(
+        mut self,
+        audit: crate::AuthorizationAuditInput,
+    ) -> Self {
+        self.authorization_audit = Some(audit);
+        self
+    }
+    pub(crate) fn authorization_audit(&self) -> Option<&crate::AuthorizationAuditInput> {
+        self.authorization_audit.as_ref()
     }
 }
 
@@ -605,6 +617,7 @@ pub struct ConfigDeleteCommand {
     task_id: String,
     config_id: CallbackConfigId,
     requested_at: i64,
+    authorization_audit: Option<crate::AuthorizationAuditInput>,
 }
 impl ConfigDeleteCommand {
     pub fn new(
@@ -622,6 +635,7 @@ impl ConfigDeleteCommand {
             task_id,
             config_id,
             requested_at,
+            authorization_audit: None,
         })
     }
     #[must_use]
@@ -639,6 +653,16 @@ impl ConfigDeleteCommand {
     #[must_use]
     pub const fn requested_at(&self) -> i64 {
         self.requested_at
+    }
+    pub(crate) fn with_authorization_audit(
+        mut self,
+        audit: crate::AuthorizationAuditInput,
+    ) -> Self {
+        self.authorization_audit = Some(audit);
+        self
+    }
+    pub(crate) fn authorization_audit(&self) -> Option<&crate::AuthorizationAuditInput> {
+        self.authorization_audit.as_ref()
     }
 }
 

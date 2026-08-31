@@ -379,7 +379,7 @@ fn readiness_card_and_retry_identity_are_stable_and_bounded() {
     let starting = build_agent_card_with_push_readiness("https://gateway.example", &readiness);
     assert_eq!(starting.capabilities.push_notifications, Some(false));
     assert_eq!(starting.capabilities.extended_agent_card, Some(false));
-    readiness.mark_ready();
+    readiness.mark_worker_ready();
     let ready = build_agent_card_with_push_readiness("https://gateway.example", &readiness);
     assert_eq!(ready.capabilities.push_notifications, Some(true));
     assert_eq!(ready.capabilities.extended_agent_card, Some(false));
@@ -525,6 +525,11 @@ fn strict_policy_enrolls_exact_tenant_url_and_rejects_unknown_fields() {
 
     let unknown = format!("{POLICY}\nattacker_override = true\n");
     assert!(PushPolicy::parse_bytes(unknown.as_bytes()).is_err());
+    let uppercase_digest = POLICY.replace(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    );
+    assert!(PushPolicy::parse_bytes(uppercase_digest.as_bytes()).is_err());
     for caller_auth in [
         "token = \"caller-secret\"",
         "credentials = \"caller-secret\"",

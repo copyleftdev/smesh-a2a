@@ -376,3 +376,27 @@ the exact crash/failover process vertical remained green across **10/10** repeti
 Superseding process-test SHA-256:
 
 - `tests/postgres_push_process.rs` — `be6e5c622f764f196a07ffbfc3e18a92679aadc1af77043785da69325063c5ff`
+
+## CodeRabbit closure for PR 70 — 2026-08-30
+
+Focused required-PostgreSQL evidence on the exact review tree:
+
+- callback authority: **19/19 passed**;
+- PostgreSQL store: **61/61 passed** after the direct-transaction allowlist was updated for the reviewed forced-RLS validation transaction;
+- callback process: **2/2 passed**;
+- artifact migration: **7/7 passed**, **4 helper subprocess tests ignored**;
+- push security: **27/27 passed**; audit projection: **10/10 passed**; telemetry schema: **11/11 passed**; authorized gateway process: **2/2 passed**.
+
+Superseding SHA-256 values:
+
+- `migrations/postgres/0007_callback_authority.sql` — `1a7554355a426d933acc7cf7eb87af0b03e3fa919222b9699a387d60d844a65b`
+- `src/callback_authority.rs` — `f97ef85290540b4c11d7347513ec63424508bb22f90141fc21cad911bf3a7be0`
+- `src/postgres_store.rs` — `f0b5062780dfa199c9b1e840fe0510df7cf545b4b893be4aa1ee5305db7ff9aa`
+- `src/sqlite_store.rs` — `eeba6157442a2f50f44fa738f4cf30011500e307e785959c327e009cfff9fc75`
+- `src/durable_handler.rs` — `c8827833027ad16c76d2b1411e1db7f073cd3bd0e0addd2d197aeac4652c122f`
+- `src/push.rs` — `389a1bb513c34c1da3fb51aba8c02bba67262a7511b72a51ebe4b70d00741004`
+- `src/artifact_restore_executor.rs` — `2589e8cc53dc60641d4fcc2e6cece7586f1064b8a3cfbf7bc0d67d752f7d71bf`
+- `src/telemetry.rs` — `b077aee62efae8742301067511f3be0b3e2fd79ba7c80e50f5ea4f81991e8d79`
+- `tests/callback_authority.rs` — `4f4156168d17a78172e7ea4fff68d7fd065908cacb3a56c6f88a058a0caae11e`
+- `tests/postgres_push_process.rs` — `700538eb6bbb8a1b774d2174725df4d49996c1164f94581a14fbc89a60dd49eb`
+- `tests/artifact_migration.rs` — `2b714a5a60c9fd6ee4408715df7596b9ad937862e3fb6d18660004847db0a3c9`

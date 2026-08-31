@@ -3866,6 +3866,58 @@ mod audit_projection_mapping_tests {
                 S::ArtifactKeyRotation,
                 "artifact_rotation_completed",
             ),
+            (
+                K::CallbackPolicyReconciled,
+                S::CallbackPolicy,
+                "callback_policy_reconciled",
+            ),
+            (
+                K::CallbackConfigCreated,
+                S::CallbackConfig,
+                "callback_config_created",
+            ),
+            (
+                K::CallbackConfigDeleted,
+                S::CallbackConfig,
+                "callback_config_deleted",
+            ),
+            (
+                K::CallbackEventEnqueued,
+                S::CallbackEvent,
+                "callback_event_enqueued",
+            ),
+            (
+                K::CallbackDeliveryAttempted,
+                S::CallbackDelivery,
+                "callback_delivery_attempted",
+            ),
+            (
+                K::CallbackDeliveryAttempted,
+                S::CallbackAttempt,
+                "callback_delivery_attempted",
+            ),
+            (
+                K::CallbackDelivered,
+                S::CallbackDelivery,
+                "callback_delivered",
+            ),
+            (
+                K::CallbackDelivered,
+                S::CallbackAttempt,
+                "callback_delivered",
+            ),
+            (
+                K::CallbackRetryScheduled,
+                S::CallbackDelivery,
+                "callback_retry_scheduled",
+            ),
+            (
+                K::CallbackRetryScheduled,
+                S::CallbackAttempt,
+                "callback_retry_scheduled",
+            ),
+            (K::CallbackDead, S::CallbackDelivery, "callback_dead"),
+            (K::CallbackDead, S::CallbackAttempt, "callback_dead"),
         ];
         for (kind, source, expected) in cases {
             assert_eq!(audit_projection_operation(kind, source), Some(expected));

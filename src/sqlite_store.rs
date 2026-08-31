@@ -732,6 +732,11 @@ impl SqliteTaskStore {
         &self,
         fault: crate::CallbackTerminalTestFault,
     ) -> Result<(), A2AError> {
+        if !cfg!(debug_assertions) {
+            return Err(A2AError::invalid_request(
+                "callback terminal test faults are disabled",
+            ));
+        }
         *SQLITE_CALLBACK_TERMINAL_TEST_FAULT
             .lock()
             .map_err(|_| A2AError::internal("callback terminal fault lock failed"))? = Some(fault);
@@ -2453,6 +2458,7 @@ impl SqliteTaskStore {
             .map(|result| serde_json::to_string(&result))
             .transpose()
             .map_err(|_| A2AError::internal("failed to encode final idempotency result"))?;
+        let tenant_scope = self.default_scope.to_string();
         self.run(move |connection| {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2474,7 +2480,7 @@ impl SqliteTaskStore {
                         .query_row(
                             "SELECT final_result_json FROM idempotency_records
                              WHERE tenant_scope = ?1 AND task_id = ?2",
-                            params![TRUSTED_SINGLE_TENANT_SCOPE, task_id],
+                            params![tenant_scope, task_id],
                             |row| row.get::<_, Option<String>>(0),
                         )
                         .optional()
@@ -2513,7 +2519,7 @@ impl SqliteTaskStore {
                 .query_row(
                     "SELECT COALESCE(MAX(event_seq), 0) + 1 FROM task_events
                      WHERE tenant_scope = ?1 AND task_id = ?2",
-                    params![TRUSTED_SINGLE_TENANT_SCOPE, task_id],
+                    params![tenant_scope, task_id],
                     |row| row.get(0),
                 )
                 .map_err(|_| A2AError::internal("event sequence lookup failed"))?;
@@ -2522,7 +2528,7 @@ impl SqliteTaskStore {
                     "INSERT INTO task_events(tenant_scope, task_id, event_seq, task_revision,
                          event_kind, from_state, to_state, event_json, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![TRUSTED_SINGLE_TENANT_SCOPE, task_id, event_seq, next_revision,
+                    params![tenant_scope, task_id, event_seq, next_revision,
                         event_kind, current_state, next_state, encoded, now],
                 )
                 .map_err(|_| A2AError::internal("event append failed"))?;
@@ -2532,12 +2538,12 @@ impl SqliteTaskStore {
                         "UPDATE idempotency_records SET state = 'completed',
                              final_result_json = COALESCE(final_result_json, ?2), updated_at = ?3
                          WHERE tenant_scope = ?1 AND task_id = ?4",
-                        params![TRUSTED_SINGLE_TENANT_SCOPE, final_json, now, task_id],
+                        params![tenant_scope, final_json, now, task_id],
                     )
                     .map_err(|_| A2AError::internal("idempotency completion failed"))?;
             }
             if task.status.state.is_terminal() {
-                enqueue_terminal_callbacks(&transaction, TRUSTED_SINGLE_TENANT_SCOPE, &task, next_revision, now)?;
+                enqueue_terminal_callbacks(&transaction, &tenant_scope, &task, next_revision, now)?;
                 transaction
                     .execute(
                         "UPDATE outbox_attempts SET finished_at = ?2, outcome = 'superseded'
@@ -8164,6 +8170,7 @@ impl crate::CallbackAuthority for SqliteTaskStore {
         let url = command.canonical_url().to_owned();
         let digest = command.url_digest().to_owned();
         let created = command.created_at();
+        let authorization_audit = command.authorization_audit().cloned();
         self.run(move |connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("callback config transaction failed"))?;
@@ -8186,7 +8193,10 @@ impl crate::CallbackAuthority for SqliteTaskStore {
                 if e != enrollment || g != generation || u != url || d != digest {
                     return Err(A2AError::invalid_request("callback config id is already bound to different semantics"));
                 }
-                return callback_config_from_parts(&tenant,&task,&config_id,&e,g,&u,&d,&s,c);
+                let config = callback_config_from_parts(&tenant,&task,&config_id,&e,g,&u,&d,&s,c)?;
+                if let Some(audit) = authorization_audit.as_ref() { insert_authorization_audit(&tx, audit)?; }
+                tx.commit().map_err(|_| A2AError::internal("callback config commit failed"))?;
+                return Ok(config);
             }
             let count: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM callback_configs WHERE tenant_scope=?1 AND task_id=?2 AND state<>'revoked'",
@@ -8202,6 +8212,7 @@ impl crate::CallbackAuthority for SqliteTaskStore {
                 "INSERT INTO callback_configs(tenant_scope,task_id,config_id,owner_account_id,principal_scope,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'active',?10,?10)",
                 params![tenant,task,config_id,owner,principal,enrollment,generation,url,digest,created],
             ).map_err(|_| A2AError::internal("callback config insert failed"))?;
+            if let Some(audit) = authorization_audit.as_ref() { insert_authorization_audit(&tx, audit)?; }
             tx.commit().map_err(|_| A2AError::internal("callback config commit failed"))?;
             callback_config_from_parts(&tenant,&task,&config_id,&enrollment,generation,&url,&digest,"active",created)
         }).await
@@ -8271,16 +8282,18 @@ impl crate::CallbackAuthority for SqliteTaskStore {
         let task = command.task_id().to_owned();
         let id = command.config_id().as_str().to_owned();
         let requested = command.requested_at();
+        let authorization_audit = command.authorization_audit().cloned();
         self.run(move |c| { let tx=c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| A2AError::internal("callback delete failed"))?;
             let visible: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE tenant_scope=?1 AND task_id=?2 AND (?3=0 OR owner_account_id=?4))",params![tenant,task,i64::from(own),owner],|r|r.get(0)).map_err(|_|A2AError::internal("callback parent lookup failed"))?;
             if !visible{return Err(A2AError::task_not_found("resource"));}
             let state:Option<String>=tx.query_row("SELECT state FROM callback_configs WHERE tenant_scope=?1 AND task_id=?2 AND config_id=?3",params![tenant,task,id],|r|r.get(0)).optional().map_err(|_|A2AError::internal("callback delete lookup failed"))?;
-            let Some(state)=state else { tx.commit().map_err(|_|A2AError::internal("callback delete commit failed"))?; return Ok(crate::CallbackDeleteOutcome::AlreadyAbsent); };
-            if state=="revoked" { tx.commit().map_err(|_|A2AError::internal("callback delete commit failed"))?; return Ok(crate::CallbackDeleteOutcome::AlreadyAbsent); }
+            let Some(state)=state else { if let Some(audit)=authorization_audit.as_ref(){insert_authorization_audit(&tx,audit)?;} tx.commit().map_err(|_|A2AError::internal("callback delete commit failed"))?; return Ok(crate::CallbackDeleteOutcome::AlreadyAbsent); };
+            if state=="revoked" { if let Some(audit)=authorization_audit.as_ref(){insert_authorization_audit(&tx,audit)?;} tx.commit().map_err(|_|A2AError::internal("callback delete commit failed"))?; return Ok(crate::CallbackDeleteOutcome::AlreadyAbsent); }
             let now:i64=tx.query_row("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER)",[],|r|r.get(0)).map_err(|_|A2AError::internal("callback DB clock failed"))?;
             tx.execute("UPDATE callback_deliveries SET state='canceled',lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at=?4 WHERE tenant_scope=?1 AND task_id=?2 AND config_id=?3 AND (state IN ('pending','retry') OR (state='leased' AND lease_until<=?4))",params![tenant,task,id,now]).map_err(|_|A2AError::internal("callback cancellation failed"))?;
             let leased:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM callback_deliveries WHERE tenant_scope=?1 AND task_id=?2 AND config_id=?3 AND state='leased' AND lease_until>?4)",params![tenant,task,id,now],|r|r.get(0)).map_err(|_|A2AError::internal("callback lease lookup failed"))?;
             let next=if leased{"draining"}else{"revoked"}; tx.execute("UPDATE callback_configs SET state=?4,updated_at=?5 WHERE tenant_scope=?1 AND task_id=?2 AND config_id=?3",params![tenant,task,id,next,requested]).map_err(|_|A2AError::internal("callback revoke failed"))?;
+            if let Some(audit)=authorization_audit.as_ref(){insert_authorization_audit(&tx,audit)?;}
             tx.commit().map_err(|_|A2AError::internal("callback delete commit failed"))?; Ok(if leased{crate::CallbackDeleteOutcome::Draining}else{crate::CallbackDeleteOutcome::Revoked}) }).await
     }
 
@@ -8355,6 +8368,9 @@ fn sqlite_callback_terminal_fault(
     point: crate::CallbackTerminalTestFault,
     task_id: &str,
 ) -> Result<(), A2AError> {
+    if !cfg!(debug_assertions) {
+        return Ok(());
+    }
     if !task_id.starts_with("fault-") {
         return Ok(());
     }
@@ -8414,8 +8430,8 @@ fn enqueue_terminal_callbacks(
     let max_pending:i64=tx.query_row("SELECT max_pending FROM callback_policy_snapshots ORDER BY policy_revision DESC LIMIT 1",[],|r|r.get(0)).map_err(|_|A2AError::internal("callback terminal policy lookup failed"))?;
     let pending: i64 = tx
         .query_row(
-            "SELECT COUNT(*) FROM callback_deliveries WHERE state IN ('pending','retry','leased')",
-            [],
+            "SELECT COUNT(*) FROM callback_deliveries WHERE tenant_scope=?1 AND state IN ('pending','retry','leased')",
+            params![tenant],
             |r| r.get(0),
         )
         .map_err(|_| A2AError::internal("callback retained count failed"))?;
@@ -9127,6 +9143,7 @@ impl TaskStore for SqliteTaskStore {
         let encoded = encode_task(&task)?;
         let state = state_key(&task)?;
         let timestamp = task.status.timestamp.map(|value| value.to_rfc3339());
+        let tenant_scope = self.default_scope.to_string();
         self.run(move |connection| {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -9196,7 +9213,7 @@ impl TaskStore for SqliteTaskStore {
                 .query_row(
                     "SELECT COALESCE(MAX(event_seq), 0) + 1 FROM task_events
                      WHERE tenant_scope = ?1 AND task_id = ?2",
-                    params![TRUSTED_SINGLE_TENANT_SCOPE, task.id],
+                    params![tenant_scope, task.id],
                     |row| row.get(0),
                 )
                 .map_err(|_| A2AError::internal("persistent task event sequence failed"))?;
@@ -9206,7 +9223,7 @@ impl TaskStore for SqliteTaskStore {
                          event_kind, from_state, to_state, event_json, created_at)
                      VALUES (?1, ?2, ?3, ?4, 'sdk_update', ?5, ?6, ?7, ?8)",
                     params![
-                        TRUSTED_SINGLE_TENANT_SCOPE,
+                        tenant_scope,
                         task.id,
                         event_seq,
                         next_revision,
@@ -9219,7 +9236,7 @@ impl TaskStore for SqliteTaskStore {
                 .map_err(|_| A2AError::internal("persistent task event append failed"))?;
             enqueue_terminal_callbacks(
                 &transaction,
-                TRUSTED_SINGLE_TENANT_SCOPE,
+                &tenant_scope,
                 &task,
                 next_revision,
                 chrono::Utc::now().timestamp_millis(),

@@ -1882,10 +1882,17 @@ impl RequestHandler for DurableRequestHandler {
         {
             return Err(A2AError::invalid_params("invalid callback configuration"));
         }
-        let (_context, scope) = self
+        let (context, scope) = self
             .authorization_for(Operation::PushCreate, "task", &request.task_id)
             .await?
             .ok_or_else(|| A2AError::invalid_request("forbidden"))?;
+        let authorization_audit = self
+            .audit(&context, Operation::PushCreate, "task", &request.task_id)?
+            .decided(
+                AuthorizationDecisionEffect::Allow,
+                "policy_grant",
+                Some(request.task_id.clone()),
+            );
         let Some(authority) = self.store.callback_authority() else {
             self.audit_unsupported(Operation::PushCreate, "task", &request.task_id)
                 .await?;
@@ -1918,7 +1925,8 @@ impl RequestHandler for DurableRequestHandler {
             enrollment.canonical_url(),
             enrollment.url_digest(),
             self.clock.now(),
-        )?;
+        )?
+        .with_authorization_audit(authorization_audit);
         let config = authority.create_callback_config(command).await?;
         if let Some(telemetry) = &self.telemetry {
             telemetry.durable_event(
@@ -2004,10 +2012,17 @@ impl RequestHandler for DurableRequestHandler {
         if request.task_id.is_empty() || request.tenant.is_some() {
             return Err(A2AError::invalid_params("invalid callback request"));
         }
-        let (_context, scope) = self
+        let (context, scope) = self
             .authorization_for(Operation::PushDelete, "task", &request.task_id)
             .await?
             .ok_or_else(|| A2AError::invalid_request("forbidden"))?;
+        let authorization_audit = self
+            .audit(&context, Operation::PushDelete, "task", &request.task_id)?
+            .decided(
+                AuthorizationDecisionEffect::Allow,
+                "policy_grant",
+                Some(request.task_id.clone()),
+            );
         let Some(authority) = self.store.callback_authority() else {
             self.audit_unsupported(Operation::PushDelete, "task", &request.task_id)
                 .await?;
@@ -2018,9 +2033,12 @@ impl RequestHandler for DurableRequestHandler {
             request.task_id,
             crate::CallbackConfigId::new(request.id)?,
             self.clock.now(),
-        )?;
-        let _ = authority.delete_callback_config(command).await?;
-        if let Some(telemetry) = &self.telemetry {
+        )?
+        .with_authorization_audit(authorization_audit);
+        let outcome = authority.delete_callback_config(command).await?;
+        if !matches!(outcome, crate::CallbackDeleteOutcome::AlreadyAbsent)
+            && let Some(telemetry) = &self.telemetry
+        {
             telemetry.durable_event(
                 crate::telemetry::EventName::PushConfigChanged,
                 "ok",

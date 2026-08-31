@@ -76,6 +76,8 @@ pub enum PushSecurityError {
     UnsafeDns,
     #[error("callback DNS lookup is unavailable")]
     DnsUnavailable,
+    #[error("callback transport is unavailable")]
+    TransportUnavailable,
 }
 
 /// Exact canonical HTTPS callback URI.
@@ -760,7 +762,7 @@ impl SecureCallbackTransport {
             .body(body.to_vec())
             .send()
             .await
-            .map_err(|_| PushSecurityError::UnsafeDns)?;
+            .map_err(|_| PushSecurityError::TransportUnavailable)?;
         Ok(classify_status(response.status().as_u16()))
     }
 
@@ -990,16 +992,6 @@ impl PushReadiness {
             expected_workers: AtomicU16::new(worker_count),
             ready_workers: AtomicU16::new(0),
         })
-    }
-
-    pub fn mark_ready(&self) {
-        if !self.fatal.load(Ordering::Acquire) {
-            self.ready_workers.store(
-                self.expected_workers.load(Ordering::Acquire),
-                Ordering::Release,
-            );
-            self.ready.store(true, Ordering::Release);
-        }
     }
 
     /// Record one worker's first successful authority claim cycle. Duplicate
@@ -1487,7 +1479,7 @@ fn validate_raw_policy(raw: RawPolicy) -> Result<PushPolicy, PushSecurityError> 
         || !raw.policy_digest.starts_with("sha256:")
         || !raw.policy_digest[7..]
             .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         || raw.max_pending == 0
         || raw.max_pending > 1_000_000
         || !(1..=32).contains(&raw.max_configs_per_task)

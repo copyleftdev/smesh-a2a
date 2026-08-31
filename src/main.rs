@@ -569,10 +569,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quota_policy = std::env::var_os("SMESH_A2A_QUOTA_POLICY_PATH")
         .map(|path| QuotaPolicy::load(std::path::PathBuf::from(path)).map(Arc::new))
         .transpose()?;
-    let push_config_path = smesh_a2a::push::resolve_push_config_path(
-        std::env::var_os("SMESH_A2A_PUSH_CONFIG_PATH"),
-        std::env::var_os("SMESH_A2A_PUSH_POLICY_PATH"),
-    )?;
+    let push_config = std::env::var_os("SMESH_A2A_PUSH_CONFIG_PATH");
+    let push_policy_alias = std::env::var_os("SMESH_A2A_PUSH_POLICY_PATH");
+    if push_config.is_some() && push_policy_alias.is_some() {
+        return Err(
+            "SMESH_A2A_PUSH_CONFIG_PATH conflicts with deprecated SMESH_A2A_PUSH_POLICY_PATH"
+                .into(),
+        );
+    }
+    let push_config_path =
+        smesh_a2a::push::resolve_push_config_path(push_config, push_policy_alias)?;
     if push_config_path.is_some() && std::env::var_os("SMESH_A2A_PUSH_POLICY_PATH").is_some() {
         tracing::warn!("SMESH_A2A_PUSH_POLICY_PATH is deprecated; use SMESH_A2A_PUSH_CONFIG_PATH");
     }

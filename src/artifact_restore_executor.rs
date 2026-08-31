@@ -16,6 +16,17 @@ use std::{
 use tokio::io::AsyncWriteExt as _;
 use tokio_postgres::{Client, Transaction};
 
+fn restore_lock_error(error: &tokio_postgres::Error) -> PostgresStoreError {
+    if error
+        .code()
+        .is_some_and(|code| matches!(code.code(), "55P03" | "57014"))
+    {
+        PostgresStoreError::ArtifactMigrationBusy
+    } else {
+        PostgresStoreError::Unavailable
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ArtifactRestoreOutcome {
     pub objects: u64,
@@ -790,9 +801,11 @@ async fn commit_restore_journal(
     // backup authority. Fence registration and every callback mutation before
     // proving that no callback authority exists. The proof rotation and stale
     // session cleanup then commit atomically with the restore journal.
-    tx.batch_execute("SET LOCAL smesh.internal_global='callback-worker-v1'")
-        .await
-        .map_err(|_| PostgresStoreError::Unavailable)?;
+    tx.batch_execute(
+        "SET LOCAL lock_timeout='1s'; SET LOCAL smesh.internal_global='callback-worker-v1'",
+    )
+    .await
+    .map_err(|_| PostgresStoreError::Unavailable)?;
     tx.batch_execute(&format!(
         "LOCK TABLE
             {schema}.callback_attempts,
@@ -807,7 +820,7 @@ async fn commit_restore_journal(
          IN ACCESS EXCLUSIVE MODE"
     ))
     .await
-    .map_err(|_| PostgresStoreError::Unavailable)?;
+    .map_err(|error| restore_lock_error(&error))?;
     let callback_state = tx
         .query_one(
             &format!(
@@ -861,7 +874,7 @@ async fn commit_restore_journal(
         "LOCK TABLE {schema}.audit_projection_outbox IN ACCESS EXCLUSIVE MODE"
     ))
     .await
-    .map_err(|_| PostgresStoreError::Unavailable)?;
+    .map_err(|error| restore_lock_error(&error))?;
     tx.query_one(
         &format!(
             "SELECT enabled FROM {schema}.audit_projection_control WHERE singleton=1 FOR UPDATE"

@@ -1520,7 +1520,7 @@ impl PostgresTaskStore {
             let driver = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            validate_catalog(&client, &config.schema).await?;
+            validate_catalog(&mut client, &config.schema).await?;
             let result = crate::artifact_restore_executor::execute(
                 &mut client,
                 &config.schema,
@@ -1553,7 +1553,7 @@ impl PostgresTaskStore {
             let driver = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            validate_catalog(&client, &config.schema).await?;
+            validate_catalog(&mut client, &config.schema).await?;
             let result = crate::artifact_restore_executor::execute(
                 &mut client,
                 &config.schema,
@@ -1617,7 +1617,7 @@ impl PostgresTaskStore {
             let driver = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            validate_catalog(&client, &config.schema).await?;
+            validate_catalog(&mut client, &config.schema).await?;
             let result = crate::artifact_reencryption_executor::execute(
                 &mut client,
                 &config.schema,
@@ -1640,7 +1640,7 @@ impl PostgresTaskStore {
             let driver = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            validate_catalog(&client, &config.schema).await?;
+            validate_catalog(&mut client, &config.schema).await?;
             let result = crate::artifact_reencryption_executor::execute(
                 &mut client,
                 &config.schema,
@@ -1689,7 +1689,7 @@ impl PostgresTaskStore {
             let driver = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            validate_catalog(&client, &config.schema).await?;
+            validate_catalog(&mut client, &config.schema).await?;
             let result = crate::artifact_backup_executor::execute(
                 &mut client,
                 &config.schema,
@@ -1711,7 +1711,7 @@ impl PostgresTaskStore {
             let driver = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            validate_catalog(&client, &config.schema).await?;
+            validate_catalog(&mut client, &config.schema).await?;
             let result = crate::artifact_backup_executor::execute(
                 &mut client,
                 &config.schema,
@@ -1761,7 +1761,7 @@ impl PostgresTaskStore {
             let driver = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            let (cursor_key, _) = validate_catalog(&client, &config.schema).await?;
+            let (cursor_key, _) = validate_catalog(&mut client, &config.schema).await?;
             let result = crate::artifact_migration_executor::execute(
                 &mut client,
                 &config.schema,
@@ -1784,7 +1784,7 @@ impl PostgresTaskStore {
             let driver = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            let (cursor_key, _) = validate_catalog(&client, &config.schema).await?;
+            let (cursor_key, _) = validate_catalog(&mut client, &config.schema).await?;
             let result = crate::artifact_migration_executor::execute(
                 &mut client,
                 &config.schema,
@@ -1927,7 +1927,7 @@ impl PostgresTaskStore {
                 eprintln!("smesh.postgres.validation_failed category=runtime_login_post_migrate");
             })?;
 
-        let (cursor_key, receipt_key) = validate_catalog(&migration, &config.schema)
+        let (cursor_key, receipt_key) = validate_catalog(&mut migration, &config.schema)
             .await
             .inspect_err(|_| {
                 eprintln!("smesh.postgres.validation_failed category=catalog");
@@ -5326,10 +5326,18 @@ where
 }
 
 async fn validate_callback_semantics(
-    client: &tokio_postgres::Client,
+    client: &mut tokio_postgres::Client,
     schema: &str,
 ) -> Result<(), PostgresStoreError> {
-    let policies = client
+    // read-only callback semantic validation needs a transaction-local forced-RLS marker
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    tx.batch_execute("SET LOCAL smesh.internal_global='callback-worker-v1'")
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    let policies = tx
         .query(
             &format!("SELECT policy_id,policy_revision,policy_digest,max_configs_per_task,max_configs_per_tenant,max_pending,max_payload_bytes,max_attempts,max_delivery_age_ms FROM {schema}.callback_policy_snapshots"),
             &[],
@@ -5350,7 +5358,7 @@ async fn validate_callback_semantics(
         )
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
     }
-    let invalid: i64 = client
+    let invalid: i64 = tx
         .query_one(
             &format!(
                 "SELECT
@@ -5413,11 +5421,14 @@ async fn validate_callback_semantics(
     if invalid != 0 {
         return Err(PostgresStoreError::InvalidSchema);
     }
+    tx.commit()
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
     Ok(())
 }
 
 async fn validate_catalog(
-    client: &tokio_postgres::Client,
+    client: &mut tokio_postgres::Client,
     schema: &str,
 ) -> Result<([u8; 32], [u8; 32]), PostgresStoreError> {
     let expected_owner: String = client
@@ -6478,7 +6489,8 @@ impl crate::CallbackAuthority for PostgresTaskStore {
         let url = command.canonical_url().to_owned();
         let digest = command.url_digest().to_owned();
         let created = command.created_at();
-        self.run_retryable_transaction(&tenant,Some(&owner),|store,tx|{let tenant=tenant.clone();let owner=owner.clone();let principal=principal.clone();let task=task.clone();let id=id.clone();let enrollment=enrollment.clone();let url=url.clone();let digest=digest.clone();let policy=policy.clone();Box::pin(async move{let visible=store.q("SELECT EXISTS(SELECT 1 FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 AND (NOT $3 OR owner_account_id=$4) AND state NOT IN ('\"TASK_STATE_COMPLETED\"','\"TASK_STATE_FAILED\"','\"TASK_STATE_CANCELED\"','\"TASK_STATE_REJECTED\"'))");if !tx.query_one(&visible,&[&tenant,&task,&own,&owner]).await.map_err(|_|A2AError::internal("callback parent lookup failed"))?.get::<_,bool>(0){return Err(A2AError::task_not_found("resource"));}let enrolled=store.q("SELECT EXISTS(SELECT 1 FROM __S__.callback_enrollments WHERE tenant_scope=$1 AND enrollment_id=$2 AND enrollment_generation=$3 AND canonical_url=$4 AND url_digest=$5)");if !tx.query_one(&enrolled,&[&tenant,&enrollment,&generation,&url,&digest]).await.map_err(|_|A2AError::internal("callback enrollment lookup failed"))?.get::<_,bool>(0){return Err(A2AError::invalid_request("callback enrollment is not authorized"));}let lookup=store.q("SELECT config_id,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at FROM __S__.callback_configs WHERE tenant_scope=$1 AND task_id=$2 AND config_id=$3");if let Some(row)=tx.query_opt(&lookup,&[&tenant,&task,&id]).await.map_err(|_|A2AError::internal("callback idempotency lookup failed"))?{if row.get::<_,&str>(1)!=enrollment||row.get::<_,i64>(2)!=generation||row.get::<_,&str>(3)!=url||row.get::<_,&str>(4)!=digest{return Err(A2AError::invalid_request("callback config id is already bound to different semantics"));}return postgres_callback_config(&row,&tenant,&task);}let scheduler_lock=store.q("SELECT pg_advisory_xact_lock(hashtextextended($1,17))");tx.query_one(&scheduler_lock,&[&tenant]).await.map_err(|_|A2AError::internal("callback tenant capacity lock failed"))?;let tenant_count=store.q("SELECT count(*) FROM __S__.callback_configs WHERE tenant_scope=$1 AND state<>'revoked'");if tx.query_one(&tenant_count,&[&tenant]).await.map_err(|_|A2AError::internal("callback tenant config count failed"))?.get::<_,i64>(0)>=i64::from(policy.max_configs_per_tenant()){return Err(A2AError::invalid_params("callback tenant config capacity reached"));}let count=store.q("SELECT count(*) FROM __S__.callback_configs WHERE tenant_scope=$1 AND task_id=$2 AND state<>'revoked'");if tx.query_one(&count,&[&tenant,&task]).await.map_err(|_|A2AError::internal("callback config count failed"))?.get::<_,i64>(0)>=i64::from(policy.max_configs_per_task()){return Err(A2AError::invalid_request("callback config capacity reached"));}let insert=store.q("INSERT INTO __S__.callback_configs(tenant_scope,task_id,config_id,owner_account_id,principal_scope,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$10) RETURNING config_id,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at");let row=tx.query_one(&insert,&[&tenant,&task,&id,&owner,&principal,&enrollment,&generation,&url,&digest,&created]).await.map_err(|_|A2AError::internal("callback config insert failed"))?;postgres_callback_config(&row,&tenant,&task)})}).await
+        let authorization_audit = command.authorization_audit().cloned();
+        self.run_retryable_transaction(&tenant,Some(&owner),|store,tx|{let tenant=tenant.clone();let owner=owner.clone();let principal=principal.clone();let task=task.clone();let id=id.clone();let enrollment=enrollment.clone();let url=url.clone();let digest=digest.clone();let policy=policy.clone();let authorization_audit=authorization_audit.clone();Box::pin(async move{let visible=store.q("SELECT EXISTS(SELECT 1 FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 AND (NOT $3 OR owner_account_id=$4) AND state NOT IN ('\"TASK_STATE_COMPLETED\"','\"TASK_STATE_FAILED\"','\"TASK_STATE_CANCELED\"','\"TASK_STATE_REJECTED\"'))");if !tx.query_one(&visible,&[&tenant,&task,&own,&owner]).await.map_err(|_|A2AError::internal("callback parent lookup failed"))?.get::<_,bool>(0){return Err(A2AError::task_not_found("resource"));}let enrolled=store.q("SELECT EXISTS(SELECT 1 FROM __S__.callback_enrollments WHERE tenant_scope=$1 AND enrollment_id=$2 AND enrollment_generation=$3 AND canonical_url=$4 AND url_digest=$5)");if !tx.query_one(&enrolled,&[&tenant,&enrollment,&generation,&url,&digest]).await.map_err(|_|A2AError::internal("callback enrollment lookup failed"))?.get::<_,bool>(0){return Err(A2AError::invalid_request("callback enrollment is not authorized"));}let lookup=store.q("SELECT config_id,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at FROM __S__.callback_configs WHERE tenant_scope=$1 AND task_id=$2 AND config_id=$3");if let Some(row)=tx.query_opt(&lookup,&[&tenant,&task,&id]).await.map_err(|_|A2AError::internal("callback idempotency lookup failed"))?{if row.get::<_,&str>(1)!=enrollment||row.get::<_,i64>(2)!=generation||row.get::<_,&str>(3)!=url||row.get::<_,&str>(4)!=digest{return Err(A2AError::invalid_request("callback config id is already bound to different semantics"));}let config=postgres_callback_config(&row,&tenant,&task)?;if let Some(audit)=authorization_audit.clone(){store.insert_audit(tx,audit).await?;}return Ok(config);}let scheduler_lock=store.q("SELECT pg_advisory_xact_lock(hashtextextended($1,17))");tx.query_one(&scheduler_lock,&[&tenant]).await.map_err(|_|A2AError::internal("callback tenant capacity lock failed"))?;let tenant_count=store.q("SELECT count(*) FROM __S__.callback_configs WHERE tenant_scope=$1 AND state<>'revoked'");if tx.query_one(&tenant_count,&[&tenant]).await.map_err(|_|A2AError::internal("callback tenant config count failed"))?.get::<_,i64>(0)>=i64::from(policy.max_configs_per_tenant()){return Err(A2AError::invalid_params("callback tenant config capacity reached"));}let count=store.q("SELECT count(*) FROM __S__.callback_configs WHERE tenant_scope=$1 AND task_id=$2 AND state<>'revoked'");if tx.query_one(&count,&[&tenant,&task]).await.map_err(|_|A2AError::internal("callback config count failed"))?.get::<_,i64>(0)>=i64::from(policy.max_configs_per_task()){return Err(A2AError::invalid_request("callback config capacity reached"));}let insert=store.q("INSERT INTO __S__.callback_configs(tenant_scope,task_id,config_id,owner_account_id,principal_scope,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$10) RETURNING config_id,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at");let row=tx.query_one(&insert,&[&tenant,&task,&id,&owner,&principal,&enrollment,&generation,&url,&digest,&created]).await.map_err(|_|A2AError::internal("callback config insert failed"))?;let config=postgres_callback_config(&row,&tenant,&task)?;if let Some(audit)=authorization_audit{store.insert_audit(tx,audit).await?;}Ok(config)})}).await
     }
     async fn get_callback_config(
         &self,
@@ -6527,7 +6539,8 @@ impl crate::CallbackAuthority for PostgresTaskStore {
         let task = command.task_id().to_owned();
         let id = command.config_id().as_str().to_owned();
         let requested = command.requested_at();
-        self.run_retryable_transaction(&tenant,Some(&owner),|store,tx|{let tenant=tenant.clone();let owner=owner.clone();let task=task.clone();let id=id.clone();Box::pin(async move{let parent=store.q("SELECT EXISTS(SELECT 1 FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 AND (NOT $3 OR owner_account_id=$4))");if !tx.query_one(&parent,&[&tenant,&task,&own,&owner]).await.map_err(|_|A2AError::internal("callback parent lookup failed"))?.get::<_,bool>(0){return Err(A2AError::task_not_found("resource"));}let lookup=store.q("SELECT state FROM __S__.callback_configs WHERE tenant_scope=$1 AND task_id=$2 AND config_id=$3 FOR UPDATE");let Some(row)=tx.query_opt(&lookup,&[&tenant,&task,&id]).await.map_err(|_|A2AError::internal("callback delete lookup failed"))? else{return Ok(crate::CallbackDeleteOutcome::AlreadyAbsent)};if row.get::<_,&str>(0)=="revoked"{return Ok(crate::CallbackDeleteOutcome::AlreadyAbsent);}let cancel=store.q("SELECT __S__.cancel_callback_config_deliveries($1,$2,$3)");tx.query_one(&cancel,&[&tenant,&task,&id]).await.map_err(|_|A2AError::internal("callback cancellation failed"))?;let leased=store.q("SELECT EXISTS(SELECT 1 FROM __S__.callback_deliveries WHERE tenant_scope=$1 AND task_id=$2 AND config_id=$3 AND state='leased' AND lease_until>__S__.db_millis())");let draining=tx.query_one(&leased,&[&tenant,&task,&id]).await.map_err(|_|A2AError::internal("callback lease lookup failed"))?.get::<_,bool>(0);let update=store.q("UPDATE __S__.callback_configs SET state=$4,updated_at=$5 WHERE tenant_scope=$1 AND task_id=$2 AND config_id=$3");tx.execute(&update,&[&tenant,&task,&id,&if draining{"draining"}else{"revoked"},&requested]).await.map_err(|_|A2AError::internal("callback revoke failed"))?;Ok(if draining{crate::CallbackDeleteOutcome::Draining}else{crate::CallbackDeleteOutcome::Revoked})})}).await
+        let authorization_audit = command.authorization_audit().cloned();
+        self.run_retryable_transaction(&tenant,Some(&owner),|store,tx|{let tenant=tenant.clone();let owner=owner.clone();let task=task.clone();let id=id.clone();let authorization_audit=authorization_audit.clone();Box::pin(async move{let parent=store.q("SELECT EXISTS(SELECT 1 FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 AND (NOT $3 OR owner_account_id=$4))");if !tx.query_one(&parent,&[&tenant,&task,&own,&owner]).await.map_err(|_|A2AError::internal("callback parent lookup failed"))?.get::<_,bool>(0){return Err(A2AError::task_not_found("resource"));}let lookup=store.q("SELECT state FROM __S__.callback_configs WHERE tenant_scope=$1 AND task_id=$2 AND config_id=$3 FOR UPDATE");let Some(row)=tx.query_opt(&lookup,&[&tenant,&task,&id]).await.map_err(|_|A2AError::internal("callback delete lookup failed"))? else{if let Some(audit)=authorization_audit.clone(){store.insert_audit(tx,audit).await?;}return Ok(crate::CallbackDeleteOutcome::AlreadyAbsent)};if row.get::<_,&str>(0)=="revoked"{if let Some(audit)=authorization_audit.clone(){store.insert_audit(tx,audit).await?;}return Ok(crate::CallbackDeleteOutcome::AlreadyAbsent);}let cancel=store.q("SELECT __S__.cancel_callback_config_deliveries($1,$2,$3)");tx.query_one(&cancel,&[&tenant,&task,&id]).await.map_err(|_|A2AError::internal("callback cancellation failed"))?;let leased=store.q("SELECT EXISTS(SELECT 1 FROM __S__.callback_deliveries WHERE tenant_scope=$1 AND task_id=$2 AND config_id=$3 AND state='leased' AND lease_until>__S__.db_millis())");let draining=tx.query_one(&leased,&[&tenant,&task,&id]).await.map_err(|_|A2AError::internal("callback lease lookup failed"))?.get::<_,bool>(0);let update=store.q("UPDATE __S__.callback_configs SET state=$4,updated_at=$5 WHERE tenant_scope=$1 AND task_id=$2 AND config_id=$3");tx.execute(&update,&[&tenant,&task,&id,&if draining{"draining"}else{"revoked"},&requested]).await.map_err(|_|A2AError::internal("callback revoke failed"))?;if let Some(audit)=authorization_audit{store.insert_audit(tx,audit).await?;}Ok(if draining{crate::CallbackDeleteOutcome::Draining}else{crate::CallbackDeleteOutcome::Revoked})})}).await
     }
     async fn claim_callback_deliveries(
         &self,
@@ -6553,7 +6566,12 @@ impl crate::CallbackAuthority for PostgresTaskStore {
                 let rows = tx
                     .query(&q, &[&owner, &token, &duration, &limit, &attempts])
                     .await
-                    .map_err(|_| A2AError::internal("callback claim failed"))?;
+                    .map_err(|error| {
+                        Self::transaction_body_error(
+                            &error,
+                            A2AError::internal("callback claim failed"),
+                        )
+                    })?;
                 rows.into_iter()
                     .map(|r| {
                         let tenant: String = r.get(0);
@@ -6615,7 +6633,12 @@ impl crate::CallbackAuthority for PostgresTaskStore {
                 )
                 .await
                 .map(|r| r.get(0))
-                .map_err(|_| A2AError::internal("callback renewal failed"))
+                .map_err(|error| {
+                    Self::transaction_body_error(
+                        &error,
+                        A2AError::internal("callback renewal failed"),
+                    )
+                })
             })
         })
         .await
@@ -6689,7 +6712,12 @@ impl PostgresTaskStore {
                         ],
                     )
                     .await
-                    .map_err(|_| A2AError::invalid_request("stale callback delivery fence"))?
+                    .map_err(|error| {
+                        Self::transaction_body_error(
+                            &error,
+                            A2AError::invalid_request("stale callback delivery fence"),
+                        )
+                    })?
                     .get(0);
                 match state.as_str() {
                     "delivered" => Ok(crate::CallbackDeliveryState::Delivered),

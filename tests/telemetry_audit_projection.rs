@@ -163,6 +163,7 @@ fn callback_projection_types_are_distinct_and_closed() {
         AuditProjectionSource::CallbackPolicy,
         AuditProjectionSource::CallbackConfig,
         AuditProjectionSource::CallbackEvent,
+        AuditProjectionSource::CallbackDelivery,
         AuditProjectionSource::CallbackAttempt,
     ];
     assert_eq!(
@@ -171,6 +172,7 @@ fn callback_projection_types_are_distinct_and_closed() {
             "callback_policy_snapshots",
             "callback_configs",
             "callback_events",
+            "callback_deliveries",
             "callback_attempts",
         ]
     );
