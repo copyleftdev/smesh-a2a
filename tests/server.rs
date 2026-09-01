@@ -124,3 +124,93 @@ async fn router_rejects_http_bodies_over_the_gateway_limit() {
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+#[tokio::test]
+async fn rest_list_rejects_invalid_status_instead_of_widening_query() {
+    let config = GatewayConfig::new("http://127.0.0.1:3000", "gateway-node");
+    let app = build_router(config, LoopbackDispatcher);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/rest/tasks?status=not-a-task-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn jsonrpc_and_rest_reject_caller_tenant_without_leak_or_authority_effect() {
+    const TENANT: &str = "tenant-wire-canary-never-echo";
+    let config = GatewayConfig::new("http://127.0.0.1:3000", "gateway-node");
+    let app = build_router(config, LoopbackDispatcher);
+    let message = serde_json::json!({
+        "message":{
+            "messageId":"tenant-wire-message",
+            "role":"ROLE_USER",
+            "parts":[{"text":"work"}]
+        },
+        "tenant":TENANT
+    });
+    let jsonrpc = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc":"2.0","id":"tenant","method":a2a::jsonrpc::methods::SEND_MESSAGE,"params":message
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(jsonrpc.status(), StatusCode::OK);
+    let jsonrpc_body = jsonrpc.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&jsonrpc_body).unwrap()["error"]["code"],
+        a2a::error_code::INVALID_PARAMS
+    );
+    assert!(!String::from_utf8_lossy(&jsonrpc_body).contains(TENANT));
+
+    let rest = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rest/message:send")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&message).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rest.status(), StatusCode::BAD_REQUEST);
+    let rest_body = rest.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&rest_body).contains(TENANT));
+
+    let listed = app
+        .oneshot(
+            Request::builder()
+                .uri("/rest/tasks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listed = listed.into_body().collect().await.unwrap().to_bytes();
+    let listed: serde_json::Value = serde_json::from_slice(&listed).unwrap();
+    assert!(
+        listed["tasks"]
+            .as_array()
+            .is_none_or(std::vec::Vec::is_empty),
+        "{listed}"
+    );
+    assert!(listed["totalSize"].is_null() || listed["totalSize"] == 0);
+}

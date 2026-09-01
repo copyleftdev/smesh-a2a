@@ -6,6 +6,26 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
+
+pub(crate) enum FieldPresence<T> {
+    Missing,
+    Present(T),
+}
+
+impl<T> Default for FieldPresence<T> {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl<'de, T> Deserialize<'de> for FieldPresence<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::Present)
+    }
+}
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -264,40 +284,45 @@ impl Serialize for Part {
 
 impl<'de> Deserialize<'de> for Part {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw: HashMap<String, Value> = HashMap::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct RawPart {
+            #[serde(default)]
+            text: FieldPresence<Value>,
+            #[serde(default)]
+            raw: FieldPresence<Value>,
+            #[serde(default)]
+            url: FieldPresence<Value>,
+            #[serde(default)]
+            data: FieldPresence<Value>,
+            #[serde(default)]
+            filename: Option<String>,
+            #[serde(default)]
+            media_type: Option<String>,
+            #[serde(default)]
+            metadata: Option<HashMap<String, Value>>,
+        }
 
-        let content = if let Some(Value::String(t)) = raw.get("text") {
-            PartContent::Text(t.clone())
-        } else if let Some(Value::String(r)) = raw.get("raw") {
-            let bytes = BASE64.decode(r).map_err(serde::de::Error::custom)?;
-            PartContent::Raw(bytes)
-        } else if let Some(Value::String(u)) = raw.get("url") {
-            PartContent::Url(u.clone())
-        } else if let Some(d) = raw.get("data") {
-            PartContent::Data(d.clone())
-        } else {
-            return Err(serde::de::Error::custom(
-                "Part must have one of: text, raw, url, data",
-            ));
+        let raw = RawPart::deserialize(deserializer)?;
+        let content = match (raw.text, raw.raw, raw.url, raw.data) {
+            (FieldPresence::Present(Value::String(text)), FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing) => PartContent::Text(text),
+            (FieldPresence::Missing, FieldPresence::Present(Value::String(encoded)), FieldPresence::Missing, FieldPresence::Missing) => PartContent::Raw(
+                BASE64.decode(encoded).map_err(serde::de::Error::custom)?,
+            ),
+            (FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Present(Value::String(url)), FieldPresence::Missing) => PartContent::Url(url),
+            (FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Present(data)) => PartContent::Data(data),
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "Part must contain exactly one of: text, raw, url, data",
+                ));
+            }
         };
-
-        let filename = raw
-            .get("filename")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let media_type = raw
-            .get("mediaType")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let metadata: Option<HashMap<String, Value>> = raw
-            .get("metadata")
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
 
         Ok(Part {
             content,
-            filename,
-            media_type,
-            metadata,
+            filename: raw.filename,
+            media_type: raw.media_type,
+            metadata: raw.metadata,
         })
     }
 }
@@ -484,18 +509,29 @@ impl Serialize for SendMessageResponse {
 
 impl<'de> Deserialize<'de> for SendMessageResponse {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw: HashMap<String, Value> = HashMap::deserialize(deserializer)?;
-        if let Some(v) = raw.get("task") {
-            let task: Task = serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?;
-            Ok(SendMessageResponse::Task(task))
-        } else if let Some(v) = raw.get("message") {
-            let msg: Message =
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?;
-            Ok(SendMessageResponse::Message(msg))
-        } else {
-            Err(serde::de::Error::custom(
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawSendMessageResponse {
+            #[serde(default)]
+            task: FieldPresence<Value>,
+            #[serde(default)]
+            message: FieldPresence<Value>,
+        }
+
+        let raw = RawSendMessageResponse::deserialize(deserializer)?;
+        match (raw.task, raw.message) {
+            (FieldPresence::Present(value), FieldPresence::Missing) => serde_json::from_value(value)
+                .map(SendMessageResponse::Task)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Present(value)) => serde_json::from_value(value)
+                .map(SendMessageResponse::Message)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Present(_), FieldPresence::Present(_)) => Err(serde::de::Error::custom(
+                "SendMessageResponse must contain exactly one of 'task' or 'message'",
+            )),
+            (FieldPresence::Missing, FieldPresence::Missing) => Err(serde::de::Error::custom(
                 "SendMessageResponse must have 'task' or 'message'",
-            ))
+            )),
         }
     }
 }

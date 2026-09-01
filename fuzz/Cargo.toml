@@ -1,0 +1,49 @@
+[package]
+name = "smesh-a2a-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+members = ["."]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+a2a = { package = "a2a-lf", version = "0.3.0" }
+smesh-a2a = { path = ".." }
+
+[patch.crates-io]
+a2a-lf = { path = "../vendor/a2a-lf" }
+a2a-server-lf = { path = "../vendor/a2a-server-lf" }
+
+[[bin]]
+name = "protocol_json"
+path = "fuzz_targets/protocol_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_json"
+path = "fuzz_targets/policy_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "page_tokens"
+path = "fuzz_targets/page_tokens.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_replay"
+path = "fuzz_targets/state_replay.rs"
+test = false
+doc = false
+bench = false

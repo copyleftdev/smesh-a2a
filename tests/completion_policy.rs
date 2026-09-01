@@ -560,3 +560,12 @@ fn policy_version_and_configuration_are_bound_to_the_policy_hash() {
 
     assert_ne!(first.policy_hash(), stricter.policy_hash());
 }
+
+#[test]
+fn completion_policy_rejects_whitespace_and_control_text() {
+    for policy_id in ["   ", "policy\0id", "policy\nid"] {
+        let mut spec = baseline_spec();
+        policy_id.clone_into(&mut spec.policy_id);
+        assert!(VersionedCompletionPolicy::new_with_receipt_key(spec, [3; 32]).is_err());
+    }
+}

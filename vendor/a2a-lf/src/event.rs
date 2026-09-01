@@ -35,25 +35,36 @@ impl Serialize for StreamResponse {
 
 impl<'de> Deserialize<'de> for StreamResponse {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw: HashMap<String, Value> = HashMap::deserialize(deserializer)?;
-        if let Some(v) = raw.get("message") {
-            Ok(StreamResponse::Message(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else if let Some(v) = raw.get("task") {
-            Ok(StreamResponse::Task(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else if let Some(v) = raw.get("statusUpdate") {
-            Ok(StreamResponse::StatusUpdate(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else if let Some(v) = raw.get("artifactUpdate") {
-            Ok(StreamResponse::ArtifactUpdate(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else {
-            Err(serde::de::Error::custom("unknown StreamResponse variant"))
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct RawStreamResponse {
+            #[serde(default)]
+            message: FieldPresence<Value>,
+            #[serde(default)]
+            task: FieldPresence<Value>,
+            #[serde(default)]
+            status_update: FieldPresence<Value>,
+            #[serde(default)]
+            artifact_update: FieldPresence<Value>,
+        }
+
+        let raw = RawStreamResponse::deserialize(deserializer)?;
+        match (raw.message, raw.task, raw.status_update, raw.artifact_update) {
+            (FieldPresence::Present(value), FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing) => serde_json::from_value(value)
+                .map(StreamResponse::Message)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Present(value), FieldPresence::Missing, FieldPresence::Missing) => serde_json::from_value(value)
+                .map(StreamResponse::Task)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Present(value), FieldPresence::Missing) => serde_json::from_value(value)
+                .map(StreamResponse::StatusUpdate)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Present(value)) => serde_json::from_value(value)
+                .map(StreamResponse::ArtifactUpdate)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(
+                "StreamResponse must contain exactly one variant",
+            )),
         }
     }
 }

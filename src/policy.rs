@@ -1131,7 +1131,11 @@ fn hex_nibble(value: u8) -> Option<u8> {
 }
 
 fn validate_text(field: &str, value: &str) -> Result<(), PolicyError> {
-    if value.is_empty() || value.len() > MAX_TEXT_BYTES {
+    if value.is_empty()
+        || value.len() > MAX_TEXT_BYTES
+        || value.trim().is_empty()
+        || value.chars().any(char::is_control)
+    {
         return Err(PolicyError::InvalidText {
             field: field.to_owned(),
             limit: MAX_TEXT_BYTES,

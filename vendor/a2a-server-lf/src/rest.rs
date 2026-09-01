@@ -213,9 +213,13 @@ async fn handle_list_tasks<H: RequestHandler>(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
-    let status = query
-        .status
-        .and_then(|s| serde_json::from_value::<TaskState>(serde_json::Value::String(s)).ok());
+    let status = match query.status {
+        Some(status) => match serde_json::from_value::<TaskState>(serde_json::Value::String(status)) {
+            Ok(status) => Some(status),
+            Err(_) => return rest_error_response(A2AError::invalid_params("invalid status")),
+        },
+        None => None,
+    };
     let req = ListTasksRequest {
         context_id: query.context_id,
         status,
