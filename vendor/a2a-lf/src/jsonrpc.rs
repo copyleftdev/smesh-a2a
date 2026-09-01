@@ -3,12 +3,15 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+use crate::types::FieldPresence;
+
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 types
 // ---------------------------------------------------------------------------
 
 /// JSON-RPC 2.0 request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
     pub id: JsonRpcId,
@@ -29,7 +32,7 @@ impl JsonRpcRequest {
 }
 
 /// JSON-RPC 2.0 response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: String,
     pub id: JsonRpcId,
@@ -37,6 +40,40 @@ pub struct JsonRpcResponse {
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+}
+
+impl<'de> Deserialize<'de> for JsonRpcResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawJsonRpcResponse {
+            jsonrpc: String,
+            id: JsonRpcId,
+            #[serde(default)]
+            result: FieldPresence<Value>,
+            #[serde(default)]
+            error: FieldPresence<JsonRpcError>,
+        }
+
+        let raw = RawJsonRpcResponse::deserialize(deserializer)?;
+        match (raw.result, raw.error) {
+            (FieldPresence::Present(result), FieldPresence::Missing) => Ok(Self {
+                jsonrpc: raw.jsonrpc,
+                id: raw.id,
+                result: Some(result),
+                error: None,
+            }),
+            (FieldPresence::Missing, FieldPresence::Present(error)) => Ok(Self {
+                jsonrpc: raw.jsonrpc,
+                id: raw.id,
+                result: None,
+                error: Some(error),
+            }),
+            _ => Err(serde::de::Error::custom(
+                "JSON-RPC response must contain exactly one of result or error",
+            )),
+        }
+    }
 }
 
 impl JsonRpcResponse {
@@ -61,6 +98,7 @@ impl JsonRpcResponse {
 
 /// JSON-RPC 2.0 error object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JsonRpcError {
     pub code: i32,
     pub message: String,

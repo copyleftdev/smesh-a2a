@@ -84,7 +84,6 @@ const ACTIVE_CALLBACK_ENROLLMENT_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM
 const CALLBACK_POLICY_FENCE_LOCK: i64 = 6_001_136_200_065;
 const PAGE_TOKEN_VERSION: i64 = 1;
 const PAGE_TOKEN_KEY_GENERATION: i64 = 1;
-const MAX_PAGE_TOKEN_BYTES: usize = 4096;
 const SNAPSHOT_TTL_MILLIS: i64 = 5 * 60 * 1_000;
 const MAX_ACTIVE_SNAPSHOTS: i64 = 128;
 const MAX_SNAPSHOT_BYTES: i64 = 64 * 1024 * 1024;
@@ -6324,42 +6323,7 @@ fn is_dispatch_closed(state: &a2a::TaskState) -> bool {
 }
 
 fn legal_transition(from: &a2a::TaskState, to: &a2a::TaskState) -> bool {
-    use a2a::TaskState;
-    if from == to {
-        return true;
-    }
-    match from {
-        TaskState::Unspecified => matches!(
-            to,
-            TaskState::Submitted | TaskState::Failed | TaskState::Rejected
-        ),
-        TaskState::Submitted => matches!(
-            to,
-            TaskState::Working
-                | TaskState::InputRequired
-                | TaskState::AuthRequired
-                | TaskState::Completed
-                | TaskState::Failed
-                | TaskState::Canceled
-                | TaskState::Rejected
-        ),
-        TaskState::Working => matches!(
-            to,
-            TaskState::InputRequired
-                | TaskState::AuthRequired
-                | TaskState::Completed
-                | TaskState::Failed
-                | TaskState::Canceled
-                | TaskState::Rejected
-        ),
-        TaskState::InputRequired | TaskState::AuthRequired => matches!(
-            to,
-            TaskState::Working | TaskState::Failed | TaskState::Canceled | TaskState::Rejected
-        ),
-        TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::Rejected => {
-            false
-        }
-    }
+    crate::task_state_transition_allowed(from, to)
 }
 
 fn final_result_matches_task(result: &SendMessageResponse, task: &Task) -> bool {
@@ -6570,16 +6534,8 @@ fn derive_page_token(
 }
 
 fn decode_page_token_hash(token: &str) -> Result<[u8; 32], A2AError> {
-    if token.len() > MAX_PAGE_TOKEN_BYTES {
-        return Err(A2AError::invalid_params("invalid pageToken"));
-    }
-    let raw = URL_SAFE_NO_PAD
-        .decode(token)
-        .map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
-    if raw.len() != 32 {
-        return Err(A2AError::invalid_params("invalid pageToken"));
-    }
-    Ok(Sha256::digest(raw).into())
+    crate::fuzzing::decode_opaque_page_token_hash(token)
+        .ok_or_else(|| A2AError::invalid_params("invalid pageToken"))
 }
 
 impl crate::IntoDurableAuthority for PostgresTaskStore {
@@ -6805,41 +6761,8 @@ fn parse_postgres_callback_token(
     tenant: &str,
     task: &str,
 ) -> Result<(i64, String), A2AError> {
-    let (p, m) = token
-        .split_once('.')
-        .ok_or_else(|| A2AError::invalid_request("invalid callback page token"))?;
-    let payload = URL_SAFE_NO_PAD
-        .decode(p)
-        .map_err(|_| A2AError::invalid_request("invalid callback page token"))?;
-    let supplied = URL_SAFE_NO_PAD
-        .decode(m)
-        .map_err(|_| A2AError::invalid_request("invalid callback page token"))?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .map_err(|_| A2AError::internal("callback token failed"))?;
-    mac.update(b"smesh-callback-page-v1\0");
-    mac.update(&payload);
-    if mac.verify_slice(&supplied).is_err() {
-        return Err(A2AError::invalid_request("invalid callback page token"));
-    }
-    let text = std::str::from_utf8(&payload)
-        .map_err(|_| A2AError::invalid_request("invalid callback page token"))?;
-    let mut p = text.split('\u{1f}');
-    if p.next() != Some("1") || p.next() != Some(tenant) || p.next() != Some(task) {
-        return Err(A2AError::invalid_request("invalid callback page token"));
-    }
-    let at = p
-        .next()
-        .and_then(|v| v.parse().ok())
-        .ok_or_else(|| A2AError::invalid_request("invalid callback page token"))?;
-    let id = p
-        .next()
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| A2AError::invalid_request("invalid callback page token"))?
-        .to_owned();
-    if p.next().is_some() {
-        return Err(A2AError::invalid_request("invalid callback page token"));
-    }
-    Ok((at, id))
+    crate::fuzzing::parse_callback_page_token(key, token, tenant, task)
+        .ok_or_else(|| A2AError::invalid_request("invalid callback page token"))
 }
 
 #[async_trait]
@@ -8415,8 +8338,7 @@ impl AuthorizedTaskRead for PostgresTaskStore {
                 .apply_quota_intent(tx, intent, &tenant, &owner, None, quota_now, true, None)
                 .await?;
         }
-        let response = if let Some(token) = request.page_token.as_deref().filter(|v| !v.is_empty())
-        {
+        let response = if let Some(token) = request.page_token.as_deref() {
             let hash = decode_page_token_hash(token)?;
             let lookup=store.q("SELECT p.snapshot_id,p.next_position,p.scope_digest,p.query_digest,p.token_version,p.key_generation,p.issued_at,p.expires_at,s.total_size,s.page_size,s.projection_version,s.frozen_bytes,s.metadata_digest,s.owner_account_id FROM __S__.list_page_tokens p JOIN __S__.list_snapshots s ON s.tenant_scope=p.tenant_scope AND s.snapshot_id=p.snapshot_id WHERE p.tenant_scope=$1 AND p.token_hash=$2");
             let row = tx

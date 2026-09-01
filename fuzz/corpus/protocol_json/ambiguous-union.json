@@ -1,0 +1,1 @@
+{"task":{"id":"t","contextId":"c","status":{"state":"TASK_STATE_SUBMITTED"}},"message":{"messageId":"m","role":"ROLE_USER","parts":[{"text":"x"}]}}

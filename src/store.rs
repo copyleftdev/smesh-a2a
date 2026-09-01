@@ -305,6 +305,11 @@ impl TaskStore for BoundedTaskStore {
                 "terminal task state cannot be changed",
             ));
         }
+        if !crate::task_state_transition_allowed(&stored.status.state, &task.status.state) {
+            return Err(A2AError::unsupported_operation(
+                "invalid task state transition",
+            ));
+        }
         *stored = task;
         Ok(1)
     }
@@ -319,7 +324,7 @@ impl TaskStore for BoundedTaskStore {
         let now = (self.clock)().max(state.observed_now);
         state.observed_now = now;
         gc_memory_snapshots(&mut state, now);
-        if let Some(token) = req.page_token.as_deref().filter(|token| !token.is_empty()) {
+        if let Some(token) = req.page_token.as_deref() {
             if token.len() > MAX_PAGE_TOKEN_BYTES {
                 return Err(A2AError::invalid_params("invalid pageToken"));
             }

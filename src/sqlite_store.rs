@@ -61,7 +61,6 @@ const AUTHORIZATION_COUNT_SELECT_SQL: &str =
     "SELECT decision_count FROM authorization_decision_accounting WHERE singleton=1";
 const PAGE_TOKEN_VERSION: i64 = 1;
 const PAGE_TOKEN_KEY_GENERATION: i64 = 1;
-const MAX_PAGE_TOKEN_BYTES: usize = 4096;
 const SNAPSHOT_TTL_MILLIS: i64 = 5 * 60 * 1_000;
 const MAX_ACTIVE_SNAPSHOTS: i64 = 128;
 const MAX_SNAPSHOT_BYTES: i64 = 64 * 1024 * 1024;
@@ -4522,44 +4521,7 @@ fn ensure_atomic_capacity(connection: &Connection) -> Result<(), A2AError> {
 }
 
 fn legal_transition(from: &a2a::TaskState, to: &a2a::TaskState) -> bool {
-    use a2a::TaskState;
-    if from == to {
-        return true;
-    }
-    match from {
-        TaskState::Unspecified => {
-            matches!(
-                to,
-                TaskState::Submitted | TaskState::Failed | TaskState::Rejected
-            )
-        }
-        TaskState::Submitted => matches!(
-            to,
-            TaskState::Working
-                | TaskState::InputRequired
-                | TaskState::AuthRequired
-                | TaskState::Completed
-                | TaskState::Failed
-                | TaskState::Canceled
-                | TaskState::Rejected
-        ),
-        TaskState::Working => matches!(
-            to,
-            TaskState::InputRequired
-                | TaskState::AuthRequired
-                | TaskState::Completed
-                | TaskState::Failed
-                | TaskState::Canceled
-                | TaskState::Rejected
-        ),
-        TaskState::InputRequired | TaskState::AuthRequired => matches!(
-            to,
-            TaskState::Working | TaskState::Failed | TaskState::Canceled | TaskState::Rejected
-        ),
-        TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::Rejected => {
-            false
-        }
-    }
+    crate::task_state_transition_allowed(from, to)
 }
 
 #[allow(clippy::too_many_lines)] // Terminal task, replay, and stream interruption remain atomic.
@@ -7888,16 +7850,8 @@ fn derive_page_token(
 }
 
 fn decode_page_token_hash(token: &str) -> Result<[u8; 32], A2AError> {
-    if token.len() > MAX_PAGE_TOKEN_BYTES {
-        return Err(A2AError::invalid_params("invalid pageToken"));
-    }
-    let raw = URL_SAFE_NO_PAD
-        .decode(token)
-        .map_err(|_| A2AError::invalid_params("invalid pageToken"))?;
-    if raw.len() != 32 {
-        return Err(A2AError::invalid_params("invalid pageToken"));
-    }
-    Ok(Sha256::digest(raw).into())
+    crate::fuzzing::decode_opaque_page_token_hash(token)
+        .ok_or_else(|| A2AError::invalid_params("invalid pageToken"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7960,11 +7914,7 @@ fn frozen_list_transaction(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| A2AError::internal("task snapshot transaction failed"))?;
 
-    let response = if let Some(token) = request
-        .page_token
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
+    let response = if let Some(token) = request.page_token.as_deref() {
         let hash = decode_page_token_hash(token)?;
         let record: Option<PageTokenRow> = tx
             .query_row(
@@ -8768,42 +8718,8 @@ fn parse_callback_page_token(
     tenant: &str,
     task: &str,
 ) -> Result<(i64, String), A2AError> {
-    let (p, m) = token
-        .split_once('.')
-        .ok_or_else(|| A2AError::invalid_request("invalid callback page token"))?;
-    let payload = URL_SAFE_NO_PAD
-        .decode(p)
-        .map_err(|_| A2AError::invalid_request("invalid callback page token"))?;
-    let supplied = URL_SAFE_NO_PAD
-        .decode(m)
-        .map_err(|_| A2AError::invalid_request("invalid callback page token"))?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .map_err(|_| A2AError::internal("callback token failed"))?;
-    mac.update(b"smesh-callback-page-v1\0");
-    mac.update(&payload);
-    let expected = mac.finalize().into_bytes();
-    if supplied.len() != 32 || !bool::from(expected.as_slice().ct_eq(&supplied)) {
-        return Err(A2AError::invalid_request("invalid callback page token"));
-    }
-    let text = std::str::from_utf8(&payload)
-        .map_err(|_| A2AError::invalid_request("invalid callback page token"))?;
-    let mut parts = text.split('\u{1f}');
-    if parts.next() != Some("1") || parts.next() != Some(tenant) || parts.next() != Some(task) {
-        return Err(A2AError::invalid_request("invalid callback page token"));
-    }
-    let created = parts
-        .next()
-        .and_then(|v| v.parse().ok())
-        .ok_or_else(|| A2AError::invalid_request("invalid callback page token"))?;
-    let id = parts
-        .next()
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| A2AError::invalid_request("invalid callback page token"))?
-        .to_owned();
-    if parts.next().is_some() {
-        return Err(A2AError::invalid_request("invalid callback page token"));
-    }
-    Ok((created, id))
+    crate::fuzzing::parse_callback_page_token(key, token, tenant, task)
+        .ok_or_else(|| A2AError::invalid_request("invalid callback page token"))
 }
 
 async fn finish_callback_delivery(

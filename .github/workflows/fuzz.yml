@@ -1,0 +1,79 @@
+name: Scheduled fuzz qualification
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'fuzz/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'vendor/a2a-lf/src/**'
+      - 'vendor/a2a-server-lf/src/**'
+      - '.github/workflows/fuzz.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'fuzz/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'vendor/a2a-lf/src/**'
+      - 'vendor/a2a-server-lf/src/**'
+      - '.github/workflows/fuzz.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned cargo-fuzz
+        run: cargo +stable install cargo-fuzz --locked --version 0.13.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Build fuzz targets outside execution watchdogs
+        shell: bash
+        run: |
+          for target in protocol_json policy_json page_tokens state_replay; do
+            cargo fuzz build "$target"
+          done
+      - name: Run bounded fuzz targets
+        shell: bash
+        run: |
+          set +e
+          status=0
+          for target in protocol_json policy_json page_tokens state_replay; do
+            timeout --signal=TERM --kill-after=10s 90s \
+              cargo fuzz run "$target" "fuzz/corpus/$target" -- \
+              -max_total_time=60 \
+              -max_len=65536 \
+              -timeout=5 \
+              -dict=fuzz/dictionaries/protocol.dict
+            code=$?
+            if [ "$code" -ne 0 ]; then
+              status="$code"
+            fi
+          done
+          exit "$status"
+      - name: Upload minimized crashes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 14

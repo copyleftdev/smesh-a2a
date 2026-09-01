@@ -1,0 +1,1 @@
+{"schemaVersion":"smesh-quota-policy/v1","policyId":"seed","revision":1,"requestWindowMillis":1000,"reconnectWindowMillis":60000,"limits":{}}

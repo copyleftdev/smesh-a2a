@@ -27,6 +27,7 @@ mod durable_handler;
 #[cfg(test)]
 mod durable_handler_tests;
 mod executor;
+mod fuzzing;
 mod guard;
 mod input;
 mod lifeline;
@@ -43,6 +44,7 @@ mod runtime_worker;
 mod server;
 mod sqlite_store;
 mod store;
+mod task_state;
 /// Closed, bounded optional OpenTelemetry projection schema and exporter owner.
 pub mod telemetry;
 /// Production exposure policy, TLS material loading, reload, and bounded acceptor.
@@ -125,6 +127,8 @@ pub use durable_dispatch::{
     DurableReceiverResult, DurableReceiverTermination, InjectedClock, SystemClockTicker,
 };
 pub use executor::{ExecutionLimits, SmeshExecutor};
+#[doc(hidden)]
+pub use fuzzing::{fuzz_decode_opaque_page_token, fuzz_parse_callback_page_token};
 pub use input::{InputError, InputLimits, extract_text};
 pub use lifeline::{
     TraceError, TraceEvent, generate_lifeline_trace, verify_trace, write_lifeline_trace,
@@ -167,3 +171,5 @@ pub use server::{
 };
 pub use sqlite_store::{LegacyTenantBinding, SqliteStoreError, SqliteTaskStore};
 pub use store::BoundedTaskStore;
+#[doc(hidden)]
+pub use task_state::task_state_transition_allowed;

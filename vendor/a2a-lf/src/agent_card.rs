@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::types::{ProtocolVersion, TRANSPORT_PROTOCOL_GRPC, TransportProtocol};
+use crate::types::{FieldPresence, ProtocolVersion, TRANSPORT_PROTOCOL_GRPC, TransportProtocol};
 
 // ---------------------------------------------------------------------------
 // AgentCard
@@ -321,29 +321,47 @@ impl Serialize for SecurityScheme {
 
 impl<'de> Deserialize<'de> for SecurityScheme {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw: HashMap<String, Value> = HashMap::deserialize(deserializer)?;
-        if let Some(v) = raw.get("apiKeySecurityScheme") {
-            Ok(SecurityScheme::ApiKey(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else if let Some(v) = raw.get("httpAuthSecurityScheme") {
-            Ok(SecurityScheme::HttpAuth(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else if let Some(v) = raw.get("oauth2SecurityScheme") {
-            Ok(SecurityScheme::OAuth2(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else if let Some(v) = raw.get("openIdConnectSecurityScheme") {
-            Ok(SecurityScheme::OpenIdConnect(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else if let Some(v) = raw.get("mtlsSecurityScheme") {
-            Ok(SecurityScheme::MutualTls(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else {
-            Err(serde::de::Error::custom("unknown security scheme variant"))
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct RawSecurityScheme {
+            #[serde(default)]
+            api_key_security_scheme: FieldPresence<Value>,
+            #[serde(default)]
+            http_auth_security_scheme: FieldPresence<Value>,
+            #[serde(default)]
+            oauth2_security_scheme: FieldPresence<Value>,
+            #[serde(default)]
+            open_id_connect_security_scheme: FieldPresence<Value>,
+            #[serde(default)]
+            mtls_security_scheme: FieldPresence<Value>,
+        }
+
+        let raw = RawSecurityScheme::deserialize(deserializer)?;
+        match (
+            raw.api_key_security_scheme,
+            raw.http_auth_security_scheme,
+            raw.oauth2_security_scheme,
+            raw.open_id_connect_security_scheme,
+            raw.mtls_security_scheme,
+        ) {
+            (FieldPresence::Present(value), FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing) => serde_json::from_value(value)
+                .map(SecurityScheme::ApiKey)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Present(value), FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing) => serde_json::from_value(value)
+                .map(SecurityScheme::HttpAuth)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Present(value), FieldPresence::Missing, FieldPresence::Missing) => serde_json::from_value(value)
+                .map(SecurityScheme::OAuth2)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Present(value), FieldPresence::Missing) => serde_json::from_value(value)
+                .map(SecurityScheme::OpenIdConnect)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Present(value)) => serde_json::from_value(value)
+                .map(SecurityScheme::MutualTls)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(
+                "security scheme must contain exactly one variant",
+            )),
         }
     }
 }
@@ -426,29 +444,47 @@ impl Serialize for OAuthFlows {
 
 impl<'de> Deserialize<'de> for OAuthFlows {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw: HashMap<String, Value> = HashMap::deserialize(deserializer)?;
-        if let Some(v) = raw.get("authorizationCode") {
-            Ok(OAuthFlows::AuthorizationCode(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else if let Some(v) = raw.get("clientCredentials") {
-            Ok(OAuthFlows::ClientCredentials(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else if let Some(v) = raw.get("deviceCode") {
-            Ok(OAuthFlows::DeviceCode(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else if let Some(v) = raw.get("implicit") {
-            Ok(OAuthFlows::Implicit(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else if let Some(v) = raw.get("password") {
-            Ok(OAuthFlows::Password(
-                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
-            ))
-        } else {
-            Err(serde::de::Error::custom("unknown OAuth flow variant"))
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct RawOAuthFlows {
+            #[serde(default)]
+            authorization_code: FieldPresence<Value>,
+            #[serde(default)]
+            client_credentials: FieldPresence<Value>,
+            #[serde(default)]
+            device_code: FieldPresence<Value>,
+            #[serde(default)]
+            implicit: FieldPresence<Value>,
+            #[serde(default)]
+            password: FieldPresence<Value>,
+        }
+
+        let raw = RawOAuthFlows::deserialize(deserializer)?;
+        match (
+            raw.authorization_code,
+            raw.client_credentials,
+            raw.device_code,
+            raw.implicit,
+            raw.password,
+        ) {
+            (FieldPresence::Present(value), FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing) => serde_json::from_value(value)
+                .map(OAuthFlows::AuthorizationCode)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Present(value), FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing) => serde_json::from_value(value)
+                .map(OAuthFlows::ClientCredentials)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Present(value), FieldPresence::Missing, FieldPresence::Missing) => serde_json::from_value(value)
+                .map(OAuthFlows::DeviceCode)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Present(value), FieldPresence::Missing) => serde_json::from_value(value)
+                .map(OAuthFlows::Implicit)
+                .map_err(serde::de::Error::custom),
+            (FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Missing, FieldPresence::Present(value)) => serde_json::from_value(value)
+                .map(OAuthFlows::Password)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(
+                "OAuth flows must contain exactly one variant",
+            )),
         }
     }
 }
