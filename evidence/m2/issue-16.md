@@ -78,8 +78,8 @@ stable `event.id` is the dedupe key. Exporter loss after queue acceptance is an 
 not authoritative data loss. No external telemetry backend retention or tenant ACL configuration is
 claimed, and audit read remains OTLP-only.
 Authorization-denial storage and process-global runtime-trace capacity abuse are closed by issues #72
-and #73. Protocol fuzzing plus the remaining hostile-load/chaos matrix continue under #18; required
-evidence was not weakened to hide those risks.
+and #73. Protocol fuzzing and the load/chaos matrix are closed by issues #74 and #75; the aggregate
+STRIDE/data-flow model and accepted residuals are maintained in `docs/GATEWAY_THREAT_MODEL.md`.
 
 The process test does not claim a live OIDC issuer/bearer-verifier process, artifact publication from
 that same two-gateway fixture, or kill-after-downstream-accept ambiguity. Those production paths are

@@ -86,4 +86,6 @@ Required evidence:
 
 - PostgreSQL retention is operator-scheduled; a disabled or undersized maintenance schedule can still permit durable growth. This is an operational configuration failure and must be monitored.
 - Terminal `dead` projection state permits source cleanup even though export did not succeed. The durable dead state and projection diagnostics are the retained evidence of that accepted export failure.
-- SQLite startup reconciliation remains O(n), intentionally outside the hostile steady-state request path. Startup time at maximum capacity is measured in the issue #18 load/chaos track.
+- SQLite startup reconciliation remains O(n), intentionally outside the hostile steady-state request path.
+  Startup time at the full 65,536-row/64 MiB audit boundary has not been measured; this is an accepted
+  operational residual requiring deployment startup budgeting and monitoring.

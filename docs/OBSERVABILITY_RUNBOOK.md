@@ -81,8 +81,9 @@ Resolve only after probes pass, backlog age returns to baseline, workers are hea
 lag falls, and the emitted edge error ratio is declining. Preserve collector outage intervals as
 evidence gaps.
 
-## Explicit #18 boundaries
+## Issue #18 closure
 
-Issue #72 bounds authorization-denial auditing. Issue #73 bounds process-global runtime-trace history
-and OTLP dispatch correlations with explicit retirement evidence. The remaining protocol fuzzing and
-hostile load/chaos matrix stays tracked under #18; OTLP remains lossy and is never durable authority.
+Issues #72 and #73 bound authorization-denial auditing, process-global runtime trace history, and OTLP
+dispatch correlations. Issues #74 and #75 add strict protocol fuzzing plus measured load/chaos recovery.
+The aggregate STRIDE/data-flow model and accepted residual risks are maintained in
+`docs/GATEWAY_THREAT_MODEL.md`. OTLP remains lossy and is never durable authority.

@@ -3,6 +3,8 @@
 ## Boundary
 
 A2A is the durable external contract. SMESH signals are the ephemeral internal coordination mechanism.
+The reviewed trust boundaries, STRIDE analysis, abuse evidence, and accepted M2 residual risks are
+maintained in [`GATEWAY_THREAT_MODEL.md`](GATEWAY_THREAT_MODEL.md).
 
 ```text
 A2A client
@@ -202,11 +204,13 @@ Composes the official JSON-RPC, REST, Agent Card, task store, and executor into 
 8. The gateway emits one final terminal event for every accepted request.
 9. Successful runtime Query ingress is progress, never completion authority.
 
-## Production extensions
+## Deployment-specific extensions and remaining work
 
-- SQLite/Postgres `TaskStore` with tenant-aware authorization and cursor pagination.
-- Bearer/OAuth/mTLS interceptor.
-- Bounded push notifications with an allowlist and SSRF defenses.
-- Application-specific semantic work processors and authenticated evidence issuers.
-- gRPC listener.
-- Retained quota accounting/GC and deployment-specific telemetry backend retention.
+Implemented reviewed boundaries include tenant-aware SQLite/PostgreSQL durability, bearer/OIDC/mTLS,
+bounded callbacks, retained quota accounting, and bounded optional telemetry. Deployment owners still
+supply:
+
+- application-specific semantic work processors and authenticated evidence issuers;
+- a gRPC public listener if required (the bundled public bindings are JSON-RPC/REST/SSE);
+- managed identity/policy/key/backup lifecycle and external telemetry retention/tenant ACLs;
+- deployment-specific capacity, HA, retention, alerting, and accepted residual-risk policy.

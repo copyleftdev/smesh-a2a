@@ -66,6 +66,12 @@ Local PostgreSQL 17 qualification executed serially against one task-owned loopb
 - post-suite fixture schemas: 0;
 - post-suite migrator/runtime sessions: 0.
 
+The scheduled PostgreSQL job is intentionally skipped on pull requests; PR #79's `stable-process` job
+passed, while the exact scheduled runner was executed locally against PostgreSQL 17 as recorded above.
+The workflow constructs all three DSNs at runtime from five shell fields. Repository/tool displays may
+mask password bytes as `***`; the checked workflow contains five `%s` placeholders and five arguments
+per DSN and contains no literal redaction token in the format strings.
+
 The scheduled runner writes `target/hostile-load/postgres-process.json` with observed command durations,
 command watchdogs, published RTO targets, scenario pass/fail state, and measured schema/session cleanup.
 The report is validated against `evidence/chaos-matrix-result.schema.json` and uploaded on every run.

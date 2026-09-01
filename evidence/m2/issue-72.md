@@ -83,10 +83,13 @@ cargo +1.88.0 check --all-targets --all-features
 git diff --check
 ```
 
-Focused formatter, Clippy, and diff hygiene passed before integration. Full exact-tree gates and independent review evidence must pass before the pull request is opened.
+Focused formatter, Clippy, and diff hygiene passed before integration. Local independent exact-diff
+review and full gates are summarized in `evidence/m2/independent-reviews.md`; this is not a formal
+GitHub review record.
 
 ## Residual risks
 
 - PostgreSQL cleanup is operator-scheduled, not automatic. Deployments must monitor cleanup cadence, maximum-batch saturation, blocked projection rows, and durable storage growth.
 - Terminal projection state `dead` allows source decision cleanup; the durable dead projection and retention diagnostics remain the evidence of failed export.
-- SQLite startup reconciliation is O(n) by design and remains outside the hostile request path. Startup-at-capacity timing belongs to issue #75.
+- SQLite startup reconciliation is O(n) by design and remains outside the hostile request path. Full
+  65,536-row/64 MiB startup timing is unmeasured and accepted as an operator startup-budget residual.
