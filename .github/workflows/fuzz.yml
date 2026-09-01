@@ -41,7 +41,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install pinned cargo-fuzz
-        run: cargo install cargo-fuzz --locked --version 0.13.1
+        run: cargo +stable install cargo-fuzz --locked --version 0.13.1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz

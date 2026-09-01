@@ -60,8 +60,8 @@ Observed locally: all four targets built against the vendored A2A crates and com
 without crash, hang, panic, or sanitizer finding. Input loops contain no network, filesystem, process,
 or durable-authority calls.
 
-`.github/workflows/fuzz.yml` installs the qualified cargo-fuzz 0.13.1 release, builds all targets
-outside the execution watchdogs, then runs them on
+`.github/workflows/fuzz.yml` installs the qualified cargo-fuzz 0.13.1 release with stable Rust, then
+uses nightly to build all targets outside the execution watchdogs and then runs them on
 relevant pull requests/pushes, daily, and on manual dispatch, with 60-second
 libFuzzer budgets, 90-second outer watchdogs, a 15-minute job cap, bounded input lengths, and 14-day
 crash-artifact retention.
