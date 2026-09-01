@@ -24,7 +24,7 @@ Install a nightly toolchain and cargo-fuzz:
 
 ```bash
 rustup toolchain install nightly
-cargo install cargo-fuzz --locked
+cargo install cargo-fuzz --locked --version 0.13.1
 ```
 
 Run one target for five minutes:
