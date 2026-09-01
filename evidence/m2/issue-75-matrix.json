@@ -1,0 +1,61 @@
+{
+  "schemaVersion": "smesh.chaos-matrix/1",
+  "scope": "authorized local reliability and recovery validation",
+  "issue": 75,
+  "scenarios": [
+    {
+      "id": "sqlite-hostile-load",
+      "surfaces": ["sqlite", "http", "process", "resources"],
+      "command": "cargo test --locked --test hostile_load_process -- --test-threads=1",
+      "oracles": ["canary-latency", "rss-plateau", "fd-recovery", "sqlite-growth", "network-recovery", "sigkill-rpo0", "rto", "cleanup"]
+    },
+    {
+      "id": "sqlite-official-client-sigkill",
+      "surfaces": ["sqlite", "official-client", "process"],
+      "command": "cargo test --locked --test production_durable_gateway acknowledged_completion_survives_sigkill_with_zero_rpo_and_bounded_rto -- --exact --test-threads=1",
+      "oracles": ["acknowledged-rpo0", "exact-task-recovery", "rto", "healthy-canary", "port-release", "quick-check"]
+    },
+    {
+      "id": "runtime-saturation",
+      "surfaces": ["runtime", "trace", "process"],
+      "command": "cargo test --locked --test runtime_gateway_shutdown saturated_runtime_trace_keeps_gateway_alive_and_healthy_work_bounded -- --exact --test-threads=1",
+      "oracles": ["process-survival", "canary-latency", "trace-bound", "anchor-retention", "replay"]
+    },
+    {
+      "id": "postgres-multi-replica",
+      "surfaces": ["postgres", "receiver", "outbox", "lease", "fence", "process"],
+      "command": "cargo test --locked --test postgres_multi_replica -- --test-threads=1",
+      "oracles": ["failover", "db-time-expiry", "stale-fence-rejection", "effect-once", "session-schema-role-cleanup"]
+    },
+    {
+      "id": "postgres-tenant-canaries",
+      "surfaces": ["postgres", "quota", "tenant-isolation", "process"],
+      "command": "cargo test --locked --test postgres_quota_process -- --test-threads=1",
+      "oracles": ["healthy-tenant-progress", "offender-isolation", "crash-reclaim", "bounded-recovery"]
+    },
+    {
+      "id": "postgres-callback-recovery",
+      "surfaces": ["postgres", "callback", "lease", "process"],
+      "command": "cargo test --locked --test postgres_push_process -- --test-threads=1",
+      "oracles": ["slow-downstream-bound", "2xx-before-commit-recovery", "stable-idempotency", "deduplicated-effect"]
+    },
+    {
+      "id": "postgres-artifact-recovery",
+      "surfaces": ["postgres", "artifact", "process"],
+      "command": "cargo test --locked --test postgres_artifact_process -- --test-threads=1",
+      "oracles": ["checkpoint-crash-matrix", "catalog-blob-coherence", "restart-recovery", "cleanup"]
+    },
+    {
+      "id": "postgres-observability-recovery",
+      "surfaces": ["postgres", "observability", "audit-projection", "process"],
+      "command": "cargo test --locked --test postgres_observability_process -- --test-threads=1",
+      "oracles": ["collector-outage-isolation", "durable-projection-recovery", "bounded-queue", "cleanup"]
+    }
+  ],
+  "residualRisks": [
+    "runtime trace since process start may be lost on SIGKILL because it is not durable authority",
+    "PostgreSQL wire-level committed-response loss is represented by transaction ambiguity and failover tests rather than a wire parser",
+    "Linux CI measurements are qualification evidence rather than production capacity planning",
+    "host reboot, disk-full, cgroup OOM, and physical packet corruption are outside this matrix"
+  ]
+}

@@ -7,7 +7,7 @@ use std::process::{Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use a2a::{
-    Message, Part, Role, SendMessageRequest, SendMessageResponse, StreamResponse,
+    GetTaskRequest, Message, Part, Role, SendMessageRequest, SendMessageResponse, StreamResponse,
     TRANSPORT_PROTOCOL_JSONRPC, Task, TaskState, TaskStatus,
 };
 use a2a_client::agent_card::AgentCardResolver;
@@ -321,6 +321,71 @@ async fn production_loopback_sqlite_replays_unary_and_stream_after_sigint_restar
     .await
     .unwrap();
     cleanup_database(&database);
+}
+
+#[tokio::test]
+async fn acknowledged_completion_survives_sigkill_with_zero_rpo_and_bounded_rto() {
+    let directory = test_directory("production-sigkill-rpo");
+    let database = directory.join("tasks.sqlite3");
+    let address = gateway_address();
+    let base_url = format!("http://{address}");
+    let request = send_request("sigkill-acknowledged", "survive sigkill");
+    let mut first = spawn_durable_gateway(address, &database);
+    let first_client = wait_for_official_client(&mut first, &base_url).await;
+    let acknowledged = bounded(
+        "acknowledged completion before SIGKILL",
+        first_client.send_message(&request),
+    )
+    .await
+    .unwrap();
+    let SendMessageResponse::Task(task) = &acknowledged else {
+        panic!("expected terminal task acknowledgement");
+    };
+    assert_eq!(task.status.state, TaskState::Completed);
+    let task_id = task.id.clone();
+    let killed_pid = first.id().unwrap();
+    kill_and_reap_child("SIGKILL acknowledged gateway", &mut first).await;
+    assert!(!Path::new(&format!("/proc/{killed_pid}")).exists());
+
+    let restart_started = std::time::Instant::now();
+    let mut restarted = spawn_durable_gateway(address, &database);
+    let restarted_client = wait_for_official_client(&mut restarted, &base_url).await;
+    let recovered = bounded(
+        "acknowledged task recovery after SIGKILL",
+        restarted_client.get_task(&GetTaskRequest {
+            id: task_id,
+            history_length: None,
+            tenant: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered, *task, "acknowledged mutation RPO must be zero");
+    let recovery_canary = bounded(
+        "post-SIGKILL healthy canary",
+        restarted_client.send_message(&send_request("sigkill-canary", "healthy")),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recovery_canary,
+        SendMessageResponse::Task(ref task) if task.status.state == TaskState::Completed
+    ));
+    assert!(
+        restart_started.elapsed() <= Duration::from_secs(5),
+        "restart RTO exceeded five seconds"
+    );
+    stop_with_sigterm(restarted).await;
+    drop(std::net::TcpListener::bind(address).unwrap());
+
+    let db = rusqlite::Connection::open(&database).unwrap();
+    let quick_check: String = db
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(quick_check, "ok");
+    drop(db);
+    cleanup_database(&database);
+    assert!(!directory.exists(), "SIGKILL fixture root leaked");
 }
 
 #[tokio::test]

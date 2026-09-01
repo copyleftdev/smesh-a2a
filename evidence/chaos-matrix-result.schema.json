@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smesh.dev/schemas/chaos-matrix-result-v1.json",
+  "title": "SMESH PostgreSQL chaos matrix result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "backend", "profile", "scenarios", "cleanup", "verdict", "limitations"],
+  "properties": {
+    "schemaVersion": { "const": "smesh.chaos-matrix-result/1" },
+    "backend": { "const": "postgres" },
+    "profile": { "const": "scheduled" },
+    "scenarios": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "elapsedMillis", "commandWatchdogMillis", "rtoTargetMillis"],
+        "properties": {
+          "id": {
+            "enum": [
+              "postgres-multi-replica",
+              "postgres-tenant-canaries",
+              "postgres-callback-recovery",
+              "postgres-artifact-recovery",
+              "postgres-observability-recovery"
+            ]
+          },
+          "status": { "const": "pass" },
+          "elapsedMillis": { "type": "integer", "minimum": 0 },
+          "commandWatchdogMillis": { "type": "integer", "minimum": 1, "maximum": 600000 },
+          "rtoTargetMillis": { "type": "integer", "minimum": 1, "maximum": 90000 }
+        }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemas", "sessions"],
+      "properties": {
+        "schemas": { "const": 0 },
+        "sessions": { "const": 0 }
+      }
+    },
+    "verdict": { "const": "pass" },
+    "limitations": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+    }
+  }
+}

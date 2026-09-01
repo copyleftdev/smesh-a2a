@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smesh.dev/schemas/hostile-load-evidence-v1.json",
+  "title": "SMESH hostile load evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "backend",
+    "profile",
+    "workload",
+    "epochs",
+    "latencyMillis",
+    "rssBytes",
+    "fileDescriptors",
+    "databaseBytes",
+    "network",
+    "recovery",
+    "cleanup",
+    "verdict",
+    "limitations"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "smesh.hostile-load-evidence/1" },
+    "backend": { "enum": ["sqlite", "postgres"] },
+    "profile": { "enum": ["stable", "sustained"] },
+    "workload": { "$ref": "#/$defs/workload" },
+    "epochs": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/epoch" }
+    },
+    "latencyMillis": { "$ref": "#/$defs/latency" },
+    "rssBytes": { "$ref": "#/$defs/rssTriple" },
+    "fileDescriptors": { "$ref": "#/$defs/metricTriple" },
+    "databaseBytes": { "$ref": "#/$defs/baselineFinal" },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["blackholeObserved", "healthyDuringFault", "recovered"],
+      "properties": {
+        "blackholeObserved": { "const": true },
+        "healthyDuringFault": { "const": true },
+        "recovered": { "const": true }
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signal", "acknowledged", "recovered", "rpoLost", "readinessMillis", "firstCanaryMillis"],
+      "properties": {
+        "signal": { "const": "SIGKILL" },
+        "acknowledged": { "type": "integer", "minimum": 1 },
+        "recovered": { "type": "integer", "minimum": 1 },
+        "rpoLost": { "const": 0 },
+        "readinessMillis": { "type": "integer", "minimum": 0, "maximum": 5000 },
+        "firstCanaryMillis": { "type": "integer", "minimum": 0, "maximum": 2000 }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["processes", "boundPorts", "temporaryArtifacts", "sqliteQuickCheck"],
+      "properties": {
+        "processes": { "const": 0 },
+        "boundPorts": { "const": 0 },
+        "temporaryArtifacts": { "const": 0 },
+        "sqliteQuickCheck": { "const": "ok" }
+      }
+    },
+    "verdict": { "const": "pass" },
+    "limitations": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+    }
+  },
+  "$defs": {
+    "nonnegative": { "type": "integer", "minimum": 0 },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offenders", "canaries", "slowConsumers"],
+      "properties": {
+        "offenders": { "$ref": "#/$defs/nonnegative" },
+        "canaries": { "$ref": "#/$defs/nonnegative" },
+        "slowConsumers": { "$ref": "#/$defs/nonnegative" }
+      }
+    },
+    "latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["p95", "max"],
+      "properties": {
+        "p95": { "type": "integer", "minimum": 0, "maximum": 500 },
+        "max": { "type": "integer", "minimum": 0, "maximum": 1000 }
+      }
+    },
+    "epoch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "rssPeak", "rssGrowthFromPrevious", "fdPeak", "canaryP95Millis", "canaryMaxMillis"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "rssPeak": { "type": "integer", "minimum": 0, "maximum": 268435456 },
+        "rssGrowthFromPrevious": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+        "fdPeak": { "$ref": "#/$defs/nonnegative" },
+        "canaryP95Millis": { "type": "integer", "minimum": 0, "maximum": 500 },
+        "canaryMaxMillis": { "type": "integer", "minimum": 0, "maximum": 1000 }
+      }
+    },
+    "metricTriple": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseline", "peak", "final"],
+      "properties": {
+        "baseline": { "$ref": "#/$defs/nonnegative" },
+        "peak": { "$ref": "#/$defs/nonnegative" },
+        "final": { "$ref": "#/$defs/nonnegative" }
+      }
+    },
+    "rssTriple": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseline", "peak", "final"],
+      "properties": {
+        "baseline": { "$ref": "#/$defs/nonnegative" },
+        "peak": { "type": "integer", "minimum": 0, "maximum": 268435456 },
+        "final": { "$ref": "#/$defs/nonnegative" }
+      }
+    },
+    "baselineFinal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseline", "final"],
+      "properties": {
+        "baseline": { "$ref": "#/$defs/nonnegative" },
+        "final": { "$ref": "#/$defs/nonnegative" }
+      }
+    }
+  }
+}
