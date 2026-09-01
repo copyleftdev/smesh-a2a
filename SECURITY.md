@@ -2,7 +2,9 @@
 
 ## Supported version
 
-The `0.1.x` line is an MVP intended for local development and integration testing.
+The `0.1.x` line is pre-stable and defaults to local development. Internet or multi-tenant deployment
+is supported only inside the reviewed transport/authentication/PostgreSQL boundary and accepted
+residual risks in `docs/GATEWAY_THREAT_MODEL.md`; it is not a general production-readiness claim.
 
 ## Deployment boundary
 
@@ -18,7 +20,9 @@ Current controls:
 - 128 KiB HTTP request-body limit
 - 64 KiB validated inline-text limit
 - URL and raw-file parts rejected without dereferencing
-- outbound A2A push notifications disabled
+- outbound A2A push callbacks disabled by default; production enablement requires an enrolled, canonical,
+  bounded HTTPS DNS policy with fresh all-answer IP validation, TLS/mTLS, signing, quotas, retry/fencing,
+  and stable idempotency
 - external metadata excluded from SMESH trust, confidence, reinforcement, and identity
 - bounded async channels between the A2A executor and embedded worker
 - bounded local task retention and active execution concurrency
@@ -58,14 +62,14 @@ The bundled runtime admission processor emits a private candidate receipt and co
 no review, test, contradiction, or ratification evidence. Runtime ingress therefore fails closed
 under the default completion policy and cannot masquerade as semantically completed work.
 The SQLite task ledger is Unix-only, owner-only, single-writer, crash-durable after transaction
-commit, and persists its cursor and completion-receipt keys. Schema v5 enforces immutable tenant and
-owner identity across tasks and child records, exact live-DDL validation, versioned request-digest
-validation, scoped replay, and append-only durable authorization decisions. The binary permits
-authenticated task serving only through the authorized durable SQLite loopback gateway; policy-only,
-authentication-only, non-SQLite, and runtime combinations fail closed. Authentication-only
-compatibility builders are development-only. Key rotation, revocation, rollback-resistant freshness,
-and cross-host coordination remain production work. In-memory mode retains process-local keys and
-ledger state.
+commit, and persists its cursor and completion-receipt keys. It is the local compatibility authority.
+Production multi-replica durability uses PostgreSQL with separate migrator/runtime roles, forced RLS,
+sealed append-only migrations, database-time leases/fences, tenant authorization, distributed quotas,
+callbacks, artifact metadata, and audit projection. Authenticated serving requires an authorized durable
+mode; policy-only, authentication-only, and invalid backend/runtime combinations fail closed.
+Authentication-only compatibility builders are development-only. Managed cross-deployment policy/key
+coordination and external control-plane lifecycle remain operator work. In-memory mode retains
+process-local keys and ledger state.
 
 ## Known dependency warning
 
@@ -79,17 +83,18 @@ Adding the pinned runtime initially resolved `time 0.3.45`, affected by
 `RUSTSEC-2026-0009`. The lockfile is upgraded to `time 0.3.47`; that security update raises the
 gateway MSRV to Rust 1.88.
 
-## Production requirements
+## Deployment requirements beyond the bundled boundary
 
-Before internet or multi-tenant deployment, add:
+Before internet or multi-tenant deployment, operators must provide:
 
-- managed tenant-policy enrollment, revocation, rotation, and distributed policy coordination;
-- managed certificate issuance/revocation and external key custody for direct TLS deployments;
-- per-principal rate, concurrency, task-duration, history, and artifact quotas;
-- structured audit logs and distributed tracing;
-- cancellation on client disconnect and execution deadlines;
-- outbound URL allowlists and DNS/IP revalidation before enabling push notifications;
-- signed release provenance and dependency policy enforcement.
+- managed tenant/OIDC policy enrollment, revocation, rotation, and distributed control-plane coordination;
+- managed certificate issuance/revocation and external key/backup custody;
+- deployment-specific capacity sizing, alerting, retention scheduling, PostgreSQL TLS/HA/backups, and
+  external telemetry retention/tenant ACLs;
+- application-specific semantic work processors, authenticated evidence issuers, and idempotency for
+  model/tool/network/storage effects outside forced cancellation;
+- signed release provenance and an organizational dependency/vulnerability policy;
+- explicit acceptance of the residual risks in `docs/GATEWAY_THREAT_MODEL.md`.
 
 ## Reporting
 

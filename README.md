@@ -274,10 +274,14 @@ requested work is semantically correct or independently reviewed.
 
 ## Security posture
 
-The MVP is intentionally localhost-first and single-tenant.
+The gateway is localhost-first by default. Multi-tenant PostgreSQL and reviewed internet exposure are
+available only inside the documented transport/authentication/operator boundary; this pre-stable release
+is not a general production-readiness claim.
 
 - URL and raw file parts are rejected; the gateway never dereferences user-provided URLs.
-- Push notifications are disabled to avoid an unaudited outbound webhook/SSRF surface.
+- Push callbacks are disabled by default. Production enablement requires an enrolled canonical HTTPS
+  DNS policy, fresh all-answer special-use rejection, pinned TLS/mTLS, exact signing, quotas, bounded
+  retry/fencing, and stable idempotency.
 - External metadata cannot set SMESH trust, confidence, reinforcement, or node identity.
 - Agent Card data is discovery metadata, not an attestation.
 - Input is bounded before entering the mesh (128 KiB HTTP body, 64 KiB text).

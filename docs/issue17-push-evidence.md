@@ -131,8 +131,9 @@ Verified on the explicit parent PostgreSQL fixture (all three URLs supplied; cre
 
 A dedicated 20-minute `push-postgres` CI job owns explicit role provisioning and bounded 5-minute
 callback-authority plus 10-minute process commands; the general PostgreSQL job no longer duplicates
-that process target. Broad randomized transport fuzzing and sustained high-volume load remain issue
-#18 rather than weakening this release gate.
+that process target. #18's broad randomized transport fuzzing and sustained high-volume load are now
+closed by issues #74 and #75 without weakening this release gate; accepted residuals are recorded in the
+aggregate gateway threat model.
 
 Reviewed SHA-256 values: callback contract
 `5dbb08ec3cd15ef70c570b2068801ce629e9cee7801f7091a4a24635d81365b4`; worker
