@@ -1,0 +1,122 @@
+name: Hostile load and chaos qualification
+
+on:
+  schedule:
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'evidence/**'
+      - 'scripts/**'
+      - 'docs/CHAOS_QUALIFICATION.md'
+      - '.github/workflows/chaos.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'evidence/**'
+      - 'scripts/**'
+      - 'docs/CHAOS_QUALIFICATION.md'
+      - '.github/workflows/chaos.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stable-process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: SQLite hostile load, network faults, SIGKILL RPO, and runtime saturation
+        run: |
+          timeout --signal=TERM --kill-after=15s 8m cargo test --locked --test hostile_load_process -- --test-threads=1
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test production_durable_gateway acknowledged_completion_survives_sigkill_with_zero_rpo_and_bounded_rto -- --exact --test-threads=1
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test runtime_gateway_shutdown saturated_runtime_trace_keeps_gateway_alive_and_healthy_work_bounded -- --exact --test-threads=1
+      - name: Validate machine-readable hostile-load evidence
+        run: python3 scripts/validate_hostile_load_evidence.py target/hostile-load/sqlite-process.json
+      - name: Upload hostile-load evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hostile-load-${{ github.run_id }}
+          path: target/hostile-load/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  scheduled-postgres-chaos:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: smesh_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d smesh_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      SMESH_POSTGRES_TEST_REQUIRED: '1'
+      SMESH_CHAOS_PG_HOST: 127.0.0.1
+      SMESH_CHAOS_PG_PORT: '5432'
+      SMESH_CHAOS_PG_DATABASE: smesh_test
+      SMESH_CHAOS_SUPERUSER: postgres
+      SMESH_CHAOS_SUPERUSER_PASSWORD: postgres
+      SMESH_CHAOS_MIGRATOR: smesh_migrator
+      SMESH_CHAOS_MIGRATOR_PASSWORD: smesh-ci-migrator
+      SMESH_CHAOS_RUNTIME: smesh_test_runtime
+      SMESH_CHAOS_RUNTIME_PASSWORD: smesh-ci-runtime
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Provision migrator and runtime roles
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h 127.0.0.1 -U postgres -d smesh_test -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE smesh_migrator LOGIN PASSWORD 'smesh-ci-migrator' NOSUPERUSER NOBYPASSRLS NOCREATEDB CREATEROLE NOREPLICATION NOINHERIT;
+          CREATE ROLE smesh_test_runtime LOGIN PASSWORD 'smesh-ci-runtime' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT;
+          GRANT CREATE ON DATABASE smesh_test TO smesh_migrator;
+          SQL
+          {
+            printf 'SMESH_TEST_POSTGRES_ADMIN_URL=postgresql://%s:%s@%s:%s/%s\n' "$SMESH_CHAOS_MIGRATOR" "$SMESH_CHAOS_MIGRATOR_PASSWORD" "$SMESH_CHAOS_PG_HOST" "$SMESH_CHAOS_PG_PORT" "$SMESH_CHAOS_PG_DATABASE"
+            printf 'SMESH_TEST_POSTGRES_RUNTIME_URL=postgresql://%s:%s@%s:%s/%s\n' "$SMESH_CHAOS_RUNTIME" "$SMESH_CHAOS_RUNTIME_PASSWORD" "$SMESH_CHAOS_PG_HOST" "$SMESH_CHAOS_PG_PORT" "$SMESH_CHAOS_PG_DATABASE"
+            printf 'SMESH_TEST_POSTGRES_SUPERUSER_URL=postgresql://%s:%s@%s:%s/%s\n' "$SMESH_CHAOS_SUPERUSER" "$SMESH_CHAOS_SUPERUSER_PASSWORD" "$SMESH_CHAOS_PG_HOST" "$SMESH_CHAOS_PG_PORT" "$SMESH_CHAOS_PG_DATABASE"
+          } >> "$GITHUB_ENV"
+      - name: PostgreSQL failover, fencing, tenant canaries, callbacks, artifacts, and observability
+        run: python3 scripts/run_postgres_chaos_matrix.py
+      - name: Validate PostgreSQL chaos evidence
+        run: python3 scripts/validate_postgres_chaos_evidence.py target/hostile-load/postgres-process.json
+      - name: Upload PostgreSQL chaos evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-chaos-${{ github.run_id }}
+          path: target/hostile-load/postgres-process.json
+          if-no-files-found: error
+          retention-days: 14
