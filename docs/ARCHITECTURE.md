@@ -176,7 +176,7 @@ process-wide series. Correlation IDs are span/log-only. The outer production rou
 random 128-bit request ID and removes inbound `x-request-id`, `traceparent`, `tracestate`, and
 `baggage` before handlers run.
 
-Durable authority rows and `runtime-trace/2` remain required evidence. `OtlpOwner` is a distinct,
+Durable authority rows and the bounded recent-window `runtime-trace/3` remain required evidence. `OtlpOwner` is a distinct,
 bounded, drop-newest optional projection on an isolated OS thread. HTTP protobuf and gRPC log
 exports are exercised against real decoding collectors; network export is never awaited by request,
 worker, or authority transaction paths. Configuration is parsed before binding, but exporter

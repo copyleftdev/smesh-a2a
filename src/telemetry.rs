@@ -1,6 +1,6 @@
 //! Closed, bounded observability schema.
 //!
-//! Durable authority rows and `runtime-trace/2` remain authoritative. Values
+//! Durable authority rows and the bounded recent-window `runtime-trace/3` remain authoritative. Values
 //! admitted here are safe only for the optional, lossy OTLP projection.
 #![allow(
     clippy::items_after_statements,
@@ -1184,9 +1184,10 @@ impl SpanLink {
     pub const fn new(trace_id: [u8; 16], span_id: [u8; 8]) -> Self {
         Self { trace_id, span_id }
     }
-    fn for_dispatch(dispatch_id: &str) -> Self {
-        let digest =
-            crate::content_digest(format!("smesh-dispatch-span-link/v1\0{dispatch_id}").as_bytes());
+    fn for_dispatch(tenant_scope: &str, dispatch_id: &str) -> Self {
+        let digest = crate::content_digest(
+            format!("smesh-dispatch-span-link/v2\0{tenant_scope}\0{dispatch_id}").as_bytes(),
+        );
         let mut bytes = [0_u8; 32];
         for (index, byte) in bytes.iter_mut().enumerate() {
             let offset = 7 + index * 2;
@@ -1900,19 +1901,52 @@ pub enum TelemetryConfigError {
 
 /// Isolated, bounded optional projection owner. Each signal owns a bounded
 /// queue and worker, preventing cross-signal head-of-line blocking.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DispatchCorrelationKey {
+    tenant_scope: String,
+    dispatch_id: String,
+    generation: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveDispatchCorrelation {
+    correlation: crate::TelemetryCorrelation,
+    retired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[derive(Clone)]
 pub struct TelemetryHandle {
     senders: [Option<std::sync::mpsc::SyncSender<TelemetryRecord>>; 3],
     drops: std::sync::Arc<DropCounters>,
     series: std::sync::Arc<std::sync::Mutex<SeriesRegistry>>,
     correlations: std::sync::Arc<
-        std::sync::Mutex<std::collections::BTreeMap<String, crate::TelemetryCorrelation>>,
+        std::sync::Mutex<
+            std::collections::BTreeMap<DispatchCorrelationKey, ActiveDispatchCorrelation>,
+        >,
     >,
+    correlation_capacity: usize,
     trace_sample_ratio: f64,
     emission_gate: std::sync::Arc<std::sync::Mutex<()>>,
     closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_health: std::sync::Arc<ShutdownHealth>,
 }
+
+pub(crate) struct DispatchCorrelationGuard {
+    handle: TelemetryHandle,
+    key: DispatchCorrelationKey,
+    retired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for DispatchCorrelationGuard {
+    fn drop(&mut self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut correlations) = self.handle.correlations.try_lock() {
+            correlations.remove(&self.key);
+        }
+    }
+}
+
 impl TelemetryHandle {
     fn invalid_record(&self) {
         self.drops.increment(DropReason::InvalidAttribute);
@@ -1938,6 +1972,7 @@ impl TelemetryHandle {
                 correlations: std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::BTreeMap::new(),
                 )),
+                correlation_capacity: capacity.max(1),
                 trace_sample_ratio: 1.0,
                 emission_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
                 closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1961,6 +1996,7 @@ impl TelemetryHandle {
                 correlations: std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::BTreeMap::new(),
                 )),
+                correlation_capacity: capacity.max(1),
                 trace_sample_ratio: 1.0,
                 emission_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
                 closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1985,6 +2021,7 @@ impl TelemetryHandle {
                 correlations: std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::BTreeMap::new(),
                 )),
+                correlation_capacity: capacity.max(1),
                 trace_sample_ratio,
                 emission_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
                 closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2232,15 +2269,60 @@ impl TelemetryHandle {
 
     pub(crate) fn remember_dispatch_correlation(
         &self,
+        tenant_scope: &str,
+        generation: &str,
         dispatch_id: &str,
         correlation: crate::TelemetryCorrelation,
-    ) {
-        if Attribute::new(AttributeKey::DispatchId, dispatch_id).is_err() {
-            return;
+    ) -> Option<DispatchCorrelationGuard> {
+        if tenant_scope.is_empty()
+            || tenant_scope.len() > MAX_CORRELATION_BYTES
+            || tenant_scope.chars().any(char::is_control)
+            || generation.is_empty()
+            || generation.len() > MAX_CORRELATION_BYTES
+            || generation.chars().any(char::is_control)
+            || Attribute::new(AttributeKey::DispatchId, dispatch_id).is_err()
+        {
+            self.invalid_record();
+            return None;
         }
-        if let Ok(mut correlations) = self.correlations.try_lock() {
-            correlations.insert(dispatch_id.to_owned(), correlation);
+        let key = DispatchCorrelationKey {
+            tenant_scope: tenant_scope.to_owned(),
+            dispatch_id: dispatch_id.to_owned(),
+            generation: generation.to_owned(),
+        };
+        let Ok(mut correlations) = self.correlations.try_lock() else {
+            self.drops.increment(DropReason::QueueFull);
+            return None;
+        };
+        correlations.retain(|_, active| !active.retired.load(std::sync::atomic::Ordering::Acquire));
+        if !correlations.contains_key(&key) && correlations.len() >= self.correlation_capacity {
+            self.drops.increment(DropReason::QueueFull);
+            return None;
         }
+        let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        correlations.insert(
+            key.clone(),
+            ActiveDispatchCorrelation {
+                correlation,
+                retired: std::sync::Arc::clone(&retired),
+            },
+        );
+        Some(DispatchCorrelationGuard {
+            handle: self.clone(),
+            key,
+            retired,
+        })
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dispatch_correlation_count_for_test(&self) -> usize {
+        self.correlations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|active| !active.retired.load(std::sync::atomic::Ordering::Acquire))
+            .count()
     }
 
     pub(crate) fn dispatch_event(
@@ -2249,6 +2331,8 @@ impl TelemetryHandle {
         outcome: &'static str,
         reason: &'static str,
         operation: &'static str,
+        tenant_scope: &str,
+        generation: &str,
         dispatch_id: &str,
         task_id: Option<&str>,
         context_id: Option<&str>,
@@ -2258,6 +2342,8 @@ impl TelemetryHandle {
             outcome,
             reason,
             operation,
+            tenant_scope,
+            generation,
             dispatch_id,
             task_id,
             context_id,
@@ -2272,16 +2358,25 @@ impl TelemetryHandle {
         outcome: &'static str,
         reason: &'static str,
         operation: &'static str,
+        tenant_scope: &str,
+        generation: &str,
         dispatch_id: &str,
         task_id: Option<&str>,
         context_id: Option<&str>,
         task_state: Option<&'static str>,
     ) {
+        let key = DispatchCorrelationKey {
+            tenant_scope: tenant_scope.to_owned(),
+            dispatch_id: dispatch_id.to_owned(),
+            generation: generation.to_owned(),
+        };
         let correlation = self
             .correlations
             .try_lock()
             .ok()
-            .and_then(|correlations| correlations.get(dispatch_id).cloned());
+            .and_then(|correlations| correlations.get(&key).cloned())
+            .filter(|active| !active.retired.load(std::sync::atomic::Ordering::Acquire))
+            .map(|active| active.correlation);
         if correlation.is_none() {
             self.invalid_record();
             return;
@@ -2327,7 +2422,7 @@ impl TelemetryHandle {
                 "terminal_commit" | "task_transition" => SpanName::DurableCommit,
                 _ => SpanName::OutboxAttempt,
             };
-            let root = SpanLink::for_dispatch(dispatch_id);
+            let root = SpanLink::for_dispatch(tenant_scope, dispatch_id);
             let (trace_id, span_id, links) = if operation == "outbox_claim" {
                 (root.trace_id, root.span_id, Vec::new())
             } else {
@@ -2394,15 +2489,32 @@ impl TelemetryHandle {
         artifact_id: Option<&str>,
         task_id: Option<&str>,
         context_id: Option<&str>,
+        message_id: Option<&str>,
+        tenant_scope: Option<&str>,
+        generation: Option<&str>,
         dispatch_id: Option<&str>,
     ) {
-        let correlation = dispatch_id.and_then(|id| {
-            self.correlations
-                .try_lock()
-                .ok()
-                .and_then(|correlations| correlations.get(id).cloned())
-        });
-        if dispatch_id.is_some() && correlation.is_none() {
+        let correlation =
+            tenant_scope
+                .zip(generation)
+                .zip(dispatch_id)
+                .and_then(|((tenant, generation), id)| {
+                    let key = DispatchCorrelationKey {
+                        tenant_scope: tenant.to_owned(),
+                        dispatch_id: id.to_owned(),
+                        generation: generation.to_owned(),
+                    };
+                    self.correlations
+                        .try_lock()
+                        .ok()
+                        .and_then(|correlations| correlations.get(&key).cloned())
+                        .filter(|active| !active.retired.load(std::sync::atomic::Ordering::Acquire))
+                        .map(|active| active.correlation)
+                });
+        if generation.is_some() && correlation.is_none()
+            || generation.is_some() && tenant_scope.is_none()
+            || generation.is_some() && dispatch_id.is_none()
+        {
             self.invalid_record();
             return;
         }
@@ -2412,7 +2524,9 @@ impl TelemetryHandle {
         let context_id = correlation
             .as_ref()
             .map_or(context_id, |value| Some(value.context_id.as_str()));
-        let message_id = correlation.as_ref().map(|value| value.message_id.as_str());
+        let message_id = correlation
+            .as_ref()
+            .map_or(message_id, |value| Some(value.message_id.as_str()));
         let mut attributes = Vec::with_capacity(8);
         for attribute in [
             Attribute::new(AttributeKey::Outcome, outcome),
@@ -2440,7 +2554,11 @@ impl TelemetryHandle {
         }
         if self.trace_sample_ratio > 0.0 {
             let now = now_unix_nanos();
-            let links = dispatch_id.map_or_else(Vec::new, |id| vec![SpanLink::for_dispatch(id)]);
+            let links = tenant_scope
+                .zip(dispatch_id)
+                .map_or_else(Vec::new, |(tenant, id)| {
+                    vec![SpanLink::for_dispatch(tenant, id)]
+                });
             if let Ok(span) = ClosedSpan::new(
                 SpanName::ArtifactOperation,
                 rand::random(),
@@ -2494,8 +2612,11 @@ pub struct OtlpOwner {
     drops: std::sync::Arc<DropCounters>,
     series: std::sync::Arc<std::sync::Mutex<SeriesRegistry>>,
     correlations: std::sync::Arc<
-        std::sync::Mutex<std::collections::BTreeMap<String, crate::TelemetryCorrelation>>,
+        std::sync::Mutex<
+            std::collections::BTreeMap<DispatchCorrelationKey, ActiveDispatchCorrelation>,
+        >,
     >,
+    correlation_capacity: usize,
     held_receiver: Option<std::sync::mpsc::Receiver<TelemetryRecord>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     stops: Vec<std::sync::mpsc::SyncSender<std::time::Instant>>,
@@ -2556,6 +2677,7 @@ impl OtlpOwner {
             correlations: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
+            correlation_capacity: config.log_queue.max(1),
             held_receiver: None,
             workers,
             stops,
@@ -2577,6 +2699,7 @@ impl OtlpOwner {
             correlations: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
+            correlation_capacity: capacity.max(1),
             held_receiver: Some(rx),
             workers: Vec::new(),
             stops: Vec::new(),
@@ -2604,6 +2727,7 @@ impl OtlpOwner {
             correlations: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
+            correlation_capacity: capacity.max(1),
             held_receiver: Some(rx),
             workers: Vec::new(),
             stops: Vec::new(),
@@ -2621,6 +2745,7 @@ impl OtlpOwner {
             drops: std::sync::Arc::clone(&self.drops),
             series: std::sync::Arc::clone(&self.series),
             correlations: std::sync::Arc::clone(&self.correlations),
+            correlation_capacity: self.correlation_capacity,
             trace_sample_ratio: self.trace_sample_ratio,
             emission_gate: std::sync::Arc::clone(&self.emission_gate),
             closed: std::sync::Arc::clone(&self.closed),
@@ -3810,6 +3935,216 @@ const fn audit_projection_operation(
             S::CallbackDelivery | S::CallbackAttempt => Some("callback_dead"),
             _ => None,
         },
+    }
+}
+
+#[cfg(test)]
+mod dispatch_correlation_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{EventName, SpanLink, TelemetryHandle};
+    use crate::TelemetryCorrelation;
+
+    fn correlation(label: &str) -> TelemetryCorrelation {
+        TelemetryCorrelation::new(
+            format!("message-{label}"),
+            format!("task-{label}"),
+            format!("context-{label}"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn scoped_fenced_correlations_plateau_and_retire_without_stale_identity_removal() {
+        assert_ne!(
+            SpanLink::for_dispatch("tenant-a", "shared-dispatch"),
+            SpanLink::for_dispatch("tenant-b", "shared-dispatch")
+        );
+        let (handle, receiver) = TelemetryHandle::log_capture_for_test(2);
+        let first = handle
+            .remember_dispatch_correlation(
+                "tenant-a",
+                "lease-a1",
+                "shared-dispatch",
+                correlation("a1"),
+            )
+            .unwrap();
+        let second = handle
+            .remember_dispatch_correlation(
+                "tenant-b",
+                "lease-b1",
+                "shared-dispatch",
+                correlation("b1"),
+            )
+            .unwrap();
+        assert_eq!(handle.correlations.lock().unwrap().len(), 2);
+        assert!(
+            handle
+                .remember_dispatch_correlation(
+                    "tenant-c",
+                    "lease-c1",
+                    "third-dispatch",
+                    correlation("c1"),
+                )
+                .is_none()
+        );
+        let started = Instant::now();
+        for offender in 0..10_000 {
+            assert!(
+                handle
+                    .remember_dispatch_correlation(
+                        "tenant-offender",
+                        "lease-offender",
+                        &format!("offender-{offender}"),
+                        correlation("offender"),
+                    )
+                    .is_none()
+            );
+        }
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(handle.correlations.lock().unwrap().len(), 2);
+
+        drop(second);
+        let replacement = handle
+            .remember_dispatch_correlation(
+                "tenant-a",
+                "lease-a2",
+                "shared-dispatch",
+                correlation("a2"),
+            )
+            .unwrap();
+        for (generation, expected_task) in [("lease-a1", "task-a1"), ("lease-a2", "task-a2")] {
+            handle.dispatch_event(
+                EventName::DispatchClaimed,
+                "ok",
+                "claimed",
+                "outbox_claim",
+                "tenant-a",
+                generation,
+                "shared-dispatch",
+                None,
+                None,
+            );
+            let record = receiver.recv_timeout(Duration::from_millis(50)).unwrap();
+            assert!(record.attributes().iter().any(|attribute| {
+                attribute.key() == "a2a.task.id" && attribute.value() == expected_task
+            }));
+        }
+        drop(first);
+        assert_eq!(handle.correlations.lock().unwrap().len(), 1);
+        handle.dispatch_event(
+            EventName::DispatchClaimed,
+            "ok",
+            "claimed",
+            "outbox_claim",
+            "tenant-a",
+            "lease-a1",
+            "shared-dispatch",
+            None,
+            None,
+        );
+        assert!(receiver.recv_timeout(Duration::from_millis(10)).is_err());
+        drop(replacement);
+        assert!(handle.correlations.lock().unwrap().is_empty());
+        let healthy = handle
+            .remember_dispatch_correlation(
+                "tenant-healthy",
+                "lease-healthy",
+                "healthy-dispatch",
+                correlation("healthy"),
+            )
+            .unwrap();
+        handle.dispatch_event(
+            EventName::DispatchClaimed,
+            "ok",
+            "claimed",
+            "outbox_claim",
+            "tenant-healthy",
+            "lease-healthy",
+            "healthy-dispatch",
+            None,
+            None,
+        );
+        let record = receiver.recv_timeout(Duration::from_millis(50)).unwrap();
+        assert!(record.attributes().iter().any(|attribute| {
+            attribute.key() == "a2a.task.id" && attribute.value() == "task-healthy"
+        }));
+        let lock = handle.correlations.lock().unwrap();
+        let retirement_started = Instant::now();
+        drop(healthy);
+        assert!(retirement_started.elapsed() < Duration::from_millis(10));
+        drop(lock);
+        assert_eq!(handle.dispatch_correlation_count_for_test(), 0);
+        handle.dispatch_event(
+            EventName::DispatchClaimed,
+            "ok",
+            "claimed",
+            "outbox_claim",
+            "tenant-healthy",
+            "lease-healthy",
+            "healthy-dispatch",
+            None,
+            None,
+        );
+        assert!(receiver.recv_timeout(Duration::from_millis(10)).is_err());
+    }
+
+    #[test]
+    fn direct_artifact_authority_emits_complete_or_absent_causal_identity() {
+        let (handle, receiver) = TelemetryHandle::log_capture_for_test(4);
+        handle.artifact_event(
+            EventName::ArtifactRegistered,
+            "ok",
+            "committed",
+            "artifact_register",
+            Some("artifact-registered"),
+            Some("task-registered"),
+            Some("context-registered"),
+            Some("message-registered"),
+            Some("tenant-registered"),
+            None,
+            Some("dispatch-registered"),
+        );
+        let registered = receiver.recv_timeout(Duration::from_millis(50)).unwrap();
+        assert_eq!(registered.name(), EventName::ArtifactRegistered.as_str());
+        for key in [
+            "a2a.task.id",
+            "a2a.context.id",
+            "a2a.message.id",
+            "smesh.dispatch.id",
+        ] {
+            assert!(
+                registered
+                    .attributes()
+                    .iter()
+                    .any(|attribute| attribute.key() == key)
+            );
+        }
+
+        handle.artifact_event(
+            EventName::ArtifactCorruptionDetected,
+            "failed",
+            "quarantined",
+            "artifact_resolve",
+            Some("artifact-corrupt"),
+            None,
+            None,
+            None,
+            Some("tenant-corrupt"),
+            None,
+            None,
+        );
+        let corruption = receiver.recv_timeout(Duration::from_millis(50)).unwrap();
+        assert_eq!(
+            corruption.name(),
+            EventName::ArtifactCorruptionDetected.as_str()
+        );
+        assert!(corruption.attributes().iter().all(|attribute| {
+            !matches!(
+                attribute.key(),
+                "a2a.task.id" | "a2a.context.id" | "a2a.message.id" | "smesh.dispatch.id"
+            )
+        }));
     }
 }
 

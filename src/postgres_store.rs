@@ -790,6 +790,9 @@ impl crate::ArtifactAuthority for PostgresTaskStore {
                 Some(&staged.artifact_id),
                 Some(&staged.task_id),
                 Some(&staged.context_id),
+                Some(&staged.message_id),
+                Some(&staged.tenant_scope),
+                None,
                 Some(&staged.dispatch_id),
             );
         }
@@ -852,6 +855,9 @@ impl crate::ArtifactAuthority for PostgresTaskStore {
                 Some(&registration.artifact_id),
                 Some(&registration.task_id),
                 Some(&registration.context_id),
+                Some(&registration.message_id),
+                Some(&registration.tenant_scope),
+                None,
                 Some(&registration.dispatch_id),
             );
         }
@@ -1090,7 +1096,10 @@ impl crate::ArtifactAuthority for PostgresTaskStore {
                     "quarantined",
                     "artifact_resolve",
                     Some(&r.artifact_id),
-                    Some(&r.task_id),
+                    None,
+                    None,
+                    None,
+                    Some(&r.tenant_scope),
                     None,
                     None,
                 );
@@ -1114,7 +1123,10 @@ impl crate::ArtifactAuthority for PostgresTaskStore {
                 "integrity_verified",
                 "artifact_resolve",
                 Some(&r.artifact_id),
-                Some(&r.task_id),
+                None,
+                None,
+                None,
+                Some(&r.tenant_scope),
                 None,
                 None,
             );

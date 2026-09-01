@@ -971,6 +971,23 @@ async fn run_postgres_durable_loopback_gateway(
     Ok(())
 }
 
+fn runtime_trace_limit(
+    name: &str,
+    default: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let value = std::env::var(name)
+        .ok()
+        .map(|raw| raw.parse::<usize>())
+        .transpose()?
+        .unwrap_or(default);
+    if value < minimum || value > maximum {
+        return Err(format!("{name} must be in {minimum}..={maximum}").into());
+    }
+    Ok(value)
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // Keep runtime startup, trace supervision, and shutdown ownership linear.
 async fn run_runtime_gateway(
     listener: std::net::TcpListener,
@@ -990,8 +1007,27 @@ async fn run_runtime_gateway(
         .take_events()
         .ok_or("SMESH runtime event receiver was already taken")?;
     let runtime = Arc::new(runtime_value);
-    let capture =
-        Arc::new(RuntimeEventCapture::new(65_536, 1_024).with_telemetry(telemetry.clone()));
+    let required_trace_capacity =
+        runtime_trace_limit("SMESH_A2A_RUNTIME_TRACE_REQUIRED_CAPACITY", 768, 2, 1_023)?;
+    let optional_trace_capacity =
+        runtime_trace_limit("SMESH_A2A_RUNTIME_TRACE_OPTIONAL_CAPACITY", 256, 1, 1_022)?;
+    let per_workload_trace_capacity = runtime_trace_limit(
+        "SMESH_A2A_RUNTIME_TRACE_PER_WORKLOAD_CAPACITY",
+        256,
+        2,
+        required_trace_capacity,
+    )?;
+    if required_trace_capacity + optional_trace_capacity > 1_024 {
+        return Err("runtime trace required plus optional capacity must not exceed 1024".into());
+    }
+    let capture = Arc::new(
+        RuntimeEventCapture::new_with_retention(
+            required_trace_capacity,
+            optional_trace_capacity,
+            per_workload_trace_capacity,
+        )
+        .with_telemetry(telemetry.clone()),
+    );
     let mut runtime_loop = {
         let runtime = Arc::clone(&runtime);
         tokio::spawn(async move { runtime.run().await })

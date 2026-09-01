@@ -111,6 +111,9 @@ pub fn spawn_artifact_promoter_with_telemetry(
                                         None,
                                         None,
                                         None,
+                                        None,
+                                        None,
+                                        None,
                                     );
                                 }
                                 let _ = state_tx.send(ArtifactPromoterState {

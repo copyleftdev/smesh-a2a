@@ -2,7 +2,7 @@
 
 ## Truth boundary
 
-Durable authority rows and `runtime-trace/2` are required evidence. OTLP is an optional,
+Durable authority rows and `runtime-trace/3` are required evidence. OTLP is an optional,
 bounded, lossy projection; missing telemetry is not evidence of zero errors. Confirm any
 alarm or apparent recovery against protocol probes and authoritative durable state.
 
@@ -33,6 +33,15 @@ The server generates a random 128-bit request ID. Inbound `x-request-id`, `trace
 spans/logs, never metric labels. Do not export request bodies, bearer tokens, headers, URLs,
 DSNs, SQL, artifact bytes, key paths, backend locators, panic payloads, or raw error chains.
 Public URL logs contain only canonical scheme/host/port.
+
+Dispatch correlation state is scoped by `(tenant_scope, dispatch_id, lease_generation)`. Its capacity
+is bounded by the configured OTLP log queue. The state exists only for one
+claimed attempt: retry, terminal, dead-letter, cancellation, shutdown, and error exits drop an RAII
+guard. Retirement first flips a lock-free atomic visibility bit and only then attempts best-effort
+physical removal, so optional telemetry cannot block durable progress or shutdown. A stale attempt
+cannot read or remove a newer lease generation. Capacity rejection drops optional
+telemetry only; it never blocks durable work. Missing correlation after retirement is rejected rather
+than reusing another tenant's identity.
 
 ## Audit projection
 
@@ -74,6 +83,6 @@ evidence gaps.
 
 ## Explicit #18 boundaries
 
-Audit-denial storage denial-of-service and process-global required runtime-trace capacity abuse remain
-tracked under #18. Issue #16 does not weaken required evidence, add unaudited sampling, or claim those
-hostile-load limits are closed.
+Issue #72 bounds authorization-denial auditing. Issue #73 bounds process-global runtime-trace history
+and OTLP dispatch correlations with explicit retirement evidence. The remaining protocol fuzzing and
+hostile load/chaos matrix stays tracked under #18; OTLP remains lossy and is never durable authority.
