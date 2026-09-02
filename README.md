@@ -111,6 +111,14 @@ npm run serve
 
 The checked-in JSONL is a deterministic synthetic fixture for replay, design, and conformance work. The nominal visual timeline is three minutes; the current narrated master is approximately 2:55 because export stops at the end of the narration track. It does not claim that six production organizations or six live SMESH runtimes executed the incident. The operational version must replace fixture emission with captured A2A requests, real `SignalType::Query` diffusion, dispatcher acknowledgements, task-ledger transitions, and human approval events. The film is permanently labeled `SIMULATION · NOT MEDICAL ADVICE · NO ACTIONS EXECUTED`.
 
+Issue #20 adds the first operational prerequisite: six fictional organization-specific A2A cards and a deterministic local deployment topology. Northstar's Director resolves five primary remote gateways plus an independently addressed Atlas logistics fallback:
+
+```bash
+cargo run --bin lifeline-topology -- deploy/lifeline-topology.json
+```
+
+The official Rust `AgentCardResolver` discovers every real listener in the integration suite. Cards expose only bounded public capabilities and explicitly grant no trust, authorization, clinical validation, or action authority. The local topology deliberately uses no authentication and cannot bind non-loopback addresses; it is not the Response Director or a production deployment. See [`docs/LIFELINE_TOPOLOGY.md`](docs/LIFELINE_TOPOLOGY.md).
+
 ## Run the gateway
 
 Requires Rust 1.88 or newer.

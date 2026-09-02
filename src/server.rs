@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task};
+use a2a::{A2AError, AgentCard, ListTasksRequest, ListTasksResponse, Task};
 use a2a_server::{DefaultRequestHandler, RequestHandler, StaticAgentCard, TaskStore};
 use async_trait::async_trait;
 use axum::body::Body;
@@ -814,6 +814,30 @@ where
     build_router_with_store(config, dispatcher, store)
 }
 
+/// Compose a local compatibility router with an explicit truthful public card.
+///
+/// This is intended for bounded local topology fixtures whose logical gateway
+/// profile differs from the generic SMESH card. It does not add authentication
+/// or tenant authorization.
+pub(crate) fn build_router_with_agent_card<D>(
+    config: GatewayConfig,
+    dispatcher: D,
+    card: AgentCard,
+) -> Router
+where
+    D: MeshDispatcher,
+{
+    let store = BoundedTaskStore::new(config.max_tasks);
+    compose_router_with_policy_trace_and_card(
+        config,
+        dispatcher,
+        store,
+        VersionedCompletionPolicy::default(),
+        None,
+        Some(card),
+    )
+}
+
 /// Compose authentication-only official JSON-RPC and REST routers.
 ///
 /// # Security
@@ -1023,6 +1047,21 @@ where
     D: MeshDispatcher,
     S: CompletionPolicyStore,
 {
+    compose_router_with_policy_trace_and_card(config, dispatcher, store, policy, trace, None)
+}
+
+fn compose_router_with_policy_trace_and_card<D, S>(
+    config: GatewayConfig,
+    dispatcher: D,
+    store: S,
+    policy: VersionedCompletionPolicy,
+    trace: Option<Arc<RuntimeEventCapture>>,
+    card: Option<AgentCard>,
+) -> Router
+where
+    D: MeshDispatcher,
+    S: CompletionPolicyStore,
+{
     let max_body_bytes = config.max_body_bytes;
     let store = SharedTaskStore(Arc::new(store));
     let guard_policy = policy.clone();
@@ -1035,9 +1074,9 @@ where
     let inner: Arc<dyn RequestHandler> =
         Arc::new(DefaultRequestHandler::new(executor, store.clone()));
     let handler = Arc::new(GuardedRequestHandler::new(inner, store, guard_policy));
-    let card = Arc::new(StaticAgentCard::new(build_agent_card(
-        &config.public_base_url,
-    )));
+    let card = Arc::new(StaticAgentCard::new(
+        card.unwrap_or_else(|| build_agent_card(&config.public_base_url)),
+    ));
 
     Router::new()
         .nest(
