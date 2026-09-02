@@ -31,6 +31,7 @@ mod fuzzing;
 mod guard;
 mod input;
 mod lifeline;
+mod lifeline_director;
 mod lifeline_topology;
 mod loopback;
 mod outbox_driver;
@@ -133,6 +134,11 @@ pub use fuzzing::{fuzz_decode_opaque_page_token, fuzz_parse_callback_page_token}
 pub use input::{InputError, InputLimits, extract_text};
 pub use lifeline::{
     TraceError, TraceEvent, generate_lifeline_trace, verify_trace, write_lifeline_trace,
+};
+pub use lifeline_director::{
+    LIFELINE_DIRECTOR_SCHEMA_VERSION, LifelineDirectorError, LifelineDirectorManifest,
+    LifelineDirectorOperation, LifelineDirectorOperationReceipt, LifelineDirectorRun,
+    LifelineResponseDirector, ResolvedLifelineGateway,
 };
 pub use lifeline_topology::{
     LIFELINE_DISCOVERY_DISCLAIMER, LIFELINE_TOPOLOGY_SCHEMA_VERSION, LifelineAuthentication,

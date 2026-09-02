@@ -16,6 +16,8 @@ SMESH remains the internal coordination substrate: signals diffuse, decay, reinf
 - Translation to a real `smesh_core::SignalType::Query`
 - Injectable `MeshDispatcher` boundary for a production SMESH runtime
 - Deterministic loopback worker for demos and interoperability tests
+- Official-client LIFELINE Response Director with concurrent commissioning, reconnect,
+  bounded cancellation, logistics fallback, independent review, and ID-complete run records
 - Bounded task retention, execution concurrency, event/artifact counts, and output bytes
 - Worker inactivity, cancellation, and command-channel deadlines
 - Terminal-state and task-ID reuse guards
@@ -71,6 +73,8 @@ See:
 - [`docs/RUNTIME_TERMINAL_RACES.md`](docs/RUNTIME_TERMINAL_RACES.md)
 - [`docs/ULTIMATE_DEMO.md`](docs/ULTIMATE_DEMO.md)
 - [`docs/TRACE_CAPTURE.md`](docs/TRACE_CAPTURE.md)
+- [`docs/LIFELINE_TOPOLOGY.md`](docs/LIFELINE_TOPOLOGY.md)
+- [`docs/LIFELINE_DIRECTOR.md`](docs/LIFELINE_DIRECTOR.md)
 - [`evidence/m1/README.md`](evidence/m1/README.md)
 
 ## LIFELINE cinematic demo

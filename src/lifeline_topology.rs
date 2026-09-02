@@ -366,7 +366,18 @@ impl LifelineTopologyManifest {
     /// # Errors
     /// Returns an error if validation, binding, card construction, or server
     /// ownership setup fails. Partially bound listeners are dropped on error.
-    pub async fn launch(mut self) -> Result<RunningLifelineTopology, LifelineTopologyError> {
+    pub async fn launch(self) -> Result<RunningLifelineTopology, LifelineTopologyError> {
+        self.launch_with_dispatcher(crate::LoopbackDispatcher).await
+    }
+
+    #[doc(hidden)]
+    pub async fn launch_with_dispatcher<D>(
+        mut self,
+        dispatcher: D,
+    ) -> Result<RunningLifelineTopology, LifelineTopologyError>
+    where
+        D: crate::MeshDispatcher + Clone,
+    {
         self.validate()?;
         let mut listeners = Vec::with_capacity(self.listener_count());
         for (gateway_index, gateway) in self.gateways.iter_mut().enumerate() {
@@ -401,7 +412,7 @@ impl LifelineTopologyManifest {
                 crate::GatewayConfig::new(format!("http://{}", primary.bind), gateway.id.clone());
             routers.push(crate::server::build_router_with_agent_card(
                 config,
-                crate::LoopbackDispatcher,
+                dispatcher.clone(),
                 card.clone(),
             ));
             cards.push((gateway.id.clone(), card));
