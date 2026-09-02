@@ -1,0 +1,79 @@
+{
+  "schemaVersion": "1.0.0",
+  "fictional": true,
+  "runId": "lifeline-director-0047",
+  "rootContextId": "lifeline-incident-0047",
+  "gateways": [
+    {
+      "id": "meridian",
+      "discoveryUrl": "http://127.0.0.1:43141",
+      "expectedOrganization": "Meridian Bio",
+      "expectedSkillId": "lifeline.lot-genealogy"
+    },
+    {
+      "id": "atlas-primary",
+      "discoveryUrl": "http://127.0.0.1:43142",
+      "expectedOrganization": "Atlas Cold Chain",
+      "expectedSkillId": "lifeline.shipment-quarantine"
+    },
+    {
+      "id": "helix",
+      "discoveryUrl": "http://127.0.0.1:43143",
+      "expectedOrganization": "Helix Medicines Authority",
+      "expectedSkillId": "lifeline.recall-criteria"
+    },
+    {
+      "id": "harbor",
+      "discoveryUrl": "http://127.0.0.1:43144",
+      "expectedOrganization": "Harbor Health",
+      "expectedSkillId": "lifeline.exposure-cohort"
+    },
+    {
+      "id": "sentinel",
+      "discoveryUrl": "http://127.0.0.1:43145",
+      "expectedOrganization": "Sentinel Labs",
+      "expectedSkillId": "lifeline.evidence-review"
+    },
+    {
+      "id": "atlas-fallback",
+      "discoveryUrl": "http://127.0.0.1:43146",
+      "expectedOrganization": "Atlas Cold Chain",
+      "expectedSkillId": "lifeline.shipment-quarantine"
+    }
+  ],
+  "operations": [
+    {
+      "id": "lot-genealogy",
+      "gatewayId": "meridian",
+      "path": "sync-jsonrpc",
+      "prompt": "Trace the bounded fictional lot genealogy."
+    },
+    {
+      "id": "exposure-cohort",
+      "gatewayId": "harbor",
+      "path": "sync-rest",
+      "prompt": "Build the bounded fictional exposure cohort."
+    },
+    {
+      "id": "shipment-routing",
+      "gatewayId": "atlas-primary",
+      "path": "stream-reconnect",
+      "prompt": "Map the bounded fictional shipment routes."
+    },
+    {
+      "id": "recall-criteria",
+      "gatewayId": "helix",
+      "path": "sync-jsonrpc",
+      "prompt": "Evaluate the bounded fictional recall criteria."
+    }
+  ],
+  "review": {
+    "gatewayId": "sentinel",
+    "path": "sync-jsonrpc",
+    "prompt": "Review the bounded fictional evidence packet."
+  },
+  "logistics": {
+    "primaryGatewayId": "atlas-primary",
+    "fallbackGatewayId": "atlas-fallback"
+  }
+}
