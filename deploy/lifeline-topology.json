@@ -1,0 +1,228 @@
+{
+  "schemaVersion": "1.0.0",
+  "fictional": true,
+  "disclaimer": "Fictional simulation capability metadata only; not authorization, medical advice, clinical validation, or evidence of trust.",
+  "gateways": [
+    {
+      "id": "meridian",
+      "organization": "Meridian Bio",
+      "agentName": "Pharmacovigilance Agent",
+      "description": "Builds fictional production-lot genealogy and anomaly evidence for the LIFELINE exercise.",
+      "geography": {
+        "city": "New York",
+        "country": "United States",
+        "latitude": 40.7128,
+        "longitude": -74.006
+      },
+      "authentication": "local-none",
+      "listeners": [
+        {
+          "id": "new-york-primary",
+          "bind": "127.0.0.1:43141"
+        }
+      ],
+      "skill": {
+        "id": "lifeline.lot-genealogy",
+        "name": "Production lot genealogy",
+        "description": "Returns bounded fictional lot-boundary evidence with no clinical conclusion or action authority.",
+        "tags": [
+          "fictional",
+          "lot-genealogy",
+          "pharmacovigilance"
+        ],
+        "example": "Trace the fictional production lots related to the bounded incident context.",
+        "inputModes": [
+          "text/plain"
+        ],
+        "outputModes": [
+          "application/json"
+        ]
+      }
+    },
+    {
+      "id": "atlas-primary",
+      "organization": "Atlas Cold Chain",
+      "agentName": "Logistics Agent",
+      "description": "Maps fictional shipment routes and quarantine alternatives for the LIFELINE exercise.",
+      "geography": {
+        "city": "Singapore",
+        "country": "Singapore",
+        "latitude": 1.29,
+        "longitude": 103.8
+      },
+      "authentication": "local-none",
+      "listeners": [
+        {
+          "id": "singapore-primary",
+          "bind": "127.0.0.1:43142"
+        }
+      ],
+      "skill": {
+        "id": "lifeline.shipment-quarantine",
+        "name": "Shipment quarantine routing",
+        "description": "Returns fictional shipment and reroute data; it does not execute quarantine or shipping actions.",
+        "tags": [
+          "fictional",
+          "logistics",
+          "routing"
+        ],
+        "example": "Map bounded fictional shipment routes and a quarantine fallback.",
+        "inputModes": [
+          "text/plain"
+        ],
+        "outputModes": [
+          "application/geo+json"
+        ]
+      }
+    },
+    {
+      "id": "helix",
+      "organization": "Helix Medicines Authority",
+      "agentName": "Recall Criteria Agent",
+      "description": "Evaluates fictional recall criteria and approval workflow inputs for the LIFELINE exercise.",
+      "geography": {
+        "city": "Brussels",
+        "country": "Belgium",
+        "latitude": 50.8503,
+        "longitude": 4.3517
+      },
+      "authentication": "local-none",
+      "listeners": [
+        {
+          "id": "brussels-primary",
+          "bind": "127.0.0.1:43143"
+        }
+      ],
+      "skill": {
+        "id": "lifeline.recall-criteria",
+        "name": "Recall criteria analysis",
+        "description": "Returns fictional regulatory-threshold analysis; only a human may ratify an action.",
+        "tags": [
+          "fictional",
+          "regulatory",
+          "human-ratification"
+        ],
+        "example": "Evaluate the fictional recall threshold for the bounded evidence packet.",
+        "inputModes": [
+          "text/plain"
+        ],
+        "outputModes": [
+          "text/markdown",
+          "application/json"
+        ]
+      }
+    },
+    {
+      "id": "harbor",
+      "organization": "Harbor Health",
+      "agentName": "Member Safety Agent",
+      "description": "Builds fictional de-identified exposure counts for the LIFELINE exercise.",
+      "geography": {
+        "city": "Chicago",
+        "country": "United States",
+        "latitude": 41.8781,
+        "longitude": -87.6298
+      },
+      "authentication": "local-none",
+      "listeners": [
+        {
+          "id": "chicago-primary",
+          "bind": "127.0.0.1:43144"
+        }
+      ],
+      "skill": {
+        "id": "lifeline.exposure-cohort",
+        "name": "De-identified exposure cohort",
+        "description": "Returns fictional aggregate exposure evidence without patient identity, outreach, or clinical action.",
+        "tags": [
+          "fictional",
+          "de-identified",
+          "exposure"
+        ],
+        "example": "Build the fictional de-identified exposure cohort for the incident.",
+        "inputModes": [
+          "text/plain"
+        ],
+        "outputModes": [
+          "application/json"
+        ]
+      }
+    },
+    {
+      "id": "sentinel",
+      "organization": "Sentinel Labs",
+      "agentName": "Independent Evidence Agent",
+      "description": "Produces fictional provenance and contradiction analysis for the LIFELINE exercise.",
+      "geography": {
+        "city": "London",
+        "country": "United Kingdom",
+        "latitude": 51.5072,
+        "longitude": -0.1276
+      },
+      "authentication": "local-none",
+      "listeners": [
+        {
+          "id": "london-primary",
+          "bind": "127.0.0.1:43145"
+        }
+      ],
+      "skill": {
+        "id": "lifeline.evidence-review",
+        "name": "Independent evidence review",
+        "description": "Returns fictional provenance and contradiction findings without granting trust or validating clinical claims.",
+        "tags": [
+          "fictional",
+          "provenance",
+          "contradiction"
+        ],
+        "example": "Review the fictional evidence packet for provenance gaps and contradictions.",
+        "inputModes": [
+          "text/plain"
+        ],
+        "outputModes": [
+          "application/json"
+        ]
+      }
+    },
+    {
+      "id": "atlas-fallback",
+      "organization": "Atlas Cold Chain",
+      "agentName": "Fallback Logistics Agent",
+      "description": "Provides the independently addressed fictional fallback shipment route for the LIFELINE exercise.",
+      "geography": {
+        "city": "Frankfurt",
+        "country": "Germany",
+        "latitude": 50.1109,
+        "longitude": 8.6821
+      },
+      "authentication": "local-none",
+      "listeners": [
+        {
+          "id": "frankfurt-fallback",
+          "bind": "127.0.0.1:43146"
+        }
+      ],
+      "skill": {
+        "id": "lifeline.shipment-quarantine",
+        "name": "Shipment quarantine routing",
+        "description": "Returns fictional shipment and reroute data; it does not execute quarantine or shipping actions.",
+        "tags": [
+          "fictional",
+          "logistics",
+          "routing"
+        ],
+        "example": "Map bounded fictional shipment routes and a quarantine fallback.",
+        "inputModes": [
+          "text/plain"
+        ],
+        "outputModes": [
+          "application/geo+json"
+        ]
+      }
+    }
+  ],
+  "logistics": {
+    "primaryGatewayId": "atlas-primary",
+    "fallbackGatewayId": "atlas-fallback"
+  }
+}
