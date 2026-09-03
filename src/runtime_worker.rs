@@ -321,15 +321,24 @@ impl RuntimeWorker {
             config.max_active_tasks,
             config.cancel_grace,
         ));
-        Ok((dispatcher, RuntimeWorkerHandle { shutdown, join }))
+        Ok((
+            dispatcher,
+            RuntimeWorkerHandle {
+                shutdown,
+                join: Some(join),
+            },
+        ))
     }
 }
 
 /// Handle used to stop the runtime command consumer and all active processors.
-#[must_use = "dropping the handle detaches shutdown; call shutdown().await"]
+///
+/// Dropping starts cooperative cancellation. Call [`Self::shutdown`] to also
+/// wait for every tracked processor and observe worker panics.
+#[must_use = "call shutdown().await to join the worker and observe failures"]
 pub struct RuntimeWorkerHandle {
     shutdown: CancellationToken,
-    join: JoinHandle<()>,
+    join: Option<JoinHandle<()>>,
 }
 
 impl RuntimeWorkerHandle {
@@ -338,11 +347,21 @@ impl RuntimeWorkerHandle {
     /// # Errors
     ///
     /// Returns an error if the worker task panics after shutdown is requested.
-    pub async fn shutdown(self) -> Result<(), DispatchError> {
+    pub async fn shutdown(mut self) -> Result<(), DispatchError> {
         self.shutdown.cancel();
-        self.join
-            .await
+        let Some(join) = self.join.take() else {
+            return Err(DispatchError::message(
+                "runtime worker join handle is absent",
+            ));
+        };
+        join.await
             .map_err(|_| DispatchError::Message("runtime worker shutdown failed".to_owned()))
+    }
+}
+
+impl Drop for RuntimeWorkerHandle {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
     }
 }
 

@@ -1,0 +1,100 @@
+{
+  "schemaVersion": "1.0.0",
+  "fictional": true,
+  "disclaimer": "Fictional local simulation data only; not medical advice, clinical validation, authorization, or evidence of trust.",
+  "seed": 47,
+  "teams": [
+    {
+      "id": "meridian",
+      "organization": "Meridian Bio",
+      "gateways": ["meridian"],
+      "roles": [
+        {"id": "manufacturing", "concern": "production-telemetry"},
+        {"id": "lot-genealogy", "concern": "lot-boundaries"},
+        {"id": "quality", "concern": "quality-review"},
+        {"id": "toxicology", "concern": "signal-challenge"},
+        {"id": "legal", "concern": "action-escalation"}
+      ],
+      "tool": {
+        "id": "local.meridian-lot-ledger",
+        "recordCount": 4,
+        "records": ["lot-ZX-472", "lot-ZX-473", "line-7", "window-0047"],
+        "projection": {"affectedLots": ["ZX-472", "ZX-473"], "productionLine": "line-7"}
+      },
+      "candidate": {"name": "affected-lots.json", "mediaType": "application/json"}
+    },
+    {
+      "id": "atlas",
+      "organization": "Atlas Cold Chain",
+      "gateways": ["atlas-primary", "atlas-fallback"],
+      "roles": [
+        {"id": "routing", "concern": "route-planning"},
+        {"id": "inventory", "concern": "inventory-state"},
+        {"id": "telemetry", "concern": "temperature-observation"},
+        {"id": "customs", "concern": "border-constraints"},
+        {"id": "contingency", "concern": "fallback-routing"}
+      ],
+      "tool": {
+        "id": "local.atlas-route-ledger",
+        "recordCount": 5,
+        "records": ["route-SIN-14", "route-FRA-09", "pallet-A7", "pallet-B2", "excursion-T4"],
+        "projection": {"type": "FeatureCollection", "features": [], "quarantineNodes": ["SIN-14", "FRA-09"]}
+      },
+      "candidate": {"name": "shipment-quarantine.geojson", "mediaType": "application/geo+json"}
+    },
+    {
+      "id": "helix",
+      "organization": "Helix Medicines Authority",
+      "gateways": ["helix"],
+      "roles": [
+        {"id": "regulation", "concern": "rule-interpretation"},
+        {"id": "threshold", "concern": "threshold-analysis"},
+        {"id": "jurisdiction", "concern": "jurisdiction-scope"},
+        {"id": "public-notice", "concern": "notice-drafting"}
+      ],
+      "tool": {
+        "id": "local.helix-rulebook",
+        "recordCount": 3,
+        "records": ["rule-HX-12", "threshold-3-sources", "human-ratification-required"],
+        "projection": {"criterion": "three-independent-sources", "met": true, "humanRatificationRequired": true}
+      },
+      "candidate": {"name": "regulatory-threshold.json", "mediaType": "application/json"}
+    },
+    {
+      "id": "harbor",
+      "organization": "Harbor Health",
+      "gateways": ["harbor"],
+      "roles": [
+        {"id": "eligibility", "concern": "coverage-eligibility"},
+        {"id": "claims", "concern": "aggregate-claims"},
+        {"id": "outreach", "concern": "contact-planning"},
+        {"id": "privacy", "concern": "deidentification"}
+      ],
+      "tool": {
+        "id": "local.harbor-cohort",
+        "recordCount": 6,
+        "records": ["cohort-cell-01", "cohort-cell-02", "cohort-cell-03", "cohort-cell-04", "cohort-cell-05", "cohort-cell-06"],
+        "projection": {"exposedMembers": 24, "regions": 3, "suppressedSmallCells": true}
+      },
+      "candidate": {"name": "deidentified-exposure-cohort.json", "mediaType": "application/json"}
+    },
+    {
+      "id": "sentinel",
+      "organization": "Sentinel Labs",
+      "gateways": ["sentinel"],
+      "roles": [
+        {"id": "contradiction", "concern": "contradiction-analysis"},
+        {"id": "provenance", "concern": "source-provenance"},
+        {"id": "statistics", "concern": "statistical-review"},
+        {"id": "red-team", "concern": "adversarial-review"}
+      ],
+      "tool": {
+        "id": "local.sentinel-evidence-index",
+        "recordCount": 5,
+        "records": ["meridian-receipt", "atlas-receipt", "helix-receipt", "harbor-receipt", "northstar-context"],
+        "projection": {"provenanceComplete": true, "blockingContradictions": 0, "residualUncertainty": "fictional-demo-only"}
+      },
+      "candidate": {"name": "contradiction-report.json", "mediaType": "application/json"}
+    }
+  ]
+}

@@ -18,6 +18,9 @@ SMESH remains the internal coordination substrate: signals diffuse, decay, reinf
 - Deterministic loopback worker for demos and interoperability tests
 - Official-client LIFELINE Response Director with concurrent commissioning, reconnect,
   bounded cancellation, logistics fallback, independent review, and ID-complete run records
+- Five isolated organization-local LIFELINE `SmeshRuntime` teams behind six A2A gateways, with
+  deterministic claim reinforcement, backoff, signed contradiction linkage, decay, and private
+  bounded semantic journals plus genuine runtime event traces
 - Bounded task retention, execution concurrency, event/artifact counts, and output bytes
 - Worker inactivity, cancellation, and command-channel deadlines
 - Terminal-state and task-ID reuse guards
@@ -75,6 +78,7 @@ See:
 - [`docs/TRACE_CAPTURE.md`](docs/TRACE_CAPTURE.md)
 - [`docs/LIFELINE_TOPOLOGY.md`](docs/LIFELINE_TOPOLOGY.md)
 - [`docs/LIFELINE_DIRECTOR.md`](docs/LIFELINE_DIRECTOR.md)
+- [`docs/LIFELINE_TEAMS.md`](docs/LIFELINE_TEAMS.md)
 - [`evidence/m1/README.md`](evidence/m1/README.md)
 
 ## LIFELINE cinematic demo

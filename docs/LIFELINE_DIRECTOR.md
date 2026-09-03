@@ -38,4 +38,4 @@ Before evidence is retained or forwarded to the independent review, each decoded
 
 ## Scope and safety
 
-This is a deterministic local interoperability fixture. `local-none` is not production authentication or authorization. Agent Cards are capability metadata only; they are not evidence of trust, clinical validation, medical advice, or authority to act. The run record is director-observed public A2A evidence only. It does not claim the full A2A x SMESH x tool x artifact x human capture owned by later LIFELINE milestones, and it does not claim six live organization-local SMESH dream teams.
+This is a deterministic local interoperability fixture. `local-none` is not production authentication or authorization. Agent Cards are capability metadata only; they are not evidence of trust, clinical validation, medical advice, or authority to act. The standalone Director run record is director-observed public A2A evidence only. Issue #22 can compose that same external boundary with five real organization-local SMESH runtimes, but neither fixture claims the full A2A x SMESH x tool x artifact x human capture owned by later LIFELINE milestones.
