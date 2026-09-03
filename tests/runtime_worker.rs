@@ -358,6 +358,63 @@ struct HoldingProcessor {
     stopped: Arc<AtomicBool>,
 }
 
+#[tokio::test]
+async fn dropping_worker_handle_cancels_active_processor_with_dispatcher_clone_alive() {
+    let processor = HoldingProcessor::default();
+    let observed = processor.clone();
+    let (dispatcher, worker) = RuntimeWorker::spawn_with_config(
+        runtime(),
+        "runtime-node",
+        processor,
+        RuntimeWorkerConfig {
+            command_capacity: 2,
+            max_active_tasks: 1,
+            cancel_grace: Duration::from_secs(1),
+        },
+    )
+    .await
+    .unwrap();
+    let surviving_dispatcher = dispatcher.clone();
+    let stream = tokio::spawn(async move {
+        dispatcher
+            .dispatch(MeshRequest {
+                protocol: "a2a-v1".to_owned(),
+                task_id: "drop-owned-task".to_owned(),
+                context_id: "drop-owned-context".to_owned(),
+                text: "hold until owner drop".to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .await
+    });
+    observed.started.notified().await;
+
+    drop(worker);
+
+    tokio::time::timeout(Duration::from_secs(1), observed.cancel_seen.notified())
+        .await
+        .expect("owner drop did not cancel the active processor");
+    observed.release_exit.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !observed.stopped.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("canceled processor did not stop");
+    let _ = stream.await.unwrap();
+
+    let after_drop = surviving_dispatcher
+        .dispatch(MeshRequest {
+            protocol: "a2a-v1".to_owned(),
+            task_id: "after-owner-drop".to_owned(),
+            context_id: "after-owner-drop-context".to_owned(),
+            text: "must not be accepted".to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .await;
+    assert!(after_drop.iter().any(Result::is_err));
+}
+
 #[async_trait]
 impl RuntimeTaskProcessor for HoldingProcessor {
     async fn process(

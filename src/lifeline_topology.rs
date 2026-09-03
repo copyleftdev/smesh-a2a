@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
@@ -372,12 +372,37 @@ impl LifelineTopologyManifest {
 
     #[doc(hidden)]
     pub async fn launch_with_dispatcher<D>(
-        mut self,
+        self,
         dispatcher: D,
     ) -> Result<RunningLifelineTopology, LifelineTopologyError>
     where
         D: crate::MeshDispatcher + Clone,
     {
+        let dispatchers = self
+            .gateways
+            .iter()
+            .map(|gateway| (gateway.id.clone(), dispatcher.clone()))
+            .collect();
+        self.launch_with_dispatchers(dispatchers).await
+    }
+
+    pub(crate) async fn launch_with_dispatchers<D>(
+        mut self,
+        dispatchers: HashMap<String, D>,
+    ) -> Result<RunningLifelineTopology, LifelineTopologyError>
+    where
+        D: crate::MeshDispatcher + Clone,
+    {
+        let expected: HashSet<_> = self
+            .gateways
+            .iter()
+            .map(|gateway| gateway.id.as_str())
+            .collect();
+        let actual: HashSet<_> = dispatchers.keys().map(String::as_str).collect();
+        require(
+            actual == expected,
+            "dispatcher map must exactly match topology gateways",
+        )?;
         self.validate()?;
         let mut listeners = Vec::with_capacity(self.listener_count());
         for (gateway_index, gateway) in self.gateways.iter_mut().enumerate() {
@@ -410,9 +435,13 @@ impl LifelineTopologyManifest {
                 .ok_or_else(|| invariant("gateway has no primary listener"))?;
             let config =
                 crate::GatewayConfig::new(format!("http://{}", primary.bind), gateway.id.clone());
+            let dispatcher = dispatchers
+                .get(&gateway.id)
+                .ok_or_else(|| invariant("gateway dispatcher is missing"))?
+                .clone();
             routers.push(crate::server::build_router_with_agent_card(
                 config,
-                dispatcher.clone(),
+                dispatcher,
                 card.clone(),
             ));
             cards.push((gateway.id.clone(), card));

@@ -32,6 +32,7 @@ mod guard;
 mod input;
 mod lifeline;
 mod lifeline_director;
+mod lifeline_teams;
 mod lifeline_topology;
 mod loopback;
 mod outbox_driver;
@@ -139,6 +140,11 @@ pub use lifeline_director::{
     LIFELINE_DIRECTOR_SCHEMA_VERSION, LifelineDirectorError, LifelineDirectorManifest,
     LifelineDirectorOperation, LifelineDirectorOperationReceipt, LifelineDirectorRun,
     LifelineResponseDirector, ResolvedLifelineGateway,
+};
+pub use lifeline_teams::{
+    LIFELINE_TEAM_DISCLAIMER, LIFELINE_TEAM_SCHEMA_VERSION, LifelineLocalTool, LifelineTeam,
+    LifelineTeamError, LifelineTeamManifest, LifelineTeamRole, RunningLifelineTeamTopology,
+    RunningLifelineTeams,
 };
 pub use lifeline_topology::{
     LIFELINE_DISCOVERY_DISCLAIMER, LIFELINE_TOPOLOGY_SCHEMA_VERSION, LifelineAuthentication,

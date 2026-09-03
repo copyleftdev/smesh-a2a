@@ -1,6 +1,6 @@
 # LIFELINE local topology
 
-Issue #20 provides a deterministic, local-only discovery topology for the fictional LIFELINE exercise. It does not run the operational response, organization-local SMESH dream teams, or human ratification workflow. Those remain later M3 tracks.
+Issue #20 provides a deterministic, local-only discovery topology for the fictional LIFELINE exercise. By itself it does not run the operational response, organization-local SMESH teams, or human ratification workflow. Issue #22 composes this topology with the checked teams described in [`LIFELINE_TEAMS.md`](LIFELINE_TEAMS.md).
 
 ## Boundary
 
@@ -77,4 +77,4 @@ The integration suite:
 - launches the real topology binary and observes all six readiness records;
 - explicitly shuts down and joins the in-process discovery topology.
 
-This establishes the M3 discovery and deployment-topology prerequisite only. It does not claim the later Response Director, real SMESH teams, full capture matrix, failure redelegation workflow, or operational acceptance run.
+This establishes the M3 discovery and deployment-topology prerequisite only. Issue #21 adds the Response Director and issue #22 composes real organization-local SMESH teams through this gateway boundary. Full capture, failure redelegation, human ratification, and operational acceptance remain separate tracks.
