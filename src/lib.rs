@@ -28,6 +28,7 @@ mod durable_handler;
 mod durable_handler_tests;
 mod executor;
 mod full_matrix_capture;
+mod full_matrix_replay;
 mod fuzzing;
 mod guard;
 mod input;
@@ -137,6 +138,14 @@ pub use full_matrix_capture::{
     CaptureStream, CapturedContent, FULL_MATRIX_CAPTURE_SCHEMA_VERSION, HumanConsoleCaptureAdapter,
     ProducerIdentity, ProducerKind, SmeshJournalCaptureAdapter, ToolCaptureError,
     ToolMcpCaptureAdapter,
+};
+pub use full_matrix_replay::{
+    CANONICALIZATION, CAUSAL_SOURCE_SCHEMA_VERSION, CausalMerger, CausalSourceEvent,
+    FULL_MATRIX_REPLAY_SCHEMA_VERSION, HybridLogicalClock, MergeLimits, MissingParentPolicy,
+    ProjectionReceipt, REPLAY_RECEIPT_SCHEMA_VERSION, ReplayError, ReplayReceipt, ReplaySealInput,
+    SealedReplay, capture_causal_source_jsonl, merge_and_seal_jsonl,
+    reconcile_published_replay_temporary, reconcile_unpublished_replay_temporary,
+    verify_replay_receipt, verify_sealed_replay,
 };
 #[doc(hidden)]
 pub use fuzzing::{fuzz_decode_opaque_page_token, fuzz_parse_callback_page_token};

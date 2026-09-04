@@ -205,15 +205,101 @@ Each producer owns a local spool, so no global lock sits on the hot path. The co
 
 Merge events by:
 
-1. explicit causal parents;
-2. HLC physical time;
+1. explicit causal parents and contiguous producer predecessors;
+2. HLC physical nanoseconds;
 3. HLC logical counter;
-4. producer ID;
-5. producer epoch;
-6. source sequence;
-7. event ID.
+4. producer kind wire name;
+5. producer ID;
+6. producer instance ID;
+7. producer source sequence;
+8. event ID.
 
-A child arriving before its parent remains pending. Finalization either resolves it or emits a missing-parent event.
+A child arriving before its parent remains pending. Finalization either resolves it, rejects a sorted missing-ID set, or (under the explicit `Record` policy) emits one deterministic missing-parent record per ID.
+
+### Issue #24 implemented boundary
+
+Issue #24 is implemented by the separate `full_matrix_replay` module. It does not change the
+arrival-ordered `CanonicalCapture` or `full-matrix-capture/1` contract. Distributed inputs use the
+closed `full-matrix-causal-source/1` envelope around an immutable `CaptureEvent`; the envelope adds
+a producer-supplied HLC `(physicalNs, logical)`, Lamport counter, optional recorded-decision value,
+and producer-chain hashes. Clock and length values in this protocol are canonical unsigned decimal
+strings (`"0"` or `[1-9][0-9]*`). Version 1 capture spools have no such metadata and are not silently
+admitted or assigned fabricated clocks.
+
+Admission is atomic and bounded. Hard maxima are 1,024 distinct source batches, 100,000 events,
+100,000 edges, 16 MiB aggregate distinct input, 16 MiB output, 64 KiB per line, and 128 projection
+receipts; recorded decisions also have a maximum canonical nesting depth of 64. Construction, chain
+hashing, and source capture use a byte-bounded canonical writer before cloning or retaining hostile
+decision content. Callers may only lower merge limits. An exact byte-for-byte envelope retry is checked
+before source, byte, and event accounting and consumes no additional capacity. Reuse of an event ID with any
+different clock, decision, chain, or event value is fatal. Admission reproduces each event ID from the
+issue #23 capture preimage (including run ID), validates optional identifiers and producer/event-kind
+compatibility, then validates its producer hash before retaining any pending delta. `CaptureParent::Event`
+may stay pending between calls.
+`CaptureParent::Missing` is permanent and conflicts with that ID appearing in either arrival order.
+Producer sequences are contiguous from zero per `(kind,id,instanceId)`.
+
+Finalization constructs explicit resolved-parent edges and implicit contiguous producer edges. No
+edge is removed to repair a cycle. Every edge requires strictly increasing HLC and Lamport. Kahn's
+ready set uses exactly numeric HLC physical, numeric HLC logical, producer kind wire name, producer
+ID, instance ID, producer sequence, and event ID. Lamport validates causality and is not a tie-break.
+The final bundle is repeatable and consists of canonical merged/missing records followed by one
+terminal seal record and LF.
+
+Canonical JSON is `RFC8785-JCS-restricted-no-numbers/1`: UTF-8 without BOM, UTF-16 object-key
+ordering, minimal JSON string escaping, booleans/null, arrays in protocol order, and no JSON number
+tokens. Schemas are closed and verification requires every line to equal its canonical re-encoding.
+All issue #24 hashes use SHA-256 and lowercase `sha256:` text. The common preimage is:
+
+```text
+"SMESH-A2A\0" || ASCII(label) || "\0v1\0" ||
+    for each part: u64_big_endian(part_length) || part
+```
+
+Labels are `producer-chain`, `missing-parent`, `recorded-decision`, `decision-set`,
+`merkle-leaf`, `merkle-node`, `merged-jsonl`, `artifact-manifest`, `run-seal`,
+`replay-output`, and `replay-receipt`. A producer-chain hash binds the previous raw digest (32 zero
+bytes for sequence zero) and canonical causal core. A Merkle leaf binds one exact canonical merged
+record without LF; an internal node binds raw left then right digest. An odd final node is carried
+unchanged to the next level, and empty trees are rejected. `merged-jsonl` binds all nonterminal lines,
+including each LF.
+
+The run seal binds schema/canonicalization, run ID, event and record counts, merged JSONL digest,
+Merkle root, artifact-manifest digest, sorted producer heads, sorted projection receipts (projector
+ID/version, input/output digest, output byte length), missing-parent decisions, and the recorded
+decision-set digest. The replay receipt is separate and non-circular: it binds the run seal, input
+digest/root, event count, recorded-only mode and decisions, recorded projection outputs/versions,
+and normalized complete-bundle digest. `verify_sealed_replay` applies the same global/line/record
+bounds, validates the closed event/missing/seal schemas and fixed protocol constants, reconstructs
+event identity, producer slots/chains/heads, causal edges/order/clocks, missing-parent records/claims,
+and the recorded-decision set, then requires byte equality with a freshly derived bundle.
+`verify_replay_receipt` additionally requires canonical supplied receipt bytes to equal that derived
+receipt and, when supplied, the caller's pinned seal. Verification has no clock, RNG, network, URL,
+model, tool, policy, or trust callback.
+
+`SealedReplay::persist_new` is supported on Unix and fails closed without creating a file on non-Unix
+platforms. It accepts only an absolute destination whose existing immediate parent is a
+real directory owned by the effective user with no group/world permission bits. All parent ancestors
+and same-UID processes are explicitly inside the caller's trust boundary. It publishes one mode-0600
+bundle using an unpredictable same-directory create-new temporary file, data fsync, create-new
+hard-link publication, temporary unlink, exact inode/content validation, and parent fsync. It never
+overwrites any existing directory entry. `Persistence` means publication did not occur and cleanup
+completed. `CleanupRequired` exposes only the bounded random token needed to reconcile a private
+same-directory temporary file when pre-publication cleanup fails.
+`PublishedCleanupRequired` means the destination was published but its temporary hard link could not be
+removed. Call `reconcile_unpublished_replay_temporary` only with a `CleanupRequired` token and call
+`reconcile_published_replay_temporary` with a `PublishedCleanupRequired` token. After a process crash,
+when only the same-directory `.<destination>.<token>.tmp` name remains, use the conservative published
+operation: it preserves a lone temporary rather than risk deleting the only surviving replay bytes.
+The reconcilers validate the private parent, owner, mode, expected publication state, and inode/link
+relationship before unlinking and synchronizing the directory. Published reconciliation succeeds only
+when the destination is the validated second link or is the validated surviving owner-private file.
+`Published` means the destination exists and the temporary name was
+removed, but final validation or directory durability could not be confirmed; reopen and verify the
+destination before deciding whether to retry.
+Projection payload production is external and only its recorded receipts are sealed. The SHA-256
+seal provides integrity/identity when pinned, not producer authenticity or non-repudiation.
+Classification, redaction, pseudonymization, and public-bundle privacy remain issue #25.
 
 Replay never rereads URLs, reruns a model or tool, recalculates trust, regenerates random choices, or infers decay from current wall time. Probabilistic decisions record algorithm, seed, draw, threshold, and result. Signal decay records field ticks and checkpoints.
 

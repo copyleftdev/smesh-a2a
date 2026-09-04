@@ -35,6 +35,13 @@ SMESH remains the internal coordination substrate: signals diffuse, decay, reinf
 - Bounded full-matrix capture adapters with private create-new, write-and-sync tagged JSONL lifecycle
   spools, explicit durable completion/failure, source-local producer identity/sequences, causal
   validation, and pure offline replay
+- Deterministic distributed causal merge with producer-supplied HLC/Lamport facts, pending-parent
+  resolution, contiguous producer chains, restricted-JCS canonical JSONL, Merkle run seals,
+  recorded-only projection/replay receipts with supplied-receipt/pinned-seal verification,
+  Unix-only owner-private absolute-path create-new persistence with fail-closed unsupported-platform
+  behavior and state-bound interrupted-temporary reconciliation that never deletes a possible sole
+  published copy, and independent Rust/Node source-merge
+  golden vectors plus Unicode/u64 canonicalization corpus
 
 The production artifact path requires PostgreSQL metadata authority, an owner-private absolute POSIX
 root, and an explicit key generation selected by the runtime. With those settings, receiver output is
@@ -97,8 +104,9 @@ cargo test --test full_matrix_capture
 ```
 
 The pinned A2A server interceptor abstraction does not cover streaming response frames and is not wired
-into all topology/director paths by this issue. Deterministic distributed merge/HLC/sealing is issue #24;
-publishable restricted/public redaction is issue #25. Exact behavior and limits are documented in
+into all topology/director paths by issue #23. Issue #24's distributed merge consumes only explicit
+`full-matrix-causal-source/1` envelopes and does not infer ordering metadata from legacy spools. See
+the implemented protocol, limits, hash preimages, persistence guarantees, and issue #25 boundary in
 [`docs/TRACE_CAPTURE.md`](docs/TRACE_CAPTURE.md).
 
 ## LIFELINE cinematic demo
