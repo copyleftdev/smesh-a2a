@@ -2139,7 +2139,7 @@ fn binding_kind_is_one_to_one(kind: CaptureKind) -> bool {
 
 // The digest preimage names every schema field explicitly; an options bag would weaken review.
 #[allow(clippy::too_many_arguments)]
-fn capture_event_id(
+pub(crate) fn capture_event_id(
     run_id: &str,
     identity: &ProducerIdentity,
     producer_sequence: u64,
