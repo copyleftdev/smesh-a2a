@@ -32,6 +32,9 @@ SMESH remains the internal coordination substrate: signals diffuse, decay, reinf
   A2A projections, envelope AES-256-GCM hooks, and a private immutable POSIX blob backend
 - PostgreSQL revision 5 catalog for task-bound opaque artifact references, provenance, promotion,
   read leases, legal holds, key-generation audits, tombstones, and fenced GC jobs
+- Bounded full-matrix capture adapters with private create-new, write-and-sync tagged JSONL lifecycle
+  spools, explicit durable completion/failure, source-local producer identity/sequences, causal
+  validation, and pure offline replay
 
 The production artifact path requires PostgreSQL metadata authority, an owner-private absolute POSIX
 root, and an explicit key generation selected by the runtime. With those settings, receiver output is
@@ -80,6 +83,23 @@ See:
 - [`docs/LIFELINE_DIRECTOR.md`](docs/LIFELINE_DIRECTOR.md)
 - [`docs/LIFELINE_TEAMS.md`](docs/LIFELINE_TEAMS.md)
 - [`evidence/m1/README.md`](evidence/m1/README.md)
+
+The issue #23 capture surface is intentionally adapter-level rather than installed across every gateway
+router. `CanonicalCapture::create_spool` is the durable mode; `CanonicalCapture::new` is only an in-memory
+test/schema collector. Durable spools must be explicitly `complete` before replay or ingestion; missing
+completion and failure records reject the whole prefix. The focused suite drives direct interceptor
+schema hooks plus the cancellation-safe
+unary wrapper, pinned SMESH runtime/journal types, tool closure, artifact bytes, console I/O, replay
+sabotage, and a two-process/all-adapter canonical JSONL run:
+
+```bash
+cargo test --test full_matrix_capture
+```
+
+The pinned A2A server interceptor abstraction does not cover streaming response frames and is not wired
+into all topology/director paths by this issue. Deterministic distributed merge/HLC/sealing is issue #24;
+publishable restricted/public redaction is issue #25. Exact behavior and limits are documented in
+[`docs/TRACE_CAPTURE.md`](docs/TRACE_CAPTURE.md).
 
 ## LIFELINE cinematic demo
 

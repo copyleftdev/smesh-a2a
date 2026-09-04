@@ -27,6 +27,7 @@ mod durable_handler;
 #[cfg(test)]
 mod durable_handler_tests;
 mod executor;
+mod full_matrix_capture;
 mod fuzzing;
 mod guard;
 mod input;
@@ -130,6 +131,13 @@ pub use durable_dispatch::{
     DurableReceiverResult, DurableReceiverTermination, InjectedClock, SystemClockTicker,
 };
 pub use executor::{ExecutionLimits, SmeshExecutor};
+pub use full_matrix_capture::{
+    A2aCaptureAdapter, ArtifactCaptureAdapter, CanonicalCapture, CaptureError, CaptureEvent,
+    CaptureFailure, CaptureGapReason, CaptureKind, CaptureParent, CaptureProducer, CaptureReceipt,
+    CaptureStream, CapturedContent, FULL_MATRIX_CAPTURE_SCHEMA_VERSION, HumanConsoleCaptureAdapter,
+    ProducerIdentity, ProducerKind, SmeshJournalCaptureAdapter, ToolCaptureError,
+    ToolMcpCaptureAdapter,
+};
 #[doc(hidden)]
 pub use fuzzing::{fuzz_decode_opaque_page_token, fuzz_parse_callback_page_token};
 pub use input::{InputError, InputLimits, extract_text};
