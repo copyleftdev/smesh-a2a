@@ -12,6 +12,64 @@ The LIFELINE film must be a replay of observed protocol activity, not animation 
 
 The checked-in `demo/lifeline.trace.jsonl` is a deterministic cinematic fixture using schema `1.0.0`. It proves replay, hash chaining, rendering, and export. The operational capture plane described here is the next implementation boundary.
 
+## Issue #23 implemented capture boundary
+
+Issue #23 provides the bounded `full-matrix-capture/1` observation schema and adapters in
+`src/full_matrix_capture.rs`. It is deliberately smaller than the complete pipeline below:
+
+- `CanonicalCapture::create_spool` creates a new owner-private JSONL spool (`0600` on Unix). Its closed
+  tagged record protocol contains `event`, `failure`, and terminal `complete` records. Each accepted
+  event is encoded as one bounded line, written, and `sync_all`ed before the adapter returns;
+  the source-local producer sequence advances only after that durable acknowledgement. Existing paths
+  are never truncated or appended to. The spool is limited to 16 MiB, each line to 64 KiB, and its
+  configured event capacity is mandatory rather than sampled. Bounded lifecycle headroom cannot be
+  consumed by events. Call `complete` after the final event; replay and ingestion reject an absent
+  completion and reject a failure record, so a crash or failed write cannot revive a valid prefix.
+- `CanonicalCapture::new` is an in-memory schema/test collector. A later `persist_new` export is useful
+  for fixtures but is **not** durable live capture and must not be described as the canonical production
+  path.
+- A2A send and receive observations, pinned `smesh_runtime::RuntimeEvent`/`JournalEvent` values, real
+  tool closures, artifact bytes, and console `Read`/`Write` are normalized before raw detail is lost.
+  Captured content stores only a SHA-256 digest and byte length; this is data minimization, not the full
+  publishable redaction policy owned by issue #25.
+- Tool call/result, A2A receive/send, and human prompt/decision slots are reserved as a pair before
+  invoking the wrapped operation or performing console I/O. Capacity failure therefore occurs before the
+  external effect. Tool errors and console write/read/EOF/oversize outcomes consume the terminal slot as
+  `toolFailed` or `humanFailed`. A panic, cancellation, or otherwise abandoned reservation marks the
+  capture invalid as `unclosedInteraction`; persistence and sequence-gap failures are also explicit and
+  fail closed.
+- Interaction IDs bind task/context globally, bind paired tool/human subjects, and bind artifact
+  production/consumption to one subject and content contract without coupling valid multi-signal SMESH
+  observations. Conflicting reuse is rejected. Event parents must already exist; a boundary that cannot
+  supply one uses typed `missing` parent data with a reason and a canonical lowercase SHA-256 expected
+  event ID. A `missing` claim conflicts if that expected event is already present.
+- `ingest_jsonl` accepts completed, validated source-local spools into a durable canonical spool in the
+  caller-declared causal order. It preserves producer identity, process instance, source sequence, and
+  event ID while assigning only the canonical append sequence. Identical event IDs are idempotent;
+  conflicts, regressions, and gaps fail. The complete accepted batch's event count and serialized bytes
+  are admitted before its first append; a write failure leaves the destination invalid and incomplete.
+  The integration-test executable self-spawns as two bounded,
+  simultaneously distinct OS processes, covers all five adapter families, and joins one cross-process
+  A2A send/receive causally without adding a shipped fixture binary.
+- Replay is parse/validation only. It has no URL, tool, model, clock, or randomness callback and rejects
+  unsupported schemas, unknown fields/kinds, invalid IDs, event-ID mismatch, noncontiguous canonical or
+  producer sequences, conflicting interactions, and unresolved parents.
+
+The `A2aCaptureAdapter` implements the real `a2a_server::CallInterceptor` contract, and its `before` and
+`after` hooks are exercised directly for schema coverage. `capture_unary` owns the paired unary lifecycle
+and invalidates an open reservation if dispatch is cancelled or panics. The pinned `a2a-server-lf`
+`InterceptedHandler` does not implement `RequestHandler`, and `CallInterceptor::after` receives one unary
+`Value` rather than streaming frames. Consequently issue #23 does not install this interceptor into every
+existing topology/director router and does not claim live streaming-frame coverage. A production router
+wrapper must capture each unary result and every stream frame at the `RequestHandler` seam before making
+that broader claim. Raw `before`/`after` use remains schema-hook scope: while a raw pair is outstanding it
+blocks finalization and unrelated capture/effects, and abandonment leaves the spool failed rather than
+replayable. Callers needing cancellation/panic ownership must use `capture_unary`.
+
+Issue #23 also does not provide deterministic distributed merge, HLC/Lamport ordering, per-producer hash
+chains, Merkle roots, or run sealing; those belong to issue #24. Ingestion order here is explicit caller
+order and is not permutation-independent.
+
 ## Source-of-truth rules
 
 1. One immutable JSON object per line.
