@@ -52,6 +52,8 @@ mod store;
 mod task_state;
 /// Closed, bounded optional OpenTelemetry projection schema and exporter owner.
 pub mod telemetry;
+/// Bounded pre-persistence trace classification, redaction, and privacy verification.
+pub mod trace_privacy;
 /// Production exposure policy, TLS material loading, reload, and bounded acceptor.
 pub mod transport;
 
@@ -208,3 +210,10 @@ pub use sqlite_store::{LegacyTenantBinding, SqliteStoreError, SqliteTaskStore};
 pub use store::BoundedTaskStore;
 #[doc(hidden)]
 pub use task_state::task_state_transition_allowed;
+pub use trace_privacy::{
+    DataClass, PrivacyError, PrivacyPolicy, PublicProjectionReceipt, PublicTraceManifest,
+    RedactionAction, RedactionLogEntry, RedactionRule, RestrictedStoragePolicy,
+    RestrictedTraceManifest, RunHmacKey, SanitizedTrace, TraceArtifactBinding, TraceArtifactOrigin,
+    TraceArtifactProvenance, sanitize_public_trace, sanitize_public_trace_with_receipts,
+    scan_public_trace, verify_sanitized_trace,
+};

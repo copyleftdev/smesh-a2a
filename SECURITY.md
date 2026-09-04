@@ -71,6 +71,45 @@ Authentication-only compatibility builders are development-only. Managed cross-d
 coordination and external control-plane lifecycle remain operator work. In-memory mode retains
 process-local keys and ledger state.
 
+## Public trace privacy boundary
+
+`trace_privacy` is the pre-persistence boundary for callers producing public trace packages. It accepts strict,
+terminal-LF JSONL records (or one explicitly documented compact JSON object), applies a closed six-class
+policy, removes secrets, pseudonymizes only explicitly stable identifiers with run-scoped HMAC-SHA-256,
+and scans decoded output semantics before returning public bytes. Malformed JSONL, unknown policy fields,
+invalid RFC 6901 pointers, duplicate, overlapping, or unmatched rules, unclassified leaves, unsupported class/action
+pairs, depth/line/record/aggregate or cumulative pointer-work overflows, and scanner findings all fail closed.
+
+The public manifest cannot contain raw issue #24 receipt input/output digests or byte lengths. It exposes
+only run/policy/key-generation-bound HMAC commitments to validated receipts plus their scanned projector
+identity/version. Exact receipts and raw-source integrity exist only in the separate restricted manifest,
+whose source binding is classified `secret`
+and whose fixed policy forbids public export and requires authenticated
+encryption, authorization, and audit. This module does not provide encryption or durable storage. Store
+restricted source/manifests only through the existing encrypted artifact authority; do not write them to
+the public replay spool. Versioned policies bind policy ID, revision, and key-generation identity into
+each handle and manifest. HMAC keys redact `Debug` and zeroize on drop; policies, rules, restricted manifests, confidential
+action entries, and sanitized packages omit exact pointers, restricted identifiers/digests, and bytes
+from `Debug`. Key custody, rotation, and
+run-to-key assignment remain caller/operator responsibilities. A stable handle accepts only a nonempty
+string identifier; arbitrary objects cannot be turned into linkable public handles.
+Non-public object-member names receive separate run/policy-scoped HMAC field labels; public `keep`
+rules explicitly attest both the member name and value as fictional.
+
+Public policy and action-log bindings are domain-separated HMAC commitments, not ordinary hashes. The
+ordinary policy/action-log digests remain restricted so low-entropy sensitive pointer names cannot be
+confirmed through a public offline dictionary.
+
+`write_lifeline_trace` serializes and semantically scans the complete public JSONL before creating its
+destination; a rejected scan cannot create, truncate, or alter that destination. Duplicate JSON object
+keys are rejected recursively before classification or scanning to
+avoid parser-differential disclosure. Existing capture spools and sealed replay persistence are
+owner-private restricted evidence,
+not public export paths; publishing either requires a separate `trace_privacy` projection. Exact JSON
+Pointer actions are confidential audit metadata and must be stored with the restricted manifest. Public
+verification that claims policy conformance must use `verify_sanitized_trace`, which consumes the trusted
+source, expected run, explicit key, policy, and expected receipts and replays the entire projection.
+
 ## Known dependency warning
 
 `cargo audit` reports `RUSTSEC-2025-0141`: `bincode 1.3.3` is unmaintained. It is pulled transitively by the pinned `smesh-core` revision. This is an unmaintained-package warning rather than a reported vulnerability. The gateway does not invoke bincode directly. It should be removed by upgrading SMESH serialization or narrowing the integration dependency when an upstream revision is available.

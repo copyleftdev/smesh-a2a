@@ -42,6 +42,10 @@ SMESH remains the internal coordination substrate: signals diffuse, decay, reinf
   behavior and state-bound interrupted-temporary reconciliation that never deletes a possible sole
   published copy, and independent Rust/Node source-merge
   golden vectors plus Unicode/u64 canonicalization corpus
+- Bounded pre-persistence trace privacy for strict JSONL (or one explicitly supplied JSON object):
+  six closed data classes, secret removal, typed placeholders, run-scoped HMAC handles, exact
+  RFC 6901 action logs with record indices, semantic leak scanning, and separate public/restricted
+  manifests with keyed public commitments for restricted metadata
 
 The production artifact path requires PostgreSQL metadata authority, an owner-private absolute POSIX
 root, and an explicit key generation selected by the runtime. With those settings, receiver output is
@@ -108,6 +112,23 @@ into all topology/director paths by issue #23. Issue #24's distributed merge con
 `full-matrix-causal-source/1` envelopes and does not infer ordering metadata from legacy spools. See
 the implemented protocol, limits, hash preimages, persistence guarantees, and issue #25 boundary in
 [`docs/TRACE_CAPTURE.md`](docs/TRACE_CAPTURE.md).
+
+Issue #25 is implemented by `trace_privacy`. `sanitize_public_trace` accepts either strict JSONL
+(one object per nonblank line, mandatory terminal LF) or one compact JSON object with no LF. It
+classifies and transforms every record before callers persist public bytes. Public export is rejected
+for unclassified values, unmatched/duplicate/malformed rules, unsafe overlapping transforms,
+unsupported class/action pairs, duplicate object keys, or semantic scanner findings. Non-public
+object-member names receive
+separately domain-separated run/policy-scoped HMAC labels. Versioned policies bind their policy ID,
+revision, and HMAC key
+generation into handles and both manifests. Exact issue #24 receipts remain restricted; the public
+manifest carries only scanned projector metadata and run/policy/key-generation-bound HMAC commitments.
+`verify_sanitized_trace` reruns the complete projection from
+restricted source bytes instead of trusting manifest-controlled run or receipt fields. The LIFELINE
+public writer scans the complete JSONL before creating, truncating, or altering its destination.
+Restricted originals are not
+persisted or encrypted by this module; use the existing encrypted artifact authority under the
+restricted manifest policy.
 
 ## LIFELINE cinematic demo
 

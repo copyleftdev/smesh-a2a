@@ -67,6 +67,7 @@ url = "2"
 # Direct dependency: reloads must inspect leaf DNS/IP SANs before atomic publish;
 # rustls/webpki verify names internally but do not expose parsed SANs for this invariant.
 x509-parser = "0.18"
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
