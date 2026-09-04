@@ -920,14 +920,29 @@ pub fn verify_trace(events: &[TraceEvent]) -> Result<(), TraceError> {
 /// final flushing fails.
 pub fn write_lifeline_trace(path: impl AsRef<Path>) -> Result<Vec<TraceEvent>, TraceError> {
     let events = generate_lifeline_trace()?;
+    write_lifeline_trace_events(path.as_ref(), &events)?;
+    Ok(events)
+}
+
+fn write_lifeline_trace_events(path: &Path, events: &[TraceEvent]) -> Result<(), TraceError> {
+    let bytes = serialize_public_lifeline_trace(events)?;
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
-    for event in &events {
-        serde_json::to_writer(&mut writer, event)?;
-        writer.write_all(b"\n")?;
-    }
+    writer.write_all(&bytes)?;
     writer.flush()?;
-    Ok(events)
+    Ok(())
+}
+
+fn serialize_public_lifeline_trace(events: &[TraceEvent]) -> Result<Vec<u8>, TraceError> {
+    verify_trace(events)?;
+    let mut bytes = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut bytes, event)?;
+        bytes.write_all(b"\n")?;
+    }
+    crate::trace_privacy::scan_public_trace(&bytes)
+        .map_err(|error| TraceError::Invariant(format!("public privacy scan failed: {error}")))?;
+    Ok(bytes)
 }
 
 fn event_hash(event: &TraceEvent) -> Result<String, serde_json::Error> {
@@ -1129,5 +1144,46 @@ fn actor(id: &str) -> TraceActor {
         role: role.to_owned(),
         endpoint: endpoint.map(str::to_owned),
         geo: Geo { lon, lat, alt: 0.0 },
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+
+    #[test]
+    fn public_writer_rejects_sensitive_content_before_touching_destination() {
+        let mut events = generate_lifeline_trace().unwrap();
+        events[0].payload["clientSecret"] = Value::String("canary-value".into());
+        let mut previous = None;
+        for event in &mut events {
+            event.integrity.prev_hash.clone_from(&previous);
+            event.integrity.event_hash.clear();
+            let digest = event_hash(event).unwrap();
+            event.integrity.event_hash.clone_from(&digest);
+            previous = Some(digest);
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("smesh-a2a-lifeline-privacy-{}", std::process::id()));
+        let absent = root.with_extension("absent.jsonl");
+        let existing = root.with_extension("existing.jsonl");
+        let _ = std::fs::remove_file(&absent);
+        let _ = std::fs::remove_file(&existing);
+
+        assert!(matches!(
+            write_lifeline_trace_events(&absent, &events),
+            Err(TraceError::Invariant(_))
+        ));
+        assert!(!absent.exists());
+
+        let sentinel = b"sentinel-must-survive";
+        std::fs::write(&existing, sentinel).unwrap();
+        assert!(matches!(
+            write_lifeline_trace_events(&existing, &events),
+            Err(TraceError::Invariant(_))
+        ));
+        assert_eq!(std::fs::read(&existing).unwrap(), sentinel);
+        std::fs::remove_file(existing).unwrap();
     }
 }

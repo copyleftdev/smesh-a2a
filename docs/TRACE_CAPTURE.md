@@ -299,7 +299,69 @@ removed, but final validation or directory durability could not be confirmed; re
 destination before deciding whether to retry.
 Projection payload production is external and only its recorded receipts are sealed. The SHA-256
 seal provides integrity/identity when pinned, not producer authenticity or non-repudiation.
-Classification, redaction, pseudonymization, and public-bundle privacy remain issue #25.
+### Issue #25 implemented privacy boundary
+
+The dedicated `trace_privacy` module operates on bounded bytes before public persistence. Its primary
+package form is strict JSONL: every line is one JSON object, blank lines are forbidden, and the package
+must end in LF. A single compact JSON object without LF is also accepted as an explicit one-record form.
+Limits are 64 KiB per source/output line, 16 MiB each for aggregate source, public output, action
+log, and cumulative RFC 6901 pointer construction work, 100,000 records, and decoded nesting depth 64.
+
+Policies use the exact six classes `public`, `internal`, `confidential`, `pii`, `phi`, and `secret`.
+Duplicate JSON object keys are rejected at every nesting level before classification or scanning,
+avoiding cross-parser ambiguity. Public values may be kept only with nonempty fictional provenance.
+Internal, confidential, PII, and
+PHI become fixed typed placeholders, or a run-scoped HMAC-SHA-256 handle only when the rule explicitly
+marks a stable identifier. Their object-member names are replaced with separately domain-separated,
+run/policy-scoped HMAC field labels so names cannot carry identifying data. Secrets are removed
+(object members are deleted; array slots become `null`
+to preserve source indices). Stable handles accept only nonempty string identifiers. HMAC input is
+domain separated and length framed over the run ID, policy ID/revision, declared key generation, and identifier; equal
+identifiers under one run/key generation/key are stable while different runs are unlinkable. Key debug
+output is redacted and key bytes are zeroized on drop.
+
+Every object-member name and every source leaf must be covered by an exact rule or by a non-public
+subtree replacement/removal. Public `keep` rules explicitly attest both the member name and value as
+fictional; a container `keep` may parent explicit descendant rules but never classifies those descendants.
+Transforming rules cannot overlap descendants. Rules are closed, sorted, and fail
+closed when malformed, duplicated, unsupported, or unmatched. Policy IDs, key generations, fictional
+provenance labels, and run IDs use bounded public-safe ASCII labels so manifest metadata cannot become a
+side channel. Action entries contain a separate zero-based record index plus the exact
+escaped RFC 6901 source pointer, class, and action; they never contain source values. The decoded semantic
+scanner traverses nested objects/arrays and rejects secret-bearing key names, boundary-aware bearer
+credentials (including whitespace, colon, equals, and trailing-punctuation forms), JWTs, AWS
+`AKIA`/`ASIA`, GitHub `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`, legacy `sk-`, and modern
+`sk-proj-`/`sk-svcacct-` token forms, private-key markers, email addresses, SSNs, and raw
+patient/MRN/insurance or clinical fields unless the
+field holds a valid HMAC handle or fixed typed placeholder as applicable. The checked-in
+`demo/lifeline.trace.jsonl` is scanned as the actual public LIFELINE fixture.
+
+The closed public manifest binds public classification, the closed provenance origin (`fictional`,
+`sanitized`, or `mixed`), any fictional source labels, policy ID/revision, declared HMAC key
+generation, public output, and optional sorted public receipt records containing scanned projector
+identity/version plus a run/policy/key-generation-bound HMAC commitment to each exact issue #24
+`ProjectionReceipt`. Exact input/output digests and output byte lengths remain restricted. It
+uses run-keyed, domain-separated commitments for policy and action-log bytes so sensitive pointer names
+cannot be confirmed by an offline digest dictionary. It intentionally has no raw-source digest. A
+separate closed confidential manifest binds the raw-source,
+confidential action-log, and public-manifest digests; it gives the source and action log explicit
+`secret` source and confidential action-log classification with
+`restricted_source`/`confidential_audit` provenance origins and requires
+public export to remain forbidden, authenticated encryption, authorization, and audit. The
+privacy module describes and verifies that storage policy; it does **not** encrypt or persist restricted
+bytes. Restricted bytes and their manifest must flow through the existing encrypted artifact authority.
+The action log and its ordinary digest remain confidential audit metadata; only its keyed commitment is
+bound into the public manifest.
+`verify_sanitized_trace` takes the trusted restricted source, expected run ID, explicit HMAC key, policy,
+and expected exact issue #24 projection receipts, reruns the complete transformation, and byte-compares both output
+surfaces and manifests. It does not accept run identity or receipt authority from the manifest under
+verification.
+
+`write_lifeline_trace` scans the complete serialized public JSONL before it creates or truncates the
+destination file; filesystem regressions cover both absent destinations and existing sentinel content.
+The issue #23 capture spool and issue #24 sealed replay persistence remain owner-private restricted
+evidence paths; they are not public exporters and must pass through a privacy projection before any
+publication.
 
 Replay never rereads URLs, reruns a model or tool, recalculates trust, regenerates random choices, or infers decay from current wall time. Probabilistic decisions record algorithm, seed, draw, threshold, and result. Signal decay records field ticks and checkpoints.
 
