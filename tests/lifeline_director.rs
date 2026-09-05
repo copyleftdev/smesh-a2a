@@ -266,6 +266,7 @@ struct FailoverDispatcher {
     shipment_attempts: Arc<AtomicUsize>,
     cancellation_attempts: Arc<AtomicUsize>,
     fail_primary: bool,
+    fail_fallback: bool,
 }
 
 #[async_trait]
@@ -274,18 +275,24 @@ impl MeshDispatcher for FailoverDispatcher {
         &self,
         request: MeshRequest,
     ) -> BoxStream<'static, Result<MeshEvent, DispatchError>> {
-        if request.text.contains("shipment routes")
-            && self.shipment_attempts.fetch_add(1, Ordering::SeqCst) == 0
-        {
-            if self.fail_primary {
+        if request.text.contains("shipment routes") {
+            let attempt = self.shipment_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 && self.fail_primary {
                 return Box::pin(stream::once(async {
                     Err(DispatchError::message("primary failed"))
                 }));
             }
-            return Box::pin(
-                stream::once(async { Ok(MeshEvent::Progress("primary admitted".to_owned())) })
-                    .chain(stream::pending()),
-            );
+            if attempt == 0 {
+                return Box::pin(
+                    stream::once(async { Ok(MeshEvent::Progress("primary admitted".to_owned())) })
+                        .chain(stream::pending()),
+                );
+            }
+            if self.fail_fallback {
+                return Box::pin(stream::once(async {
+                    Err(DispatchError::message("fallback failed"))
+                }));
+            }
         }
         smesh_a2a::LoopbackDispatcher.dispatch(request)
     }
@@ -756,6 +763,30 @@ async fn stalled_primary_is_canceled_and_redelegated_without_restarting_siblings
     assert!(run.captured_message_ids().len() > 6);
     assert_eq!(run.captured_task_ids().len(), 6);
 
+    topology.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_fallback_stops_after_one_redelegation_without_tertiary_retry() {
+    let dispatcher = FailoverDispatcher {
+        fail_fallback: true,
+        ..FailoverDispatcher::default()
+    };
+    let topology =
+        LifelineTopologyManifest::from_json(include_str!("../deploy/lifeline-topology.json"))
+            .unwrap()
+            .with_ephemeral_loopback_ports()
+            .launch_with_dispatcher(dispatcher.clone())
+            .await
+            .unwrap();
+    let director = LifelineResponseDirector::new(manifest_for_topology(&topology, None));
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(8), director.run())
+        .await
+        .unwrap();
+
+    assert!(result.is_err());
+    assert_eq!(dispatcher.shipment_attempts.load(Ordering::SeqCst), 2);
     topology.shutdown().await.unwrap();
 }
 

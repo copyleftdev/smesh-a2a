@@ -17,6 +17,12 @@ use a2a_client::{A2AClient, A2AClientFactory, Transport};
 use futures::StreamExt as _;
 use futures::future::join_all;
 
+use crate::lifeline_failure::verify_lifeline_failure_events;
+use crate::{
+    LifelineFailureEvent, LifelineFailureEventKind, LifelineFailureTrace,
+    LifelineFailureTransition, LifelineTeamFailureMode,
+};
+
 pub const LIFELINE_DIRECTOR_SCHEMA_VERSION: &str = "1.0.0";
 const LIFELINE_DIRECTOR_EVIDENCE_DISCLAIMER: &str = "Fictional loopback evidence only; not authorization, medical advice, clinical validation, or evidence of trust.";
 const APPROVED_DIRECTOR_MANIFEST: &str = include_str!("../deploy/lifeline-director.json");
@@ -114,6 +120,23 @@ pub struct LifelineDirectorRun {
     captured_message_ids: Vec<String>,
     captured_task_ids: Vec<String>,
     captured_artifact_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LifelineFailureScenarioRun {
+    schema_version: String,
+    root_context_id: String,
+    primary_task_id: String,
+    fallback_task_id: String,
+    fallback_context_id: String,
+    fallback_replaces_task_id: String,
+    primary_final_state: String,
+    primary_attempts: usize,
+    fallback_attempts: usize,
+    sibling_dispatches: usize,
+    root_context_restarts: usize,
+    director_run: LifelineDirectorRun,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,6 +451,661 @@ impl LifelineResponseDirector {
         )
         .await
     }
+
+    /// Runs the closed Atlas-primary outage, cancellation, and single fallback scenario.
+    ///
+    /// # Errors
+    /// Returns an error when discovery, an official A2A operation, live trace capture,
+    /// cancellation reconciliation, fallback, or final primary reconciliation fails.
+    #[allow(clippy::too_many_lines)] // The linear orchestration order is the audited scenario contract.
+    pub async fn run_failure_scenario(
+        &self,
+        failure: LifelineTeamFailureMode,
+    ) -> Result<LifelineFailureScenarioRun, LifelineDirectorError> {
+        let trace = failure.trace();
+        let resolved = self.resolve_gateways().await?;
+        let root = self.manifest.root_context_id.clone();
+        let primary_operation = self
+            .manifest
+            .operations
+            .iter()
+            .find(|operation| operation.gateway_id == self.manifest.logistics.primary_gateway_id)
+            .cloned()
+            .ok_or_else(|| invariant("primary logistics operation is missing"))?;
+        let primary_gateway = resolved
+            .iter()
+            .find(|gateway| gateway.gateway_id == primary_operation.gateway_id)
+            .cloned()
+            .ok_or_else(|| invariant("primary logistics gateway is missing"))?;
+        let primary_future = execute_failure_primary(
+            primary_operation,
+            primary_gateway.clone(),
+            root.clone(),
+            failure,
+            trace.clone(),
+        );
+        let sibling_futures = self
+            .manifest
+            .operations
+            .iter()
+            .filter(|operation| operation.gateway_id != self.manifest.logistics.primary_gateway_id)
+            .map(|operation| {
+                let operation = operation.clone();
+                let gateway = resolved
+                    .iter()
+                    .find(|gateway| gateway.gateway_id == operation.gateway_id)
+                    .cloned();
+                let root = root.clone();
+                let trace = trace.clone();
+                async move {
+                    trace
+                        .record(LifelineFailureTransition {
+                            kind: LifelineFailureEventKind::SiblingSubmitted,
+                            operation_id: &operation.id,
+                            gateway_id: &operation.gateway_id,
+                            context_id: &root,
+                            task_id: None,
+                            message_id: None,
+                            attempt: 1,
+                            outcome: "submitted",
+                            replaces_task_id: None,
+                        })
+                        .map_err(|_| LifelineDirectorError::Operation {
+                            operation_id: operation.id.clone(),
+                        })?;
+                    let receipt =
+                        execute_initial_operation(operation, gateway, root, Vec::new()).await?;
+                    record_receipt_transition(
+                        &trace,
+                        LifelineFailureEventKind::SiblingCompleted,
+                        &receipt,
+                        "completed",
+                        None,
+                    )?;
+                    Ok::<LifelineDirectorOperationReceipt, LifelineDirectorError>(receipt)
+                }
+            });
+        let sibling_future = join_all(sibling_futures);
+        let (primary, siblings) = tokio::join!(primary_future, sibling_future);
+        let primary = primary?;
+        let siblings = siblings.into_iter().collect::<Result<Vec<_>, _>>()?;
+        if !primary.is_canceled() || siblings.iter().any(|receipt| !receipt.is_completed()) {
+            return Err(LifelineDirectorError::Operation {
+                operation_id: primary.operation_id.clone(),
+            });
+        }
+
+        trace
+            .record(LifelineFailureTransition {
+                kind: LifelineFailureEventKind::FallbackSelected,
+                operation_id: "shipment-routing-fallback",
+                gateway_id: &self.manifest.logistics.fallback_gateway_id,
+                context_id: &root,
+                task_id: None,
+                message_id: None,
+                attempt: 1,
+                outcome: "selected",
+                replaces_task_id: Some(&primary.task_id),
+            })
+            .map_err(|_| LifelineDirectorError::Operation {
+                operation_id: "shipment-routing-fallback".to_owned(),
+            })?;
+        let fallback_gateway = resolved
+            .iter()
+            .find(|gateway| gateway.gateway_id == self.manifest.logistics.fallback_gateway_id)
+            .cloned()
+            .ok_or_else(|| invariant("fallback logistics gateway is missing"))?;
+        let fallback = execute_failure_fallback(
+            fallback_gateway,
+            root.clone(),
+            primary.task_id.clone(),
+            trace.clone(),
+        )
+        .await?;
+
+        let mut initial_operations = siblings;
+        initial_operations.push(primary.clone());
+        initial_operations.sort_by_key(|receipt| {
+            self.manifest
+                .operations
+                .iter()
+                .position(|operation| operation.id == receipt.operation_id)
+                .unwrap_or(usize::MAX)
+        });
+        let review_reference_task_ids = initial_operations
+            .iter()
+            .chain(std::iter::once(&fallback))
+            .map(|receipt| receipt.task_id.clone())
+            .collect::<Vec<_>>();
+        let review_operation = LifelineDirectorOperation {
+            id: "independent-review".to_owned(),
+            gateway_id: self.manifest.review.gateway_id.clone(),
+            path: self.manifest.review.path,
+            prompt: review_prompt(&self.manifest, &initial_operations, Some(&fallback)),
+        };
+        let review = execute_initial_operation(
+            review_operation,
+            resolved
+                .iter()
+                .find(|gateway| gateway.gateway_id == self.manifest.review.gateway_id)
+                .cloned(),
+            root.clone(),
+            review_reference_task_ids,
+        )
+        .await?;
+        record_receipt_transition(
+            &trace,
+            LifelineFailureEventKind::ReviewCompleted,
+            &review,
+            "completed",
+            None,
+        )?;
+
+        let final_primary = get_failure_primary(&primary_gateway, &primary.task_id, &root).await?;
+        if final_primary.status.state != TaskState::Canceled
+            || final_primary
+                .artifacts
+                .as_ref()
+                .is_some_and(|artifacts| !artifacts.is_empty())
+        {
+            return Err(LifelineDirectorError::Operation {
+                operation_id: primary.operation_id.clone(),
+            });
+        }
+        trace
+            .record(LifelineFailureTransition {
+                kind: LifelineFailureEventKind::PrimaryFinalReconciled,
+                operation_id: &primary.operation_id,
+                gateway_id: &primary.gateway_id,
+                context_id: &primary.context_id,
+                task_id: Some(&primary.task_id),
+                message_id: Some(&primary.message_id),
+                attempt: 1,
+                outcome: "canceled",
+                replaces_task_id: None,
+            })
+            .map_err(|_| LifelineDirectorError::Operation {
+                operation_id: primary.operation_id.clone(),
+            })?;
+        trace.sync().map_err(|_| LifelineDirectorError::Operation {
+            operation_id: primary.operation_id.clone(),
+        })?;
+
+        let director_run = build_run_record(
+            &self.manifest,
+            &resolved,
+            Vec::new(),
+            root.clone(),
+            initial_operations,
+            Some(fallback.clone()),
+            Some(review),
+        );
+        let all_contexts = director_run
+            .initial_operations
+            .iter()
+            .chain(director_run.fallback_operation.iter())
+            .chain(director_run.review.iter())
+            .map(|receipt| receipt.context_id.as_str())
+            .collect::<HashSet<_>>();
+        let run = LifelineFailureScenarioRun {
+            schema_version: "lifeline-failure-scenario-run/1".to_owned(),
+            root_context_id: root,
+            primary_task_id: primary.task_id.clone(),
+            fallback_task_id: fallback.task_id.clone(),
+            fallback_context_id: fallback.context_id.clone(),
+            fallback_replaces_task_id: fallback
+                .replaces_task_id
+                .clone()
+                .ok_or_else(|| invariant("fallback replacement is missing"))?,
+            primary_final_state: "canceled".to_owned(),
+            primary_attempts: director_run
+                .initial_operations
+                .iter()
+                .filter(|receipt| receipt.gateway_id == self.manifest.logistics.primary_gateway_id)
+                .count(),
+            fallback_attempts: usize::from(director_run.fallback_operation.is_some()),
+            sibling_dispatches: director_run
+                .initial_operations
+                .iter()
+                .filter(|receipt| receipt.gateway_id != self.manifest.logistics.primary_gateway_id)
+                .count(),
+            root_context_restarts: all_contexts.len().saturating_sub(1),
+            director_run,
+        };
+        trace
+            .record(LifelineFailureTransition {
+                kind: LifelineFailureEventKind::ScenarioCompleted,
+                operation_id: "incident-response",
+                gateway_id: "director",
+                context_id: &run.root_context_id,
+                task_id: None,
+                message_id: None,
+                attempt: 1,
+                outcome: "completed",
+                replaces_task_id: None,
+            })
+            .map_err(|_| invariant("scenario completion evidence could not be recorded"))?;
+        trace
+            .sync()
+            .map_err(|_| invariant("scenario completion evidence could not be synchronized"))?;
+        Ok(run)
+    }
+}
+
+struct FailurePrimaryOwner {
+    failure: LifelineTeamFailureMode,
+    armed: bool,
+}
+
+impl FailurePrimaryOwner {
+    fn new(failure: LifelineTeamFailureMode) -> Self {
+        Self {
+            failure,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailurePrimaryOwner {
+    fn drop(&mut self) {
+        if self.armed {
+            self.failure.abandon_primary();
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Keep stream outage and cancel linearization visibly contiguous.
+async fn execute_failure_primary(
+    operation: LifelineDirectorOperation,
+    gateway: ResolvedLifelineGateway,
+    root_context_id: String,
+    failure: LifelineTeamFailureMode,
+    trace: LifelineFailureTrace,
+) -> Result<LifelineDirectorOperationReceipt, LifelineDirectorError> {
+    let error = || LifelineDirectorError::Operation {
+        operation_id: operation.id.clone(),
+    };
+    let stage_error = |stage: &str| LifelineDirectorError::Operation {
+        operation_id: format!("{}:{stage}", operation.id),
+    };
+    let client = official_client_for(&gateway, TRANSPORT_PROTOCOL_JSONRPC)
+        .await
+        .map_err(|_| error())?;
+    let mut message = Message::new(Role::User, vec![Part::text(operation.prompt.clone())]);
+    message.context_id = Some(root_context_id.clone());
+    let message_id = message.message_id.clone();
+    let request = SendMessageRequest {
+        message,
+        configuration: None,
+        metadata: None,
+        tenant: None,
+    };
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.send_streaming_message(&request),
+    )
+    .await
+    .map_err(|_| stage_error("stream-open-timeout"))?
+    .map_err(|_| stage_error("stream-open"))?;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .map_err(|_| stage_error("first-event-timeout"))?
+        .ok_or_else(|| stage_error("first-event-closed"))?
+        .map_err(|_| stage_error("first-event-error"))?;
+    let StreamResponse::Task(task) = first else {
+        return Err(stage_error("first-event-not-task"));
+    };
+    validate_task_evidence(&task)?;
+    validate_task_identity(&task.id, &task.context_id, &task.id, &root_context_id)?;
+    trace
+        .record(LifelineFailureTransition {
+            kind: LifelineFailureEventKind::PrimarySubmitted,
+            operation_id: &operation.id,
+            gateway_id: &gateway.gateway_id,
+            context_id: &root_context_id,
+            task_id: Some(&task.id),
+            message_id: Some(&message_id),
+            attempt: 1,
+            outcome: "submitted",
+            replaces_task_id: None,
+        })
+        .map_err(|_| error())?;
+    failure
+        .bind_primary(&operation.id, &task.id, &root_context_id, &message_id)
+        .map_err(|_| error())?;
+    let mut primary_owner = FailurePrimaryOwner::new(failure.clone());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        failure.wait_for_outage_signal(),
+    )
+    .await
+    .map_err(|_| stage_error("outage-timeout"))?;
+    let mut observed_message_ids = vec![message_id.clone()];
+    let mut observed_task_ids = Vec::new();
+    let mut artifact_ids = Vec::new();
+    capture_task_ids(
+        &task,
+        &mut observed_message_ids,
+        &mut observed_task_ids,
+        &mut artifact_ids,
+    )?;
+    let stream_failure = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match stream.next().await {
+                None => return Err(stage_error("stream-closed-without-error")),
+                Some(Err(_)) => return Ok("error"),
+                Some(Ok(update)) => {
+                    validate_stream_evidence(&update)?;
+                    let terminal =
+                        stream_event_is_terminal_for(&update, &task.id, &root_context_id)?;
+                    capture_stream_ids(
+                        &update,
+                        &mut observed_message_ids,
+                        &mut observed_task_ids,
+                        &mut artifact_ids,
+                    )?;
+                    if terminal {
+                        return Err(stage_error("unexpected-stream-terminal"));
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| stage_error("stream-failure-timeout"))??;
+    trace
+        .record(LifelineFailureTransition {
+            kind: LifelineFailureEventKind::PrimaryStreamFailed,
+            operation_id: &operation.id,
+            gateway_id: &gateway.gateway_id,
+            context_id: &root_context_id,
+            task_id: Some(&task.id),
+            message_id: Some(&message_id),
+            attempt: 1,
+            outcome: stream_failure,
+            replaces_task_id: None,
+        })
+        .map_err(|_| error())?;
+    drop(stream);
+    trace
+        .record(LifelineFailureTransition {
+            kind: LifelineFailureEventKind::CancelRequested,
+            operation_id: &operation.id,
+            gateway_id: &gateway.gateway_id,
+            context_id: &root_context_id,
+            task_id: Some(&task.id),
+            message_id: Some(&message_id),
+            attempt: 1,
+            outcome: "requested",
+            replaces_task_id: None,
+        })
+        .map_err(|_| error())?;
+    let cancellation_response = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        client.cancel_task(&CancelTaskRequest {
+            id: task.id.clone(),
+            metadata: None,
+            tenant: None,
+        }),
+    )
+    .await
+    .map_err(|_| stage_error("cancel-timeout"))?
+    .map_err(|_| stage_error("cancel"))?;
+    validate_task_evidence(&cancellation_response)?;
+    validate_task_identity(
+        &cancellation_response.id,
+        &cancellation_response.context_id,
+        &task.id,
+        &root_context_id,
+    )?;
+    let canceled = wait_for_failure_primary_canceled(&client, &task.id, &root_context_id)
+        .await
+        .map_err(|_| stage_error("cancel-not-canceled"))?;
+    failure.mark_public_cancel_confirmed();
+    capture_task_ids(
+        &canceled,
+        &mut observed_message_ids,
+        &mut observed_task_ids,
+        &mut artifact_ids,
+    )?;
+    trace
+        .record(LifelineFailureTransition {
+            kind: LifelineFailureEventKind::CancelConfirmed,
+            operation_id: &operation.id,
+            gateway_id: &gateway.gateway_id,
+            context_id: &root_context_id,
+            task_id: Some(&task.id),
+            message_id: Some(&message_id),
+            attempt: 1,
+            outcome: "canceled",
+            replaces_task_id: None,
+        })
+        .map_err(|_| error())?;
+    primary_owner.disarm();
+    Ok(LifelineDirectorOperationReceipt {
+        operation_id: operation.id,
+        gateway_id: gateway.gateway_id,
+        binding: TRANSPORT_PROTOCOL_JSONRPC.to_owned(),
+        message_id,
+        observed_message_ids,
+        observed_task_ids,
+        task_id: canceled.id,
+        context_id: canceled.context_id,
+        terminal_state: canceled.status.state,
+        artifact_ids,
+        observations: vec![
+            LifelineDirectorObservation::Streaming,
+            LifelineDirectorObservation::Cancel,
+        ],
+        replaces_task_id: None,
+        reference_task_ids: Vec::new(),
+    })
+}
+
+async fn execute_failure_fallback(
+    gateway: ResolvedLifelineGateway,
+    root_context_id: String,
+    primary_task_id: String,
+    trace: LifelineFailureTrace,
+) -> Result<LifelineDirectorOperationReceipt, LifelineDirectorError> {
+    let operation_id = "shipment-routing-fallback";
+    let error = || LifelineDirectorError::Operation {
+        operation_id: operation_id.to_owned(),
+    };
+    let client = official_client_for(&gateway, TRANSPORT_PROTOCOL_HTTP_JSON)
+        .await
+        .map_err(|_| error())?;
+    let mut message = Message::new(
+        Role::User,
+        vec![Part::text(
+            "Map the bounded fictional shipment routes using the reviewed fallback route.",
+        )],
+    );
+    message.context_id = Some(root_context_id.clone());
+    message.reference_task_ids = Some(vec![primary_task_id.clone()]);
+    let message_id = message.message_id.clone();
+    trace
+        .record(LifelineFailureTransition {
+            kind: LifelineFailureEventKind::FallbackSubmitted,
+            operation_id,
+            gateway_id: &gateway.gateway_id,
+            context_id: &root_context_id,
+            task_id: None,
+            message_id: Some(&message_id),
+            attempt: 1,
+            outcome: "submitted",
+            replaces_task_id: Some(&primary_task_id),
+        })
+        .map_err(|_| error())?;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.send_message(&SendMessageRequest {
+            message,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        }),
+    )
+    .await
+    .map_err(|_| error())?
+    .map_err(|_| error())?;
+    let SendMessageResponse::Task(task) = response else {
+        return Err(error());
+    };
+    validate_task_evidence(&task)?;
+    validate_task_identity(&task.id, &task.context_id, &task.id, &root_context_id)?;
+    if task.status.state != TaskState::Completed || task.id == primary_task_id {
+        return Err(error());
+    }
+    let mut observed_message_ids = vec![message_id.clone()];
+    let mut observed_task_ids = vec![primary_task_id.clone()];
+    let mut artifact_ids = Vec::new();
+    capture_task_ids(
+        &task,
+        &mut observed_message_ids,
+        &mut observed_task_ids,
+        &mut artifact_ids,
+    )?;
+    trace
+        .record(LifelineFailureTransition {
+            kind: LifelineFailureEventKind::FallbackCompleted,
+            operation_id,
+            gateway_id: &gateway.gateway_id,
+            context_id: &root_context_id,
+            task_id: Some(&task.id),
+            message_id: Some(&message_id),
+            attempt: 1,
+            outcome: "completed",
+            replaces_task_id: Some(&primary_task_id),
+        })
+        .map_err(|_| error())?;
+    Ok(LifelineDirectorOperationReceipt {
+        operation_id: operation_id.to_owned(),
+        gateway_id: gateway.gateway_id,
+        binding: TRANSPORT_PROTOCOL_HTTP_JSON.to_owned(),
+        message_id,
+        observed_message_ids,
+        observed_task_ids,
+        task_id: task.id,
+        context_id: task.context_id,
+        terminal_state: task.status.state,
+        artifact_ids,
+        observations: Vec::new(),
+        replaces_task_id: Some(primary_task_id.clone()),
+        reference_task_ids: vec![primary_task_id],
+    })
+}
+
+async fn official_client_for(
+    gateway: &ResolvedLifelineGateway,
+    binding: &str,
+) -> Result<OfficialA2AClient, LifelineDirectorError> {
+    let http = director_http_client()?;
+    let factory = match binding {
+        TRANSPORT_PROTOCOL_JSONRPC => A2AClientFactory::builder()
+            .no_defaults()
+            .register(Arc::new(JsonRpcTransportFactory::new(Some(http)))),
+        TRANSPORT_PROTOCOL_HTTP_JSON => A2AClientFactory::builder()
+            .no_defaults()
+            .register(Arc::new(RestTransportFactory::new(Some(http)))),
+        _ => return Err(invariant("unsupported failure scenario binding")),
+    }
+    .preferred_bindings(vec![binding.to_owned()])
+    .build();
+    factory
+        .create_from_card(&gateway.card)
+        .await
+        .map_err(|_| LifelineDirectorError::Operation {
+            operation_id: "failure-scenario-client".to_owned(),
+        })
+}
+
+async fn get_failure_primary(
+    gateway: &ResolvedLifelineGateway,
+    task_id: &str,
+    context_id: &str,
+) -> Result<Task, LifelineDirectorError> {
+    let client = official_client_for(gateway, TRANSPORT_PROTOCOL_JSONRPC).await?;
+    let task = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.get_task(&GetTaskRequest {
+            id: task_id.to_owned(),
+            history_length: Some(0),
+            tenant: None,
+        }),
+    )
+    .await
+    .map_err(|_| LifelineDirectorError::Operation {
+        operation_id: "primary-final-reconciliation".to_owned(),
+    })?
+    .map_err(|_| LifelineDirectorError::Operation {
+        operation_id: "primary-final-reconciliation".to_owned(),
+    })?;
+    validate_task_evidence(&task)?;
+    validate_task_identity(&task.id, &task.context_id, task_id, context_id)?;
+    Ok(task)
+}
+
+async fn wait_for_failure_primary_canceled(
+    client: &OfficialA2AClient,
+    task_id: &str,
+    context_id: &str,
+) -> Result<Task, LifelineDirectorError> {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let task = client
+                .get_task(&GetTaskRequest {
+                    id: task_id.to_owned(),
+                    history_length: Some(0),
+                    tenant: None,
+                })
+                .await
+                .map_err(|_| invariant("primary cancellation reconciliation failed"))?;
+            validate_task_evidence(&task)?;
+            validate_task_identity(&task.id, &task.context_id, task_id, context_id)?;
+            if task.status.state == TaskState::Canceled {
+                return Ok(task);
+            }
+            if task.status.state.is_terminal() {
+                return Err(invariant(
+                    "primary reached a non-canceled terminal state during reconciliation",
+                ));
+            }
+        }
+    })
+    .await
+    .map_err(|_| invariant("primary cancellation reconciliation timed out"))?
+}
+
+fn record_receipt_transition(
+    trace: &LifelineFailureTrace,
+    kind: LifelineFailureEventKind,
+    receipt: &LifelineDirectorOperationReceipt,
+    outcome: &str,
+    replaces_task_id: Option<&str>,
+) -> Result<(), LifelineDirectorError> {
+    trace
+        .record(LifelineFailureTransition {
+            kind,
+            operation_id: &receipt.operation_id,
+            gateway_id: &receipt.gateway_id,
+            context_id: &receipt.context_id,
+            task_id: Some(&receipt.task_id),
+            message_id: Some(&receipt.message_id),
+            attempt: 1,
+            outcome,
+            replaces_task_id,
+        })
+        .map_err(|_| LifelineDirectorError::Operation {
+            operation_id: receipt.operation_id.clone(),
+        })
 }
 
 async fn assemble_director_run(
@@ -474,6 +1152,11 @@ async fn assemble_director_run(
             replaced_task_id.iter().cloned().collect(),
         )
         .await?;
+        if !receipt.is_completed() {
+            return Err(LifelineDirectorError::Operation {
+                operation_id: receipt.operation_id.clone(),
+            });
+        }
         receipt.replaces_task_id.clone_from(&replaced_task_id);
         fallback_operation = Some(receipt);
     }
@@ -1198,6 +1881,263 @@ impl LifelineDirectorRun {
                 .collect::<HashSet<_>>()
                 == artifact_ids
     }
+}
+
+impl LifelineFailureScenarioRun {
+    /// Verifies the read-back run receipt against the closed causal trace.
+    ///
+    /// # Errors
+    /// Returns an error when either artifact is invalid, downgraded, or belongs
+    /// to a different scenario execution.
+    #[allow(clippy::too_many_lines)] // Keep the audited cross-artifact contract visibly contiguous.
+    pub fn verify(&self, events: &[LifelineFailureEvent]) -> Result<(), LifelineDirectorError> {
+        verify_lifeline_failure_events(events)
+            .map_err(|_| invariant("failure trace semantic verification failed"))?;
+        let primary = self
+            .director_run
+            .initial_operations
+            .iter()
+            .find(|receipt| receipt.task_id == self.primary_task_id)
+            .ok_or_else(|| invariant("primary receipt is missing"))?;
+        let fallback = self
+            .director_run
+            .fallback_operation
+            .as_ref()
+            .ok_or_else(|| invariant("fallback receipt is missing"))?;
+        let review = self
+            .director_run
+            .review
+            .as_ref()
+            .ok_or_else(|| invariant("review receipt is missing"))?;
+        let event = |kind: &str| events.iter().find(|event| event.kind() == kind);
+        let trace_primary = event("primary-submitted")
+            .ok_or_else(|| invariant("primary trace event is missing"))?;
+        let trace_fallback = event("fallback-completed")
+            .ok_or_else(|| invariant("fallback trace event is missing"))?;
+        let trace_review =
+            event("review-completed").ok_or_else(|| invariant("review trace event is missing"))?;
+        let sibling_receipts = self
+            .director_run
+            .initial_operations
+            .iter()
+            .filter(|receipt| receipt.task_id != self.primary_task_id)
+            .collect::<Vec<_>>();
+        let trace_siblings = events
+            .iter()
+            .filter(|event| event.kind() == "sibling-completed")
+            .collect::<Vec<_>>();
+        let receipts = self
+            .director_run
+            .initial_operations
+            .iter()
+            .chain(self.director_run.fallback_operation.iter())
+            .chain(self.director_run.review.iter())
+            .collect::<Vec<_>>();
+        let receipt_ids_are_valid = failure_receipt_ids_are_valid(&receipts);
+        let receipt_protocols_are_valid = failure_receipt_protocols_are_valid(&receipts);
+        let expected_review_references = self
+            .director_run
+            .initial_operations
+            .iter()
+            .chain(self.director_run.fallback_operation.iter())
+            .map(|receipt| receipt.task_id.as_str())
+            .collect::<HashSet<_>>();
+        let observed_review_references = review
+            .reference_task_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let review_references_match = review.reference_task_ids.len()
+            == expected_review_references.len()
+            && observed_review_references == expected_review_references;
+        let siblings_match = sibling_receipts.iter().all(|receipt| {
+            trace_siblings.iter().any(|event| {
+                event.operation_id() == receipt.operation_id
+                    && event.gateway_id() == receipt.gateway_id
+                    && event.context_id() == receipt.context_id
+                    && event.task_id() == Some(receipt.task_id.as_str())
+                    && event.message_id() == Some(receipt.message_id.as_str())
+            })
+        });
+        require(
+            self.schema_version == "lifeline-failure-scenario-run/1"
+                && self.primary_final_state == "canceled"
+                && self.primary_attempts == 1
+                && self.fallback_attempts == 1
+                && self.sibling_dispatches == 3
+                && self.root_context_restarts == 0
+                && self.director_run.schema_version == LIFELINE_DIRECTOR_SCHEMA_VERSION
+                && self.director_run.fictional
+                && self.director_run.disclaimer == LIFELINE_DIRECTOR_EVIDENCE_DISCLAIMER
+                && self.director_run.run_id == "lifeline-director-0047"
+                && self.director_run.root_context_id == self.root_context_id
+                && self.director_run.discovery_failures.is_empty()
+                && failure_discovery_receipts_are_valid(&self.director_run.discovered_gateways)
+                && self.director_run.initial_operations.len() == 4
+                && self.director_run.all_protocol_ids_are_captured()
+                && receipt_ids_are_valid
+                && receipt_protocols_are_valid
+                && primary.operation_id == "shipment-routing"
+                && primary.gateway_id == "atlas-primary"
+                && primary.context_id == self.root_context_id
+                && primary.terminal_state == TaskState::Canceled
+                && primary.used_streaming()
+                && primary.used_cancel()
+                && trace_primary.operation_id() == primary.operation_id
+                && trace_primary.gateway_id() == primary.gateway_id
+                && fallback.operation_id == "shipment-routing-fallback"
+                && fallback.gateway_id == "atlas-fallback"
+                && fallback.task_id == self.fallback_task_id
+                && fallback.context_id == self.fallback_context_id
+                && fallback.context_id == self.root_context_id
+                && fallback.replaces_task_id.as_deref()
+                    == Some(self.fallback_replaces_task_id.as_str())
+                && self.fallback_replaces_task_id == self.primary_task_id
+                && fallback.reference_task_ids == [self.primary_task_id.as_str()]
+                && fallback.task_id != primary.task_id
+                && fallback.message_id != primary.message_id
+                && fallback.is_completed()
+                && trace_fallback.operation_id() == fallback.operation_id
+                && trace_fallback.gateway_id() == fallback.gateway_id
+                && review.operation_id == "independent-review"
+                && review.gateway_id == "sentinel"
+                && review.is_completed()
+                && review_references_match
+                && trace_review.operation_id() == review.operation_id
+                && trace_review.gateway_id() == review.gateway_id
+                && sibling_receipts.len() == 3
+                && trace_siblings.len() == 3
+                && sibling_receipts
+                    .iter()
+                    .all(|receipt| receipt.is_completed())
+                && siblings_match
+                && trace_primary.context_id() == self.root_context_id
+                && trace_primary.task_id() == Some(primary.task_id.as_str())
+                && trace_primary.message_id() == Some(primary.message_id.as_str())
+                && trace_fallback.context_id() == self.root_context_id
+                && trace_fallback.task_id() == Some(fallback.task_id.as_str())
+                && trace_fallback.message_id() == Some(fallback.message_id.as_str())
+                && trace_fallback.replaces_task_id() == Some(primary.task_id.as_str())
+                && trace_review.context_id() == self.root_context_id
+                && trace_review.task_id() == Some(review.task_id.as_str())
+                && trace_review.message_id() == Some(review.message_id.as_str()),
+            "failure scenario run and trace are inconsistent",
+        )
+    }
+}
+
+fn failure_receipt_ids_are_valid(receipts: &[&LifelineDirectorOperationReceipt]) -> bool {
+    receipts.iter().all(|receipt| {
+        [
+            receipt.operation_id.as_str(),
+            receipt.gateway_id.as_str(),
+            receipt.message_id.as_str(),
+            receipt.task_id.as_str(),
+            receipt.context_id.as_str(),
+        ]
+        .into_iter()
+        .chain(receipt.observed_message_ids.iter().map(String::as_str))
+        .chain(receipt.observed_task_ids.iter().map(String::as_str))
+        .chain(receipt.artifact_ids.iter().map(String::as_str))
+        .chain(receipt.reference_task_ids.iter().map(String::as_str))
+        .chain(receipt.replaces_task_id.iter().map(String::as_str))
+        .all(|value| require_identifier(value, "receipt protocol id").is_ok())
+    })
+}
+
+fn failure_receipt_protocols_are_valid(receipts: &[&LifelineDirectorOperationReceipt]) -> bool {
+    receipts
+        .iter()
+        .all(|receipt| match receipt.operation_id.as_str() {
+            "shipment-routing" => {
+                receipt.binding == TRANSPORT_PROTOCOL_JSONRPC
+                    && receipt.observations
+                        == [
+                            LifelineDirectorObservation::Streaming,
+                            LifelineDirectorObservation::Cancel,
+                        ]
+            }
+            "lot-genealogy" | "recall-criteria" | "independent-review" => {
+                receipt.binding == TRANSPORT_PROTOCOL_JSONRPC && receipt.observations.is_empty()
+            }
+            "exposure-cohort" | "shipment-routing-fallback" => {
+                receipt.binding == TRANSPORT_PROTOCOL_HTTP_JSON && receipt.observations.is_empty()
+            }
+            _ => false,
+        })
+}
+
+fn failure_discovery_receipts_are_valid(receipts: &[LifelineDirectorDiscoveryReceipt]) -> bool {
+    let expected = HashSet::from([
+        ("meridian", "Meridian Bio", "lifeline.lot-genealogy"),
+        (
+            "atlas-primary",
+            "Atlas Cold Chain",
+            "lifeline.shipment-quarantine",
+        ),
+        (
+            "atlas-fallback",
+            "Atlas Cold Chain",
+            "lifeline.shipment-quarantine",
+        ),
+        (
+            "helix",
+            "Helix Medicines Authority",
+            "lifeline.recall-criteria",
+        ),
+        ("harbor", "Harbor Health", "lifeline.exposure-cohort"),
+        ("sentinel", "Sentinel Labs", "lifeline.evidence-review"),
+    ]);
+    receipts.len() == expected.len()
+        && receipts
+            .iter()
+            .map(|receipt| {
+                (
+                    receipt.gateway_id.as_str(),
+                    receipt.provider_organization.as_str(),
+                    receipt.skill_ids.first().map_or("", String::as_str),
+                )
+            })
+            .collect::<HashSet<_>>()
+            == expected
+        && receipts.iter().all(|receipt| {
+            receipt.skill_ids.len() == 1
+                && validate_discovery_url(&receipt.discovery_url).is_ok()
+                && failure_interfaces_are_local(&receipt.discovery_url, &receipt.interfaces)
+        })
+}
+
+fn failure_interfaces_are_local(
+    discovery_url: &str,
+    interfaces: &[LifelineDirectorInterfaceReceipt],
+) -> bool {
+    let Ok(discovery) = Url::parse(discovery_url) else {
+        return false;
+    };
+    if interfaces.len() != 2 {
+        return false;
+    }
+    let mut bindings = HashSet::new();
+    interfaces.iter().all(|interface| {
+        let Ok(url) = Url::parse(&interface.url) else {
+            return false;
+        };
+        let expected_path = match interface.protocol_binding.as_str() {
+            TRANSPORT_PROTOCOL_JSONRPC => "/jsonrpc",
+            TRANSPORT_PROTOCOL_HTTP_JSON => "/rest",
+            _ => return false,
+        };
+        bindings.insert(interface.protocol_binding.as_str())
+            && interface.protocol_version == a2a::VERSION
+            && url.scheme() == discovery.scheme()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.host_str() == discovery.host_str()
+            && url.port_or_known_default() == discovery.port_or_known_default()
+            && url.path() == expected_path
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
 }
 
 impl LifelineDirectorOperationReceipt {

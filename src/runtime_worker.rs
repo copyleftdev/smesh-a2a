@@ -341,6 +341,44 @@ pub struct RuntimeWorkerHandle {
     join: Option<JoinHandle<()>>,
 }
 
+struct OwnedRuntimeWorkerTask(Option<JoinHandle<()>>);
+
+impl OwnedRuntimeWorkerTask {
+    async fn join(mut self) -> Result<(), DispatchError> {
+        let result = {
+            let join = self
+                .0
+                .as_mut()
+                .ok_or_else(|| DispatchError::message("runtime worker join handle is absent"))?;
+            join.await
+        };
+        self.0.take();
+        result.map_err(|_| DispatchError::Message("runtime worker shutdown failed".to_owned()))
+    }
+
+    async fn reap_bounded(mut self) {
+        let Some(join) = self.0.as_mut() else {
+            return;
+        };
+        if tokio::time::timeout(runtime_worker_drop_watchdog(), &mut *join)
+            .await
+            .is_err()
+        {
+            join.abort();
+            let _ = join.await;
+        }
+        self.0.take();
+    }
+}
+
+impl Drop for OwnedRuntimeWorkerTask {
+    fn drop(&mut self) {
+        if let Some(join) = self.0.as_ref() {
+            join.abort();
+        }
+    }
+}
+
 impl RuntimeWorkerHandle {
     /// Stop admission and wait for every tracked runtime processor to exit.
     ///
@@ -354,15 +392,29 @@ impl RuntimeWorkerHandle {
                 "runtime worker join handle is absent",
             ));
         };
-        join.await
-            .map_err(|_| DispatchError::Message("runtime worker shutdown failed".to_owned()))
+        OwnedRuntimeWorkerTask(Some(join)).join().await
     }
 }
 
 impl Drop for RuntimeWorkerHandle {
     fn drop(&mut self) {
         self.shutdown.cancel();
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            join.abort();
+            return;
+        };
+        runtime.spawn(OwnedRuntimeWorkerTask(Some(join)).reap_bounded());
     }
+}
+
+fn runtime_worker_drop_watchdog() -> Duration {
+    #[cfg(test)]
+    return Duration::from_millis(100);
+    #[cfg(not(test))]
+    Duration::from_secs(2)
 }
 
 type ActiveTask = (CancellationToken, JoinHandle<Result<(), DispatchError>>);
@@ -574,5 +626,102 @@ async fn run_task(
             let _ = send_dispatch_error(&events, &cancellation, error).await;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    struct Reaped(Option<oneshot::Sender<()>>);
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            if let Some(reaped) = self.0.take() {
+                let _ = reaped.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_worker_handle_aborts_and_reaps_its_join() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (reaped_tx, reaped_rx) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _reaped = Reaped(Some(reaped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let handle = RuntimeWorkerHandle {
+            shutdown: CancellationToken::new(),
+            join: Some(join),
+        };
+
+        drop(handle);
+
+        tokio::time::timeout(Duration::from_secs(1), reaped_rx)
+            .await
+            .expect("dropped worker handle detached its join")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceling_worker_shutdown_aborts_and_reaps_its_taken_join() {
+        let shutdown = CancellationToken::new();
+        let observed_shutdown = shutdown.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (reaped_tx, reaped_rx) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _reaped = Reaped(Some(reaped_tx));
+            observed_shutdown.cancelled().await;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let handle = RuntimeWorkerHandle {
+            shutdown,
+            join: Some(join),
+        };
+        let shutdown_task = tokio::spawn(handle.shutdown());
+        started_rx.await.unwrap();
+
+        shutdown_task.abort();
+        let _ = shutdown_task.await;
+
+        tokio::time::timeout(Duration::from_secs(1), reaped_rx)
+            .await
+            .expect("canceled worker shutdown detached its taken join")
+            .unwrap();
+    }
+
+    #[test]
+    fn shutting_down_drop_reaper_runtime_aborts_the_worker_join() {
+        let worker_runtime = tokio::runtime::Runtime::new().unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (reaped_tx, reaped_rx) = oneshot::channel();
+        let join = worker_runtime.spawn(async move {
+            let _reaped = Reaped(Some(reaped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        worker_runtime.block_on(started_rx).unwrap();
+        let handle = RuntimeWorkerHandle {
+            shutdown: CancellationToken::new(),
+            join: Some(join),
+        };
+        let reaper_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        reaper_runtime.block_on(async move {
+            drop(handle);
+            tokio::task::yield_now().await;
+        });
+        drop(reaper_runtime);
+
+        worker_runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(1), reaped_rx).await })
+            .expect("reaper runtime shutdown detached the worker join")
+            .unwrap();
     }
 }

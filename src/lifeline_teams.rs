@@ -24,13 +24,21 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ArtifactManifest, ChannelDispatcher, CompletionEvidence, DispatchError, ExecutionBudget,
-    LifelineEndpoint, LifelineTopologyError, LifelineTopologyManifest, MeshDispatcher, MeshEvent,
-    MeshRequest, RunningLifelineTopology, RuntimeEventSink, RuntimeTask, RuntimeTaskProcessor,
-    RuntimeWorker, RuntimeWorkerConfig, RuntimeWorkerHandle, artifact_set_digest,
+    LifelineEndpoint, LifelineFailureEventKind, LifelineFailureTrace, LifelineFailureTransition,
+    LifelineTopologyError, LifelineTopologyManifest, MeshDispatcher, MeshEvent, MeshRequest,
+    RunningLifelineTopology, RuntimeEventSink, RuntimeTask, RuntimeTaskProcessor, RuntimeWorker,
+    RuntimeWorkerConfig, RuntimeWorkerHandle, artifact_set_digest,
 };
 
 pub const LIFELINE_TEAM_SCHEMA_VERSION: &str = "1.0.0";
 pub const LIFELINE_TEAM_DISCLAIMER: &str = "Fictional local simulation data only; not medical advice, clinical validation, authorization, or evidence of trust.";
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_JOURNAL_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_JOURNAL_FILE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RUNTIME_MONITORS_SPAWNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Debug, Error)]
 pub enum LifelineTeamError {
@@ -98,6 +106,7 @@ pub struct LifelineTeamDispatcher {
     authority_roles: [String; 3],
     registry: Arc<Mutex<TeamTaskRegistry>>,
     runtime_trace: RuntimeTraceHealth,
+    failure: Option<LifelineTeamFailureMode>,
 }
 
 pub struct RunningLifelineTeams {
@@ -125,6 +134,14 @@ struct RuntimeEventMonitor {
     join: Option<JoinHandle<Result<(), DispatchError>>>,
 }
 
+struct OwnedRuntimeMonitorTask(JoinHandle<Result<(), DispatchError>>);
+
+impl Drop for OwnedRuntimeMonitorTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Clone)]
 struct RuntimeTraceHealth {
     barriers: mpsc::Sender<oneshot::Sender<()>>,
@@ -145,6 +162,7 @@ struct LifelineTeamProcessor {
     journal: Arc<TeamJournal>,
     registry: Arc<Mutex<TeamTaskRegistry>>,
     runtime_trace: RuntimeTraceHealth,
+    failure: Option<LifelineTeamFailureMode>,
 }
 
 #[derive(Default)]
@@ -154,9 +172,35 @@ struct TeamTaskRegistry {
 }
 
 #[derive(Clone)]
+#[allow(clippy::struct_field_names)]
 struct TeamRequestSubject {
     task_id: String,
     context_id: String,
+    gateway_id: String,
+}
+
+#[derive(Clone)]
+pub struct LifelineTeamFailureMode {
+    trace: LifelineFailureTrace,
+    primary: Arc<Mutex<Option<FailurePrimaryBinding>>>,
+    primary_bound: Arc<tokio::sync::Notify>,
+    outage_emitted: Arc<AtomicBool>,
+    outage_ready: Arc<tokio::sync::Notify>,
+    internal_stopped: Arc<AtomicBool>,
+    internal_stop_ready: Arc<tokio::sync::Notify>,
+    public_cancel_confirmed: Arc<AtomicBool>,
+    public_cancel_ready: Arc<tokio::sync::Notify>,
+    primary_abandoned: Arc<AtomicBool>,
+    primary_abandon_ready: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone)]
+#[allow(clippy::struct_field_names)]
+struct FailurePrimaryBinding {
+    operation_id: String,
+    task_id: String,
+    context_id: String,
+    message_id: String,
 }
 
 #[derive(Clone)]
@@ -317,10 +361,42 @@ impl LifelineTeamManifest {
         self,
         journal_root: impl AsRef<Path>,
     ) -> Result<RunningLifelineTeams, LifelineTeamError> {
+        self.launch_with_failure(journal_root, None).await
+    }
+
+    /// Starts the reviewed Atlas-primary outage mode in the organization runtime.
+    ///
+    /// # Errors
+    /// Returns an error if private journals or organization runtime ownership fail.
+    pub async fn launch_failure(
+        self,
+        journal_root: impl AsRef<Path>,
+        failure: LifelineTeamFailureMode,
+    ) -> Result<RunningLifelineTeams, LifelineTeamError> {
+        self.launch_with_failure(journal_root, Some(failure)).await
+    }
+
+    async fn launch_with_failure(
+        self,
+        journal_root: impl AsRef<Path>,
+        failure: Option<LifelineTeamFailureMode>,
+    ) -> Result<RunningLifelineTeams, LifelineTeamError> {
         self.validate_approved()?;
         let journal_root = journal_root.as_ref();
         prepare_private_journal_root(journal_root)?;
         preflight_team_journals(journal_root, &self.teams)?;
+        let mut prepared_journals = HashMap::with_capacity(self.teams.len());
+        for team in &self.teams {
+            let journal_path = journal_root.join(format!("{}.jsonl", team.id));
+            let journal = Arc::new(TeamJournal::create(&journal_path)?);
+            let runtime_trace_path = journal_root.join(format!("{}.runtime.jsonl", team.id));
+            let runtime_trace = Arc::new(TeamJournal::create_runtime(&runtime_trace_path)?);
+            prepared_journals.insert(
+                team.id.clone(),
+                (journal_path, journal, runtime_trace_path, runtime_trace),
+            );
+        }
+        sync_journal_directory(journal_root)?;
         let mut dispatchers = HashMap::new();
         let mut organizations = HashMap::new();
         let mut journal_paths = HashMap::new();
@@ -330,10 +406,9 @@ impl LifelineTeamManifest {
         let mut workers = Vec::with_capacity(self.teams.len());
 
         for team in self.teams {
-            let journal_path = journal_root.join(format!("{}.jsonl", team.id));
-            let journal = Arc::new(TeamJournal::create(&journal_path)?);
-            let runtime_trace_path = journal_root.join(format!("{}.runtime.jsonl", team.id));
-            let runtime_trace = Arc::new(TeamJournal::create_runtime(&runtime_trace_path)?);
+            let (journal_path, journal, runtime_trace_path, runtime_trace) = prepared_journals
+                .remove(&team.id)
+                .ok_or_else(|| invariant("prepared team journals are absent"))?;
             let gateway_node_id = format!("{}-gateway", team.id);
             let mut network = Network::new();
             network.add_node(Node::named(&gateway_node_id));
@@ -359,6 +434,7 @@ impl LifelineTeamManifest {
                 journal: Arc::clone(&journal),
                 registry: Arc::clone(&registry),
                 runtime_trace: runtime_trace_health.clone(),
+                failure: failure.clone(),
             };
             let (dispatcher, worker) = RuntimeWorker::spawn_with_config(
                 runtime,
@@ -383,6 +459,7 @@ impl LifelineTeamManifest {
                     ],
                     registry: Arc::clone(&registry),
                     runtime_trace: runtime_trace_health.clone(),
+                    failure: failure.clone(),
                 };
                 dispatchers.insert(gateway.clone(), team_dispatcher);
                 organizations.insert(gateway.clone(), team.organization.clone());
@@ -416,14 +493,151 @@ impl LifelineTeamManifest {
         journal_root: impl AsRef<Path>,
     ) -> Result<RunningLifelineTeamTopology, LifelineTeamError> {
         let teams = self.launch(journal_root).await?;
-        let dispatchers = teams.dispatchers.clone();
-        match topology.launch_with_dispatchers(dispatchers).await {
-            Ok(topology) => Ok(RunningLifelineTeamTopology { topology, teams }),
-            Err(error) => {
-                let cleanup = teams.shutdown().await;
-                cleanup?;
-                Err(error.into())
+        launch_team_topology(topology, teams, None).await
+    }
+
+    /// Starts the reviewed topology with only the Atlas primary route faulted.
+    ///
+    /// # Errors
+    /// Returns an error if the organization runtimes, trace, or gateway topology fail.
+    pub async fn launch_failure_topology(
+        self,
+        topology: LifelineTopologyManifest,
+        journal_root: impl AsRef<Path>,
+        failure: LifelineTeamFailureMode,
+    ) -> Result<RunningLifelineTeamTopology, LifelineTeamError> {
+        let teams = self.launch_failure(journal_root, failure.clone()).await?;
+        launch_team_topology(topology, teams, Some(failure)).await
+    }
+}
+
+async fn launch_team_topology(
+    topology: LifelineTopologyManifest,
+    teams: RunningLifelineTeams,
+    failure: Option<LifelineTeamFailureMode>,
+) -> Result<RunningLifelineTeamTopology, LifelineTeamError> {
+    let dispatchers = teams.dispatchers.clone();
+    let launched = match failure {
+        Some(failure) => {
+            topology
+                .launch_with_failure_dispatchers(dispatchers, failure)
+                .await
+        }
+        None => topology.launch_with_dispatchers(dispatchers).await,
+    };
+    match launched {
+        Ok(topology) => Ok(RunningLifelineTeamTopology { topology, teams }),
+        Err(error) => {
+            let cleanup = teams.shutdown().await;
+            cleanup?;
+            Err(error.into())
+        }
+    }
+}
+
+impl LifelineTeamFailureMode {
+    #[must_use]
+    pub fn new(trace: LifelineFailureTrace) -> Self {
+        Self {
+            trace,
+            primary: Arc::new(Mutex::new(None)),
+            primary_bound: Arc::new(tokio::sync::Notify::new()),
+            outage_emitted: Arc::new(AtomicBool::new(false)),
+            outage_ready: Arc::new(tokio::sync::Notify::new()),
+            internal_stopped: Arc::new(AtomicBool::new(false)),
+            internal_stop_ready: Arc::new(tokio::sync::Notify::new()),
+            public_cancel_confirmed: Arc::new(AtomicBool::new(false)),
+            public_cancel_ready: Arc::new(tokio::sync::Notify::new()),
+            primary_abandoned: Arc::new(AtomicBool::new(false)),
+            primary_abandon_ready: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub(crate) fn trace(&self) -> LifelineFailureTrace {
+        self.trace.clone()
+    }
+
+    /// Binds the official A2A primary identity before releasing the outage processor.
+    ///
+    /// # Errors
+    /// Returns an error if the binding lock fails or a primary was already bound.
+    pub fn bind_primary(
+        &self,
+        operation_id: &str,
+        task_id: &str,
+        context_id: &str,
+        message_id: &str,
+    ) -> Result<(), LifelineTeamError> {
+        let mut primary = self
+            .primary
+            .lock()
+            .map_err(|_| invariant("failure binding lock poisoned"))?;
+        if primary.is_some() {
+            return Err(invariant("failure primary identity was already bound"));
+        }
+        *primary = Some(FailurePrimaryBinding {
+            operation_id: operation_id.to_owned(),
+            task_id: task_id.to_owned(),
+            context_id: context_id.to_owned(),
+            message_id: message_id.to_owned(),
+        });
+        drop(primary);
+        self.primary_bound.notify_waiters();
+        Ok(())
+    }
+
+    async fn primary_binding(&self) -> Result<FailurePrimaryBinding, DispatchError> {
+        loop {
+            let notified = self.primary_bound.notified();
+            if let Some(binding) = self
+                .primary
+                .lock()
+                .map_err(|_| DispatchError::message("failure binding lock poisoned"))?
+                .clone()
+            {
+                return Ok(binding);
             }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn wait_for_outage_signal(&self) {
+        loop {
+            let notified = self.outage_ready.notified();
+            if self.outage_emitted.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn mark_public_cancel_confirmed(&self) {
+        self.public_cancel_confirmed.store(true, Ordering::SeqCst);
+        self.public_cancel_ready.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_public_cancel_signal(&self) {
+        loop {
+            let notified = self.public_cancel_ready.notified();
+            if self.public_cancel_confirmed.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn abandon_primary(&self) {
+        self.primary_abandoned.store(true, Ordering::SeqCst);
+        self.primary_abandon_ready.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_primary_abandonment(&self) {
+        loop {
+            let notified = self.primary_abandon_ready.notified();
+            if self.primary_abandoned.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -500,6 +714,62 @@ impl RuntimeTaskProcessor for LifelineTeamProcessor {
                 "signal_hash": task.signal_hash,
             }),
         )?;
+        if subject.gateway_id == "atlas-primary"
+            && let Some(failure) = &self.failure
+        {
+            let binding = failure.primary_binding().await?;
+            if binding.task_id != subject.task_id || binding.context_id != subject.context_id {
+                return Err(DispatchError::message(
+                    "failure primary binding does not match runtime subject",
+                ));
+            }
+            failure
+                .trace
+                .record(LifelineFailureTransition {
+                    kind: LifelineFailureEventKind::PrimaryOutageObserved,
+                    operation_id: &binding.operation_id,
+                    gateway_id: &subject.gateway_id,
+                    context_id: &binding.context_id,
+                    task_id: Some(&binding.task_id),
+                    message_id: Some(&binding.message_id),
+                    attempt: 1,
+                    outcome: "unavailable",
+                    replaces_task_id: None,
+                })
+                .map_err(|error| DispatchError::message(error.to_string()))?;
+            events.progress("atlas primary route unavailable").await?;
+            failure.outage_emitted.store(true, Ordering::SeqCst);
+            failure.outage_ready.notify_waiters();
+            cancellation.cancelled().await;
+            let artifact_fenced = events
+                .artifact("late-primary.json", "application/json", "{}")
+                .await
+                .is_err();
+            let completion_fenced = events
+                .propose_completion("late primary completion")
+                .await
+                .is_err();
+            if !(artifact_fenced && completion_fenced) {
+                return Err(DispatchError::message(
+                    "late primary output escaped cancellation fence",
+                ));
+            }
+            failure
+                .trace
+                .record(LifelineFailureTransition {
+                    kind: LifelineFailureEventKind::LateOutputFenced,
+                    operation_id: &binding.operation_id,
+                    gateway_id: &subject.gateway_id,
+                    context_id: &binding.context_id,
+                    task_id: Some(&binding.task_id),
+                    message_id: Some(&binding.message_id),
+                    attempt: 1,
+                    outcome: "fenced",
+                    replaces_task_id: None,
+                })
+                .map_err(|error| DispatchError::message(error.to_string()))?;
+            return Ok(());
+        }
         let first = self
             .team
             .roles
@@ -974,7 +1244,39 @@ impl MeshDispatcher for LifelineTeamDispatcher {
     async fn cancel(&self, task_id: &str) -> Result<(), DispatchError> {
         self.inner
             .cancel(&scoped_task_id(&self.gateway_id, task_id))
-            .await
+            .await?;
+        if self.gateway_id == "atlas-primary"
+            && let Some(failure) = &self.failure
+        {
+            let binding = failure
+                .primary
+                .lock()
+                .map_err(|_| DispatchError::message("failure binding lock poisoned"))?
+                .clone()
+                .ok_or_else(|| DispatchError::message("failure primary binding is missing"))?;
+            if binding.task_id != task_id {
+                return Err(DispatchError::message(
+                    "failure cancellation identity does not match the primary",
+                ));
+            }
+            failure
+                .trace
+                .record(LifelineFailureTransition {
+                    kind: LifelineFailureEventKind::InternalProcessorStopped,
+                    operation_id: &binding.operation_id,
+                    gateway_id: &self.gateway_id,
+                    context_id: &binding.context_id,
+                    task_id: Some(&binding.task_id),
+                    message_id: Some(&binding.message_id),
+                    attempt: 1,
+                    outcome: "cooperative-stop",
+                    replaces_task_id: None,
+                })
+                .map_err(|error| DispatchError::message(error.to_string()))?;
+            failure.internal_stopped.store(true, Ordering::SeqCst);
+            failure.internal_stop_ready.notify_waiters();
+        }
+        Ok(())
     }
 }
 
@@ -986,6 +1288,7 @@ impl LifelineTeamDispatcher {
         let outer = TeamRequestSubject {
             task_id: request.task_id.clone(),
             context_id: request.context_id.clone(),
+            gateway_id: self.gateway_id.clone(),
         };
         let internal_task_id = scoped_task_id(&self.gateway_id, &request.task_id);
         let mut registry = self
@@ -1373,11 +1676,22 @@ fn prepare_private_journal_root(path: &Path) -> Result<(), LifelineTeamError> {
     Ok(())
 }
 
+fn sync_journal_directory(path: &Path) -> Result<(), LifelineTeamError> {
+    #[cfg(test)]
+    if FAIL_JOURNAL_DIRECTORY_SYNC.with(|failure| failure.replace(false)) {
+        return Err(std::io::Error::other("injected journal directory sync failure").into());
+    }
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
 impl RuntimeEventMonitor {
     fn spawn(
         mut events: mpsc::Receiver<RuntimeEvent>,
         journal: Arc<TeamJournal>,
     ) -> (Self, RuntimeTraceHealth) {
+        #[cfg(test)]
+        RUNTIME_MONITORS_SPAWNED.with(|count| count.set(count.get() + 1));
         let stop = CancellationToken::new();
         let stop_signal = stop.clone();
         let failed = Arc::new(AtomicBool::new(false));
@@ -1391,7 +1705,7 @@ impl RuntimeEventMonitor {
                         let Some(event) = event else {
                             return Ok(());
                         };
-                        capture_runtime_event(&journal, &monitor_failed, event)?;
+                        capture_runtime_event(&journal, &monitor_failed, event, &stop_signal).await?;
                     }
                     barrier = barrier_requests.recv() => {
                         let Some(barrier) = barrier else {
@@ -1401,7 +1715,7 @@ impl RuntimeEventMonitor {
                     }
                     () = stop_signal.cancelled() => {
                         while let Ok(event) = events.try_recv() {
-                            capture_runtime_event(&journal, &monitor_failed, event)?;
+                            capture_runtime_event(&journal, &monitor_failed, event, &stop_signal).await?;
                         }
                         return Ok(());
                     }
@@ -1419,25 +1733,38 @@ impl RuntimeEventMonitor {
 
     async fn shutdown(mut self) -> Result<(), DispatchError> {
         self.stop.cancel();
-        self.join
-            .take()
-            .expect("runtime monitor join handle is present until shutdown")
-            .await
-            .map_err(|_| DispatchError::message("runtime event monitor failed"))?
+        let mut join = OwnedRuntimeMonitorTask(
+            self.join
+                .take()
+                .expect("runtime monitor join handle is present until shutdown"),
+        );
+        if let Ok(result) = tokio::time::timeout(runtime_trace_watchdog(), &mut join.0).await {
+            result.map_err(|_| DispatchError::message("runtime event monitor failed"))?
+        } else {
+            join.0.abort();
+            let _ = (&mut join.0).await;
+            Err(DispatchError::message(
+                "runtime event monitor shutdown deadline exceeded",
+            ))
+        }
     }
 }
 
 impl RuntimeTraceHealth {
     async fn verify(&self) -> Result<(), DispatchError> {
         self.ensure_healthy()?;
-        let (ack, observed) = oneshot::channel();
-        self.barriers
-            .send(ack)
-            .await
-            .map_err(|_| DispatchError::message("runtime trace capture is unavailable"))?;
-        observed
-            .await
-            .map_err(|_| DispatchError::message("runtime trace capture failed"))?;
+        tokio::time::timeout(runtime_trace_watchdog(), async {
+            let (ack, observed) = oneshot::channel();
+            self.barriers
+                .send(ack)
+                .await
+                .map_err(|_| DispatchError::message("runtime trace capture is unavailable"))?;
+            observed
+                .await
+                .map_err(|_| DispatchError::message("runtime trace capture failed"))
+        })
+        .await
+        .map_err(|_| DispatchError::message("runtime trace capture deadline exceeded"))??;
         self.ensure_healthy()
     }
 
@@ -1450,21 +1777,39 @@ impl RuntimeTraceHealth {
     }
 }
 
-impl Drop for RuntimeEventMonitor {
-    fn drop(&mut self) {
-        self.stop.cancel();
+fn runtime_trace_watchdog() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(100)
+    } else {
+        Duration::from_secs(2)
     }
 }
 
-fn capture_runtime_event(
+impl Drop for RuntimeEventMonitor {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
+    }
+}
+
+async fn capture_runtime_event(
     journal: &TeamJournal,
     failed: &AtomicBool,
     event: RuntimeEvent,
+    stop: &CancellationToken,
 ) -> Result<(), DispatchError> {
-    record_runtime_event(journal, event).inspect_err(|_| failed.store(true, Ordering::SeqCst))
+    record_runtime_event(journal, event, stop)
+        .await
+        .inspect_err(|_| failed.store(true, Ordering::SeqCst))
 }
 
-fn record_runtime_event(journal: &TeamJournal, event: RuntimeEvent) -> Result<(), DispatchError> {
+async fn record_runtime_event(
+    journal: &TeamJournal,
+    event: RuntimeEvent,
+    stop: &CancellationToken,
+) -> Result<(), DispatchError> {
     let (kind, data) = match event {
         RuntimeEvent::SignalEmitted { hash } => {
             ("signal_emitted", serde_json::json!({"hash": hash}))
@@ -1501,16 +1846,34 @@ fn record_runtime_event(journal: &TeamJournal, event: RuntimeEvent) -> Result<()
             serde_json::json!({"peer_id": peer_id.clone()}),
         ),
     };
-    journal.record(kind, &data)
+    loop {
+        match journal.record(kind, &data) {
+            Ok(()) => return Ok(()),
+            Err(DispatchError::Message(message)) if message == "team journal is unavailable" => {
+                tokio::select! {
+                    biased;
+                    () = stop.cancelled() => {
+                        return Err(DispatchError::message("team journal is unavailable"));
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 impl TeamJournal {
     fn create(path: &Path) -> Result<Self, std::io::Error> {
-        Self::create_with_kind(path, false)
+        let journal = Self::create_with_kind(path, false)?;
+        journal.sync_preflight()?;
+        Ok(journal)
     }
 
     fn create_runtime(path: &Path) -> Result<Self, std::io::Error> {
-        Self::create_with_kind(path, true)
+        let journal = Self::create_with_kind(path, true)?;
+        journal.sync_preflight()?;
+        Ok(journal)
     }
 
     fn create_with_kind(path: &Path, runtime_trace: bool) -> Result<Self, std::io::Error> {
@@ -1566,8 +1929,8 @@ impl TeamJournal {
         }
         let mut state = self
             .state
-            .lock()
-            .map_err(|_| DispatchError::message("team journal lock poisoned"))?;
+            .try_lock()
+            .map_err(|_| DispatchError::message("team journal is unavailable"))?;
         if state.event_count >= MAX_EVENTS {
             return Err(DispatchError::message("team journal event limit reached"));
         }
@@ -1607,6 +1970,16 @@ impl TeamJournal {
             .map_err(|_| std::io::Error::other("team journal lock poisoned"))?
             .file
             .sync_all()
+    }
+
+    fn sync_preflight(&self) -> Result<(), std::io::Error> {
+        #[cfg(test)]
+        if FAIL_JOURNAL_FILE_SYNC.with(|failure| failure.replace(false)) {
+            return Err(std::io::Error::other(
+                "injected team journal file synchronization failure",
+            ));
+        }
+        self.sync()
     }
 }
 
@@ -1653,6 +2026,244 @@ fn invariant(message: impl Into<String>) -> LifelineTeamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn journal_file_sync_failure_precedes_runtime_spawn() {
+        let root = std::env::temp_dir().join(format!(
+            "smesh-journal-file-sync-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let manifest =
+            LifelineTeamManifest::from_json(include_str!("../deploy/lifeline-teams.json")).unwrap();
+        FAIL_JOURNAL_FILE_SYNC.with(|failure| failure.set(true));
+        RUNTIME_MONITORS_SPAWNED.with(|count| count.set(0));
+
+        let result = manifest.launch(&root).await;
+
+        assert!(result.is_err());
+        assert_eq!(RUNTIME_MONITORS_SPAWNED.with(std::cell::Cell::get), 0);
+        assert!(!FAIL_JOURNAL_FILE_SYNC.with(std::cell::Cell::get));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn journal_directory_sync_failure_precedes_runtime_spawn() {
+        let root = std::env::temp_dir().join(format!(
+            "smesh-journal-launch-sync-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let manifest =
+            LifelineTeamManifest::from_json(include_str!("../deploy/lifeline-teams.json")).unwrap();
+        FAIL_JOURNAL_DIRECTORY_SYNC.with(|failure| failure.set(true));
+        RUNTIME_MONITORS_SPAWNED.with(|count| count.set(0));
+
+        let result = manifest.launch(&root).await;
+
+        assert!(result.is_err());
+        assert_eq!(RUNTIME_MONITORS_SPAWNED.with(std::cell::Cell::get), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn journal_directory_sync_failure_is_not_acknowledged() {
+        let root = std::env::temp_dir().join(format!(
+            "smesh-journal-sync-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        FAIL_JOURNAL_DIRECTORY_SYNC.with(|failure| failure.set(true));
+
+        let result = sync_journal_directory(&root);
+
+        assert!(result.is_err());
+        assert!(!FAIL_JOURNAL_DIRECTORY_SYNC.with(std::cell::Cell::get));
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn public_team_error_shape_remains_exhaustive() {
+        fn classify(error: &LifelineTeamError) -> &'static str {
+            match error {
+                LifelineTeamError::Json(_) => "json",
+                LifelineTeamError::Io(_) => "io",
+                LifelineTeamError::Runtime(_) => "runtime",
+                LifelineTeamError::Topology(_) => "topology",
+                LifelineTeamError::Invariant(_) => "invariant",
+            }
+        }
+        assert_eq!(
+            classify(&LifelineTeamError::Invariant("test".into())),
+            "invariant"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_stop_does_not_release_transport_before_public_cancel() {
+        let path = std::env::temp_dir().join(format!(
+            "smesh-failure-signal-{}-{}.jsonl",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let failure = LifelineTeamFailureMode::new(LifelineFailureTrace::create(&path).unwrap());
+        failure.internal_stopped.store(true, Ordering::SeqCst);
+        failure.internal_stop_ready.notify_waiters();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                failure.wait_for_public_cancel_signal(),
+            )
+            .await
+            .is_err()
+        );
+        failure.mark_public_cancel_confirmed();
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            failure.wait_for_public_cancel_signal(),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[allow(clippy::await_holding_lock)] // Holds the journal gate to prove monitor shutdown cannot block on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_monitor_shutdown_rejects_a_busy_journal_without_blocking() {
+        let path = std::env::temp_dir().join(format!(
+            "smesh-runtime-monitor-{}-{}.jsonl",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let journal = Arc::new(TeamJournal::create_runtime(&path).unwrap());
+        let (events, receiver) = mpsc::channel(1);
+        let (monitor, _health) = RuntimeEventMonitor::spawn(receiver, Arc::clone(&journal));
+        let gate = journal.state.lock().unwrap();
+        events
+            .send(RuntimeEvent::TickCompleted {
+                tick: 1,
+                active_signals: 0,
+                expired: 0,
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let result = tokio::time::timeout(Duration::from_millis(250), monitor.shutdown()).await;
+        drop(gate);
+
+        assert!(result.unwrap().is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_runtime_monitor_aborts_and_reaps_its_join() {
+        struct Reaped(Option<oneshot::Sender<()>>);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (reaped, observed) = oneshot::channel();
+        let (started, running) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _reaped = Reaped(Some(reaped));
+            let _ = started.send(());
+            std::future::pending::<Result<(), DispatchError>>().await
+        });
+        running.await.unwrap();
+        drop(RuntimeEventMonitor {
+            stop: CancellationToken::new(),
+            join: Some(join),
+        });
+
+        tokio::time::timeout(Duration::from_millis(20), observed)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceling_runtime_monitor_shutdown_aborts_its_taken_join() {
+        struct Reaped(Option<oneshot::Sender<()>>);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (reaped, observed) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _reaped = Reaped(Some(reaped));
+            std::future::pending::<Result<(), DispatchError>>().await
+        });
+        let monitor = RuntimeEventMonitor {
+            stop: CancellationToken::new(),
+            join: Some(join),
+        };
+        let shutdown = tokio::spawn(monitor.shutdown());
+        tokio::task::yield_now().await;
+        shutdown.abort();
+        let _ = shutdown.await;
+
+        tokio::time::timeout(Duration::from_millis(50), observed)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_monitor_shutdown_is_bounded_and_reaped() {
+        struct Reaped(Option<oneshot::Sender<()>>);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (reaped, observed) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _reaped = Reaped(Some(reaped));
+            std::future::pending::<Result<(), DispatchError>>().await
+        });
+        let monitor = RuntimeEventMonitor {
+            stop: CancellationToken::new(),
+            join: Some(join),
+        };
+
+        let result = tokio::time::timeout(Duration::from_millis(250), monitor.shutdown()).await;
+
+        assert!(result.unwrap().is_err());
+        tokio::time::timeout(Duration::from_millis(20), observed)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[allow(clippy::await_holding_lock)] // Deliberately stalls trace capture to reproduce the cleanup race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_trace_barrier_wait_is_bounded() {
+        let (barriers, receiver) = mpsc::channel(1);
+        let (occupied, _occupied_rx) = oneshot::channel();
+        barriers.try_send(occupied).unwrap();
+        let health = RuntimeTraceHealth {
+            barriers,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+
+        let result = tokio::time::timeout(Duration::from_millis(250), health.verify()).await;
+        drop(receiver);
+
+        assert!(result.unwrap().is_err());
+    }
 
     #[allow(clippy::await_holding_lock)] // Deliberately stalls trace capture to reproduce the cleanup race.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
