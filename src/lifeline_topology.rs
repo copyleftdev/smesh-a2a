@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -42,10 +43,95 @@ pub struct RunningLifelineTopology {
     cards: Vec<(String, AgentCard)>,
     cancellation: tokio_util::sync::CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<Result<(), std::io::Error>>>,
+    failure_sse_tasks: FailureSseTasks,
+}
+
+type FailureSseTasks = std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+
+#[derive(Clone)]
+struct FailureSseState {
+    failure: crate::LifelineTeamFailureMode,
+    tasks: FailureSseTasks,
 }
 
 struct OwnedServerTasks {
     tasks: std::collections::VecDeque<tokio::task::JoinHandle<Result<(), std::io::Error>>>,
+}
+
+struct OwnedFailureSseTasks(FailureSseTasks);
+
+struct OwnedFailureTaskSet(std::collections::VecDeque<tokio::task::JoinHandle<()>>);
+
+impl Drop for OwnedFailureTaskSet {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+impl OwnedFailureSseTasks {
+    fn take_tasks(&self) -> Result<OwnedFailureTaskSet, LifelineTopologyError> {
+        let mut tasks = self
+            .0
+            .lock()
+            .map_err(|_| LifelineTopologyError::Server("failure SSE task lock poisoned".into()))?;
+        Ok(OwnedFailureTaskSet(std::mem::take(&mut *tasks).into()))
+    }
+
+    async fn abort_and_join(&mut self) -> Result<(), LifelineTopologyError> {
+        let mut tasks = self.take_tasks()?;
+        for task in &tasks.0 {
+            task.abort();
+        }
+        while let Some(task) = tasks.0.pop_front() {
+            let _ = task.await;
+        }
+        Ok(())
+    }
+
+    async fn join(&mut self) -> Result<(), LifelineTopologyError> {
+        let mut tasks = self.take_tasks()?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+        while let Some(mut task) = tasks.0.pop_front() {
+            match tokio::time::timeout_at(deadline, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    for remaining in &tasks.0 {
+                        remaining.abort();
+                    }
+                    while let Some(remaining) = tasks.0.pop_front() {
+                        let _ = remaining.await;
+                    }
+                    return Err(LifelineTopologyError::Server(error.to_string()));
+                }
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    for remaining in &tasks.0 {
+                        remaining.abort();
+                    }
+                    while let Some(remaining) = tasks.0.pop_front() {
+                        let _ = remaining.await;
+                    }
+                    return Err(LifelineTopologyError::Server(
+                        "failure SSE task shutdown deadline exceeded".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OwnedFailureSseTasks {
+    fn drop(&mut self) {
+        if let Ok(tasks) = self.0.lock() {
+            for task in tasks.iter() {
+                task.abort();
+            }
+        }
+    }
 }
 
 impl OwnedServerTasks {
@@ -387,8 +473,32 @@ impl LifelineTopologyManifest {
     }
 
     pub(crate) async fn launch_with_dispatchers<D>(
+        self,
+        dispatchers: HashMap<String, D>,
+    ) -> Result<RunningLifelineTopology, LifelineTopologyError>
+    where
+        D: crate::MeshDispatcher + Clone,
+    {
+        self.launch_with_dispatchers_and_failure(dispatchers, None)
+            .await
+    }
+
+    pub(crate) async fn launch_with_failure_dispatchers<D>(
+        self,
+        dispatchers: HashMap<String, D>,
+        failure: crate::LifelineTeamFailureMode,
+    ) -> Result<RunningLifelineTopology, LifelineTopologyError>
+    where
+        D: crate::MeshDispatcher + Clone,
+    {
+        self.launch_with_dispatchers_and_failure(dispatchers, Some(failure))
+            .await
+    }
+
+    async fn launch_with_dispatchers_and_failure<D>(
         mut self,
         dispatchers: HashMap<String, D>,
+        failure: Option<crate::LifelineTeamFailureMode>,
     ) -> Result<RunningLifelineTopology, LifelineTopologyError>
     where
         D: crate::MeshDispatcher + Clone,
@@ -404,6 +514,7 @@ impl LifelineTopologyManifest {
             "dispatcher map must exactly match topology gateways",
         )?;
         self.validate()?;
+        let failure_sse_tasks = FailureSseTasks::default();
         let mut listeners = Vec::with_capacity(self.listener_count());
         for (gateway_index, gateway) in self.gateways.iter_mut().enumerate() {
             for (listener_index, listener) in gateway.listeners.iter_mut().enumerate() {
@@ -439,11 +550,20 @@ impl LifelineTopologyManifest {
                 .get(&gateway.id)
                 .ok_or_else(|| invariant("gateway dispatcher is missing"))?
                 .clone();
-            routers.push(crate::server::build_router_with_agent_card(
-                config,
-                dispatcher,
-                card.clone(),
-            ));
+            let mut router =
+                crate::server::build_router_with_agent_card(config, dispatcher, card.clone());
+            if gateway.id == "atlas-primary"
+                && let Some(failure) = failure.clone()
+            {
+                router = router.layer(axum::middleware::from_fn_with_state(
+                    FailureSseState {
+                        failure,
+                        tasks: failure_sse_tasks.clone(),
+                    },
+                    fail_primary_sse_after_outage,
+                ));
+            }
+            routers.push(router);
             cards.push((gateway.id.clone(), card));
         }
 
@@ -473,8 +593,68 @@ impl LifelineTopologyManifest {
             cards,
             cancellation,
             tasks,
+            failure_sse_tasks,
         })
     }
+}
+
+async fn fail_primary_sse_after_outage(
+    axum::extract::State(state): axum::extract::State<FailureSseState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let failure = state.failure;
+    let response = next.run(request).await;
+    let is_sse = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    if !is_sse {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let stream = futures::stream::unfold(
+        (
+            Some(body.into_data_stream().boxed()),
+            failure,
+            state.tasks,
+            false,
+        ),
+        |(body, failure, tasks, faulted)| async move {
+            if faulted {
+                return None;
+            }
+            let mut body = body?;
+            tokio::select! {
+                biased;
+                () = failure.wait_for_outage_signal() => {
+                    let held_failure = failure.clone();
+                    let task = tokio::spawn(async move {
+                        tokio::select! {
+                            () = held_failure.wait_for_public_cancel_signal() => {}
+                            () = held_failure.wait_for_primary_abandonment() => {}
+                        }
+                        drop(body);
+                    });
+                    match tasks.lock() {
+                        Ok(mut registered) => registered.push(task),
+                        Err(_) => task.abort(),
+                    }
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "fictional atlas primary endpoint outage",
+                    );
+                    Some((Err(error), (None, failure, tasks, true)))
+                }
+                item = body.next() => item.map(|item| {
+                    let item = item.map_err(|_| std::io::Error::other("SSE body failed"));
+                    (item, (Some(body), failure, tasks, false))
+                }),
+            }
+        },
+    );
+    axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
 impl LifelineEndpoint {
@@ -519,6 +699,7 @@ impl RunningLifelineTopology {
     pub async fn shutdown(mut self) -> Result<(), LifelineTopologyError> {
         self.cancellation.cancel();
         let mut tasks = OwnedServerTasks::new(std::mem::take(&mut self.tasks));
+        let mut failure_sse_tasks = OwnedFailureSseTasks(self.failure_sse_tasks.clone());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while let Some(task) = tasks.tasks.front_mut() {
             let outcome = tokio::time::timeout_at(deadline, task).await;
@@ -527,15 +708,18 @@ impl RunningLifelineTopology {
                 Ok(Ok(Err(error))) => {
                     tasks.tasks.pop_front();
                     tasks.abort_and_join().await;
+                    failure_sse_tasks.abort_and_join().await?;
                     return Err(LifelineTopologyError::Server(error.to_string()));
                 }
                 Ok(Err(error)) => {
                     tasks.tasks.pop_front();
                     tasks.abort_and_join().await;
+                    failure_sse_tasks.abort_and_join().await?;
                     return Err(LifelineTopologyError::Server(error.to_string()));
                 }
                 Err(_) => {
                     tasks.abort_and_join().await;
+                    failure_sse_tasks.abort_and_join().await?;
                     return Err(LifelineTopologyError::Server(
                         "shutdown deadline exceeded".to_owned(),
                     ));
@@ -543,6 +727,7 @@ impl RunningLifelineTopology {
             }
             tasks.tasks.pop_front();
         }
+        failure_sse_tasks.join().await?;
         Ok(())
     }
 }
@@ -552,6 +737,11 @@ impl Drop for RunningLifelineTopology {
         self.cancellation.cancel();
         for task in &self.tasks {
             task.abort();
+        }
+        if let Ok(tasks) = self.failure_sse_tasks.lock() {
+            for task in tasks.iter() {
+                task.abort();
+            }
         }
     }
 }
@@ -667,6 +857,7 @@ mod tests {
             cards: Vec::new(),
             cancellation: tokio_util::sync::CancellationToken::new(),
             tasks: vec![task],
+            failure_sse_tasks: Arc::default(),
         };
 
         assert!(
@@ -701,6 +892,7 @@ mod tests {
             cards: Vec::new(),
             cancellation: tokio_util::sync::CancellationToken::new(),
             tasks: vec![failed, pending],
+            failure_sse_tasks: Arc::default(),
         };
 
         let error = topology.shutdown().await.unwrap_err();
@@ -711,6 +903,40 @@ mod tests {
         assert!(
             dropped.load(Ordering::SeqCst),
             "task after failed listener was detached instead of reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_error_aborts_and_reaps_failure_sse_tasks() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task_started = Arc::clone(&started);
+        let pending = tokio::spawn(async move {
+            let _dropped = Dropped(task_dropped);
+            task_started.notify_one();
+            std::future::pending::<()>().await;
+        });
+        started.notified().await;
+        let failure_sse_tasks = Arc::new(std::sync::Mutex::new(vec![pending]));
+        let topology = RunningLifelineTopology {
+            endpoints: Vec::new(),
+            cards: Vec::new(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            tasks: vec![tokio::spawn(async {
+                Err(std::io::Error::other("injected listener failure"))
+            })],
+            failure_sse_tasks,
+        };
+
+        let error = topology.shutdown().await.unwrap_err();
+
+        assert!(
+            matches!(error, LifelineTopologyError::Server(message) if message == "injected listener failure")
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "failure SSE task was not reaped before shutdown returned"
         );
     }
 
@@ -731,6 +957,7 @@ mod tests {
             cards: Vec::new(),
             cancellation: tokio_util::sync::CancellationToken::new(),
             tasks: vec![task],
+            failure_sse_tasks: Arc::default(),
         };
 
         let error = topology.shutdown().await.unwrap_err();
