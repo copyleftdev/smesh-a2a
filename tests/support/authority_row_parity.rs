@@ -9,7 +9,7 @@ use rusqlite::{Connection, types::ValueRef};
 use serde_json::{Map, Value};
 use tokio_postgres::Client;
 
-pub const AUTHORITY_TABLES: [&str; 25] = [
+pub const AUTHORITY_TABLES: [&str; 28] = [
     "store_metadata",
     "store_identity",
     "tasks",
@@ -25,6 +25,9 @@ pub const AUTHORITY_TABLES: [&str; 25] = [
     "cancellation_intents",
     "authorization_decisions",
     "audit_projection_outbox",
+    "ratification_key_check",
+    "ratification_packets",
+    "ratification_events",
     "callback_policy_snapshots",
     "callback_enrollments",
     "callback_configs",
@@ -402,6 +405,27 @@ fn normalize(tables: &mut BTreeMap<String, Vec<Value>>) {
                 object.insert("metadata_digest".into(), Value::String(alias));
             }
             match table.as_str() {
+                "tasks" => {
+                    // PostgreSQL alone persists the policy part of trusted admission provenance
+                    // on the task for later ratification. Normalize only these three enumerated
+                    // columns and retain shared principal/authentication plus every other field.
+                    let postgres_only_provenance = [
+                        "authorization_policy_id",
+                        "authorization_policy_revision",
+                        "authorization_policy_digest",
+                    ];
+                    let present = postgres_only_provenance
+                        .iter()
+                        .filter(|field| object.contains_key(**field))
+                        .count();
+                    assert!(
+                        present == 0 || present == postgres_only_provenance.len(),
+                        "partial PostgreSQL task policy provenance row"
+                    );
+                    for field in postgres_only_provenance {
+                        object.remove(field);
+                    }
+                }
                 "store_metadata" => {
                     // Physical migration counters are backend-local (SQLite 7,
                     // PostgreSQL 6); both represent the same current logical

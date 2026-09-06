@@ -297,11 +297,16 @@ impl DurableRequestHandler {
             }
             return Err(A2AError::invalid_request("forbidden"));
         };
-        let scope = OwnedTaskScope::new_with_principal(
+        let authentication_method = match context.authentication_method() {
+            crate::auth::AuthenticationMethod::BearerJwt => "bearer-jwt",
+            crate::auth::AuthenticationMethod::MutualTls => "mutual-tls",
+        };
+        let scope = OwnedTaskScope::new_with_principal_and_authentication(
             context.tenant_id(),
             context.account_id(),
             context.principal_scope(),
             visibility,
+            authentication_method,
         )?;
         Ok(Some((context, scope)))
     }

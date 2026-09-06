@@ -722,6 +722,17 @@ fn spawn_durable_driver_inner(
                     return Err(a2a::A2AError::task_not_found(&lease.task_id));
                 };
                 let admitted_task = task.clone();
+                let mut approved_task = task.clone();
+                let candidate_artifacts = extract_artifacts(&lease.dispatch_id, &events)?;
+                approved_task.artifacts = (!candidate_artifacts.is_empty()).then_some(candidate_artifacts);
+                approved_task.status = TaskStatus {
+                    state: TaskState::Completed,
+                    message: Some(Message::new(
+                        Role::Agent,
+                        vec![Part::text("Candidate completion awaiting human ratification")],
+                    )),
+                    timestamp: chrono::DateTime::from_timestamp_millis(clock.now()),
+                };
                 apply_terminal_events(
                     &mut task,
                     &lease.dispatch_id,
@@ -737,11 +748,32 @@ fn spawn_durable_driver_inner(
                     clock.now(),
                 );
                 let committed_state = task.status.state.clone();
-                let result = SendMessageResponse::Task(task.clone());
-                if authority
-                    .commit_delivery(&lease, task, result, &public_transcript, clock.now())
-                    .await?
-                    == TransitionOutcome::Applied
+                let candidate = ratification_candidate(&task, &events)?;
+                let outcome = if let Some(candidate) = candidate {
+                    let approved_transcript = build_public_transcript(
+                        &admitted_task,
+                        &approved_task,
+                        &events,
+                        public_transcript.get(1).cloned(),
+                        clock.now(),
+                    );
+                    authority
+                        .commit_delivery_for_ratification(
+                            &lease,
+                            approved_task.clone(),
+                            SendMessageResponse::Task(approved_task),
+                            &approved_transcript,
+                            candidate,
+                            clock.now(),
+                        )
+                        .await?
+                } else {
+                    let result = SendMessageResponse::Task(task.clone());
+                    authority
+                        .commit_delivery(&lease, task, result, &public_transcript, clock.now())
+                        .await?
+                };
+                if outcome == TransitionOutcome::Applied
                 {
                     if let Some(telemetry) = &telemetry {
                         let task_state = telemetry_task_state(&committed_state);
@@ -820,52 +852,12 @@ fn apply_terminal_events(
     termination: &DurableReceiverTermination,
     now: i64,
 ) -> Result<(), a2a::A2AError> {
-    let mut artifacts = Vec::new();
+    let artifacts = extract_artifacts(dispatch_id, events)?;
     let mut completed_summary = None;
-    for (index, event) in events.iter().enumerate() {
+    for event in events {
         match event {
-            MeshEvent::Artifact {
-                name,
-                media_type,
-                content,
-            } => match crate::bridge::internal_artifact_payload(content) {
-                Some(crate::bridge::InternalArtifactPayload::Published { projection }) => {
-                    artifacts.push(
-                        serde_json::from_str(&projection)
-                            .map_err(|_| a2a::A2AError::invalid_agent_response())?,
-                    );
-                }
-                Some(crate::bridge::InternalArtifactPayload::Binary { bytes }) => {
-                    use base64::Engine as _;
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(bytes)
-                        .map_err(|_| a2a::A2AError::invalid_agent_response())?;
-                    artifacts.push(Artifact {
-                        artifact_id: format!(
-                            "artifact-{}",
-                            &content_digest(format!("{dispatch_id}\0{index}").as_bytes())[..32]
-                        ),
-                        name: Some(name.clone()),
-                        description: Some("Durably replayable SMESH output".to_owned()),
-                        parts: vec![Part::raw(bytes).with_media_type(media_type.clone())],
-                        metadata: None,
-                        extensions: None,
-                    });
-                }
-                None => artifacts.push(Artifact {
-                    artifact_id: format!(
-                        "artifact-{}",
-                        &content_digest(format!("{dispatch_id}\0{index}").as_bytes())[..32]
-                    ),
-                    name: Some(name.clone()),
-                    description: Some("Durably replayable SMESH output".to_owned()),
-                    parts: vec![Part::text(content.clone()).with_media_type(media_type.clone())],
-                    metadata: None,
-                    extensions: None,
-                }),
-            },
             MeshEvent::Completed { summary } => completed_summary = Some(summary.clone()),
-            MeshEvent::Progress(_) | MeshEvent::Evidence(_) => {}
+            MeshEvent::Artifact { .. } | MeshEvent::Progress(_) | MeshEvent::Evidence(_) => {}
         }
     }
     let (state, summary, keep_artifacts) = match termination {
@@ -895,6 +887,127 @@ fn apply_terminal_events(
     };
     task.artifacts = (keep_artifacts && !artifacts.is_empty()).then_some(artifacts);
     Ok(())
+}
+
+fn extract_artifacts(
+    dispatch_id: &str,
+    events: &[MeshEvent],
+) -> Result<Vec<Artifact>, a2a::A2AError> {
+    let mut artifacts = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        let MeshEvent::Artifact {
+            name,
+            media_type,
+            content,
+        } = event
+        else {
+            continue;
+        };
+        let artifact = match crate::bridge::internal_artifact_payload(content) {
+            Some(crate::bridge::InternalArtifactPayload::Published { projection }) => {
+                serde_json::from_str(&projection)
+                    .map_err(|_| a2a::A2AError::invalid_agent_response())?
+            }
+            Some(crate::bridge::InternalArtifactPayload::Binary { bytes }) => {
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(bytes)
+                    .map_err(|_| a2a::A2AError::invalid_agent_response())?;
+                Artifact {
+                    artifact_id: format!(
+                        "artifact-{}",
+                        &content_digest(format!("{dispatch_id}\0{index}").as_bytes())[..32]
+                    ),
+                    name: Some(name.clone()),
+                    description: Some("Durably replayable SMESH output".to_owned()),
+                    parts: vec![Part::raw(bytes).with_media_type(media_type.clone())],
+                    metadata: None,
+                    extensions: None,
+                }
+            }
+            None => Artifact {
+                artifact_id: format!(
+                    "artifact-{}",
+                    &content_digest(format!("{dispatch_id}\0{index}").as_bytes())[..32]
+                ),
+                name: Some(name.clone()),
+                description: Some("Durably replayable SMESH output".to_owned()),
+                parts: vec![Part::text(content.clone()).with_media_type(media_type.clone())],
+                metadata: None,
+                extensions: None,
+            },
+        };
+        artifacts.push(artifact);
+    }
+    Ok(artifacts)
+}
+
+fn ratification_candidate(
+    task: &a2a::Task,
+    events: &[MeshEvent],
+) -> Result<Option<crate::AuthoritativeReviewCandidate>, a2a::A2AError> {
+    if task.status.state != TaskState::InputRequired {
+        return Ok(None);
+    }
+    let Some(policy) = task
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("smesh.completionPolicy"))
+    else {
+        return Ok(None);
+    };
+    if policy.get("status").and_then(serde_json::Value::as_str) != Some("awaitingRatification") {
+        return Ok(None);
+    }
+    let checkpoint: crate::PolicyCheckpoint = serde_json::from_value(
+        policy
+            .get("record")
+            .cloned()
+            .ok_or_else(a2a::A2AError::invalid_agent_response)?,
+    )
+    .map_err(|_| a2a::A2AError::invalid_agent_response())?;
+    if checkpoint.task_id != task.id || checkpoint.context_id != task.context_id {
+        return Err(a2a::A2AError::invalid_agent_response());
+    }
+    let evidence = events
+        .iter()
+        .filter_map(|event| match event {
+            MeshEvent::Evidence(
+                crate::CompletionEvidence::Review { evidence, .. }
+                | crate::CompletionEvidence::Test { evidence, .. }
+                | crate::CompletionEvidence::Contradiction { evidence, .. },
+            ) => Some(evidence.clone()),
+            MeshEvent::Evidence(crate::CompletionEvidence::Attestation { attestation, .. }) => {
+                serde_json::to_vec(attestation).ok()
+            }
+            MeshEvent::Evidence(crate::CompletionEvidence::Ratification(_))
+            | MeshEvent::Progress(_)
+            | MeshEvent::Artifact { .. }
+            | MeshEvent::Completed { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let observed_hashes = evidence
+        .iter()
+        .map(|value| content_digest(value))
+        .collect::<Vec<_>>();
+    if observed_hashes != checkpoint.evidence_hashes {
+        return Err(a2a::A2AError::invalid_agent_response());
+    }
+    let checkpoint_bytes =
+        serde_json::to_vec(&checkpoint).map_err(|_| a2a::A2AError::invalid_agent_response())?;
+    crate::AuthoritativeReviewCandidate::new(
+        checkpoint.policy_id,
+        checkpoint.policy_version,
+        checkpoint.policy_hash,
+        checkpoint_bytes,
+        evidence,
+        format!(
+            "completion assurance: {} basis points",
+            checkpoint.assurance_bps
+        ),
+    )
+    .map(Some)
+    .map_err(|_| a2a::A2AError::invalid_agent_response())
 }
 
 fn build_progress_frame(task: &a2a::Task, progress: String, now: i64) -> StreamResponse {
@@ -1243,6 +1356,71 @@ mod tests {
     }
 
     crate::impl_unsupported_artifact_authority!(PanickingAuthority);
+
+    #[tokio::test]
+    async fn authority_without_ratification_commit_support_fails_closed() {
+        let authority = PanickingAuthority {
+            release: Arc::new(Notify::new()),
+            claims: std::sync::Mutex::new(Vec::new()),
+        };
+        let task = a2a::Task {
+            id: "unsupported-ratification-task".to_owned(),
+            context_id: "unsupported-ratification-context".to_owned(),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: chrono::DateTime::from_timestamp_millis(10),
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let lease = OutboxLease {
+            tenant_scope: "unsupported-ratification-tenant".to_owned(),
+            outbox_id: 1,
+            dispatch_id: "unsupported-ratification-dispatch".to_owned(),
+            task_id: task.id.clone(),
+            attempt_no: 1,
+            max_attempts: 1,
+            lease_owner: "worker".to_owned(),
+            lease_token: "lease-token".to_owned(),
+            lease_until: 100,
+            request: crate::MeshRequest {
+                protocol: "a2a".to_owned(),
+                task_id: task.id.clone(),
+                context_id: task.context_id.clone(),
+                text: "candidate".to_owned(),
+            },
+            execution_reservation: None,
+        };
+        let candidate = crate::AuthoritativeReviewCandidate::new(
+            "release-policy",
+            1,
+            content_digest(b"release-policy"),
+            b"checkpoint".to_vec(),
+            vec![b"evidence".to_vec()],
+            "uncertainty remains",
+        )
+        .expect("candidate");
+
+        let error = authority
+            .commit_delivery_for_ratification(
+                &lease,
+                task.clone(),
+                SendMessageResponse::Task(task),
+                &[],
+                candidate,
+                10,
+            )
+            .await
+            .expect_err("unsupported authority must not commit an unreachable review state");
+
+        assert!(
+            error
+                .to_string()
+                .contains("human ratification is unsupported")
+        );
+    }
 
     #[tokio::test]
     async fn dropping_driver_requests_cooperative_shutdown_before_reaping_root() {

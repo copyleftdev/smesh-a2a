@@ -261,11 +261,12 @@ async fn populated_postgres_migration_rewrites_causal_copies_and_exact_rerun_is_
       INSERT INTO {schema}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,to_state,event_json,created_at) VALUES('tenant-a','task-1',1,1,'completed','\"TASK_STATE_COMPLETED\"','{}',1);
       SET session_replication_role=origin;
       INSERT INTO {schema}.retained_authority_usage(tenant_scope,scope_kind,scope_id,retained_bytes,updated_at) VALUES
-       ('tenant-a','tenant','tenant-a',0,1),('tenant-a','account','account-a',0,1),('tenant-a','principal','account:account-a',0,1);
+       ('tenant-a','tenant','tenant-a',0,1),('tenant-a','account','account-a',0,1),
+       ('tenant-a','principal','account:account-a',0,1),('tenant-a','principal','legacy-principal',0,1);
       UPDATE {schema}.retained_authority_usage SET retained_bytes=CASE scope_kind
        WHEN 'tenant' THEN {schema}.retained_authority_oracle('tenant-a',NULL)
        WHEN 'account' THEN {schema}.retained_authority_account_oracle('tenant-a','account-a')
-       ELSE {schema}.retained_authority_oracle('tenant-a','account:account-a') END;",
+       ELSE {schema}.retained_authority_oracle('tenant-a',scope_id) END;",
       inline.replace('\'', "''"), inline.replace('\'', "''"))).await.unwrap();
 
     assert!(matches!(
@@ -286,7 +287,8 @@ async fn populated_postgres_migration_rewrites_causal_copies_and_exact_rerun_is_
             .iter()
             .filter(|outcome| outcome.is_ok())
             .count(),
-        1
+        1,
+        "{migration_outcomes:?}"
     );
     assert_eq!(
         migration_outcomes

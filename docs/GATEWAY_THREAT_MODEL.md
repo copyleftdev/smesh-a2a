@@ -21,6 +21,8 @@ In scope:
 - bounded runtime trace and optional OTLP/audit projection;
 - migrator/operator maintenance, retention, backup, restore, and reconciliation;
 - process crash, restart, load, slow-consumer, and fault-recovery behavior.
+- issue #27 human-ratification key custody, public bootstrap, authenticated browser/API review,
+  immutable receipts, and atomic decision/publication effects.
 
 Security objectives:
 
@@ -53,6 +55,8 @@ M2 claims.
 - PostgreSQL migration/projection proofs, runtime role boundaries, backup/restore journals, and audit
   projection rows;
 - runtime-trace required evidence and redacted operational telemetry.
+- frozen private human-review candidates, ordered evidence/artifact digests, ratification HMAC key
+  generation/check material, review acknowledgements, decisions, and receipt chains.
 
 ## Actors and assumptions
 
@@ -68,6 +72,9 @@ M2 claims.
   replay semantic IDs, control its own callback DNS/HTTP server, stall streams, and attempt resource
   exhaustion. It cannot set its authoritative account, tenant membership, lease, fence, clock, quota,
   projection proof, or operator capability.
+- **Human ratifier:** a server-authenticated `kind: human` account with the dedicated
+  `humanRatifier` role. It may review and decide only in its enrolled tenant; browser-supplied actor,
+  tenant, policy, packet, revision, timestamp, and key-generation claims are not authority.
 - **Runtime processor or mesh peer:** may emit progress, artifacts, errors, and completion proposals. Its
   output is untrusted until validated and accepted by completion policy and durable authority.
 - **Runtime database role:** may execute only the sealed runtime API under forced RLS. Caller-settable
@@ -116,6 +123,10 @@ Offline operator/migrator -> retention / migration / restore / key rotation
 
 Bearer verifier -> bounded HTTPS/no-proxy/no-redirect JWKS fetch -> external identity provider
         TB9 external identity-key boundary -> validated bounded cache / singleflight rotation
+
+Public fixed ratification shell/script ------------------------------+
+Authenticated human -> protected packet GET -> exact review/decision v
+        TB10 human-decision boundary -> integrated durable authority -> public/suppressed result
 ```
 
 ### TB1 - public transport
@@ -193,6 +204,33 @@ is rate-limited and singleflight; a failed refresh fails authentication rather t
 unverified token. Cached keys remain bearer authority until their bounded freshness expires. Compromise
 of the external issuer/CA or malicious but correctly signed identity remains an IdP governance risk.
 
+### TB10 - human ratification
+
+`SMESH_A2A_RATIFICATION_HMAC_KEY_PATH` enables routes only on the authenticated/authorized SQLite or
+PostgreSQL production authority in `loopback` mode with an actual loopback listener IP. The key is
+exactly 32 raw bytes read once from an absolute, owner-owned, owner-private, no-follow regular-file
+descriptor. Only its versioned generation commitment/check is durable; wrong-key reopen fails before
+readiness. Online ratification-key rotation is not implemented.
+
+The public console and script are fixed, data-free bootstrap bytes. Protected packet/history access
+requires an authenticated human-ratifier. Mutations authenticate and authorize before checking exact
+canonical Origin, byte-exact `application/json`, one opaque actor-specific strong `If-Match`, and one
+bounded idempotency header, all before JSON decoding. Every response is no-store with restrictive CSP,
+nosniff, no-referrer, restrictive Permissions-Policy, and no permissive CORS. The browser keeps bearer
+credentials only in memory and renders untrusted strings as text.
+
+The same actor must inspect canonical, publication-equivalent JSON containing every private artifact
+payload and all artifact/part publication fields, then acknowledge every exact evidence/artifact
+digest, the canonical artifact-manifest digest, and uncertainty before deciding. Manifest bytes are
+derived by decoding the frozen task through the same A2A task decoder used at publication. This
+task-bound ratification view does not grant `HumanRatifier` broad artifact read or resolve authority.
+Chained HMAC receipts are immutable. Receipt, authorization audit, task/event transition, private
+candidate publication or suppression, amendment quota/idempotency/outbox work, and terminal callback
+creation share one authority transaction. Approve alone publishes the sealed candidate; reject
+suppresses it; amend keeps it private and starts a new generation. External callback and audit receivers
+remain at-least-once boundaries and deduplicate stable identities. See
+[`HUMAN_RATIFICATION_RUNBOOK.md`](HUMAN_RATIFICATION_RUNBOOK.md).
+
 ## STRIDE analysis and executable controls
 
 | Category | Threat | Enforced control | Repeatable evidence |
@@ -219,6 +257,10 @@ of the external issuer/CA or malicious but correctly signed identity remains an 
 | Elevation of privilege | Caller-set tenant GUC grants cleanup/projection/operator capability | Runtime execute revoked; migrator-only API/proof; fixed search path; catalog/grant validation | `postgres_authorization_retention`, `postgres_store`, issue #72 review |
 | Elevation of privilege | Runtime event directly publishes completion or evidence | Processor sink cannot grant policy evidence; completion policy independently validates canonical evidence | `executor`, `runtime_worker`, completion-policy tests |
 | Elevation of privilege | Filesystem blob or Agent Card metadata grants authority | PostgreSQL metadata/scoped join is authority; Agent Card is discovery only | artifact authority tests, agent-card/auth tests |
+| Spoofing | Service/non-ratifier or browser-supplied actor makes a human decision | Server-derived bearer/mTLS principal; human-only role; same-actor review/decision | `human_ratification`, `human_ratification_process`, `postgres_ratification` |
+| Tampering | Stale tab, altered packet, conflicting idempotency reuse, or partial decision effects | Opaque actor/view-bound strong ETag; transactional recheck; chained receipts; one atomic audit/task/publication/quota/outbox/callback commit | ratification HTTP/two-tab/rollback/restart matrices |
+| Information disclosure | Public bootstrap, browser credential handling, errors, or private candidates leak protected data | Fixed data-free bootstrap; protected APIs; memory-only bearer; text rendering; no-store/CSP; private candidate until approval; canary scans | production Chromium and process ratification suites |
+| Elevation of privilege | Standalone ledger or worker proposal becomes production completion authority | Production routes use only integrated SQLite/PostgreSQL task authority; exact human gate; standalone ledger remains compatibility/test-only | real-binary route and integrated authority tests |
 
 ## Abuse and recovery qualification
 
@@ -276,7 +318,15 @@ The following are explicitly accepted for M2 and must not be silently upgraded i
     Deployment-specific authenticated evidence issuers, revocation, and durable freshness remain required.
 18. Cryptographic security depends on protecting key material/backups and on the stated SHA-256,
     AES-256-GCM, HMAC, TLS, and signature assumptions.
+19. Human-ratification HMAC key rotation, HSM/KMS custody, and managed human enrollment/revocation are
+    not implemented by issue #27. The matching key must accompany restart/restore; a wrong key fails.
+20. Bearer production Chromium and deterministic two-tab recovery are browser-tested. Lower-level
+    production mTLS process tests pass and Chromium rejects a missing client certificate, but real
+    Chromium mTLS client-certificate acceptance is skipped: Puppeteer/CDP has no chooser API, Chrome
+    152 ignored command-line auto-selection, and managed exact-origin policy installation was denied.
+21. Issue #27 contributes M3 readiness evidence only. Release, merge, remote CI, and milestone
+    completion are not claimed before the exact tree is merged and those gates are read back.
 
-Any change that crosses TB1-TB9, adds a new authority field, widens an enum/schema, creates an unbounded
+Any change that crosses TB1-TB10, adds a new authority field, widens an enum/schema, creates an unbounded
 queue/cardinality source, or changes RPO/RTO requires an updated threat row, executable regression, and
 independent exact-tree review.

@@ -229,12 +229,27 @@ pub(crate) fn valid_bounded_identity(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && value.is_ascii()
 }
 
+pub(crate) fn principal_and_authentication_are_valid(
+    principal_scope: &str,
+    authentication_method: &str,
+) -> bool {
+    !principal_scope.is_empty()
+        && principal_scope.len() <= 256
+        && principal_scope.is_ascii()
+        && !principal_scope.contains('\0')
+        && !authentication_method.is_empty()
+        && authentication_method.len() <= 64
+        && authentication_method.is_ascii()
+        && !authentication_method.contains('\0')
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedTaskScope {
     pub(crate) tenant_scope: String,
     pub(crate) owner_account_id: String,
     pub(crate) principal_scope: String,
     pub(crate) visibility: VisibilityScope,
+    pub(crate) authentication_method: String,
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -260,17 +275,35 @@ impl OwnedTaskScope {
         principal_scope: impl Into<String>,
         visibility: VisibilityScope,
     ) -> Result<Self, A2AError> {
+        Self::new_with_principal_and_authentication(
+            tenant_scope,
+            owner_account_id,
+            principal_scope,
+            visibility,
+            "trusted-local",
+        )
+    }
+
+    pub fn new_with_principal_and_authentication(
+        tenant_scope: impl Into<String>,
+        owner_account_id: impl Into<String>,
+        principal_scope: impl Into<String>,
+        visibility: VisibilityScope,
+        authentication_method: impl Into<String>,
+    ) -> Result<Self, A2AError> {
         let value = Self {
             tenant_scope: tenant_scope.into(),
             owner_account_id: owner_account_id.into(),
             principal_scope: principal_scope.into(),
             visibility,
+            authentication_method: authentication_method.into(),
         };
         if !valid_bounded_identity(&value.tenant_scope)
             || !valid_bounded_identity(&value.owner_account_id)
-            || value.principal_scope.is_empty()
-            || value.principal_scope.len() > 256
-            || !value.principal_scope.is_ascii()
+            || !principal_and_authentication_are_valid(
+                &value.principal_scope,
+                &value.authentication_method,
+            )
         {
             return Err(A2AError::invalid_request("invalid owned task scope"));
         }
@@ -295,6 +328,11 @@ impl OwnedTaskScope {
     #[must_use]
     pub const fn visibility(&self) -> VisibilityScope {
         self.visibility
+    }
+
+    #[must_use]
+    pub fn authentication_method(&self) -> &str {
+        &self.authentication_method
     }
 }
 
@@ -1630,6 +1668,48 @@ pub trait AuthorityIdentity: Send + Sync {
     fn callback_authority(&self) -> Option<&dyn crate::CallbackAuthority> {
         None
     }
+    /// Optional backend-neutral human-ratification authority.
+    fn ratification_authority(&self) -> Option<&dyn RatificationAuthority> {
+        None
+    }
+}
+
+#[async_trait]
+pub trait RatificationAuthority: Send + Sync {
+    async fn ratification_view(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+    ) -> Result<Option<crate::RatificationView>, A2AError>;
+
+    async fn acknowledge_ratification_review(
+        &self,
+        scope: &OwnedTaskScope,
+        command: crate::ReviewAcknowledgement,
+        audit: AuthorizationAuditInput,
+    ) -> Result<crate::HumanRatificationReceipt, A2AError>;
+
+    async fn decide_ratification(
+        &self,
+        scope: &OwnedTaskScope,
+        command: crate::RatificationCommand,
+        audit: AuthorizationAuditInput,
+    ) -> Result<crate::HumanRatificationReceipt, A2AError>;
+
+    async fn decide_ratification_with_quota(
+        &self,
+        scope: &OwnedTaskScope,
+        command: crate::RatificationCommand,
+        audit: AuthorizationAuditInput,
+        amendment_quota_intent: Option<&crate::QuotaIntent>,
+    ) -> Result<crate::HumanRatificationReceipt, A2AError> {
+        if amendment_quota_intent.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "quota-bound ratification decisions are unsupported",
+            ));
+        }
+        self.decide_ratification(scope, command, audit).await
+    }
 }
 
 #[async_trait]
@@ -1783,6 +1863,20 @@ pub trait OutboxAuthority: Send + Sync {
         public_transcript: &[StreamResponse],
         now: i64,
     ) -> Result<TransitionOutcome, A2AError>;
+    async fn commit_delivery_for_ratification(
+        &self,
+        lease: &OutboxLease,
+        task: Task,
+        result: SendMessageResponse,
+        public_transcript: &[StreamResponse],
+        candidate: crate::AuthoritativeReviewCandidate,
+        now: i64,
+    ) -> Result<TransitionOutcome, A2AError> {
+        let _ = (lease, task, result, public_transcript, candidate, now);
+        Err(A2AError::unsupported_operation(
+            "human ratification is unsupported by this durable authority",
+        ))
+    }
 }
 
 #[async_trait]

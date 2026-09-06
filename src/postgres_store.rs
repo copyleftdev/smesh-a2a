@@ -77,8 +77,15 @@ const CALLBACK_POLICY_FENCE_MIGRATION_NAME: &str = "0008_callback_policy_fence";
 const AUTHORIZATION_RETENTION_MIGRATION_SQL: &str =
     include_str!("../migrations/postgres/0009_authorization_audit_retention.sql");
 const AUTHORIZATION_RETENTION_MIGRATION_NAME: &str = "0009_authorization_audit_retention";
-const LOGICAL_SCHEMA_VERSION: i64 = 6;
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const RATIFICATION_MIGRATION_SQL: &str =
+    include_str!("../migrations/postgres/0010_human_ratification.sql");
+const RATIFICATION_MIGRATION_NAME: &str = "0010_human_ratification";
+const RATIFICATION_RETAINED_MIGRATION_SQL: &str =
+    include_str!("../migrations/postgres/0011_ratification_retained_authority.sql");
+const RATIFICATION_RETAINED_MIGRATION_NAME: &str = "0011_ratification_retained_authority";
+const LEGACY_LOGICAL_SCHEMA_VERSION: i64 = 6;
+const LOGICAL_SCHEMA_VERSION: i64 = 11;
+const CURRENT_SCHEMA_VERSION: i64 = 11;
 const MAX_CONFIG_BYTES: usize = 4096;
 const ACTIVE_CALLBACK_ENROLLMENT_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM __S__.callback_enrollments WHERE tenant_scope=$1 AND enrollment_id=$2 AND enrollment_generation=$3 AND canonical_url=$4 AND url_digest=$5 AND policy_id=$6 AND policy_revision=$7 AND policy_revision=(SELECT max(policy_revision) FROM __S__.callback_policy_snapshots))";
 const CALLBACK_POLICY_FENCE_LOCK: i64 = 6_001_136_200_065;
@@ -187,6 +194,9 @@ pub(crate) const EXPECTED_TABLES: &[&str] = &[
     "quota_receipts",
     "quota_request_receipts",
     "quota_reservations",
+    "ratification_events",
+    "ratification_key_check",
+    "ratification_packets",
     "receiver_frames",
     "receiver_inbox",
     "retained_authority_usage",
@@ -251,6 +261,8 @@ const TENANT_TABLES: &[&str] = &[
     "quota_receipts",
     "quota_request_receipts",
     "quota_reservations",
+    "ratification_events",
+    "ratification_packets",
     "receiver_frames",
     "receiver_inbox",
     "retained_authority_usage",
@@ -317,6 +329,8 @@ const EXPECTED_CUSTOM_INDEXES: &[&str] = &[
     "quota_receipts_scope_lookup",
     "quota_request_receipts_mutation_lookup",
     "quota_reservations_principal_state",
+    "ratification_events_packet",
+    "ratification_packets_active",
     "receiver_inbox_reclaim",
     "retained_authority_usage_principal",
     "stream_transcripts_task",
@@ -357,6 +371,7 @@ pub struct PostgresStoreConfig {
     quota_policy: Option<Arc<crate::QuotaPolicy>>,
     quota_reconciliation_plan: Option<Arc<crate::QuotaReconciliationPlan>>,
     push_policy: Option<Arc<crate::push::PushPolicy>>,
+    ratification_key: Option<Arc<zeroize::Zeroizing<[u8; 32]>>>,
     max_tasks: usize,
     artifact_store: Option<Arc<ArtifactStoreConfig>>,
     artifact_migration_plan: Option<Arc<ArtifactMigrationPlan>>,
@@ -418,6 +433,10 @@ impl fmt::Debug for PostgresStoreConfig {
             .field("quota_enforcement", &self.quota_enforcement)
             .field("quota_policy_configured", &self.quota_policy.is_some())
             .field("push_policy_configured", &self.push_policy.is_some())
+            .field(
+                "ratification_key_configured",
+                &self.ratification_key.is_some(),
+            )
             .field(
                 "quota_reconciliation_plan_configured",
                 &self.quota_reconciliation_plan.is_some(),
@@ -490,6 +509,7 @@ impl PostgresStoreConfig {
             quota_policy: None,
             quota_reconciliation_plan: None,
             push_policy: None,
+            ratification_key: None,
             max_tasks: 1024,
             artifact_store: None,
             artifact_migration_plan: None,
@@ -525,6 +545,13 @@ impl PostgresStoreConfig {
         if let Some(cleanup) = self.test_cleanup.take() {
             cleanup.armed.store(false, Ordering::SeqCst);
         }
+        self
+    }
+
+    /// Bind production human-ratification records to an operator-owned key.
+    #[must_use]
+    pub fn with_ratification_key(mut self, key: zeroize::Zeroizing<[u8; 32]>) -> Self {
+        self.ratification_key = Some(Arc::new(key));
         self
     }
 
@@ -696,6 +723,14 @@ pub enum PostgresStoreError {
     TlsRequired,
     #[error("PostgreSQL durable-authority initialization failed")]
     Initialization,
+    #[error("PostgreSQL retained-authority materialization does not match its oracle")]
+    RetainedAuthorityMaterializationMismatch,
+    #[error("PostgreSQL retained-authority tenant quota exceeded during migration")]
+    RetainedAuthorityTenantQuotaExceeded,
+    #[error("PostgreSQL retained-authority account quota exceeded during migration")]
+    RetainedAuthorityAccountQuotaExceeded,
+    #[error("PostgreSQL retained-authority principal quota exceeded during migration")]
+    RetainedAuthorityPrincipalQuotaExceeded,
     #[error("PostgreSQL durable-authority schema is unsupported or corrupt")]
     InvalidSchema,
     #[error("PostgreSQL durable-authority pool is unavailable")]
@@ -730,6 +765,8 @@ pub struct PostgresTaskStore {
     schema: Arc<str>,
     cursor_key: Arc<[u8; 32]>,
     receipt_key: Arc<[u8; 32]>,
+    ratification_key: Arc<zeroize::Zeroizing<[u8; 32]>>,
+    ratification_enabled: bool,
     acquire_timeout: Duration,
     observation: ChangeObservation,
     max_tasks: usize,
@@ -1000,7 +1037,7 @@ impl crate::ArtifactAuthority for PostgresTaskStore {
                     if intent.operation()!=crate::QuotaOperation::TaskGet {
                         return Err(A2AError::invalid_params("artifact request quota intent mismatch"));
                     }
-                    store.apply_quota_intent(tx,intent,scope.tenant_scope(),scope.owner_account_id(),None,now,true,None).await?;
+                    store.apply_quota_intent(tx,intent,scope.tenant_scope(),scope.owner_account_id(),None,now,true,None,None).await?;
                 }
                 let own=matches!(scope.visibility(),VisibilityScope::Own);
                 let q=store.q("SELECT m.owner_account_id,m.task_id,m.media_type,o.content_digest,m.manifest_digest,o.plaintext_length,o.classification,o.encryption_domain,o.ciphertext_digest,o.ciphertext_length,o.backend_locator,o.nonce,o.key_generation,m.canonical_json,o.state FROM __S__.artifact_references r JOIN __S__.artifact_manifests m USING(tenant_scope,artifact_id) JOIN __S__.content_objects o USING(tenant_scope,object_id) WHERE r.tenant_scope=$1 AND r.artifact_id=$2 AND r.state='active' AND o.state IN ('available','quarantined') AND o.retain_until>=$6 AND ($3::text IS NULL OR r.task_id=$3) AND (NOT $4 OR r.owner_account_id=$5) FOR UPDATE OF o");
@@ -1015,7 +1052,7 @@ impl crate::ArtifactAuthority for PostgresTaskStore {
                     let subject=crate::QuotaSubject::new(scope.tenant_scope(),scope.owner_account_id(),intent.principal_scope.to_string()).map_err(|_|crate::quota::quota_authority_unavailable())?;
                     let egress=policy.egress_intent(&subject,&intent.semantic_id,plaintext_length.max(1),1).map_err(|_|crate::quota::quota_authority_unavailable())?;
                     *transaction_egress_intent.lock().map_err(|_|crate::quota::quota_authority_unavailable())?=Some(egress.clone());
-                    store.apply_quota_intent(tx,&egress,scope.tenant_scope(),scope.owner_account_id(),None,now,true,None).await?;
+                    store.apply_quota_intent(tx,&egress,scope.tenant_scope(),scope.owner_account_id(),None,now,true,None,None).await?;
                 }
                 if row.get::<_, &str>(14) == "quarantined" {
                     store.insert_audit(tx,audit.decided(AuthorizationDecisionEffect::Deny,"artifact_quarantined",Some(row.get(1)))).await?;
@@ -1967,6 +2004,17 @@ impl PostgresTaskStore {
             .inspect_err(|_| {
                 eprintln!("smesh.postgres.validation_failed category=catalog");
             })?;
+        let ratification_enabled = config.ratification_key.is_some();
+        let ratification_key = reconcile_ratification_key(
+            &migration,
+            &config.schema,
+            config.ratification_key.clone(),
+            &receipt_key,
+        )
+        .await
+        .inspect_err(|_| {
+            eprintln!("smesh.postgres.validation_failed category=ratification_key");
+        })?;
 
         if let Some(keyring) = artifact_keyring.as_ref() {
             migration
@@ -2204,6 +2252,11 @@ impl PostgresTaskStore {
                 &[],
             )
             .await
+            .inspect_err(|error| {
+                eprintln!(
+                    "smesh.postgres.validation_failed category=authority_tenants error={error:?}"
+                );
+            })
             .map_err(|_| PostgresStoreError::InvalidSchema)?;
         let mut quota_policy_mismatch = false;
         for row in tenants {
@@ -2242,10 +2295,11 @@ impl PostgresTaskStore {
             }
             let account_rows = validation
                 .query(
-                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_account_oracle($1,scopes.scope_id)+{}.artifact_retained_account_oracle($1,scopes.scope_id)+{}.callback_retained_account_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'account') scope_id UNION SELECT DISTINCT {}.callback_retained_scopes_bounded($1,'account') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='account') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='account' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema, config.schema, config.schema, config.schema),
+                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_account_oracle($1,scopes.scope_id)+{}.artifact_retained_account_oracle($1,scopes.scope_id)+{}.callback_retained_account_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'account') scope_id UNION SELECT DISTINCT {}.artifact_retained_scopes_bounded($1,'account') scope_id UNION SELECT DISTINCT {}.callback_retained_scopes_bounded($1,'account') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='account') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='account' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema, config.schema, config.schema, config.schema, config.schema),
                     &[&tenant],
                 )
                 .await
+                .inspect_err(|error| eprintln!("smesh.postgres.validation_failed category=retained_account_query error={error:?}"))
                 .map_err(|_| PostgresStoreError::InvalidSchema)?;
             if account_rows
                 .iter()
@@ -2257,10 +2311,11 @@ impl PostgresTaskStore {
             }
             let principal_rows = validation
                 .query(
-                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_oracle($1,scopes.scope_id)+{}.artifact_retained_oracle($1,scopes.scope_id)+{}.callback_retained_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'principal') scope_id UNION SELECT DISTINCT {}.callback_retained_scopes_bounded($1,'principal') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='principal') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='principal' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema, config.schema, config.schema, config.schema),
+                    &format!("SELECT scopes.scope_id,COALESCE(u.retained_bytes,-1),{}.retained_authority_oracle($1,scopes.scope_id)+{}.artifact_retained_oracle($1,scopes.scope_id)+{}.callback_retained_oracle($1,scopes.scope_id) FROM (SELECT DISTINCT {}.authority_retained_scopes_bounded($1,'principal') scope_id UNION SELECT DISTINCT {}.artifact_retained_scopes_bounded($1,'principal') scope_id UNION SELECT DISTINCT {}.callback_retained_scopes_bounded($1,'principal') scope_id UNION SELECT scope_id FROM {}.retained_authority_usage WHERE tenant_scope=$1 AND scope_kind='principal') scopes LEFT JOIN {}.retained_authority_usage u ON u.tenant_scope=$1 AND u.scope_kind='principal' AND u.scope_id=scopes.scope_id ORDER BY scopes.scope_id", config.schema, config.schema, config.schema, config.schema, config.schema, config.schema, config.schema, config.schema),
                     &[&tenant],
                 )
                 .await
+                .inspect_err(|error| eprintln!("smesh.postgres.validation_failed category=retained_principal_query error={error:?}"))
                 .map_err(|_| PostgresStoreError::InvalidSchema)?;
             if principal_rows
                 .iter()
@@ -2294,7 +2349,7 @@ impl PostgresTaskStore {
                     break;
                 }
             }
-            validate_semantics(&*validation, &config.schema, &cursor_key)
+            validate_semantics(&*validation, &config.schema, &cursor_key, &ratification_key)
                 .await
                 .inspect_err(|_| {
                     eprintln!("smesh.postgres.validation_failed category=semantics");
@@ -2313,6 +2368,8 @@ impl PostgresTaskStore {
             schema: config.schema,
             cursor_key: Arc::new(cursor_key),
             receipt_key: Arc::new(receipt_key),
+            ratification_key,
+            ratification_enabled,
             acquire_timeout: config.acquire_timeout,
             observation: ChangeObservation::new(Duration::from_millis(100))
                 .map_err(|_| PostgresStoreError::Initialization)?,
@@ -3017,6 +3074,7 @@ impl PostgresTaskStore {
         now: i64,
         insert_if_missing: bool,
         request: Option<&SendMessageRequest>,
+        input_bytes_override: Option<u64>,
     ) -> Result<(), A2AError> {
         let policy = self
             .quota_policy
@@ -3032,14 +3090,19 @@ impl PostgresTaskStore {
         }
         let subject = crate::QuotaSubject::new(tenant, account, intent.principal_scope.as_ref())
             .map_err(|_| A2AError::invalid_request("quota intent binding mismatch"))?;
-        let input_bytes = request.map_or(Ok(0), |request| {
-            u64::try_from(
-                serde_json::to_vec(request)
-                    .map_err(|_| A2AError::internal("failed to measure quota input"))?
-                    .len(),
-            )
-            .map_err(|_| A2AError::invalid_request("quota input is too large"))
-        })?;
+        let input_bytes = input_bytes_override.map_or_else(
+            || {
+                request.map_or(Ok(0), |request| {
+                    u64::try_from(
+                        serde_json::to_vec(request)
+                            .map_err(|_| A2AError::internal("failed to measure quota input"))?
+                            .len(),
+                    )
+                    .map_err(|_| A2AError::invalid_request("quota input is too large"))
+                })
+            },
+            Ok,
+        )?;
         let expected = if intent.operation() == crate::QuotaOperation::PublicEgress {
             let bytes = intent
                 .charges()
@@ -4678,6 +4741,27 @@ async fn reconcile_callback_retained_usage(
         .map_err(|_| PostgresStoreError::Initialization)
 }
 
+fn map_ratification_retained_migration_error(error: &tokio_postgres::Error) -> PostgresStoreError {
+    match error
+        .as_db_error()
+        .map(tokio_postgres::error::DbError::message)
+    {
+        Some("retained authority materialization mismatch") => {
+            PostgresStoreError::RetainedAuthorityMaterializationMismatch
+        }
+        Some("retained authority tenant quota exceeded") => {
+            PostgresStoreError::RetainedAuthorityTenantQuotaExceeded
+        }
+        Some("retained authority account quota exceeded") => {
+            PostgresStoreError::RetainedAuthorityAccountQuotaExceeded
+        }
+        Some("retained authority principal quota exceeded") => {
+            PostgresStoreError::RetainedAuthorityPrincipalQuotaExceeded
+        }
+        _ => PostgresStoreError::Initialization,
+    }
+}
+
 async fn migrate(
     client: &mut tokio_postgres::Client,
     schema: &str,
@@ -4799,7 +4883,9 @@ async fn migrate(
             .await
             .map_err(|_| PostgresStoreError::InvalidSchema)?
             .ok_or(PostgresStoreError::InvalidSchema)?;
-        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION || row.get::<_, String>(1) != checksum {
+        if row.get::<_, i64>(0) != LEGACY_LOGICAL_SCHEMA_VERSION
+            || row.get::<_, String>(1) != checksum
+        {
             return Err(PostgresStoreError::InvalidSchema);
         }
     }
@@ -4812,7 +4898,7 @@ async fn migrate(
         .await
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
     if let Some(row) = quota_row {
-        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+        if row.get::<_, i64>(0) != LEGACY_LOGICAL_SCHEMA_VERSION
             || row.get::<_, String>(1) != quota_checksum
         {
             return Err(PostgresStoreError::InvalidSchema);
@@ -4859,7 +4945,7 @@ async fn migrate(
         .await
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
     if let Some(row) = fence_row {
-        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+        if row.get::<_, i64>(0) != LEGACY_LOGICAL_SCHEMA_VERSION
             || row.get::<_, String>(1) != fence_checksum
         {
             return Err(PostgresStoreError::InvalidSchema);
@@ -4906,7 +4992,7 @@ async fn migrate(
         .await
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
     if let Some(row) = distributed_quota_row {
-        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+        if row.get::<_, i64>(0) != LEGACY_LOGICAL_SCHEMA_VERSION
             || row.get::<_, String>(1) != distributed_quota_checksum
         {
             return Err(PostgresStoreError::InvalidSchema);
@@ -4957,7 +5043,7 @@ async fn migrate(
         .await
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
     if let Some(row) = artifact_row {
-        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+        if row.get::<_, i64>(0) != LEGACY_LOGICAL_SCHEMA_VERSION
             || row.get::<_, String>(1) != artifact_checksum
         {
             return Err(PostgresStoreError::InvalidSchema);
@@ -5000,7 +5086,7 @@ async fn migrate(
     let audit_row = tx.query_opt(&format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=6"), &[])
         .await.map_err(|_| PostgresStoreError::InvalidSchema)?;
     if let Some(row) = audit_row {
-        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+        if row.get::<_, i64>(0) != LEGACY_LOGICAL_SCHEMA_VERSION
             || row.get::<_, String>(1) != audit_checksum
         {
             return Err(PostgresStoreError::InvalidSchema);
@@ -5137,8 +5223,7 @@ async fn migrate(
         .await
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
     if let Some(row) = authorization_retention_row {
-        if row.get::<_, i64>(0) != CURRENT_SCHEMA_VERSION
-            || row.get::<_, String>(1) != authorization_retention_checksum
+        if row.get::<_, i64>(0) != 9 || row.get::<_, String>(1) != authorization_retention_checksum
         {
             return Err(PostgresStoreError::InvalidSchema);
         }
@@ -5184,6 +5269,131 @@ async fn migrate(
         .map_err(|_| PostgresStoreError::Initialization)?;
         tx.execute(
             &format!("UPDATE {schema}.store_metadata SET schema_version=9,catalog_hash=$1 WHERE singleton=1"),
+            &[&catalog],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    }
+    let ratification_checksum = content_digest(RATIFICATION_MIGRATION_SQL.as_bytes());
+    let ratification_row = tx
+        .query_opt(
+            &format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=10"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if let Some(row) = ratification_row {
+        if row.get::<_, i64>(0) != 10 || row.get::<_, String>(1) != ratification_checksum {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    } else {
+        let metadata = tx
+            .query_one(
+                &format!("SELECT schema_version,catalog_hash FROM {schema}.store_metadata WHERE singleton=1"),
+                &[],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        let sealed_catalog: String = metadata.get(1);
+        if metadata.get::<_, i64>(0) != 9 || sealed_catalog != catalog_digest(&tx, schema).await? {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+        let sql = RATIFICATION_MIGRATION_SQL
+            .replace("__SCHEMA__", schema)
+            .replace("__ROLE__", &format!("{schema}_runtime"));
+        tx.batch_execute(&sql)
+            .await
+            .inspect_err(|error| {
+                eprintln!("smesh.postgres.migration_failed revision=10 error={error:?}");
+            })
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {schema}.schema_migrations VALUES(10,10,$1,$2,{schema}.db_millis())"
+            ),
+            &[&RATIFICATION_MIGRATION_NAME, &ratification_checksum],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        let catalog = catalog_digest(&tx, schema).await?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata DISABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!("UPDATE {schema}.store_metadata SET schema_version=10,catalog_hash=$1 WHERE singleton=1"),
+            &[&catalog],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    }
+    let ratification_retained_checksum =
+        content_digest(RATIFICATION_RETAINED_MIGRATION_SQL.as_bytes());
+    let ratification_retained_row = tx
+        .query_opt(
+            &format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=11"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if let Some(row) = ratification_retained_row {
+        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+            || row.get::<_, String>(1) != ratification_retained_checksum
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    } else {
+        let metadata = tx
+            .query_one(
+                &format!("SELECT schema_version,catalog_hash FROM {schema}.store_metadata WHERE singleton=1"),
+                &[],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        let sealed_catalog: String = metadata.get(1);
+        if metadata.get::<_, i64>(0) != 10 || sealed_catalog != catalog_digest(&tx, schema).await? {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+        let sql = RATIFICATION_RETAINED_MIGRATION_SQL
+            .replace("__SCHEMA__", schema)
+            .replace("__ROLE__", &format!("{schema}_runtime"))
+            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        tx.batch_execute(&sql)
+            .await
+            .inspect_err(|error| {
+                eprintln!("smesh.postgres.migration_failed revision=11 error={error:?}");
+            })
+            .map_err(|error| map_ratification_retained_migration_error(&error))?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {schema}.schema_migrations VALUES(11,11,$1,$2,{schema}.db_millis())"
+            ),
+            &[
+                &RATIFICATION_RETAINED_MIGRATION_NAME,
+                &ratification_retained_checksum,
+            ],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        let catalog = catalog_digest(&tx, schema).await?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata DISABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!("UPDATE {schema}.store_metadata SET schema_version=11,catalog_hash=$1 WHERE singleton=1"),
             &[&catalog],
         )
         .await
@@ -5390,15 +5600,155 @@ where
     Ok(())
 }
 
+async fn validate_ratification_semantics<C>(
+    client: &C,
+    schema: &str,
+    key: &[u8; 32],
+) -> Result<(), PostgresStoreError>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let packets=client.query(&format!("SELECT p.tenant_scope,p.task_id,p.generation,p.task_revision,p.checkpoint_hash,p.packet_hash,p.packet_seal,p.packet_json,p.state,p.revision,p.reviewer_account_id,p.head_receipt_hash,p.approved_task_json,p.approved_result_json,p.approved_transcript_json,t.state,t.revision,t.task_json,p.generation=max(p.generation) OVER (PARTITION BY p.tenant_scope,p.task_id) FROM {schema}.ratification_packets p JOIN {schema}.tasks t USING(tenant_scope,task_id) ORDER BY p.tenant_scope,p.task_id,p.generation"),&[])
+        .await.map_err(|_|PostgresStoreError::InvalidSchema)?;
+    for row in packets {
+        let packet_row = crate::sqlite_store::RatificationPacketIntegrityRow {
+            tenant_scope: row.get(0),
+            task_id: row.get(1),
+            generation: row.get(2),
+            task_revision: row.get(3),
+            checkpoint_hash: row.get(4),
+            packet_hash: row.get(5),
+            packet_seal: row.get(6),
+            packet_json: row.get(7),
+            state: row.get(8),
+            revision: row.get(9),
+            reviewer_account_id: row.get(10),
+            head_receipt_hash: row.get(11),
+            approved_task_json: row.get(12),
+            approved_result_json: row.get(13),
+            approved_transcript_json: row.get(14),
+        };
+        let tenant = packet_row.tenant_scope.clone();
+        let task_id = packet_row.task_id.clone();
+        let generation = packet_row.generation;
+        let rows=client.query(&format!("SELECT tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at FROM {schema}.ratification_events WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 ORDER BY revision"),&[&tenant,&task_id,&generation])
+            .await.map_err(|_|PostgresStoreError::InvalidSchema)?;
+        let events = rows
+            .into_iter()
+            .map(|event| crate::sqlite_store::RatificationEventIntegrityRow {
+                tenant_scope: event.get(0),
+                task_id: event.get(1),
+                generation: event.get(2),
+                revision: event.get(3),
+                account_id: event.get(4),
+                action: event.get(5),
+                command_digest: event.get(6),
+                idempotency_key: event.get(7),
+                receipt_json: event.get(8),
+                receipt_hash: event.get(9),
+                receipt_seal: event.get(10),
+                previous_receipt_hash: event.get(11),
+                occurred_at: event.get(12),
+            })
+            .collect::<Vec<_>>();
+        let (packet, receipts) = crate::sqlite_store::verify_ratification_packet_chain(
+            &packet_row,
+            &events,
+            &tenant,
+            &task_id,
+            u64::try_from(generation).map_err(|_| PostgresStoreError::InvalidSchema)?,
+            key,
+        )
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        let task_state: String = row.get(15);
+        let task_revision: i64 = row.get(16);
+        let task_json: String = row.get(17);
+        if row.get::<_, bool>(18) {
+            if let Some(crate::HumanRatificationAction::Decision(decision)) =
+                receipts.last().map(|r| &r.action)
+            {
+                let expected = match decision {
+                    crate::HumanDecision::Approve => a2a::TaskState::Completed,
+                    crate::HumanDecision::Reject => a2a::TaskState::Rejected,
+                    crate::HumanDecision::Amend => a2a::TaskState::InputRequired,
+                };
+                let task: Task = serde_json::from_str(&task_json)
+                    .map_err(|_| PostgresStoreError::InvalidSchema)?;
+                if task.id != packet.task_id
+                    || task.context_id != packet.context_id
+                    || task.status.state != expected
+                    || state_key(&task).ok().as_deref() != Some(task_state.as_str())
+                    || u64::try_from(task_revision).ok() != packet.task_revision.checked_add(1)
+                {
+                    return Err(PostgresStoreError::InvalidSchema);
+                }
+            } else if matches!(packet_row.state.as_str(), "awaiting_review" | "reviewed")
+                && u64::try_from(task_revision).ok() != Some(packet.task_revision)
+            {
+                return Err(PostgresStoreError::InvalidSchema);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn reconcile_ratification_key(
+    client: &tokio_postgres::Client,
+    schema: &str,
+    supplied: Option<Arc<zeroize::Zeroizing<[u8; 32]>>>,
+    compatibility_key: &[u8; 32],
+) -> Result<Arc<zeroize::Zeroizing<[u8; 32]>>, PostgresStoreError> {
+    let row = client
+        .query_opt(
+            &format!(
+                "SELECT version,key_generation,check_seal FROM {schema}.ratification_key_check WHERE singleton=1"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    let Some(key) = supplied else {
+        if row.is_some() {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+        return Ok(Arc::new(zeroize::Zeroizing::new(*compatibility_key)));
+    };
+    let generation = content_digest(key.as_ref().as_ref());
+    let check = crate::ratification::ratification_mac(
+        &key,
+        b"smesh-ratification-key-check/v1\0",
+        generation.as_bytes(),
+    );
+    match row {
+        None => {
+            client
+                .execute(
+                    &format!("INSERT INTO {schema}.ratification_key_check(singleton,version,key_generation,check_seal) VALUES(1,1,$1,$2)"),
+                    &[&generation, &check],
+                )
+                .await
+                .map_err(|_| PostgresStoreError::Initialization)?;
+        }
+        Some(row)
+            if row.get::<_, i16>(0) == 1
+                && row.get::<_, String>(1) == generation
+                && row.get::<_, String>(2) == check => {}
+        Some(_) => return Err(PostgresStoreError::InvalidSchema),
+    }
+    Ok(key)
+}
+
 async fn validate_semantics<C>(
     client: &C,
     schema: &str,
     cursor_key: &[u8; 32],
+    receipt_key: &[u8; 32],
 ) -> Result<(), PostgresStoreError>
 where
     C: tokio_postgres::GenericClient + Sync,
 {
     validate_artifact_semantics(client, schema).await?;
+    validate_ratification_semantics(client, schema, receipt_key).await?;
     let evidence_gaps: i64 = client.query_one(
         &format!("SELECT (SELECT count(*) FROM {schema}.quota_intents i LEFT JOIN {schema}.quota_policy_versions p ON p.tenant_scope=i.tenant_scope AND p.policy_id=i.policy_id AND p.policy_revision=i.policy_revision WHERE p.policy_id IS NULL OR p.policy_digest<>i.policy_digest) + (SELECT count(*) FROM {schema}.quota_receipts r LEFT JOIN {schema}.quota_intents i USING(tenant_scope,binding_digest) WHERE i.binding_digest IS NULL) + (SELECT count(*) FROM {schema}.quota_allocations a LEFT JOIN {schema}.quota_intents i USING(tenant_scope,binding_digest) WHERE i.binding_digest IS NULL) + (SELECT count(*) FROM {schema}.quota_leases l LEFT JOIN {schema}.quota_intents i USING(tenant_scope,binding_digest) WHERE i.binding_digest IS NULL)"),
         &[],
@@ -5447,7 +5797,7 @@ where
     if invalid_execution_reservations != 0 {
         return Err(PostgresStoreError::InvalidSchema);
     }
-    let tasks=client.query(&format!("SELECT task_id,context_id,state,status_timestamp,revision,task_json FROM {schema}.tasks ORDER BY tenant_scope,task_id"),&[]).await.map_err(|_|PostgresStoreError::InvalidSchema)?;
+    let tasks=client.query(&format!("SELECT task_id,context_id,state,status_timestamp,revision,task_json,principal_scope,authentication_method,authorization_policy_id,authorization_policy_revision,authorization_policy_digest FROM {schema}.tasks ORDER BY tenant_scope,task_id"),&[]).await.map_err(|_|PostgresStoreError::InvalidSchema)?;
     for row in tasks {
         let id: String = row.get(0);
         let context: String = row.get(1);
@@ -5457,11 +5807,34 @@ where
         let json: String = row.get(5);
         let task: Task =
             serde_json::from_str(&json).map_err(|_| PostgresStoreError::InvalidSchema)?;
+        let principal: String = row.get(6);
+        let authentication: String = row.get(7);
+        let policy_id: String = row.get(8);
+        let policy_revision: i64 = row.get(9);
+        let policy_digest: String = row.get(10);
+        let legacy = principal == "legacy-principal"
+            && authentication == "trusted-local"
+            && policy_id == "legacy-policy"
+            && policy_revision == 0
+            && policy_digest
+                == "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let contemporary = !principal.is_empty()
+            && principal.len() <= 256
+            && principal.is_ascii()
+            && !authentication.is_empty()
+            && authentication.len() <= 64
+            && authentication.is_ascii()
+            && !policy_id.is_empty()
+            && policy_id.len() <= 128
+            && policy_revision > 0
+            && !policy_digest.is_empty()
+            && policy_digest.len() <= 256;
         if task.id != id
             || task.context_id != context
             || revision <= 0
             || state_key(&task).map_err(|_| PostgresStoreError::InvalidSchema)? != state
             || task.status.timestamp.map(|v| v.to_rfc3339()) != timestamp
+            || !(legacy || contemporary)
             || json.len() > 1_048_576
         {
             return Err(PostgresStoreError::InvalidSchema);
@@ -5498,14 +5871,30 @@ where
                     && from.as_deref() == Some(prior_to.as_str())
             }
         };
+        let ratification_transition = matches!(
+            (kind.as_str(), from_state.as_ref(), &to_state),
+            (
+                "ratification_approved",
+                Some(a2a::TaskState::InputRequired),
+                a2a::TaskState::Completed
+            ) | (
+                "ratification_rejected",
+                Some(a2a::TaskState::InputRequired),
+                a2a::TaskState::Rejected
+            ) | (
+                "ratification_amend_requested",
+                Some(a2a::TaskState::InputRequired),
+                a2a::TaskState::InputRequired
+            )
+        );
         if !valid_chain
             || kind.is_empty()
             || kind.len() > 4096
             || event_task.id != task_id
             || state_key(&event_task).map_err(|_| PostgresStoreError::InvalidSchema)? != to
-            || from_state
-                .as_ref()
-                .is_some_and(|state| !legal_transition(state, &to_state))
+            || from_state.as_ref().is_some_and(|state| {
+                !legal_transition(state, &to_state) && !ratification_transition
+            })
         {
             return Err(PostgresStoreError::InvalidSchema);
         }
@@ -5855,6 +6244,7 @@ async fn validate_catalog(
         != [
             "artifact_inline_migration_required",
             "artifact_restore_incomplete",
+            "artifact_retained_scopes_bounded",
             "artifact_stage_locator_live",
             "audit_projection_session_valid",
             "authority_diagnostics_bounded",
@@ -5908,6 +6298,7 @@ async fn validate_catalog(
             })
         })
     {
+        eprintln!("smesh.postgres.catalog_definer_invalid names={definer_names:?}");
         return Err(PostgresStoreError::InvalidSchema);
     }
     let rows = client.query("SELECT c.relname,c.relrowsecurity,c.relforcerowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p') ORDER BY c.relname", &[&schema]).await.map_err(|_| PostgresStoreError::InvalidSchema)?;
@@ -5997,6 +6388,16 @@ async fn validate_catalog(
             AUTHORIZATION_RETENTION_MIGRATION_NAME,
             content_digest(AUTHORIZATION_RETENTION_MIGRATION_SQL.as_bytes()),
         ),
+        (
+            10_i64,
+            RATIFICATION_MIGRATION_NAME,
+            content_digest(RATIFICATION_MIGRATION_SQL.as_bytes()),
+        ),
+        (
+            11_i64,
+            RATIFICATION_RETAINED_MIGRATION_NAME,
+            content_digest(RATIFICATION_RETAINED_MIGRATION_SQL.as_bytes()),
+        ),
     ];
     if migration_rows.len() != expected_migrations.len()
         || migration_rows
@@ -6008,8 +6409,10 @@ async fn validate_catalog(
                         != match expected.0 {
                             7 => 7,
                             8 => 8,
-                            9 => CURRENT_SCHEMA_VERSION,
-                            _ => LOGICAL_SCHEMA_VERSION,
+                            9 => 9,
+                            10 => 10,
+                            11 => LOGICAL_SCHEMA_VERSION,
+                            _ => LEGACY_LOGICAL_SCHEMA_VERSION,
                         }
                     || row.get::<_, &str>(2) != expected.1
                     || row.get::<_, &str>(3) != expected.2
@@ -6340,7 +6743,7 @@ fn validate_terminal_public_transcript(
     let Some(StreamResponse::Task(initial)) = frames.first() else {
         return Err(A2AError::invalid_agent_response());
     };
-    if is_dispatch_closed(&initial.status.state)
+    if initial.status.state.is_terminal()
         || frames
             .iter()
             .filter(|frame| matches!(frame, StreamResponse::Task(_)))
@@ -6675,6 +7078,11 @@ impl crate::AuditProjectionAuthority for PostgresTaskStore {
 }
 
 impl AuthorityIdentity for PostgresTaskStore {
+    fn ratification_authority(&self) -> Option<&dyn crate::RatificationAuthority> {
+        self.ratification_enabled
+            .then_some(self as &dyn crate::RatificationAuthority)
+    }
+
     fn callback_authority(&self) -> Option<&dyn crate::CallbackAuthority> {
         self.callback_policy
             .as_ref()
@@ -7230,7 +7638,9 @@ impl QuotaLeaseAuthority for PostgresTaskStore {
                 Box::pin(async move {
                     let now = store.effective_now(tx, now).await?;
                     store
-                        .apply_quota_intent(tx, &intent, &tenant, &account, None, now, true, None)
+                        .apply_quota_intent(
+                            tx, &intent, &tenant, &account, None, now, true, None, None,
+                        )
                         .await
                 })
             })
@@ -7281,7 +7691,7 @@ impl QuotaLeaseAuthority for PostgresTaskStore {
                     .ok_or_else(|| A2AError::invalid_request("quota lease time overflow"))?;
                 store.reclaim_expired_quota_leases(tx, &tenant, now, 100).await?;
                 store
-                    .apply_quota_intent(tx, &intent, &tenant, &account, None, now, true, None)
+                    .apply_quota_intent(tx, &intent, &tenant, &account, None, now, true, None, None)
                     .await?;
                 let sql = store.q("INSERT INTO __S__.quota_leases(tenant_scope,lease_id,lease_token,lease_epoch,binding_digest,policy_digest,account_id,principal_scope,operation,lease_kind,resource_digest,lease_until,state,created_at,updated_at) VALUES($1,$2,$3,1,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$12)");
                 tx.execute(
@@ -7382,7 +7792,9 @@ impl QuotaLeaseAuthority for PostgresTaskStore {
                 Box::pin(async move {
                     let now = store.effective_now(tx, now).await?;
                     store
-                        .apply_quota_intent(tx, &intent, &tenant, &account, None, now, true, None)
+                        .apply_quota_intent(
+                            tx, &intent, &tenant, &account, None, now, true, None, None,
+                        )
                         .await
                 })
             })
@@ -7580,6 +7992,8 @@ impl TaskAdmission for PostgresTaskStore {
         }
         let tenant = scope.tenant_scope().to_owned();
         let owner = scope.owner_account_id().to_owned();
+        let principal_scope = scope.principal_scope().to_owned();
+        let authentication_method = scope.authentication_method().to_owned();
         let message_id = authorized_message_identity(&tenant, &owner, raw);
         let request_digest =
             canonical_send_message_digest_v2(&tenant, &owner, &command.request, command.streaming)?;
@@ -7618,6 +8032,8 @@ impl TaskAdmission for PostgresTaskStore {
             let audit = audit.clone();
             let tenant = tenant.clone();
             let owner = owner.clone();
+            let principal_scope = principal_scope.clone();
+            let authentication_method = authentication_method.clone();
             let message_id = message_id.clone();
             let request_digest = request_digest.clone();
             let payload_json = payload_json.clone();
@@ -7655,7 +8071,7 @@ impl TaskAdmission for PostgresTaskStore {
             }
             store.insert_quota_reservation(tx, quota_reservation.as_ref(), &tenant, &owner, &stored_task_id, quota_now, false).await?;
             if let Some(intent) = quota_intent.as_ref() {
-                store.apply_quota_intent(tx, intent, &tenant, &owner, Some(&stored_task_id), quota_now, false, Some(&command.request)).await?;
+                store.apply_quota_intent(tx, intent, &tenant, &owner, Some(&stored_task_id), quota_now, false, Some(&command.request), None).await?;
                 store.bind_execution_reservation(tx, intent, &stored_task_id, &message_id, &dispatch_id, quota_now, false).await?;
             }
             return serde_json::from_str(final_json.as_deref().unwrap_or(&admission))
@@ -7675,7 +8091,9 @@ impl TaskAdmission for PostgresTaskStore {
         if usize::try_from(count).unwrap_or(usize::MAX) >= store.max_tasks {
             return Err(A2AError::internal("task capacity reached"));
         }
-        let tasks=store.q("INSERT INTO __S__.tasks(tenant_scope,task_id,context_id,state,status_timestamp,revision,task_json,owner_account_id) VALUES($1,$2,$3,$4,$5,1,$6,$7)");
+        let tasks=store.q("INSERT INTO __S__.tasks(tenant_scope,task_id,context_id,state,status_timestamp,revision,task_json,owner_account_id,principal_scope,authentication_method,authorization_policy_id,authorization_policy_revision,authorization_policy_digest) VALUES($1,$2,$3,$4,$5,1,$6,$7,$8,$9,$10,$11,$12)");
+        let authorization_policy_revision = i64::try_from(audit.policy_revision())
+            .map_err(|_| A2AError::invalid_request("authorization policy revision is too large"))?;
         tx.execute(
             &tasks,
             &[
@@ -7686,6 +8104,11 @@ impl TaskAdmission for PostgresTaskStore {
                 &timestamp,
                 &task_json,
                 &owner,
+                &principal_scope,
+                &authentication_method,
+                &audit.policy_id(),
+                &authorization_policy_revision,
+                &audit.policy_digest(),
             ],
         )
         .await
@@ -7694,7 +8117,7 @@ impl TaskAdmission for PostgresTaskStore {
         })?;
         store.insert_quota_reservation(tx, quota_reservation.as_ref(), &tenant, &owner, &command.task.id, quota_now, true).await?;
         let execution_reservation = if let Some(intent) = quota_intent.as_ref() {
-            store.apply_quota_intent(tx, intent, &tenant, &owner, Some(&command.task.id), quota_now, true, Some(&command.request)).await?;
+            store.apply_quota_intent(tx, intent, &tenant, &owner, Some(&command.task.id), quota_now, true, Some(&command.request), None).await?;
             Some(store.bind_execution_reservation(tx, intent, &command.task.id, &message_id, &dispatch_id, quota_now, true).await?)
         } else {
             None
@@ -7909,7 +8332,7 @@ impl TaskAdmission for PostgresTaskStore {
             let final_json: Option<String> = row.get(2);
             store.insert_quota_reservation(tx, quota_reservation.as_ref(), &tenant, &owner, &command.task.id, quota_now, false).await?;
             if let Some(intent) = quota_intent.as_ref() {
-                store.apply_quota_intent(tx, intent, &tenant, &owner, Some(&command.task.id), quota_now, false, Some(&command.request)).await?;
+                store.apply_quota_intent(tx, intent, &tenant, &owner, Some(&command.task.id), quota_now, false, Some(&command.request), None).await?;
                 store.bind_execution_reservation(tx, intent, &command.task.id, &message_id, &dispatch_id, quota_now, false).await?;
             }
             let replay = serde_json::from_str(final_json.as_deref().unwrap_or(&admission))
@@ -7933,7 +8356,7 @@ impl TaskAdmission for PostgresTaskStore {
             .ok_or_else(|| A2AError::task_not_found(&command.task.id))?;
         store.insert_quota_reservation(tx, quota_reservation.as_ref(), &tenant, &owner, &command.task.id, quota_now, true).await?;
         let execution_reservation = if let Some(intent) = quota_intent.as_ref() {
-            store.apply_quota_intent(tx, intent, &tenant, &owner, Some(&command.task.id), quota_now, true, Some(&command.request)).await?;
+            store.apply_quota_intent(tx, intent, &tenant, &owner, Some(&command.task.id), quota_now, true, Some(&command.request), None).await?;
             Some(store.bind_execution_reservation(tx, intent, &command.task.id, &message_id, &dispatch_id, quota_now, true).await?)
         } else {
             None
@@ -8005,6 +8428,9 @@ impl TaskAdmission for PostgresTaskStore {
                 "task no longer accepts continuation",
             ));
         }
+        let supersede_packet=store.q("UPDATE __S__.ratification_packets SET state='superseded',updated_at=$1 WHERE tenant_scope=$2 AND task_id=$3 AND state IN ('awaiting_review','reviewed')");
+        tx.execute(&supersede_packet,&[&quota_now,&tenant,&task.id]).await
+            .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("continuation ratification supersession failed")))?;
         let event=store.q("INSERT INTO __S__.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) SELECT $1,$2,COALESCE(max(event_seq),0)+1,$3,'continued',$4,$5,$6,$7 FROM __S__.task_events WHERE tenant_scope=$1 AND task_id=$2");
         tx.execute(
             &event,
@@ -8216,7 +8642,7 @@ impl AuthorizedTaskRead for PostgresTaskStore {
                 if let Some(intent) = quota_intent.as_ref() {
                     let now = store.effective_now(tx, audit.decided_at()).await?;
                     store
-                        .apply_quota_intent(tx, intent, &tenant, &account, None, now, true, None)
+                        .apply_quota_intent(tx, intent, &tenant, &account, None, now, true, None, None)
                         .await?;
                 }
                 let sql = store.q("SELECT task_json FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 AND ($3::boolean=false OR owner_account_id=$4)");
@@ -8335,7 +8761,7 @@ impl AuthorizedTaskRead for PostgresTaskStore {
             .get(0);
         if let Some(intent) = quota_intent.as_ref() {
             store
-                .apply_quota_intent(tx, intent, &tenant, &owner, None, quota_now, true, None)
+                .apply_quota_intent(tx, intent, &tenant, &owner, None, quota_now, true, None, None)
                 .await?;
         }
         let response = if let Some(token) = request.page_token.as_deref() {
@@ -8668,6 +9094,237 @@ impl TaskLifecycle for PostgresTaskStore {
                 .map_err(|_| A2AError::internal("stored final result is corrupt"))
         })
         .transpose()
+    }
+}
+
+impl PostgresTaskStore {
+    async fn commit_delivery_inner(
+        &self,
+        lease: &OutboxLease,
+        task: Task,
+        result: SendMessageResponse,
+        public_transcript: &[StreamResponse],
+        ratification: Option<crate::ratification::PreparedRatification>,
+        now: i64,
+    ) -> Result<TransitionOutcome, A2AError> {
+        if task.id != lease.task_id
+            || !is_dispatch_closed(&task.status.state)
+            || !final_result_matches_task(&result, &task)
+        {
+            return Err(A2AError::invalid_params("invalid durable delivery result"));
+        }
+        validate_terminal_public_transcript(public_transcript, &task)?;
+        let transcript_bytes = serde_json::to_vec(public_transcript)
+            .map_err(|_| A2AError::internal("failed to encode delivery transcript"))?;
+        if transcript_bytes.len() > 64 * 1024 * 1024
+            || public_transcript.iter().any(|frame| {
+                serde_json::to_vec(frame).map_or(true, |encoded| encoded.len() > 1_048_576)
+            })
+        {
+            return Err(A2AError::invalid_params(
+                "public stream transcript exceeds limit",
+            ));
+        }
+        let task_json = serde_json::to_string(&task)
+            .map_err(|_| A2AError::internal("failed to encode delivered task"))?;
+        let final_json = serde_json::to_string(&result)
+            .map_err(|_| A2AError::internal("failed to encode delivery result"))?;
+        let state = state_key(&task)?;
+        let tenant = lease.tenant_scope.clone();
+        let public_transcript = public_transcript.to_vec();
+        self.run_retryable_transaction(&tenant, None, |store, tx| {
+            let lease = lease.clone();
+            let task = task.clone();
+            let public_transcript = public_transcript.clone();
+            let task_json = task_json.clone();
+            let final_json = final_json.clone();
+            let state = state.clone();
+            let ratification = ratification.clone();
+            Box::pin(async move {
+        let now = store.effective_now(tx, now).await?;
+        let fence=store.q("SELECT message_id,causative_revision FROM __S__.outbox WHERE tenant_scope=$1 AND outbox_id=$2 AND dispatch_id=$3 AND task_id=$4 AND state='leased' AND lease_owner=$5 AND lease_token=$6 AND lease_until=$7 AND attempt_count=$8 AND max_attempts=$9 AND lease_until>$10 FOR UPDATE");
+        let Some(row) = tx
+            .query_opt(
+                &fence,
+                &[
+                    &lease.tenant_scope,
+                    &lease.outbox_id,
+                    &lease.dispatch_id,
+                    &lease.task_id,
+                    &lease.lease_owner,
+                    &lease.lease_token,
+                    &lease.lease_until,
+                    &i64::from(lease.attempt_no),
+                    &i64::from(lease.max_attempts),
+                    &now,
+                ],
+            )
+            .await
+            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery fence lookup failed")))?
+        else {
+            return Ok(TransitionOutcome::Stale);
+        };
+        let message: String = row.get(0);
+        let causative_revision: i64 = row.get(1);
+        let revision = causative_revision
+            .checked_add(1)
+            .ok_or_else(|| A2AError::internal("persistent task revision exhausted"))?;
+        let prior_state_sql =
+            store.q("SELECT revision,state FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 FOR UPDATE");
+        let prior = tx
+            .query_one(&prior_state_sql, &[&lease.tenant_scope, &lease.task_id])
+            .await
+            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery prior state lookup failed")))?;
+        if prior.get::<_, i64>(0) != causative_revision {
+            return Ok(TransitionOutcome::Stale);
+        }
+        store
+            .settle_execution_reservation(tx, &lease, "receiver-completed", now)
+            .await?;
+        let prior_state: String = prior.get(1);
+        let update_task=store.q("UPDATE __S__.tasks SET state=$1,status_timestamp=$2,revision=$3,task_json=$4 WHERE tenant_scope=$5 AND task_id=$6");
+        let timestamp = task.status.timestamp.map(|v| v.to_rfc3339());
+        tx.execute(
+            &update_task,
+            &[
+                &state,
+                &timestamp,
+                &revision,
+                &task_json,
+                &lease.tenant_scope,
+                &lease.task_id,
+            ],
+        )
+        .await
+        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery task update failed")))?;
+        let event=store.q("INSERT INTO __S__.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) SELECT $1,$2,COALESCE(max(event_seq),0)+1,$3,'durable_completed',$4,$5,$6,$7 FROM __S__.task_events WHERE tenant_scope=$1 AND task_id=$2");
+        tx.execute(
+            &event,
+            &[
+                &lease.tenant_scope,
+                &lease.task_id,
+                &revision,
+                &prior_state,
+                &state,
+                &task_json,
+                &now,
+            ],
+        )
+        .await
+        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery event append failed")))?;
+        enqueue_postgres_terminal_callbacks(store,tx,&lease.tenant_scope,&task,revision,now).await?;
+        let idem=store.q("UPDATE __S__.idempotency_records SET state='completed',final_result_json=$1,updated_at=$2 WHERE tenant_scope=$3 AND message_id=$4 AND task_id=$5");
+        tx.execute(
+            &idem,
+            &[
+                &final_json,
+                &now,
+                &lease.tenant_scope,
+                &message,
+                &lease.task_id,
+            ],
+        )
+        .await
+        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery idempotency update failed")))?;
+        let outbox=store.q("UPDATE __S__.outbox SET state='delivered',lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at=$1 WHERE tenant_scope=$2 AND outbox_id=$3");
+        tx.execute(&outbox, &[&now, &lease.tenant_scope, &lease.outbox_id])
+            .await
+            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery outbox update failed")))?;
+        let attempt=store.q("UPDATE __S__.outbox_attempts SET finished_at=$1,outcome='delivered' WHERE tenant_scope=$2 AND outbox_id=$3 AND attempt_no=$4");
+        tx.execute(
+            &attempt,
+            &[
+                &now,
+                &lease.tenant_scope,
+                &lease.outbox_id,
+                &i64::from(lease.attempt_no),
+            ],
+        )
+        .await
+        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery attempt close failed")))?;
+        let lookup=store.q("SELECT frame_count,transcript_digest FROM __S__.stream_transcripts WHERE tenant_scope=$1 AND message_id=$2 AND dispatch_id=$3 AND task_id=$4 AND state='open' FOR UPDATE");
+        if let Some(meta) = tx
+            .query_opt(&lookup, &[&lease.tenant_scope, &message, &lease.dispatch_id, &lease.task_id])
+            .await
+            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery transcript lookup failed")))?
+        {
+            let persisted_count: i64 = meta.get(0);
+            let persisted_digest: String = meta.get(1);
+            if persisted_count < 0 || usize::try_from(persisted_count).unwrap_or(usize::MAX) > public_transcript.len() {
+                return Err(A2AError::internal("persisted public stream prefix diverges from delivery transcript"));
+            }
+            let existing_sql = store.q("SELECT frame_seq,frame_version,frame_kind,frame_json,frame_digest FROM __S__.stream_frames WHERE tenant_scope=$1 AND message_id=$2 ORDER BY frame_seq");
+            let rows = tx.query(&existing_sql, &[&lease.tenant_scope, &message]).await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery transcript lookup failed")))?;
+            let mut persisted = Vec::with_capacity(rows.len());
+            for (index, row) in rows.iter().enumerate() {
+                let json: String = row.get(3);
+                let frame: StreamResponse = serde_json::from_str(&json)
+                    .map_err(|_| A2AError::internal("persisted public stream prefix is corrupt"))?;
+                if row.get::<_, i64>(0) != i64::try_from(index + 1).unwrap_or(i64::MAX)
+                    || row.get::<_, i64>(1) != 1
+                    || row.get::<_, String>(2) != frame_kind(&frame)
+                    || row.get::<_, String>(4) != content_digest(json.as_bytes())
+                {
+                    return Err(A2AError::internal("persisted public stream prefix is corrupt"));
+                }
+                persisted.push(frame);
+            }
+            if i64::try_from(persisted.len()).ok() != Some(persisted_count)
+                || transcript_digest(&persisted)? != persisted_digest
+                || persisted != public_transcript[..persisted.len()]
+            {
+                return Err(A2AError::internal("persisted public stream prefix diverges from delivery transcript"));
+            }
+            let insert=store.q("INSERT INTO __S__.stream_frames(tenant_scope,message_id,frame_seq,frame_version,frame_kind,frame_json,frame_digest,created_at) VALUES($1,$2,$3,1,$4,$5,$6,$7)");
+            for (seq, frame) in public_transcript.iter().enumerate().skip(persisted.len()) {
+                let json = serde_json::to_string(frame)
+                    .map_err(|_| A2AError::internal("failed to encode delivery frame"))?;
+                let n = i64::try_from(seq + 1)
+                    .map_err(|_| A2AError::internal("too many delivery frames"))?;
+                tx.execute(&insert, &[&lease.tenant_scope, &message, &n, &frame_kind(frame), &json, &content_digest(json.as_bytes()), &now])
+                    .await
+                    .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery frame append failed")))?;
+            }
+            let count = i64::try_from(public_transcript.len())
+                .map_err(|_| A2AError::internal("too many delivery frames"))?;
+            let update=store.q("UPDATE __S__.stream_transcripts SET state='terminal',frame_count=$1,transcript_digest=$2,terminal_seq=$1,updated_at=$3 WHERE tenant_scope=$4 AND message_id=$5 AND state='open'");
+            if tx.execute(&update, &[&count, &transcript_digest(&public_transcript)?, &now, &lease.tenant_scope, &message]).await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery transcript seal failed")))? != 1
+            {
+                return Err(A2AError::internal("stale public stream completion"));
+            }
+        }
+                if let Some(mut pending) = ratification {
+                    let binding_sql=store.q("SELECT t.context_id,t.principal_scope,t.authentication_method,i.request_digest,i.message_id,t.authorization_policy_id,t.authorization_policy_revision,t.authorization_policy_digest FROM __S__.tasks t JOIN __S__.idempotency_records i ON i.tenant_scope=t.tenant_scope AND i.task_id=t.task_id AND i.message_id=$3 WHERE t.tenant_scope=$1 AND t.task_id=$2");
+                    let binding=tx.query_one(&binding_sql,&[&lease.tenant_scope,&lease.task_id,&message]).await
+                        .map_err(|error| Self::transaction_body_error(&error,A2AError::internal("ratification authority binding lookup failed")))?;
+                    let generation_sql=store.q("SELECT COALESCE(MAX(generation),0)+1 FROM __S__.ratification_packets WHERE tenant_scope=$1 AND task_id=$2");
+                    let generation:i64=tx.query_one(&generation_sql,&[&lease.tenant_scope,&lease.task_id]).await
+                        .map_err(|error| Self::transaction_body_error(&error,A2AError::internal("ratification generation lookup failed")))?.get(0);
+                    pending.packet_input.generation=u64::try_from(generation).map_err(|_|A2AError::internal("ratification generation corrupt"))?;
+                    pending.packet_input.task_revision=u64::try_from(revision).map_err(|_|A2AError::internal("ratification revision corrupt"))?;
+                    pending.packet_input.context_id=binding.get(0);
+                    pending.packet_input.principal_scope=binding.get(1);
+                    pending.packet_input.authentication_method=binding.get(2);
+                    pending.packet_input.request_digest=binding.get(3);
+                    let idempotency_key:String=binding.get(4);
+                    pending.packet_input.idempotency_key_digest=content_digest(idempotency_key.as_bytes());
+                    pending.packet_input.authorization_policy_id=binding.get(5);
+                    pending.packet_input.authorization_policy_revision=u64::try_from(binding.get::<_,i64>(6)).map_err(|_|A2AError::internal("ratification policy revision corrupt"))?;
+                    pending.packet_input.authorization_policy_digest=binding.get(7);
+                    pending.packet_input.ratification_key_generation=content_digest(store.ratification_key.as_ref().as_ref());
+                    let packet=crate::ReviewPacket::freeze(pending.packet_input,&store.ratification_key)
+                        .map_err(|_|A2AError::invalid_params("invalid ratification packet"))?;
+                    let packet_json=serde_json::to_string(&packet).map_err(|_|A2AError::internal("ratification packet encoding failed"))?;
+                    let insert=store.q("INSERT INTO __S__.ratification_packets(tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,packet_seal,packet_json,approved_task_json,approved_result_json,approved_transcript_json,state,revision,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'awaiting_review',0,$12,$12)");
+                    tx.execute(&insert,&[&lease.tenant_scope,&lease.task_id,&generation,&revision,&packet.checkpoint_hash,&packet.packet_hash,&packet.seal,&packet_json,&pending.approved_task_json,&pending.approved_result_json,&pending.approved_transcript_json,&now]).await
+                        .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("ratification packet commit failed")))?;
+                }
+                Ok(TransitionOutcome::Applied)
+            })
+        })
+        .await
     }
 }
 
@@ -9108,197 +9765,519 @@ impl OutboxAuthority for PostgresTaskStore {
         public_transcript: &[StreamResponse],
         now: i64,
     ) -> Result<TransitionOutcome, A2AError> {
-        if task.id != lease.task_id
-            || !is_dispatch_closed(&task.status.state)
-            || !final_result_matches_task(&result, &task)
-        {
-            return Err(A2AError::invalid_params("invalid durable delivery result"));
+        self.commit_delivery_inner(lease, task, result, public_transcript, None, now)
+            .await
+    }
+
+    async fn commit_delivery_for_ratification(
+        &self,
+        lease: &OutboxLease,
+        approved_task: Task,
+        approved_result: SendMessageResponse,
+        approved_transcript: &[StreamResponse],
+        candidate: crate::AuthoritativeReviewCandidate,
+        now: i64,
+    ) -> Result<TransitionOutcome, A2AError> {
+        if !self.ratification_enabled {
+            return Err(A2AError::invalid_request("ratification is not enabled"));
         }
-        validate_terminal_public_transcript(public_transcript, &task)?;
-        let transcript_bytes = serde_json::to_vec(public_transcript)
-            .map_err(|_| A2AError::internal("failed to encode delivery transcript"))?;
-        if transcript_bytes.len() > 64 * 1024 * 1024
-            || public_transcript.iter().any(|frame| {
-                serde_json::to_vec(frame).map_or(true, |encoded| encoded.len() > 1_048_576)
-            })
+        if approved_task.id != lease.task_id
+            || approved_task.status.state != a2a::TaskState::Completed
+            || !final_result_matches_task(&approved_result, &approved_task)
         {
-            return Err(A2AError::invalid_params(
-                "public stream transcript exceeds limit",
-            ));
+            return Err(A2AError::invalid_params("invalid ratification candidate"));
         }
-        let task_json = serde_json::to_string(&task)
-            .map_err(|_| A2AError::internal("failed to encode delivered task"))?;
-        let final_json = serde_json::to_string(&result)
-            .map_err(|_| A2AError::internal("failed to encode delivery result"))?;
-        let state = state_key(&task)?;
-        let tenant = lease.tenant_scope.clone();
-        let public_transcript = public_transcript.to_vec();
-        self.run_retryable_transaction(&tenant, None, |store, tx| {
-            let lease = lease.clone();
-            let task = task.clone();
-            let public_transcript = public_transcript.clone();
-            let task_json = task_json.clone();
-            let final_json = final_json.clone();
-            let state = state.clone();
-            Box::pin(async move {
-        let now = store.effective_now(tx, now).await?;
-        let fence=store.q("SELECT message_id,causative_revision FROM __S__.outbox WHERE tenant_scope=$1 AND outbox_id=$2 AND dispatch_id=$3 AND task_id=$4 AND state='leased' AND lease_owner=$5 AND lease_token=$6 AND lease_until=$7 AND attempt_count=$8 AND max_attempts=$9 AND lease_until>$10 FOR UPDATE");
-        let Some(row) = tx
-            .query_opt(
-                &fence,
-                &[
-                    &lease.tenant_scope,
-                    &lease.outbox_id,
-                    &lease.dispatch_id,
-                    &lease.task_id,
-                    &lease.lease_owner,
-                    &lease.lease_token,
-                    &lease.lease_until,
-                    &i64::from(lease.attempt_no),
-                    &i64::from(lease.max_attempts),
-                    &now,
-                ],
+        let prepared = crate::ratification::prepare_authoritative_review_candidate(
+            lease,
+            approved_task,
+            &approved_result,
+            approved_transcript,
+            candidate,
+            now,
+        )?;
+        self.commit_delivery_inner(
+            lease,
+            prepared.awaiting_task.clone(),
+            prepared.awaiting_result.clone(),
+            &prepared.awaiting_transcript.clone(),
+            Some(prepared),
+            now,
+        )
+        .await
+    }
+}
+
+async fn reject_postgres_global_ratification_idempotency_conflict(
+    store: &PostgresTaskStore,
+    tx: &tokio_postgres::Transaction<'_>,
+    tenant: &str,
+    account: &str,
+    idempotency_key: &str,
+) -> Result<(), A2AError> {
+    // The unique index alone is not enough under READ COMMITTED: two commands
+    // for different tasks can both observe absence and race at INSERT, leaking a
+    // generic unique-violation. Serialize exactly one tenant/account/key domain
+    // in PostgreSQL so the waiter authenticates the committed winner before it
+    // returns the typed conflict. The transaction-scoped lock is retained across
+    // the subsequent insert and cannot leak across a rollback.
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended('smesh-ratification-idempotency/v1' || chr(31) || $1 || chr(31) || $2 || chr(31) || $3,0))",
+        &[&tenant, &account, &idempotency_key],
+    )
+    .await
+    .map_err(|error| {
+        PostgresTaskStore::transaction_body_error(
+            &error,
+            A2AError::internal("ratification idempotency serialization failed"),
+        )
+    })?;
+    let locator_sql = store.q("SELECT task_id,generation FROM __S__.ratification_events
+         WHERE tenant_scope=$1 AND account_id=$2 AND idempotency_key=$3");
+    let locator = tx
+        .query_opt(&locator_sql, &[&tenant, &account, &idempotency_key])
+        .await
+        .map_err(|error| {
+            PostgresTaskStore::transaction_body_error(
+                &error,
+                A2AError::internal("ratification idempotency lookup failed"),
             )
-            .await
-            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery fence lookup failed")))?
-        else {
-            return Ok(TransitionOutcome::Stale);
-        };
-        let message: String = row.get(0);
-        let causative_revision: i64 = row.get(1);
-        let revision = causative_revision
-            .checked_add(1)
-            .ok_or_else(|| A2AError::internal("persistent task revision exhausted"))?;
-        let prior_state_sql =
-            store.q("SELECT revision,state FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 FOR UPDATE");
-        let prior = tx
-            .query_one(&prior_state_sql, &[&lease.tenant_scope, &lease.task_id])
-            .await
-            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery prior state lookup failed")))?;
-        if prior.get::<_, i64>(0) != causative_revision {
-            return Ok(TransitionOutcome::Stale);
-        }
-        store
-            .settle_execution_reservation(tx, &lease, "receiver-completed", now)
-            .await?;
-        let prior_state: String = prior.get(1);
-        let update_task=store.q("UPDATE __S__.tasks SET state=$1,status_timestamp=$2,revision=$3,task_json=$4 WHERE tenant_scope=$5 AND task_id=$6");
-        let timestamp = task.status.timestamp.map(|v| v.to_rfc3339());
-        tx.execute(
-            &update_task,
-            &[
-                &state,
-                &timestamp,
-                &revision,
-                &task_json,
-                &lease.tenant_scope,
-                &lease.task_id,
-            ],
-        )
+        })?;
+    let Some(locator) = locator else {
+        return Ok(());
+    };
+    let task_id: String = locator.get(0);
+    let generation: i64 = locator.get(1);
+    let packet_sql = store.q(
+        "SELECT tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,
+                packet_seal,packet_json,state,revision,reviewer_account_id,head_receipt_hash,
+                approved_task_json,approved_result_json,approved_transcript_json
+         FROM __S__.ratification_packets
+         WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 FOR SHARE",
+    );
+    let packet = tx
+        .query_opt(&packet_sql, &[&tenant, &task_id, &generation])
         .await
-        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery task update failed")))?;
-        let event=store.q("INSERT INTO __S__.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) SELECT $1,$2,COALESCE(max(event_seq),0)+1,$3,'durable_completed',$4,$5,$6,$7 FROM __S__.task_events WHERE tenant_scope=$1 AND task_id=$2");
-        tx.execute(
-            &event,
-            &[
-                &lease.tenant_scope,
-                &lease.task_id,
-                &revision,
-                &prior_state,
-                &state,
-                &task_json,
-                &now,
-            ],
-        )
+        .map_err(|error| {
+            PostgresTaskStore::transaction_body_error(
+                &error,
+                A2AError::internal("ratification idempotency packet lookup failed"),
+            )
+        })?
+        .ok_or_else(|| A2AError::internal("ratification idempotency integrity failure"))?;
+    let packet_row = crate::sqlite_store::RatificationPacketIntegrityRow {
+        tenant_scope: packet.get(0),
+        task_id: packet.get(1),
+        generation: packet.get(2),
+        task_revision: packet.get(3),
+        checkpoint_hash: packet.get(4),
+        packet_hash: packet.get(5),
+        packet_seal: packet.get(6),
+        packet_json: packet.get(7),
+        state: packet.get(8),
+        revision: packet.get(9),
+        reviewer_account_id: packet.get(10),
+        head_receipt_hash: packet.get(11),
+        approved_task_json: packet.get(12),
+        approved_result_json: packet.get(13),
+        approved_transcript_json: packet.get(14),
+    };
+    let task_sql = store.q(
+        "SELECT state,revision,task_json,owner_account_id,context_id,status_timestamp,
+                authorization_policy_id,authorization_policy_revision,authorization_policy_digest,
+                principal_scope,authentication_method
+         FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 FOR SHARE",
+    );
+    let task = tx
+        .query_opt(&task_sql, &[&tenant, &task_id])
         .await
-        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery event append failed")))?;
-        enqueue_postgres_terminal_callbacks(store,tx,&lease.tenant_scope,&task,revision,now).await?;
-        let idem=store.q("UPDATE __S__.idempotency_records SET state='completed',final_result_json=$1,updated_at=$2 WHERE tenant_scope=$3 AND message_id=$4 AND task_id=$5");
-        tx.execute(
-            &idem,
-            &[
-                &final_json,
-                &now,
-                &lease.tenant_scope,
-                &message,
-                &lease.task_id,
-            ],
-        )
+        .map_err(|error| {
+            PostgresTaskStore::transaction_body_error(
+                &error,
+                A2AError::internal("ratification idempotency task lookup failed"),
+            )
+        })?
+        .ok_or_else(|| A2AError::internal("ratification idempotency integrity failure"))?;
+    let causative_revision = packet_row
+        .task_revision
+        .checked_sub(1)
+        .ok_or_else(|| A2AError::internal("ratification idempotency integrity failure"))?;
+    let cause_sql = store.q("SELECT i.actor_account_id,i.request_digest,i.message_id
+         FROM __S__.outbox o JOIN __S__.idempotency_records i
+           ON i.tenant_scope=o.tenant_scope AND i.message_id=o.message_id AND i.task_id=o.task_id
+         WHERE o.tenant_scope=$1 AND o.task_id=$2 AND o.causative_revision=$3
+           AND o.state='delivered' FOR SHARE OF o,i");
+    let causes = tx
+        .query(&cause_sql, &[&tenant, &task_id, &causative_revision])
         .await
-        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery idempotency update failed")))?;
-        let outbox=store.q("UPDATE __S__.outbox SET state='delivered',lease_owner=NULL,lease_token=NULL,lease_until=NULL,updated_at=$1 WHERE tenant_scope=$2 AND outbox_id=$3");
-        tx.execute(&outbox, &[&now, &lease.tenant_scope, &lease.outbox_id])
-            .await
-            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery outbox update failed")))?;
-        let attempt=store.q("UPDATE __S__.outbox_attempts SET finished_at=$1,outcome='delivered' WHERE tenant_scope=$2 AND outbox_id=$3 AND attempt_no=$4");
-        tx.execute(
-            &attempt,
-            &[
-                &now,
-                &lease.tenant_scope,
-                &lease.outbox_id,
-                &i64::from(lease.attempt_no),
-            ],
-        )
+        .map_err(|error| {
+            PostgresTaskStore::transaction_body_error(
+                &error,
+                A2AError::internal("ratification idempotency cause lookup failed"),
+            )
+        })?;
+    let [cause] = causes.as_slice() else {
+        return Err(A2AError::internal(
+            "ratification causative identity integrity failure",
+        ));
+    };
+    let task_owner: String = task.get(3);
+    let principal: String = task.get(9);
+    let authentication: String = task.get(10);
+    let policy_id: String = task.get(6);
+    let policy_revision: i64 = task.get(7);
+    let policy_digest: String = task.get(8);
+    let cause_owner = resolve_postgres_ratification_causative_owner(
+        cause.get(0),
+        &task_owner,
+        &principal,
+        &authentication,
+        &policy_id,
+        policy_revision,
+        &policy_digest,
+    )?;
+    let task_row = crate::sqlite_store::RatificationTaskIntegrityRow {
+        state: task.get(0),
+        revision: task.get(1),
+        task_json: task.get(2),
+        owner_account_id: task_owner,
+        context_id: task.get(4),
+        status_timestamp: task.get(5),
+        authorization_policy_id: Some(policy_id),
+        authorization_policy_revision: Some(policy_revision),
+        authorization_policy_digest: Some(policy_digest),
+        principal_scope: principal,
+        authentication_method: authentication,
+        causative_owner_account_id: cause_owner,
+        causative_request_digest: cause.get(1),
+        causative_idempotency_key: cause.get(2),
+    };
+    let chain_sql = store.q(
+        "SELECT tenant_scope,task_id,generation,revision,account_id,action,command_digest,
+                idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at
+         FROM __S__.ratification_events
+         WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 ORDER BY revision",
+    );
+    let events = tx
+        .query(&chain_sql, &[&tenant, &task_id, &generation])
         .await
-        .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery attempt close failed")))?;
-        let lookup=store.q("SELECT frame_count,transcript_digest FROM __S__.stream_transcripts WHERE tenant_scope=$1 AND message_id=$2 AND dispatch_id=$3 AND task_id=$4 AND state='open' FOR UPDATE");
-        if let Some(meta) = tx
-            .query_opt(&lookup, &[&lease.tenant_scope, &message, &lease.dispatch_id, &lease.task_id])
-            .await
-            .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery transcript lookup failed")))?
-        {
-            let persisted_count: i64 = meta.get(0);
-            let persisted_digest: String = meta.get(1);
-            if persisted_count < 0 || usize::try_from(persisted_count).unwrap_or(usize::MAX) > public_transcript.len() {
-                return Err(A2AError::internal("persisted public stream prefix diverges from delivery transcript"));
-            }
-            let existing_sql = store.q("SELECT frame_seq,frame_version,frame_kind,frame_json,frame_digest FROM __S__.stream_frames WHERE tenant_scope=$1 AND message_id=$2 ORDER BY frame_seq");
-            let rows = tx.query(&existing_sql, &[&lease.tenant_scope, &message]).await
-                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery transcript lookup failed")))?;
-            let mut persisted = Vec::with_capacity(rows.len());
-            for (index, row) in rows.iter().enumerate() {
-                let json: String = row.get(3);
-                let frame: StreamResponse = serde_json::from_str(&json)
-                    .map_err(|_| A2AError::internal("persisted public stream prefix is corrupt"))?;
-                if row.get::<_, i64>(0) != i64::try_from(index + 1).unwrap_or(i64::MAX)
-                    || row.get::<_, i64>(1) != 1
-                    || row.get::<_, String>(2) != frame_kind(&frame)
-                    || row.get::<_, String>(4) != content_digest(json.as_bytes())
-                {
-                    return Err(A2AError::internal("persisted public stream prefix is corrupt"));
-                }
-                persisted.push(frame);
-            }
-            if i64::try_from(persisted.len()).ok() != Some(persisted_count)
-                || transcript_digest(&persisted)? != persisted_digest
-                || persisted != public_transcript[..persisted.len()]
-            {
-                return Err(A2AError::internal("persisted public stream prefix diverges from delivery transcript"));
-            }
-            let insert=store.q("INSERT INTO __S__.stream_frames(tenant_scope,message_id,frame_seq,frame_version,frame_kind,frame_json,frame_digest,created_at) VALUES($1,$2,$3,1,$4,$5,$6,$7)");
-            for (seq, frame) in public_transcript.iter().enumerate().skip(persisted.len()) {
-                let json = serde_json::to_string(frame)
-                    .map_err(|_| A2AError::internal("failed to encode delivery frame"))?;
-                let n = i64::try_from(seq + 1)
-                    .map_err(|_| A2AError::internal("too many delivery frames"))?;
-                tx.execute(&insert, &[&lease.tenant_scope, &message, &n, &frame_kind(frame), &json, &content_digest(json.as_bytes()), &now])
-                    .await
-                    .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery frame append failed")))?;
-            }
-            let count = i64::try_from(public_transcript.len())
-                .map_err(|_| A2AError::internal("too many delivery frames"))?;
-            let update=store.q("UPDATE __S__.stream_transcripts SET state='terminal',frame_count=$1,transcript_digest=$2,terminal_seq=$1,updated_at=$3 WHERE tenant_scope=$4 AND message_id=$5 AND state='open'");
-            if tx.execute(&update, &[&count, &transcript_digest(&public_transcript)?, &now, &lease.tenant_scope, &message]).await
-                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("delivery transcript seal failed")))? != 1
-            {
-                return Err(A2AError::internal("stale public stream completion"));
-            }
-        }
-                Ok(TransitionOutcome::Applied)
-            })
+        .map_err(|error| {
+            PostgresTaskStore::transaction_body_error(
+                &error,
+                A2AError::internal("ratification idempotency chain lookup failed"),
+            )
+        })?
+        .into_iter()
+        .map(|event| crate::sqlite_store::RatificationEventIntegrityRow {
+            tenant_scope: event.get(0),
+            task_id: event.get(1),
+            generation: event.get(2),
+            revision: event.get(3),
+            account_id: event.get(4),
+            action: event.get(5),
+            command_digest: event.get(6),
+            idempotency_key: event.get(7),
+            receipt_json: event.get(8),
+            receipt_hash: event.get(9),
+            receipt_seal: event.get(10),
+            previous_receipt_hash: event.get(11),
+            occurred_at: event.get(12),
         })
-        .await
+        .collect::<Vec<_>>();
+    let generation = u64::try_from(generation)
+        .map_err(|_| A2AError::internal("ratification idempotency integrity failure"))?;
+    let conflict = crate::sqlite_store::verify_ratification_conflict_evidence(
+        &packet_row,
+        &task_row,
+        &events,
+        tenant,
+        &task_id,
+        generation,
+        account,
+        idempotency_key,
+        &store.ratification_key,
+    )?;
+    if conflict {
+        return Err(crate::sqlite_store::ratification_idempotency_conflict());
+    }
+    Err(A2AError::internal(
+        "ratification idempotency index integrity failure",
+    ))
+}
+
+fn resolve_postgres_ratification_causative_owner(
+    cause_actor: Option<String>,
+    task_owner: &str,
+    principal: &str,
+    authentication: &str,
+    policy_id: &str,
+    policy_revision: i64,
+    policy_digest: &str,
+) -> Result<String, A2AError> {
+    let legacy_contract = principal == "legacy-principal"
+        && authentication == "trusted-local"
+        && policy_id == "legacy-policy"
+        && policy_revision == 0
+        && policy_digest
+            == "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    cause_actor
+        .or_else(|| legacy_contract.then(|| task_owner.to_owned()))
+        .ok_or_else(|| A2AError::internal("ratification causative owner integrity failure"))
+}
+
+#[cfg(test)]
+#[test]
+fn postgres_legacy_null_causative_owner_is_derived_only_from_authenticated_legacy_task() {
+    let zero = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    assert_eq!(
+        resolve_postgres_ratification_causative_owner(
+            None,
+            "legacy-owner",
+            "legacy-principal",
+            "trusted-local",
+            "legacy-policy",
+            0,
+            zero,
+        )
+        .unwrap(),
+        "legacy-owner"
+    );
+    assert!(
+        resolve_postgres_ratification_causative_owner(
+            None,
+            "contemporary-owner",
+            "principal",
+            "bearer-jwt",
+            "policy",
+            1,
+            zero,
+        )
+        .is_err()
+    );
+}
+
+#[async_trait]
+impl crate::RatificationAuthority for PostgresTaskStore {
+    async fn ratification_view(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+    ) -> Result<Option<crate::RatificationView>, A2AError> {
+        let tenant = scope.tenant_scope().to_owned();
+        let owner = scope.owner_account_id().to_owned();
+        let own = scope.visibility() == VisibilityScope::Own;
+        let task_id = task_id.to_owned();
+        self.run_retryable_transaction(&tenant, Some(&owner), |store, tx| {
+            let tenant = tenant.clone();
+            let owner = owner.clone();
+            let task_id = task_id.clone();
+            Box::pin(async move {
+                let query=store.q("SELECT p.tenant_scope,p.task_id,p.generation,p.task_revision,p.checkpoint_hash,p.packet_hash,p.packet_seal,p.packet_json,p.state,p.revision,p.reviewer_account_id,p.head_receipt_hash,p.approved_task_json,p.approved_result_json,p.approved_transcript_json,t.state,t.revision,t.task_json FROM __S__.tasks t JOIN __S__.ratification_packets p USING(tenant_scope,task_id) WHERE t.tenant_scope=$1 AND t.task_id=$2 AND (NOT $3 OR t.owner_account_id=$4) ORDER BY p.generation DESC LIMIT 1");
+                let Some(row)=tx.query_opt(&query,&[&tenant,&task_id,&own,&owner]).await
+                    .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("ratification packet lookup failed")))?
+                else{return Ok(None)};
+                let packet_row=crate::sqlite_store::RatificationPacketIntegrityRow{tenant_scope:row.get(0),task_id:row.get(1),generation:row.get(2),task_revision:row.get(3),checkpoint_hash:row.get(4),packet_hash:row.get(5),packet_seal:row.get(6),packet_json:row.get(7),state:row.get(8),revision:row.get(9),reviewer_account_id:row.get(10),head_receipt_hash:row.get(11),approved_task_json:row.get(12),approved_result_json:row.get(13),approved_transcript_json:row.get(14)};
+                let events=store.q("SELECT tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at FROM __S__.ratification_events WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 ORDER BY revision");
+                let rows=tx.query(&events,&[&tenant,&task_id,&packet_row.generation]).await
+                    .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("ratification history lookup failed")))?;
+                let event_rows=rows.into_iter().map(|event|crate::sqlite_store::RatificationEventIntegrityRow{tenant_scope:event.get(0),task_id:event.get(1),generation:event.get(2),revision:event.get(3),account_id:event.get(4),action:event.get(5),command_digest:event.get(6),idempotency_key:event.get(7),receipt_json:event.get(8),receipt_hash:event.get(9),receipt_seal:event.get(10),previous_receipt_hash:event.get(11),occurred_at:event.get(12)}).collect::<Vec<_>>();
+                let (packet,history)=crate::sqlite_store::verify_ratification_packet_chain(&packet_row,&event_rows,&tenant,&task_id,u64::try_from(packet_row.generation).map_err(|_|A2AError::internal("ratification generation corrupt"))?,&store.ratification_key)?;
+                if let Some(crate::HumanRatificationAction::Decision(decision))=history.last().map(|r|&r.action){let expected=match decision{crate::HumanDecision::Approve=>a2a::TaskState::Completed,crate::HumanDecision::Reject=>a2a::TaskState::Rejected,crate::HumanDecision::Amend=>a2a::TaskState::InputRequired};let task:Task=serde_json::from_str(row.get(17)).map_err(|_|A2AError::internal("ratification task integrity failure"))?;if task.status.state!=expected||state_key(&task).ok().as_deref()!=Some(row.get::<_,&str>(15))||u64::try_from(row.get::<_,i64>(16)).ok()!=packet.task_revision.checked_add(1){return Err(A2AError::internal("ratification task integrity failure"));}}
+                let state=match packet_row.state.as_str() {
+                    "awaiting_review"=>crate::RatificationState::AwaitingReview,
+                    "reviewed"=>crate::RatificationState::Reviewed,
+                    "approved"=>crate::RatificationState::Approved,
+                    "rejected"=>crate::RatificationState::Rejected,
+                    "amended"=>crate::RatificationState::Amended,
+                    "canceled"=>crate::RatificationState::Canceled,
+                    "superseded"=>crate::RatificationState::Superseded,
+                    _=>return Err(A2AError::internal("ratification state corrupt")),
+                };
+                Ok(Some(crate::RatificationView{packet,state,revision:u64::try_from(packet_row.revision).map_err(|_|A2AError::internal("ratification revision corrupt"))?,history}))
+            })
+        }).await
+    }
+
+    async fn acknowledge_ratification_review(
+        &self,
+        scope: &OwnedTaskScope,
+        command: crate::ReviewAcknowledgement,
+        audit: AuthorizationAuditInput,
+    ) -> Result<crate::HumanRatificationReceipt, A2AError> {
+        crate::sqlite_store::validate_ratification_authorization(
+            scope,
+            &audit,
+            &command.tenant_id,
+            &command.account_id,
+            &command.authorization_policy_id,
+            command.authorization_policy_revision,
+            &command.authorization_policy_digest,
+            &command.principal_scope,
+            &command.authentication_method,
+            &command.task_id,
+        )?;
+        let digest = crate::sqlite_store::review_command_digest(&command)?;
+        let tenant = scope.tenant_scope().to_owned();
+        let owner = scope.owner_account_id().to_owned();
+        let own = scope.visibility() == VisibilityScope::Own;
+        self.run_retryable_transaction(&tenant, Some(&owner), |store, tx| {
+            let tenant=tenant.clone(); let owner=owner.clone(); let command=command.clone();
+            let audit=audit.clone(); let digest=digest.clone();
+            Box::pin(async move {
+                let generation=i64::try_from(command.generation).map_err(|_|A2AError::invalid_request("ratification generation invalid"))?;
+                let task_sql=store.q("SELECT state,revision,task_json,owner_account_id,context_id,status_timestamp,authorization_policy_id,authorization_policy_revision,authorization_policy_digest,principal_scope,authentication_method FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 FOR UPDATE");
+                let task=tx.query_opt(&task_sql,&[&tenant,&command.task_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification task lookup failed")))?.ok_or_else(||A2AError::task_not_found(&command.task_id))?;
+                let packet_sql=store.q("SELECT p.tenant_scope,p.task_id,p.generation,p.task_revision,p.checkpoint_hash,p.packet_hash,p.packet_seal,p.packet_json,p.state,p.revision,p.reviewer_account_id,p.head_receipt_hash,p.approved_task_json,p.approved_result_json,p.approved_transcript_json FROM __S__.ratification_packets p WHERE p.tenant_scope=$1 AND p.task_id=$2 AND p.generation=$3 FOR UPDATE OF p");
+                let row=tx.query_opt(&packet_sql,&[&tenant,&command.task_id,&generation]).await
+                    .map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification packet lookup failed")))?
+                    .ok_or_else(||A2AError::invalid_request("ratification packet not found"))?;
+                let packet_row=crate::sqlite_store::RatificationPacketIntegrityRow{tenant_scope:row.get(0),task_id:row.get(1),generation:row.get(2),task_revision:row.get(3),checkpoint_hash:row.get(4),packet_hash:row.get(5),packet_seal:row.get(6),packet_json:row.get(7),state:row.get(8),revision:row.get(9),reviewer_account_id:row.get(10),head_receipt_hash:row.get(11),approved_task_json:row.get(12),approved_result_json:row.get(13),approved_transcript_json:row.get(14)};
+                let packet=crate::sqlite_store::verify_ratification_packet_row(&packet_row,&tenant,&command.task_id,command.generation,&store.ratification_key)?;
+                let causative_revision=i64::try_from(packet.task_revision.checked_sub(1).ok_or_else(||A2AError::internal("ratification task integrity failure"))?).map_err(|_|A2AError::internal("ratification task integrity failure"))?;
+                let cause_sql=store.q("SELECT i.actor_account_id,i.request_digest,i.message_id FROM __S__.outbox o JOIN __S__.idempotency_records i ON i.tenant_scope=o.tenant_scope AND i.message_id=o.message_id AND i.task_id=o.task_id WHERE o.tenant_scope=$1 AND o.task_id=$2 AND o.causative_revision=$3 AND o.state='delivered'");
+                let causes=tx.query(&cause_sql,&[&tenant,&command.task_id,&causative_revision]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification authority binding lookup failed")))?;
+                let [cause]=causes.as_slice() else{return Err(A2AError::internal("ratification causative identity integrity failure"));};
+                let task_owner:String=task.get(3);let principal:String=task.get(9);let authentication:String=task.get(10);let policy_id:String=task.get(6);let policy_revision:i64=task.get(7);let policy_digest:String=task.get(8);
+                let cause_actor:Option<String>=cause.get(0);let cause_owner=resolve_postgres_ratification_causative_owner(cause_actor,&task_owner,&principal,&authentication,&policy_id,policy_revision,&policy_digest)?;
+                let task_integrity=crate::sqlite_store::RatificationTaskIntegrityRow{state:task.get(0),revision:task.get(1),task_json:task.get(2),owner_account_id:task_owner,context_id:task.get(4),status_timestamp:task.get(5),authorization_policy_id:Some(policy_id),authorization_policy_revision:Some(policy_revision),authorization_policy_digest:Some(policy_digest),principal_scope:principal,authentication_method:authentication,causative_owner_account_id:cause_owner,causative_request_digest:cause.get(1),causative_idempotency_key:cause.get(2)};
+                let chain_sql=store.q("SELECT tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at FROM __S__.ratification_events WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 ORDER BY revision");
+                let chain=tx.query(&chain_sql,&[&tenant,&command.task_id,&generation]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification receipt chain lookup failed")))?;
+                let events=chain.into_iter().map(|event|crate::sqlite_store::RatificationEventIntegrityRow{tenant_scope:event.get(0),task_id:event.get(1),generation:event.get(2),revision:event.get(3),account_id:event.get(4),action:event.get(5),command_digest:event.get(6),idempotency_key:event.get(7),receipt_json:event.get(8),receipt_hash:event.get(9),receipt_seal:event.get(10),previous_receipt_hash:event.get(11),occurred_at:event.get(12)}).collect::<Vec<_>>();
+                if let Some(receipt)=crate::sqlite_store::verify_ratification_replay(&packet_row,&task_integrity,&events,&tenant,&command.task_id,command.generation,own.then_some(owner.as_str()),&command.account_id,&command.idempotency_key,&digest,&store.ratification_key)? {
+                    store.insert_audit(tx,audit.decided(AuthorizationDecisionEffect::Allow,"ratification_review_replay",None)).await?;
+                    return Ok(receipt);
+                }
+                reject_postgres_global_ratification_idempotency_conflict(store,tx,&tenant,&command.account_id,&command.idempotency_key).await?;
+                let task_revision:i64=task.get(1); let packet_revision:i64=row.get(3);
+                let artifact_hashes=packet.artifacts.iter().map(|a|a.digest.clone()).collect::<Vec<_>>();
+                if task.get::<_,&str>(0)!="\"TASK_STATE_INPUT_REQUIRED\"" || task_revision!=packet_revision
+                    || task.get::<_,String>(4)!=command.context_id || task.get::<_,String>(6)!=command.authorization_policy_id
+                    || u64::try_from(task.get::<_,i64>(7)).ok()!=Some(command.authorization_policy_revision)
+                    || task.get::<_,String>(8)!=command.authorization_policy_digest || packet_row.state!="awaiting_review"
+                    || packet_row.revision!=0 || packet_row.head_receipt_hash.is_some() || command.expected_revision!=0
+                    || !crate::ratification::review_command_matches_packet(&command,&packet)
+                    || command.evidence_hashes!=packet.evidence_hashes || command.artifact_hashes!=artifact_hashes
+                    || command.artifact_manifest_digest!=packet.artifact_set_digest
+                    || !command.uncertainty_acknowledged { return Err(crate::sqlite_store::ratification_conflict()); }
+                let now=store.effective_now(tx,command.reviewed_at_millis).await?;
+                let receipt=crate::sqlite_store::build_ratification_receipt(&packet,&command.account_id,&command.principal_scope,&command.authentication_method,1,crate::HumanRatificationAction::ReviewAcknowledged,"exact evidence, artifacts, and uncertainty reviewed",now,&command.idempotency_key,None,&store.ratification_key)?;
+                let receipt_json=serde_json::to_string(&receipt).map_err(|_|A2AError::internal("ratification receipt encoding failed"))?;
+                let insert=store.q("INSERT INTO __S__.ratification_events(tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at) VALUES($1,$2,$3,1,$4,'review',$5,$6,$7,$8,$9,NULL,$10)");
+                tx.execute(&insert,&[&tenant,&command.task_id,&generation,&command.account_id,&digest,&command.idempotency_key,&receipt_json,&receipt.receipt_hash,&receipt.seal,&now]).await
+                    .map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification event append failed")))?;
+                let update=store.q("UPDATE __S__.ratification_packets SET state='reviewed',revision=1,reviewer_account_id=$4,head_receipt_hash=$5,updated_at=$6 WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 AND state='awaiting_review' AND revision=0");
+                if tx.execute(&update,&[&tenant,&command.task_id,&generation,&command.account_id,&receipt.receipt_hash,&now]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification review update failed")))?!=1 { return Err(crate::sqlite_store::ratification_conflict()); }
+                store.insert_audit(tx,audit.decided(AuthorizationDecisionEffect::Allow,"ratification_reviewed",None)).await?;
+                Ok(receipt)
+            })
+        }).await
+    }
+
+    async fn decide_ratification(
+        &self,
+        scope: &OwnedTaskScope,
+        command: crate::RatificationCommand,
+        audit: AuthorizationAuditInput,
+    ) -> Result<crate::HumanRatificationReceipt, A2AError> {
+        self.decide_ratification_with_quota(scope, command, audit, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn decide_ratification_with_quota(
+        &self,
+        scope: &OwnedTaskScope,
+        command: crate::RatificationCommand,
+        audit: AuthorizationAuditInput,
+        amendment_quota_intent: Option<&crate::QuotaIntent>,
+    ) -> Result<crate::HumanRatificationReceipt, A2AError> {
+        crate::sqlite_store::validate_ratification_authorization(
+            scope,
+            &audit,
+            &command.tenant_id,
+            &command.account_id,
+            &command.authorization_policy_id,
+            command.authorization_policy_revision,
+            &command.authorization_policy_digest,
+            &command.principal_scope,
+            &command.authentication_method,
+            &command.task_id,
+        )?;
+        if amendment_quota_intent
+            .is_some_and(|i| i.operation() != crate::QuotaOperation::TaskContinue)
+        {
+            return Err(A2AError::invalid_request("quota intent operation mismatch"));
+        }
+        if self.quota_enforcement
+            && matches!(command.decision, crate::HumanDecision::Amend)
+            && amendment_quota_intent.is_none()
+        {
+            return Err(crate::quota::quota_authority_unavailable());
+        }
+        let digest = crate::sqlite_store::decision_command_digest(&command)?;
+        let tenant = scope.tenant_scope().to_owned();
+        let owner = scope.owner_account_id().to_owned();
+        let own = scope.visibility() == VisibilityScope::Own;
+        let quota_intent = amendment_quota_intent.cloned();
+        self.run_retryable_transaction(&tenant,Some(&owner),|store,tx|{
+            let tenant=tenant.clone();let owner=owner.clone();let command=command.clone();let audit=audit.clone();let digest=digest.clone();let quota_intent=quota_intent.clone();
+            Box::pin(async move {
+                let generation=i64::try_from(command.generation).map_err(|_|A2AError::invalid_request("ratification generation invalid"))?;
+                let task_sql=store.q("SELECT state,revision,task_json,owner_account_id,context_id,status_timestamp,authorization_policy_id,authorization_policy_revision,authorization_policy_digest,principal_scope,authentication_method FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 FOR UPDATE");
+                let task_row=tx.query_opt(&task_sql,&[&tenant,&command.task_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification task lookup failed")))?.ok_or_else(||A2AError::task_not_found(&command.task_id))?;
+                let packet_sql=store.q("SELECT p.tenant_scope,p.task_id,p.generation,p.task_revision,p.checkpoint_hash,p.packet_hash,p.packet_seal,p.packet_json,p.state,p.revision,p.reviewer_account_id,p.head_receipt_hash,p.approved_task_json,p.approved_result_json,p.approved_transcript_json FROM __S__.ratification_packets p WHERE p.tenant_scope=$1 AND p.task_id=$2 AND p.generation=$3 FOR UPDATE OF p");
+                let row=tx.query_opt(&packet_sql,&[&tenant,&command.task_id,&generation]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification packet lookup failed")))?.ok_or_else(||A2AError::invalid_request("ratification packet not found"))?;
+                let packet_row=crate::sqlite_store::RatificationPacketIntegrityRow{tenant_scope:row.get(0),task_id:row.get(1),generation:row.get(2),task_revision:row.get(3),checkpoint_hash:row.get(4),packet_hash:row.get(5),packet_seal:row.get(6),packet_json:row.get(7),state:row.get(8),revision:row.get(9),reviewer_account_id:row.get(10),head_receipt_hash:row.get(11),approved_task_json:row.get(12),approved_result_json:row.get(13),approved_transcript_json:row.get(14)};
+                let packet=crate::sqlite_store::verify_ratification_packet_row(&packet_row,&tenant,&command.task_id,command.generation,&store.ratification_key)?;
+                let causative_revision=i64::try_from(packet.task_revision.checked_sub(1).ok_or_else(||A2AError::internal("ratification task integrity failure"))?).map_err(|_|A2AError::internal("ratification task integrity failure"))?;
+                let cause_sql=store.q("SELECT i.actor_account_id,i.request_digest,i.message_id FROM __S__.outbox o JOIN __S__.idempotency_records i ON i.tenant_scope=o.tenant_scope AND i.message_id=o.message_id AND i.task_id=o.task_id WHERE o.tenant_scope=$1 AND o.task_id=$2 AND o.causative_revision=$3 AND o.state='delivered'");
+                let causes=tx.query(&cause_sql,&[&tenant,&command.task_id,&causative_revision]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification authority binding lookup failed")))?;
+                let [cause]=causes.as_slice() else{return Err(A2AError::internal("ratification causative identity integrity failure"));};
+                let task_owner:String=task_row.get(3);let principal:String=task_row.get(9);let authentication:String=task_row.get(10);let policy_id:String=task_row.get(6);let policy_revision:i64=task_row.get(7);let policy_digest:String=task_row.get(8);
+                let cause_actor:Option<String>=cause.get(0);let cause_owner=resolve_postgres_ratification_causative_owner(cause_actor,&task_owner,&principal,&authentication,&policy_id,policy_revision,&policy_digest)?;
+                let task_integrity=crate::sqlite_store::RatificationTaskIntegrityRow{state:task_row.get(0),revision:task_row.get(1),task_json:task_row.get(2),owner_account_id:task_owner,context_id:task_row.get(4),status_timestamp:task_row.get(5),authorization_policy_id:Some(policy_id),authorization_policy_revision:Some(policy_revision),authorization_policy_digest:Some(policy_digest),principal_scope:principal,authentication_method:authentication,causative_owner_account_id:cause_owner,causative_request_digest:cause.get(1),causative_idempotency_key:cause.get(2)};
+                let approved_task_json=&packet_row.approved_task_json;let approved_result_json=&packet_row.approved_result_json;let approved_transcript_json=&packet_row.approved_transcript_json;
+                let chain_sql=store.q("SELECT tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at FROM __S__.ratification_events WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 ORDER BY revision");
+                let chain=tx.query(&chain_sql,&[&tenant,&command.task_id,&generation]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification receipt chain lookup failed")))?;
+                let events=chain.into_iter().map(|event|crate::sqlite_store::RatificationEventIntegrityRow{tenant_scope:event.get(0),task_id:event.get(1),generation:event.get(2),revision:event.get(3),account_id:event.get(4),action:event.get(5),command_digest:event.get(6),idempotency_key:event.get(7),receipt_json:event.get(8),receipt_hash:event.get(9),receipt_seal:event.get(10),previous_receipt_hash:event.get(11),occurred_at:event.get(12)}).collect::<Vec<_>>();
+                if let Some(receipt)=crate::sqlite_store::verify_ratification_replay(&packet_row,&task_integrity,&events,&tenant,&command.task_id,command.generation,own.then_some(owner.as_str()),&command.account_id,&command.idempotency_key,&digest,&store.ratification_key)? {
+                    store.insert_audit(tx,audit.decided(AuthorizationDecisionEffect::Allow,"ratification_decision_replay",None)).await?;
+                    return Ok(receipt);
+                }
+                reject_postgres_global_ratification_idempotency_conflict(store,tx,&tenant,&command.account_id,&command.idempotency_key).await?;
+                let task_revision:i64=task_row.get(1);let packet_revision=packet_row.task_revision;let head=packet_row.head_receipt_hash.clone();
+                if task_row.get::<_,&str>(0)!="\"TASK_STATE_INPUT_REQUIRED\"" || task_revision!=packet_revision || task_row.get::<_,String>(4)!=command.context_id
+                    || task_row.get::<_,String>(6)!=command.authorization_policy_id || u64::try_from(task_row.get::<_,i64>(7)).ok()!=Some(command.authorization_policy_revision)
+                    || task_row.get::<_,String>(8)!=command.authorization_policy_digest
+                    || packet_row.state!="reviewed" || packet_row.revision!=1 || command.expected_revision!=1 || packet_row.reviewer_account_id.as_deref()!=Some(&command.account_id)
+                    || head.is_none() || !crate::ratification::decision_command_matches_packet(&command,&packet) {return Err(crate::sqlite_store::ratification_conflict());}
+                let review_sql=store.q("SELECT receipt_json,receipt_hash,receipt_seal,previous_receipt_hash FROM __S__.ratification_events WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 AND revision=1");
+                let review=tx.query_one(&review_sql,&[&tenant,&command.task_id,&generation]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification receipt chain lookup failed")))?;
+                let review_receipt:crate::HumanRatificationReceipt=serde_json::from_str(review.get(0)).map_err(|_|A2AError::internal("ratification receipt integrity failure"))?;
+                let review_hash=crate::ratification::receipt_statement_hash(&review_receipt).map_err(|_|A2AError::internal("ratification receipt integrity failure"))?;
+                let review_seal=crate::ratification::ratification_mac(&store.ratification_key,crate::ratification::RECEIPT_DOMAIN,review_hash.as_bytes());
+                if review_hash!=review.get::<_,String>(1)||review_seal!=review.get::<_,String>(2)||review.get::<_,Option<String>>(3).is_some()||head.as_deref()!=Some(&review_hash)||review_receipt.account_id!=command.account_id{return Err(A2AError::internal("ratification receipt chain integrity failure"));}
+                let now=store.effective_now(tx,command.decided_at_millis).await?;
+                let action=crate::HumanRatificationAction::Decision(command.decision.clone());let action_key=match command.decision{crate::HumanDecision::Approve=>"approve",crate::HumanDecision::Reject=>"reject",crate::HumanDecision::Amend=>"amend"};
+                let receipt=crate::sqlite_store::build_ratification_receipt(&packet,&command.account_id,&command.principal_scope,&command.authentication_method,2,action,&command.rationale,now,&command.idempotency_key,head,&store.ratification_key)?;
+                let receipt_json=serde_json::to_string(&receipt).map_err(|_|A2AError::internal("ratification receipt encoding failed"))?;
+                let insert=store.q("INSERT INTO __S__.ratification_events(tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at) VALUES($1,$2,$3,2,$4,$5,$6,$7,$8,$9,$10,$11,$12)");
+                tx.execute(&insert,&[&tenant,&command.task_id,&generation,&command.account_id,&action_key,&digest,&command.idempotency_key,&receipt_json,&receipt.receipt_hash,&receipt.seal,&receipt.previous_receipt_hash,&now]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification event append failed")))?;
+                let mut task:Task=serde_json::from_str(task_row.get(2)).map_err(|_|A2AError::internal("stored task is corrupt"))?;let previous:String=task_row.get(0);let task_owner:String=task_row.get(3);let mut transcript=None;
+                match command.decision {
+                    crate::HumanDecision::Approve=>{task=crate::ratification::decode_publication_task(approved_task_json)?;let result:SendMessageResponse=serde_json::from_str(approved_result_json).map_err(|_|A2AError::internal("ratification result integrity failure"))?;let frames:Vec<StreamResponse>=serde_json::from_str(approved_transcript_json).map_err(|_|A2AError::internal("ratification transcript integrity failure"))?;if task.id!=command.task_id||task.context_id!=packet.context_id||task.status.state!=a2a::TaskState::Completed||!final_result_matches_task(&result,&task){return Err(A2AError::internal("ratification candidate integrity failure"));}transcript=Some(frames);}
+                    crate::HumanDecision::Reject=>{task.artifacts=None;task.status.state=a2a::TaskState::Rejected;task.status.message=None;task.status.timestamp=chrono::DateTime::from_timestamp_millis(now);}
+                    crate::HumanDecision::Amend=>{task.status.timestamp=chrono::DateTime::from_timestamp_millis(now);let mut message=Message::new(Role::User,vec![Part::text(command.rationale.clone())]);message.message_id=format!("ratification-amend-{}",&receipt.receipt_hash[7..31]);message.task_id=Some(task.id.clone());message.context_id=Some(task.context_id.clone());task.history.get_or_insert_with(Vec::new).push(message);}
+                }
+                let encoded=serde_json::to_string(&task).map_err(|_|A2AError::internal("ratification task encoding failed"))?;let state=state_key(&task)?;let next=task_revision.checked_add(1).ok_or_else(||A2AError::internal("task revision exhausted"))?;let timestamp=task.status.timestamp.map(|v|v.to_rfc3339());
+                let update_task=store.q("UPDATE __S__.tasks SET state=$1,status_timestamp=$2,revision=$3,task_json=$4 WHERE tenant_scope=$5 AND task_id=$6 AND revision=$7");if tx.execute(&update_task,&[&state,&timestamp,&next,&encoded,&tenant,&command.task_id,&task_revision]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification task update failed")))?!=1{return Err(crate::sqlite_store::ratification_conflict());}
+                let packet_state=match command.decision{crate::HumanDecision::Approve=>"approved",crate::HumanDecision::Reject=>"rejected",crate::HumanDecision::Amend=>"amended"};let update_packet=store.q("UPDATE __S__.ratification_packets SET state=$4,revision=2,head_receipt_hash=$5,updated_at=$6 WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 AND state='reviewed' AND revision=1");if tx.execute(&update_packet,&[&tenant,&command.task_id,&generation,&packet_state,&receipt.receipt_hash,&now]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification packet update failed")))?!=1{return Err(crate::sqlite_store::ratification_conflict());}
+                let event_kind=match command.decision{crate::HumanDecision::Approve=>"ratification_approved",crate::HumanDecision::Reject=>"ratification_rejected",crate::HumanDecision::Amend=>"ratification_amend_requested"};let event=store.q("INSERT INTO __S__.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) SELECT $1,$2,COALESCE(max(event_seq),0)+1,$3,$4,$5,$6,$7,$8 FROM __S__.task_events WHERE tenant_scope=$1 AND task_id=$2");tx.execute(&event,&[&tenant,&command.task_id,&next,&event_kind,&previous,&state,&encoded,&now]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification task event append failed")))?;
+                if let Some(frames)=transcript {let message_id=&task_integrity.causative_idempotency_key;let publish=store.q("UPDATE __S__.idempotency_records SET final_result_json=$1,updated_at=$2 WHERE tenant_scope=$3 AND message_id=$4 AND task_id=$5 AND state='completed'");if tx.execute(&publish,&[&approved_result_json,&now,&tenant,&message_id,&command.task_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification result publication failed")))?!=1{return Err(A2AError::internal("ratification result publication missing"));}let transcript_row=store.q("SELECT EXISTS(SELECT 1 FROM __S__.stream_transcripts WHERE tenant_scope=$1 AND message_id=$2 AND task_id=$3 AND state='terminal')");let has_stream:bool=tx.query_one(&transcript_row,&[&tenant,&message_id,&command.task_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification transcript lookup failed")))?.get(0);if has_stream{let delete=store.q("DELETE FROM __S__.stream_frames WHERE tenant_scope=$1 AND message_id=$2");tx.execute(&delete,&[&tenant,&message_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification transcript replacement failed")))?;for(index,frame)in frames.iter().enumerate(){let seq=i64::try_from(index+1).map_err(|_|A2AError::internal("ratification transcript sequence exhausted"))?;let json=serde_json::to_string(frame).map_err(|_|A2AError::internal("ratification transcript encoding failed"))?;let insert_frame=store.q("INSERT INTO __S__.stream_frames(tenant_scope,message_id,frame_seq,frame_version,frame_kind,frame_json,frame_digest,created_at) VALUES($1,$2,$3,1,$4,$5,$6,$7)");tx.execute(&insert_frame,&[&tenant,&message_id,&seq,&frame_kind(frame),&json,&content_digest(json.as_bytes()),&now]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification transcript publication failed")))?;}let count=i64::try_from(frames.len()).map_err(|_|A2AError::internal("ratification transcript length exhausted"))?;let update=store.q("UPDATE __S__.stream_transcripts SET frame_count=$1,transcript_digest=$2,terminal_seq=$1,updated_at=$3 WHERE tenant_scope=$4 AND message_id=$5 AND state='terminal'");if tx.execute(&update,&[&count,&content_digest(approved_transcript_json.as_bytes()),&now,&tenant,&message_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification transcript publication failed")))?!=1{return Err(A2AError::internal("ratification transcript publication missing"));}}}
+                if matches!(command.decision,crate::HumanDecision::Amend){let message=task.history.as_ref().and_then(|h|h.last()).cloned().ok_or_else(||A2AError::internal("ratification amendment missing"))?;let request=SendMessageRequest{message:message.clone(),configuration:None,metadata:None,tenant:None};let payload=MeshRequest::from_a2a(task.id.clone(),task.context_id.clone(),&message,crate::InputLimits::default()).map_err(|_|A2AError::invalid_request("invalid ratification amendment"))?;let payload_json=serde_json::to_string(&payload).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?;let result_json=serde_json::to_string(&SendMessageResponse::Task(task.clone())).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?;let message_id=authorized_message_identity(&tenant,&task_owner,&message.message_id);let request_digest=canonical_send_message_digest_v2(&tenant,&task_owner,&request,false)?;let dispatch_id=content_digest(format!("{tenant}\0send-message\0{message_id}").as_bytes());let request_json=serde_json::to_string(&request).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?;let idem=store.q("INSERT INTO __S__.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id,causative_request_json,invocation_kind) VALUES($1,$2,$3,$4,'in_progress',$5,$6,$6,2,$7,$8,'unary')");tx.execute(&idem,&[&tenant,&message_id,&request_digest,&command.task_id,&result_json,&now,&task_owner,&request_json]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification amendment reservation failed")))?;let execution=if let Some(intent)=quota_intent.as_ref(){store.apply_quota_intent(tx,intent,&tenant,&owner,Some(&command.task_id),now,true,Some(&request),Some(u64::try_from(command.rationale.len()).map_err(|_|A2AError::invalid_request("ratification amendment is too large"))?)).await?;Some(store.bind_execution_reservation(tx,intent,&command.task_id,&message_id,&dispatch_id,now,true).await?)}else{None};let reservation_id=execution.as_ref().map(|(id,_)|id.as_str());let binding=quota_intent.as_ref().map(crate::QuotaIntent::binding_digest);let version=execution.as_ref().map(|_|1_i64);let output=execution.as_ref().map(|(_,b)|i64::try_from(b.max_output_bytes()).unwrap_or(i64::MAX));let events=execution.as_ref().map(|(_,b)|i64::try_from(b.max_event_count()).unwrap_or(i64::MAX));let outbox=store.q("INSERT INTO __S__.outbox(dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version,quota_binding_digest,quota_reservation_id,quota_reservation_version,reserved_output_bytes,reserved_event_count) VALUES($1,$2,$3,$4,$5,$6,$7,'pending',8,$8,$8,$8,2,$9,$10,$11,$12,$13)");tx.execute(&outbox,&[&dispatch_id,&tenant,&command.task_id,&message_id,&next,&payload_json,&content_digest(payload_json.as_bytes()),&now,&binding,&reservation_id,&version,&output,&events]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification amendment dispatch failed")))?;}
+                if matches!(command.decision,crate::HumanDecision::Approve|crate::HumanDecision::Reject){enqueue_postgres_terminal_callbacks(store,tx,&tenant,&task,next,now).await?;}
+                store.insert_audit(tx,audit.decided(AuthorizationDecisionEffect::Allow,event_kind,None)).await?;Ok(receipt)
+            })
+        }).await
     }
 }
 
@@ -10545,6 +11524,9 @@ impl CancellationAuthority for PostgresTaskStore {
         {
             return Err(A2AError::task_not_cancelable(&task_id));
         }
+        let cancel_packet=store.q("UPDATE __S__.ratification_packets SET state='canceled',updated_at=$1 WHERE tenant_scope=$2 AND task_id=$3 AND state IN ('awaiting_review','reviewed')");
+        tx.execute(&cancel_packet,&[&now,&tenant,&task_id]).await
+            .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("cancellation ratification closure failed")))?;
         let event=store.q("INSERT INTO __S__.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) SELECT $1,$2,COALESCE(max(event_seq),0)+1,$3,'durable_canceled',$4,$5,$6,$7 FROM __S__.task_events WHERE tenant_scope=$1 AND task_id=$2");
         tx.execute(
             &event,

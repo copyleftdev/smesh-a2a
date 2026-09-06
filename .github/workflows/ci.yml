@@ -192,9 +192,9 @@ jobs:
 
   postgres:
     runs-on: ubuntu-latest
-    # Command watchdogs total 75 minutes; keep a bounded margin for builds and
+    # Command watchdogs total 100 minutes; keep a bounded margin for builds and
     # service setup without re-running postgres_store selections.
-    timeout-minutes: 90
+    timeout-minutes: 120
     services:
       postgres:
         image: postgres:17
@@ -247,3 +247,7 @@ jobs:
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test postgres_multi_replica -- --test-threads=1
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test authorized_gateway_process production_binary_selects_postgres_and_replays_after_graceful_restart -- --exact --test-threads=1
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked --test postgres_quota_process -- --test-threads=1
+      - name: Human ratification authority and production binary qualification
+        run: |
+          timeout --signal=TERM --kill-after=15s 15m cargo test --locked --test postgres_ratification -- --test-threads=1
+          timeout --signal=TERM --kill-after=15s 10m cargo test --locked --test human_ratification_process production_postgres_binary_qualifies_ratification_routes -- --exact --test-threads=1

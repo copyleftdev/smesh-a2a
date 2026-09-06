@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "serve": "node serve-demo.mjs",
-    "test": "node --test *.test.mjs && node validate-trace.mjs",
+    "test": "cargo build --locked --bin smesh-a2a-gateway && node --test *.test.mjs && node validate-trace.mjs",
     "export": "node export-film.mjs",
     "record": "node record-film.mjs"
   },

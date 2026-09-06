@@ -292,7 +292,7 @@ pub struct DurableLoopbackEndpoint {
     completion_barrier: Option<(Arc<Notify>, Arc<Notify>)>,
     completion_committed: Option<(Arc<Notify>, Arc<Notify>)>,
     active: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    interruption: Option<(String, DurableInterruptionKind, String)>,
+    interruption: Option<(String, DurableInterruptionKind, String, Vec<MeshEvent>)>,
     telemetry: Option<crate::telemetry::TelemetryHandle>,
 }
 
@@ -360,7 +360,25 @@ impl DurableLoopbackEndpoint {
             completion_barrier: None,
             completion_committed: None,
             active: Arc::new(Mutex::new(HashMap::new())),
-            interruption: Some((text.into(), kind, message.into())),
+            interruption: Some((text.into(), kind, message.into(), Vec::new())),
+            telemetry: None,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_interruption_events_for_test(
+        text: impl Into<String>,
+        kind: DurableInterruptionKind,
+        message: impl Into<String>,
+        events: Vec<MeshEvent>,
+    ) -> Self {
+        Self {
+            effects: Arc::new(AtomicUsize::new(0)),
+            completion_barrier: None,
+            completion_committed: None,
+            active: Arc::new(Mutex::new(HashMap::new())),
+            interruption: Some((text.into(), kind, message.into(), events)),
             telemetry: None,
         }
     }
@@ -506,13 +524,17 @@ impl DurableLoopbackEndpoint {
                         {
                             return Ok(ReceiverCompletion::Canceled(canceled_events()));
                         }
-                        if let Some((trigger, kind, message)) = &self.interruption
+                        if let Some((trigger, kind, message, events)) = &self.interruption
                             && envelope.request.text == *trigger
                         {
                             return Ok(ReceiverCompletion::Interrupted(DurableReceiverResult {
-                                events: vec![MeshEvent::Progress(
-                                    "SMESH swarm is processing the durable dispatch".to_owned(),
-                                )],
+                                events: if events.is_empty() {
+                                    vec![MeshEvent::Progress(
+                                        "SMESH swarm is processing the durable dispatch".to_owned(),
+                                    )]
+                                } else {
+                                    events.clone()
+                                },
                                 termination: match kind {
                                     DurableInterruptionKind::InputRequired => {
                                         DurableReceiverTermination::InputRequired {

@@ -563,9 +563,9 @@ async fn populated_revision_eight_upgrades_authorization_projection_evidence_tra
             assert_eq!(counters.get::<_, i64>(4), counters.get::<_, i64>(5));
 
             let ledger = client.query_one(
-                    &format!("SELECT m.schema_version,l.logical_schema_version,l.name,l.checksum FROM {upgrade_schema}.store_metadata m JOIN {upgrade_schema}.schema_migrations l ON l.revision=9 WHERE m.singleton=1"), &[]
+                    &format!("SELECT m.schema_version,l.logical_schema_version,l.name,l.checksum,r.logical_schema_version,r.name,r.checksum,x.logical_schema_version,x.name,x.checksum FROM {upgrade_schema}.store_metadata m JOIN {upgrade_schema}.schema_migrations l ON l.revision=9 JOIN {upgrade_schema}.schema_migrations r ON r.revision=10 JOIN {upgrade_schema}.schema_migrations x ON x.revision=11 WHERE m.singleton=1"), &[]
                 ).await.unwrap();
-            assert_eq!(ledger.get::<_, i64>(0), 9);
+            assert_eq!(ledger.get::<_, i64>(0), 11);
             assert_eq!(ledger.get::<_, i64>(1), 9);
             assert_eq!(
                 ledger.get::<_, &str>(2),
@@ -577,6 +577,36 @@ async fn populated_revision_eight_upgrades_authorization_projection_evidence_tra
                     include_str!("../migrations/postgres/0009_authorization_audit_retention.sql")
                         .as_bytes()
                 )
+            );
+            assert_eq!(ledger.get::<_, i64>(4), 10);
+            assert_eq!(ledger.get::<_, &str>(5), "0010_human_ratification");
+            assert_eq!(
+                ledger.get::<_, String>(6),
+                content_digest(
+                    include_str!("../migrations/postgres/0010_human_ratification.sql").as_bytes()
+                )
+            );
+            assert_eq!(ledger.get::<_, i64>(7), 11);
+            assert_eq!(
+                ledger.get::<_, &str>(8),
+                "0011_ratification_retained_authority"
+            );
+            assert_eq!(
+                ledger.get::<_, String>(9),
+                content_digest(
+                    include_str!("../migrations/postgres/0011_ratification_retained_authority.sql")
+                        .as_bytes()
+                )
+            );
+            let legacy_defaults = client.query(
+                "SELECT column_name,column_default FROM information_schema.columns WHERE table_schema=$1 AND table_name='tasks' AND column_name IN ('principal_scope','authentication_method','authorization_policy_id','authorization_policy_revision') ORDER BY column_name",
+                &[&upgrade_schema],
+            ).await.unwrap();
+            assert_eq!(legacy_defaults.len(), 4);
+            assert!(
+                legacy_defaults
+                    .iter()
+                    .all(|row| row.get::<_, Option<String>>(1).is_some())
             );
             store.shutdown().await.unwrap();
             drop(store);

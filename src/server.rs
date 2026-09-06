@@ -5,10 +5,10 @@ use a2a::{A2AError, AgentCard, ListTasksRequest, ListTasksResponse, Task};
 use a2a_server::{DefaultRequestHandler, RequestHandler, StaticAgentCard, TaskStore};
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::extract::{Extension, OriginalUri, Path};
+use axum::extract::{Extension, FromRequestParts, OriginalUri, Path};
 use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse as _, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Router, middleware};
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -211,6 +211,680 @@ fn canonical_artifact_resolver_request(uri: &Uri, artifact_id: &str) -> bool {
     crate::artifact::validate_artifact_id(artifact_id).is_ok()
         && uri.query().is_none()
         && uri.path() == format!("/artifacts/v1/{artifact_id}")
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReviewBody {
+    evidence_hashes: Vec<String>,
+    artifact_hashes: Vec<String>,
+    artifact_manifest_digest: String,
+    uncertainty_acknowledged: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DecisionBody {
+    decision: crate::HumanDecision,
+    rationale: String,
+}
+
+#[derive(Clone)]
+struct RatificationOrigin(Arc<str>);
+
+const RATIFICATION_CONSOLE: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SMESH Human Ratification</title><script src="/ratification/console.js" defer></script></head><body><main id="ratification"><h1>Human Ratification</h1><form id="bootstrap"><label for="task">Task</label><input id="task" required autocomplete="off"><label for="tenant">Tenant (optional)</label><input id="tenant" autocomplete="off"><label for="token">Bearer token (optional for mTLS)</label><input id="token" type="password" autocomplete="off"><button id="load" type="submit">Load</button></form><output id="status" data-state="BOOTSTRAP_LOCKED" aria-live="polite">Enter a task to begin.</output><section id="review-surface" hidden><h2>Review packet</h2><dl id="packet"></dl><fieldset id="review-items"><legend>Required acknowledgements</legend></fieldset><button id="review-submit" type="button" disabled>Record review</button><fieldset id="decisions"><legend>Decision</legend><label for="rationale">Rationale</label><textarea id="rationale"></textarea><button id="approve" type="button" disabled>Approve</button><button id="reject" type="button" disabled>Reject</button><button id="amend" type="button" disabled>Amend</button></fieldset></section><button id="retry" type="button" hidden>Retry</button></main></body></html>"#;
+
+const RATIFICATION_CONSOLE_SCRIPT: &str = r"'use strict';
+(()=>{
+const byId=id=>document.getElementById(id), form=byId('bootstrap'), task=byId('task'), tenant=byId('tenant'), token=byId('token'), status=byId('status'), surface=byId('review-surface'), packet=byId('packet'), items=byId('review-items'), review=byId('review-submit'), retry=byId('retry'), rationale=byId('rationale'), decisions=['approve','reject','amend'].map(byId);
+let bearer='', taskId='', tenantId='', view=null, etag='', busy=false, pending=null, terminal=false, epoch=0, representation=0, controller=null;
+function setState(state,message){status.dataset.state=state;status.textContent=message;}
+function lock(){review.disabled=true;for(const button of decisions)button.disabled=true;}
+function erase(){epoch++;controller?.abort();controller=null;view=null;etag='';busy=false;pending=null;terminal=false;lock();surface.hidden=true;packet.replaceChildren();items.replaceChildren(items.querySelector('legend'));rationale.value='';retry.hidden=true;}
+function bootstrapLock(){erase();setState('BOOTSTRAP_LOCKED','Enter a task to begin.');}
+function identity(){return Object.freeze({bearer,taskId,tenantId});}
+function current(requestEpoch,id){return requestEpoch===epoch&&id.bearer===bearer&&id.taskId===taskId&&id.tenantId===tenantId;}
+function headers(id,mutation){const value={accept:'application/json'};if(id.bearer)value.authorization=`Bearer ${id.bearer}`;if(id.tenantId)value['x-smesh-tenant']=id.tenantId;if(mutation){value['content-type']='application/json';value['if-match']=mutation.etag;value['idempotency-key']=mutation.nonce;}return value;}
+function text(parent,name,value){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=name;dd.textContent=String(value??'');parent.append(dt,dd);}
+function checkbox(id,labelText,value,kind){const label=document.createElement('label'),box=document.createElement('input'),span=document.createElement('span');box.type='checkbox';box.id=id;box.dataset.kind=kind;box.value=value;span.textContent=labelText;label.append(box,span);items.append(label);box.addEventListener('change',gate);}
+function gate(){if(!view||busy||terminal)return lock();const boxes=[...items.querySelectorAll('input[type=checkbox]')];review.disabled=view.reviewedByCurrentActor||boxes.length===0||boxes.some(box=>!box.checked);const allow=view.reviewedByCurrentActor;for(const button of decisions)button.disabled=!allow;}
+function render(dto,responseEtag){view=dto;etag=responseEtag||dto.etag;representation++;surface.hidden=false;packet.replaceChildren();items.replaceChildren(items.querySelector('legend'));text(packet,'Task',dto.packet.taskId);text(packet,'Checkpoint',dto.packet.checkpoint);text(packet,'Policy',dto.packet.completionPolicyId);dto.packet.evidence.forEach((value,index)=>text(packet,`Evidence ${index+1}`,value));dto.packet.artifacts.forEach((artifact,index)=>{text(packet,`Artifact ${index+1}`,`${artifact.name} (${artifact.mediaType}) ${artifact.digest}`);text(packet,`Artifact ${index+1} exact publication JSON`,artifact.canonicalJson);});text(packet,'Artifact manifest digest',dto.packet.artifactSetDigest);text(packet,'Uncertainty',dto.packet.uncertaintySummary);dto.packet.evidenceHashes.forEach((hash,index)=>checkbox(`ack-evidence-${index}`,`Acknowledge evidence ${index+1}: ${hash}`,hash,'evidence'));dto.packet.artifacts.forEach((artifact,index)=>checkbox(`ack-artifact-${index}`,`Acknowledge artifact ${index+1}: ${artifact.digest}`,artifact.digest,'artifact'));checkbox('ack-manifest','Acknowledge exact publication manifest',dto.packet.artifactSetDigest,'manifest');checkbox('ack-uncertainty','Acknowledge uncertainty','true','uncertainty');terminal=Boolean(dto.terminalDecision)||dto.phase==='canceled'||dto.phase==='superseded';busy=false;pending=null;retry.hidden=true;if(terminal){lock();setState('TERMINAL',dto.terminalDecision?`Terminal decision: ${dto.terminalDecision}`:`Ratification ${dto.phase}.`);}else if(dto.reviewedByCurrentActor){setState('REVIEWED','Review recorded. Choose a decision.');gate();}else{setState('AWAITING_REVIEW','Acknowledge every item to record review.');gate();}}
+function requestLock(state,message,operation,canRetry){erase();pending=operation;retry.hidden=!canRetry;setState(state,message);}
+async function load(id=identity()){erase();const requestEpoch=epoch;busy=true;const operation=()=>load(id);pending=operation;controller=new AbortController();lock();setState('LOADING','Loading review packet.');try{const response=await fetch(`/ratification/v1/tasks/${encodeURIComponent(id.taskId)}`,{headers:headers(id),cache:'no-store',credentials:'same-origin',signal:controller.signal});if(!current(requestEpoch,id))return;if(response.status===401||response.status===403)return requestLock('AUTH_LOCKED','Authentication required. Enter credentials and load again.',null,false);if(!response.ok)return requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',operation,true);const dto=await response.json();if(current(requestEpoch,id))render(dto,response.headers.get('etag'));}catch(error){if(current(requestEpoch,id)&&error.name!=='AbortError')requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',operation,true);}}
+async function send(operation){if(busy||terminal)return;const requestEpoch=epoch;busy=true;pending=()=>send(operation);controller=new AbortController();lock();retry.hidden=true;setState(operation.action==='review'?'REVIEW_SUBMITTING':'DECISION_SUBMITTING',operation.action==='review'?'Recording review.':'Recording decision.');try{const response=await fetch(operation.url,{method:'POST',headers:headers(operation.identity,operation),body:operation.body,cache:'no-store',credentials:'same-origin',signal:controller.signal});if(!current(requestEpoch,operation.identity))return;if(response.status===401||response.status===403)return requestLock('AUTH_LOCKED','Authentication required. Enter credentials and load again.',null,false);if(response.status===412){erase();setState('STALE','Review packet changed; reloading.');return load(operation.identity);}if(!response.ok)return requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',()=>send(operation),true);const receipt=await response.json();if(!current(requestEpoch,operation.identity))return;etag=response.headers.get('etag')||receipt.etag;view.revision=receipt.revision;busy=false;pending=null;if(operation.action==='review'){view.reviewedByCurrentActor=true;setState('REVIEWED','Review recorded. Choose a decision.');gate();}else{terminal=true;lock();setState('TERMINAL','Decision recorded.');}}catch(error){if(current(requestEpoch,operation.identity)&&error.name!=='AbortError')requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',()=>send(operation),true);}}
+function mutate(action,body){if(busy||terminal||!view)return;const encoded=JSON.stringify(body),id=identity(),capturedEtag=etag;const semantic=JSON.stringify([id.bearer,id.tenantId,id.taskId,view.packet.generation,representation,capturedEtag,action,encoded]);const operation=Object.freeze({action,body:encoded,identity:id,etag:capturedEtag,nonce:crypto.randomUUID(),semantic,url:`/ratification/v1/tasks/${encodeURIComponent(id.taskId)}/${action==='review'?'review':'decision'}`});send(operation);}
+review.addEventListener('click',()=>{if(review.disabled)return;const checked=[...items.querySelectorAll('input:checked')];mutate('review',{evidenceHashes:checked.filter(x=>x.dataset.kind==='evidence').map(x=>x.value),artifactHashes:checked.filter(x=>x.dataset.kind==='artifact').map(x=>x.value),artifactManifestDigest:checked.find(x=>x.dataset.kind==='manifest')?.value??'',uncertaintyAcknowledged:checked.some(x=>x.dataset.kind==='uncertainty')});});
+for(const button of decisions)button.addEventListener('click',()=>{if(!button.disabled)mutate(button.id,{decision:button.id,rationale:rationale.value});});
+retry.addEventListener('click',()=>{if(pending){const operation=pending;busy=false;operation();}});
+for(const input of [task,tenant,token])input.addEventListener('input',bootstrapLock);
+form.addEventListener('submit',event=>{event.preventDefault();bearer=token.value;token.value='';taskId=task.value;tenantId=tenant.value;load(identity());});
+lock();
+})();";
+
+async fn ratification_console() -> Response {
+    ratification_static_response("text/html; charset=utf-8", RATIFICATION_CONSOLE.to_owned())
+}
+
+async fn ratification_console_script() -> Response {
+    ratification_static_response(
+        "text/javascript; charset=utf-8",
+        RATIFICATION_CONSOLE_SCRIPT.to_owned(),
+    )
+}
+
+fn ratification_static_response(content_type: &'static str, body: String) -> Response {
+    (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+#[derive(Clone)]
+struct RatificationMutation {
+    view: crate::RatificationView,
+    idempotency_key: String,
+}
+
+async fn ratification_mutation_policy(
+    Extension(expected_origin): Extension<RatificationOrigin>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let operation = if request.uri().path().ends_with("/review") {
+        Operation::RatificationReview
+    } else {
+        Operation::RatificationDecide
+    };
+    let Some(context) = request
+        .extensions()
+        .get::<Arc<crate::AuthorizationContext>>()
+        .cloned()
+    else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if context.authorize(operation).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !single_header_equals(
+        request.headers(),
+        header::ORIGIN,
+        expected_origin.0.as_bytes(),
+    ) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !single_header_equals(request.headers(), header::CONTENT_TYPE, b"application/json") {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let match_values: Vec<_> = request.headers().get_all(header::IF_MATCH).iter().collect();
+    if match_values.is_empty() {
+        return StatusCode::PRECONDITION_REQUIRED.into_response();
+    }
+    let [match_value] = match_values.as_slice() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !valid_ratification_match(match_value.as_bytes()) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let if_match = match_value
+        .to_str()
+        .expect("validated visible ASCII")
+        .to_owned();
+    let idempotency_values: Vec<_> = request
+        .headers()
+        .get_all("idempotency-key")
+        .iter()
+        .collect();
+    let [idempotency_value] = idempotency_values.as_slice() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let bytes = idempotency_value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 128
+        || bytes.contains(&b',')
+        || !bytes.iter().all(|byte| (0x21..=0x7e).contains(byte))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let idempotency_key = String::from_utf8(bytes.to_vec()).expect("visible ASCII is UTF-8");
+    let Some(authority) = request
+        .extensions()
+        .get::<Arc<dyn DurableAuthority>>()
+        .cloned()
+    else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(ratification) = authority.ratification_authority() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Ok(scope) = ratification_scope(&context, operation) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let (mut parts, body) = request.into_parts();
+    let Ok(Path(task_id)) = Path::<String>::from_request_parts(&mut parts, &()).await else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let mut request = axum::extract::Request::from_parts(parts, body);
+    let view = match ratification.ratification_view(&scope, &task_id).await {
+        Ok(Some(view)) => view,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Ok(current_etag) = ratification_etag(&view, &context) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if if_match.as_bytes() != current_etag.as_bytes() {
+        return StatusCode::PRECONDITION_FAILED.into_response();
+    }
+    request.extensions_mut().insert(RatificationMutation {
+        view,
+        idempotency_key,
+    });
+    next.run(request).await
+}
+
+fn single_header_equals(
+    headers: &axum::http::HeaderMap,
+    name: header::HeaderName,
+    expected: &[u8],
+) -> bool {
+    let values: Vec<_> = headers.get_all(name).iter().collect();
+    matches!(values.as_slice(), [value] if value.as_bytes() == expected && !value.as_bytes().contains(&b','))
+}
+
+fn valid_ratification_match(bytes: &[u8]) -> bool {
+    bytes.len() == 82
+        && bytes.starts_with(b"\"ratification-v1:")
+        && bytes.ends_with(b"\"")
+        && bytes[17..81]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+async fn ratification_response_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=(), usb=()"),
+    );
+    for name in [
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        header::ACCESS_CONTROL_MAX_AGE,
+    ] {
+        response.headers_mut().remove(name);
+    }
+    response
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRatificationPacket {
+    task_id: String,
+    generation: u64,
+    task_revision: u64,
+    packet_hash: String,
+    checkpoint: String,
+    checkpoint_hash: String,
+    completion_policy_id: String,
+    completion_policy_version: u32,
+    completion_policy_hash: String,
+    evidence: Vec<String>,
+    evidence_hashes: Vec<String>,
+    artifact_set_digest: String,
+    artifacts: Vec<crate::ReviewArtifact>,
+    uncertainty_summary: String,
+    created_at_millis: i64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRatificationHistory {
+    revision: u64,
+    action: crate::HumanRatificationAction,
+    rationale: String,
+    occurred_at_millis: i64,
+    receipt_hash: String,
+    previous_receipt_hash: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRatificationView {
+    packet: BrowserRatificationPacket,
+    history: Vec<BrowserRatificationHistory>,
+    phase: crate::RatificationState,
+    revision: u64,
+    etag: String,
+    reviewed_by_current_actor: bool,
+    terminal_decision: Option<crate::HumanDecision>,
+}
+
+impl BrowserRatificationView {
+    fn from_authority(
+        view: crate::RatificationView,
+        context: &crate::AuthorizationContext,
+    ) -> Result<Self, ()> {
+        let etag = ratification_etag(&view, context)?;
+        let actor = context.account_id();
+        let reviewed_by_current_actor = view.history.iter().any(|receipt| {
+            receipt.account_id == actor
+                && matches!(
+                    receipt.action,
+                    crate::HumanRatificationAction::ReviewAcknowledged
+                )
+        });
+        let terminal_decision = view.history.iter().rev().find_map(|receipt| {
+            if let crate::HumanRatificationAction::Decision(decision) = &receipt.action {
+                Some(decision.clone())
+            } else {
+                None
+            }
+        });
+        let packet = BrowserRatificationPacket {
+            task_id: view.packet.task_id.clone(),
+            generation: view.packet.generation,
+            task_revision: view.packet.task_revision,
+            packet_hash: view.packet.packet_hash.clone(),
+            checkpoint: view.packet.checkpoint.clone(),
+            checkpoint_hash: view.packet.checkpoint_hash.clone(),
+            completion_policy_id: view.packet.completion_policy_id.clone(),
+            completion_policy_version: view.packet.completion_policy_version,
+            completion_policy_hash: view.packet.completion_policy_hash.clone(),
+            evidence: view.packet.evidence.clone(),
+            evidence_hashes: view.packet.evidence_hashes.clone(),
+            artifact_set_digest: view.packet.artifact_set_digest.clone(),
+            artifacts: view.packet.artifacts.clone(),
+            uncertainty_summary: view.packet.uncertainty_summary.clone(),
+            created_at_millis: view.packet.created_at_millis,
+        };
+        let history = view
+            .history
+            .into_iter()
+            .map(|receipt| BrowserRatificationHistory {
+                revision: receipt.revision,
+                action: receipt.action,
+                rationale: receipt.rationale,
+                occurred_at_millis: receipt.occurred_at_millis,
+                receipt_hash: receipt.receipt_hash,
+                previous_receipt_hash: receipt.previous_receipt_hash,
+            })
+            .collect();
+        Ok(Self {
+            packet,
+            history,
+            phase: view.state,
+            revision: view.revision,
+            etag,
+            reviewed_by_current_actor,
+            terminal_decision,
+        })
+    }
+}
+
+fn ratification_etag(
+    view: &crate::RatificationView,
+    context: &crate::AuthorizationContext,
+) -> Result<String, ()> {
+    let binding = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "view": view,
+        "tenantId": context.tenant_id(),
+        "accountId": context.account_id(),
+        "principalScope": context.principal_scope(),
+        "authenticationMethod": authentication_method_name(context),
+        "authorizationPolicyId": context.policy_id(),
+        "authorizationPolicyRevision": context.policy_revision(),
+        "authorizationPolicyDigest": context.policy_digest(),
+    }))
+    .map_err(|_| ())?;
+    let digest = content_digest(&binding);
+    Ok(format!(
+        "\"ratification-v1:{}\"",
+        digest.strip_prefix("sha256:").ok_or(())?
+    ))
+}
+
+async fn ratification_view(
+    Path(task_id): Path<String>,
+    Extension(authority): Extension<Arc<dyn DurableAuthority>>,
+    Extension(context): Extension<Arc<crate::AuthorizationContext>>,
+) -> Response {
+    let Ok(scope) = ratification_scope(&context, Operation::RatificationRead) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(ratification) = authority.ratification_authority() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match ratification.ratification_view(&scope, &task_id).await {
+        Ok(Some(view)) => {
+            let Ok(browser) = BrowserRatificationView::from_authority(view, &context) else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let Ok(etag) = HeaderValue::from_str(&browser.etag) else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let mut response = axum::Json(browser).into_response();
+            response.headers_mut().insert(header::ETAG, etag);
+            response
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn ratification_review(
+    Path(task_id): Path<String>,
+    Extension(authority): Extension<Arc<dyn DurableAuthority>>,
+    Extension(context): Extension<Arc<crate::AuthorizationContext>>,
+    Extension(clock): Extension<InjectedClock>,
+    Extension(mutation): Extension<RatificationMutation>,
+    axum::Json(body): axum::Json<ReviewBody>,
+) -> Response {
+    let Ok(scope) = ratification_scope(&context, Operation::RatificationReview) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(ratification) = authority.ratification_authority() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let expected_revision = mutation.view.revision;
+    let packet = mutation.view.packet;
+    let artifact_hashes = packet
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.digest.clone())
+        .collect::<Vec<_>>();
+    if body.evidence_hashes != packet.evidence_hashes
+        || body.artifact_hashes != artifact_hashes
+        || body.artifact_manifest_digest != packet.artifact_set_digest
+        || !body.uncertainty_acknowledged
+    {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let now = clock.now();
+    let command = crate::ReviewAcknowledgement {
+        tenant_id: context.tenant_id().to_owned(),
+        task_id: task_id.clone(),
+        generation: packet.generation,
+        account_id: context.account_id().to_owned(),
+        authorization_policy_id: context.policy_id().to_owned(),
+        authorization_policy_revision: context.policy_revision(),
+        authorization_policy_digest: context.policy_digest().to_owned(),
+        principal_scope: context.principal_scope().to_owned(),
+        authentication_method: authentication_method_name(&context),
+        context_id: packet.context_id.clone(),
+        request_digest: packet.request_digest.clone(),
+        ratification_key_generation: packet.ratification_key_generation.clone(),
+        expected_revision,
+        checkpoint_hash: packet.checkpoint_hash.clone(),
+        packet_hash: packet.packet_hash.clone(),
+        evidence_hashes: body.evidence_hashes,
+        artifact_hashes: body.artifact_hashes,
+        artifact_manifest_digest: body.artifact_manifest_digest,
+        uncertainty_acknowledged: body.uncertainty_acknowledged,
+        idempotency_key: mutation.idempotency_key,
+        reviewed_at_millis: now,
+    };
+    let Ok(audit) = ratification_audit(
+        &authority,
+        &context,
+        &task_id,
+        &packet.packet_hash,
+        "ratificationReview",
+        now,
+    ) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    ratification_result(
+        ratification
+            .acknowledge_ratification_review(&scope, command, audit)
+            .await,
+        ratification,
+        &scope,
+        &context,
+        &task_id,
+    )
+    .await
+}
+
+async fn ratification_decision(
+    Path(task_id): Path<String>,
+    Extension(authority): Extension<Arc<dyn DurableAuthority>>,
+    Extension(context): Extension<Arc<crate::AuthorizationContext>>,
+    Extension(clock): Extension<InjectedClock>,
+    Extension(mutation): Extension<RatificationMutation>,
+    axum::Json(body): axum::Json<DecisionBody>,
+) -> Response {
+    let Ok(scope) = ratification_scope(&context, Operation::RatificationDecide) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(ratification) = authority.ratification_authority() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let expected_revision = mutation.view.revision;
+    let packet = mutation.view.packet;
+    let now = clock.now();
+    let command = crate::RatificationCommand {
+        tenant_id: context.tenant_id().to_owned(),
+        task_id: task_id.clone(),
+        generation: packet.generation,
+        account_id: context.account_id().to_owned(),
+        authorization_policy_id: context.policy_id().to_owned(),
+        authorization_policy_revision: context.policy_revision(),
+        authorization_policy_digest: context.policy_digest().to_owned(),
+        principal_scope: context.principal_scope().to_owned(),
+        authentication_method: authentication_method_name(&context),
+        context_id: packet.context_id.clone(),
+        request_digest: packet.request_digest.clone(),
+        ratification_key_generation: packet.ratification_key_generation.clone(),
+        expected_revision,
+        checkpoint_hash: packet.checkpoint_hash.clone(),
+        packet_hash: packet.packet_hash.clone(),
+        artifact_manifest_digest: packet.artifact_set_digest.clone(),
+        idempotency_key: mutation.idempotency_key,
+        decision: body.decision,
+        rationale: body.rationale,
+        decided_at_millis: now,
+    };
+    let Ok(audit) = ratification_audit(
+        &authority,
+        &context,
+        &task_id,
+        &packet.packet_hash,
+        "ratificationDecide",
+        now,
+    ) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let amendment_quota_intent = if matches!(command.decision, crate::HumanDecision::Amend) {
+        let Ok(subject) = crate::QuotaSubject::new(
+            context.tenant_id(),
+            context.account_id(),
+            context.principal_scope(),
+        ) else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        match authority.quota_policy_snapshot() {
+            Some(policy) => match policy.operation_intent(
+                &subject,
+                crate::QuotaOperation::TaskContinue,
+                &command.idempotency_key,
+                u64::try_from(command.rationale.len()).unwrap_or(u64::MAX),
+            ) {
+                Ok(intent) => Some(intent),
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    ratification_result(
+        ratification
+            .decide_ratification_with_quota(&scope, command, audit, amendment_quota_intent.as_ref())
+            .await,
+        ratification,
+        &scope,
+        &context,
+        &task_id,
+    )
+    .await
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserMutationReceipt {
+    revision: u64,
+    etag: String,
+    action: crate::HumanRatificationAction,
+    receipt_hash: String,
+}
+
+#[derive(Clone, Copy)]
+enum RatificationHttpError {
+    PreconditionFailed,
+    Conflict,
+    Unprocessable,
+    Unavailable,
+}
+
+impl RatificationHttpError {
+    fn from_a2a(error: &a2a::A2AError) -> Self {
+        match error.code {
+            -32_620 => Self::PreconditionFailed,
+            -32_621 => Self::Conflict,
+            -32_600 | -32_602 => Self::Unprocessable,
+            _ => Self::Unavailable,
+        }
+    }
+
+    fn status(self) -> StatusCode {
+        match self {
+            Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
+            Self::Conflict => StatusCode::CONFLICT,
+            Self::Unprocessable => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+#[cfg(test)]
+mod ratification_http_error_tests {
+    use super::*;
+
+    #[test]
+    fn typed_ratification_errors_have_distinct_http_statuses() {
+        for (code, expected) in [
+            (-32_621, StatusCode::CONFLICT),
+            (-32_620, StatusCode::PRECONDITION_FAILED),
+            (-32_600, StatusCode::UNPROCESSABLE_ENTITY),
+            (-32_602, StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            let error = a2a::A2AError::new(code, "redacted");
+            assert_eq!(RatificationHttpError::from_a2a(&error).status(), expected);
+        }
+    }
+}
+
+async fn ratification_result(
+    result: Result<crate::HumanRatificationReceipt, a2a::A2AError>,
+    ratification: &dyn crate::RatificationAuthority,
+    scope: &OwnedTaskScope,
+    context: &crate::AuthorizationContext,
+    task_id: &str,
+) -> Response {
+    match result {
+        Ok(receipt) => {
+            let Ok(Some(view)) = ratification.ratification_view(scope, task_id).await else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let Ok(etag) = ratification_etag(&view, context) else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let response = BrowserMutationReceipt {
+                revision: receipt.revision,
+                etag: etag.clone(),
+                action: receipt.action,
+                receipt_hash: receipt.receipt_hash,
+            };
+            let Ok(etag) = HeaderValue::from_str(&etag) else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let mut response = (StatusCode::CREATED, axum::Json(response)).into_response();
+            response.headers_mut().insert(header::ETAG, etag);
+            response
+        }
+        Err(error) => RatificationHttpError::from_a2a(&error)
+            .status()
+            .into_response(),
+    }
+}
+
+fn authentication_method_name(context: &crate::AuthorizationContext) -> String {
+    match context.authentication_method() {
+        crate::auth::AuthenticationMethod::BearerJwt => "bearer-jwt",
+        crate::auth::AuthenticationMethod::MutualTls => "mutual-tls",
+    }
+    .to_owned()
+}
+
+fn ratification_scope(
+    context: &crate::AuthorizationContext,
+    operation: Operation,
+) -> Result<OwnedTaskScope, ()> {
+    let visibility = context.visibility(operation).map_err(|_| ())?;
+    OwnedTaskScope::new_with_principal_and_authentication(
+        context.tenant_id(),
+        context.account_id(),
+        context.principal_scope(),
+        visibility,
+        authentication_method_name(context),
+    )
+    .map_err(|_| ())
+}
+
+fn ratification_audit(
+    authority: &Arc<dyn DurableAuthority>,
+    context: &crate::AuthorizationContext,
+    task_id: &str,
+    packet_hash: &str,
+    operation: &str,
+    now: i64,
+) -> Result<crate::AuthorizationAuditInput, a2a::A2AError> {
+    let resource_digest = authority.authorization_resource_digest(packet_hash)?;
+    crate::AuthorizationAuditInput::new(
+        content_digest(&rand::random::<[u8; 32]>()),
+        context.tenant_id(),
+        context.account_id(),
+        context.policy_id(),
+        context.policy_revision(),
+        context.policy_digest(),
+        operation,
+        crate::AuthorizationDecisionEffect::Allow,
+        "authorized",
+        "ratification",
+        resource_digest,
+        Some(task_id.to_owned()),
+        now,
+    )
 }
 
 /// A task store that declares whether completion receipts must use durable key material.
@@ -651,6 +1325,113 @@ pub fn build_authorized_durable_loopback_gateway<A: IntoDurableAuthority>(
         Some(policy),
         None,
     ))
+}
+
+/// Build the production authorized durable gateway with the human-ratification API.
+///
+/// Ratification is provided only by the selected durable authority so packet,
+/// decision, task, event, audit, and callback writes share one transaction.
+///
+/// # Errors
+/// Returns an error if durable gateway policy construction fails.
+pub fn build_authorized_durable_loopback_gateway_with_ratification<A: IntoDurableAuthority>(
+    config: GatewayConfig,
+    store: A,
+    endpoint: DurableLoopbackEndpoint,
+    clock: InjectedClock,
+    auth: AuthState,
+    policy: Arc<AuthorizationPolicy>,
+) -> Result<DurableGateway, PolicyError> {
+    build_authorized_durable_loopback_gateway_with_ratification_and_telemetry(
+        config, store, endpoint, clock, auth, policy, None,
+    )
+}
+
+/// Build the authorized ratification gateway without dropping optional telemetry.
+///
+/// # Errors
+/// Returns an error if durable gateway or ratification route construction fails.
+pub fn build_authorized_durable_loopback_gateway_with_ratification_and_telemetry<
+    A: IntoDurableAuthority,
+>(
+    config: GatewayConfig,
+    store: A,
+    endpoint: DurableLoopbackEndpoint,
+    clock: InjectedClock,
+    auth: AuthState,
+    policy: Arc<AuthorizationPolicy>,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
+) -> Result<DurableGateway, PolicyError> {
+    let public_url = url::Url::parse(&config.public_base_url).map_err(|_| {
+        PolicyError::InvalidPolicy("ratification public base URL is invalid".to_owned())
+    })?;
+    let origin = public_url.origin().ascii_serialization();
+    if origin == "null" {
+        return Err(PolicyError::InvalidPolicy(
+            "ratification public base URL has no tuple origin".to_owned(),
+        ));
+    }
+    let origin = RatificationOrigin(Arc::from(origin));
+    let route_auth = auth.clone();
+    let route_policy = Arc::clone(&policy);
+    let mut gateway = build_authorized_durable_loopback_gateway_with_telemetry(
+        config,
+        store,
+        endpoint,
+        clock.clone(),
+        auth,
+        policy,
+        telemetry,
+    )?;
+    let authority = gateway
+        .authority
+        .as_ref()
+        .ok_or_else(|| PolicyError::InvalidPolicy("durable authority unavailable".to_owned()))?
+        .clone();
+    if authority.ratification_authority().is_none() {
+        return Err(PolicyError::InvalidPolicy(
+            "durable authority does not support ratification".to_owned(),
+        ));
+    }
+    let authorization =
+        AuthorizationMiddlewareState::with_audit(route_policy, authority.clone(), clock.clone());
+    let mutations = Router::new()
+        .route(
+            "/ratification/v1/tasks/{task_id}/review",
+            post(ratification_review),
+        )
+        .route(
+            "/ratification/v1/tasks/{task_id}/decision",
+            post(ratification_decision),
+        )
+        .layer(middleware::from_fn(ratification_mutation_policy))
+        .layer(RequestBodyLimitLayer::new(128 * 1024));
+    let protected = Router::new()
+        .route("/ratification/v1/tasks/{task_id}", get(ratification_view))
+        .merge(mutations)
+        .layer(Extension(clock))
+        .layer(Extension(origin))
+        .layer(Extension(authority))
+        .layer(middleware::from_fn_with_state(
+            authorization,
+            authorize_request,
+        ))
+        .layer(middleware::from_fn_with_state(
+            route_auth,
+            authenticate_request,
+        ));
+    let public = Router::new()
+        .route("/ratification/console", get(ratification_console))
+        .route("/ratification/console.js", get(ratification_console_script));
+    let ratification = public
+        .merge(protected)
+        .layer(middleware::from_fn(ratification_response_headers));
+    let router = gateway
+        .router
+        .take()
+        .ok_or_else(|| PolicyError::InvalidPolicy("durable router unavailable".to_owned()))?;
+    gateway.router = Some(router.merge(ratification));
+    Ok(gateway)
 }
 
 /// Build the production authorized durable gateway with an optional telemetry handle.

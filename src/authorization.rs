@@ -175,6 +175,7 @@ pub enum AuthorizationError {
 #[serde(rename_all = "camelCase")]
 pub enum TenantRole {
     TenantAdmin,
+    HumanRatifier,
     TaskOperator,
     TaskViewer,
     Auditor,
@@ -201,6 +202,9 @@ pub enum Operation {
     PushList,
     PushDelete,
     ExtendedCard,
+    RatificationRead,
+    RatificationReview,
+    RatificationDecide,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,12 +226,19 @@ pub struct AuthorizationContext {
     tenant_id: Arc<str>,
     principal_scope: Arc<str>,
     roles: Arc<[TenantRole]>,
+    account_kind: AccountKind,
     policy_id: Arc<str>,
     policy_revision: u64,
     policy_digest: Arc<str>,
+    authentication_method: crate::auth::AuthenticationMethod,
 }
 
 impl AuthorizationContext {
+    /// Whether the authenticated principal resolves to a human account.
+    #[must_use]
+    pub const fn is_human(&self) -> bool {
+        matches!(self.account_kind, AccountKind::Human)
+    }
     #[must_use]
     pub fn account_id(&self) -> &str {
         &self.account_id
@@ -251,6 +262,11 @@ impl AuthorizationContext {
     #[must_use]
     pub fn policy_digest(&self) -> &str {
         &self.policy_digest
+    }
+
+    #[must_use]
+    pub const fn authentication_method(&self) -> crate::auth::AuthenticationMethod {
+        self.authentication_method
     }
 
     /// Check whether the fixed role matrix grants an operation.
@@ -283,10 +299,12 @@ impl AuthorizationContext {
 fn role_grant(role: TenantRole, operation: Operation) -> Option<VisibilityScope> {
     use Operation::{
         ArtifactRead, ArtifactResolve, AuditRead, AuthorizationAdmin, ExtendedCard, HistoryRead,
-        PushCreate, PushDelete, PushGet, PushList, TaskCancel, TaskContinue, TaskCreate, TaskGet,
-        TaskList, TaskSubscribe,
+        PushCreate, PushDelete, PushGet, PushList, RatificationDecide, RatificationRead,
+        RatificationReview, TaskCancel, TaskContinue, TaskCreate, TaskGet, TaskList, TaskSubscribe,
     };
-    use TenantRole::{Auditor, ServiceReader, TaskAgent, TaskOperator, TaskViewer, TenantAdmin};
+    use TenantRole::{
+        Auditor, HumanRatifier, ServiceReader, TaskAgent, TaskOperator, TaskViewer, TenantAdmin,
+    };
     match (role, operation) {
         (
             TenantAdmin,
@@ -310,7 +328,8 @@ fn role_grant(role: TenantRole, operation: Operation) -> Option<VisibilityScope>
             | ExtendedCard,
         )
         | (TaskAgent, ExtendedCard) => Some(VisibilityScope::Tenant),
-        (TenantAdmin | TaskOperator, PushCreate | PushGet | PushList | PushDelete) => {
+        (HumanRatifier, RatificationRead | RatificationReview | RatificationDecide)
+        | (TenantAdmin | TaskOperator, PushCreate | PushGet | PushList | PushDelete) => {
             Some(VisibilityScope::Tenant)
         }
         (
@@ -324,10 +343,20 @@ fn role_grant(role: TenantRole, operation: Operation) -> Option<VisibilityScope>
             PushCreate | PushGet | PushList | PushDelete | TaskCreate | TaskContinue | TaskCancel,
         )
         | (
-            TaskOperator | TaskViewer | Auditor | TaskAgent | ServiceReader,
+            TaskOperator | TaskViewer | Auditor | TaskAgent | ServiceReader | HumanRatifier,
             AuditRead | AuthorizationAdmin,
         )
-        | (Auditor, TaskSubscribe) => None,
+        | (Auditor, TaskSubscribe)
+        | (
+            TenantAdmin | TaskOperator | TaskViewer | Auditor | TaskAgent | ServiceReader,
+            RatificationRead | RatificationReview | RatificationDecide,
+        )
+        | (
+            HumanRatifier,
+            TaskCreate | TaskContinue | TaskGet | TaskList | TaskSubscribe | TaskCancel
+            | HistoryRead | ArtifactRead | ArtifactResolve | PushCreate | PushGet | PushList
+            | PushDelete | ExtendedCard,
+        ) => None,
     }
 }
 
@@ -376,6 +405,7 @@ struct PrincipalDocument {
 #[derive(Clone)]
 struct Account {
     id: Arc<str>,
+    kind: AccountKind,
     memberships: BTreeMap<Arc<str>, Arc<[TenantRole]>>,
 }
 
@@ -491,7 +521,14 @@ impl AuthorizationPolicy {
             }
             let id: Arc<str> = Arc::from(account.id.as_str());
             if accounts
-                .insert(id.clone(), Account { id, memberships })
+                .insert(
+                    id.clone(),
+                    Account {
+                        id,
+                        kind: account.kind,
+                        memberships,
+                    },
+                )
                 .is_some()
             {
                 return Err(AuthorizationError::InvalidPolicy);
@@ -610,9 +647,11 @@ impl AuthorizationPolicy {
                 .as_bytes(),
             )),
             roles: roles.clone(),
+            account_kind: account.kind,
             policy_id: self.policy_id.clone(),
             policy_revision: self.revision,
             policy_digest: self.digest.clone(),
+            authentication_method: principal.authentication_method(),
         })
     }
 }

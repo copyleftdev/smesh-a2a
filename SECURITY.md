@@ -37,6 +37,16 @@ Current controls:
 - HMAC seals on ratification checkpoints and accepted completion receipts, verified with
   task/context/policy and recomputed artifact bindings before stored tasks are exposed; SQLite mode
   stores the receipt key in the owner-only ledger so pre-restart receipts remain verifiable
+- issue #27 human-ratification routes only on an authenticated, authorized, durable `loopback` gateway
+  whose listener IP is loopback; an external 32-byte operator key is loaded from one owner-owned,
+  owner-private, absolute, no-follow regular-file descriptor and bound to SQLite/PostgreSQL authority
+- public fixed/data-free ratification bootstrap separated from authenticated `humanRatifier` API
+  routes; exact Origin/Content-Type/opaque actor-specific strong If-Match/idempotency gates run
+  before body decoding, and every
+  response is no-store with restrictive browser headers and no permissive CORS
+- exact-review and same-human-account decision gates with chained immutable receipts; task transition,
+  candidate publication/suppression, audit, amendment quota/outbox, and terminal callbacks commit or
+  roll back with the causative decision
 - bounded dispatcher cancellation after local deadlines, inactivity, resource-budget failures,
   policy rejection, and abandoned response streams
 - explicit `loopback`/`runtime` mode selection; malformed runtime or bootstrap addresses fail startup
@@ -55,9 +65,12 @@ Completion-policy review/test payload hashes are recomputed by the gateway and i
 appear in the locally configured policy profile, but those labels are not authenticated identities.
 A review/test record proves only that the policy received a structurally valid claim bound to exact
 artifact, request, task, context, and policy hashes. Cryptographic attestations must match a locally
-configured key and prove possession of that key, not real-world authority. Human ratification proves configured-key possession,
-but durable freshness, revocation, and cross-restart replay prevention still require persistent
-identity and ledger work. The loopback worker emits explicitly synthetic evidence fixtures.
+configured key and prove possession of that key, not real-world authority. Issue #27 human
+ratification derives the actor from bearer or mTLS authentication, requires an enrolled human-only
+role and same-actor exact review, and persists packet/receipt chains and key continuity across restart
+in the integrated SQLite or PostgreSQL authority. It does not prove real-world expertise or truth;
+managed identity enrollment/revocation and online ratification-key rotation remain operator/control-
+plane work. The loopback worker emits explicitly synthetic evidence fixtures.
 The bundled runtime admission processor emits a private candidate receipt and completion proposal but
 no review, test, contradiction, or ratification evidence. Runtime ingress therefore fails closed
 under the default completion policy and cannot masquerade as semantically completed work.
@@ -70,6 +83,15 @@ mode; policy-only, authentication-only, and invalid backend/runtime combinations
 Authentication-only compatibility builders are development-only. Managed cross-deployment policy/key
 coordination and external control-plane lifecycle remain operator work. In-memory mode retains
 process-local keys and ledger state.
+
+Ratification enablement and residual qualification are documented in
+`docs/HUMAN_RATIFICATION_RUNBOOK.md`. This is issue #27/M3 readiness evidence, not a release, merge,
+remote-CI, or milestone-completion claim. Browser bearer and deterministic two-tab coverage are green;
+lower-level production mTLS process coverage is green and Chromium fails correctly without a client
+certificate. Real Chromium mTLS client-certificate acceptance remains skipped because Puppeteer/CDP
+has no chooser API, Chrome 152 ignored command-line auto-selection, and installation of the managed
+exact-origin `AutoSelectCertificateForUrls` policy was denied. Callback and audit receivers remain
+externally at-least-once and must deduplicate stable event identities.
 
 ## Public trace privacy boundary
 

@@ -877,13 +877,29 @@ postgres_test!(
         assert_eq!(postgres_dump.counts.len(), AUTHORITY_TABLES.len());
         assert_eq!(sqlite_dump, postgres_dump);
         for table in AUTHORITY_TABLES {
-            if table.starts_with("callback_") {
+            if table.starts_with("callback_")
+                || matches!(
+                    table,
+                    "ratification_key_check" | "ratification_packets" | "ratification_events"
+                )
+            {
                 continue;
             }
             assert!(
                 sqlite_dump.counts[table] > 0,
                 "row-parity scenario did not populate {table}"
             );
+        }
+        for table in [
+            "ratification_key_check",
+            "ratification_packets",
+            "ratification_events",
+        ] {
+            assert_eq!(
+                sqlite_dump.counts[table], 0,
+                "non-ratifying conformance scenario unexpectedly populated {table}"
+            );
+            assert_eq!(sqlite_dump.counts[table], postgres_dump.counts[table]);
         }
 
         let sqlite_reopened = SqliteTaskStore::open_with_audit_projection(&sqlite_path, 64)
@@ -4880,11 +4896,11 @@ postgres_test!(artifact_tamper_reopen_matrix, 60, {
         "tombstone",
         "gc-job",
     ];
-    for (index, name) in names.into_iter().enumerate() {
+    let (config, root, staged) = create_artifact_tamper_baseline(&url, "art_tm_matrix", true).await;
+    let schema = config.schema_name();
+    let (client, driver) = admin_client(&superuser_url()).await;
+    for name in names {
         eprintln!("artifact isolated tamper case: {name}");
-        let prefix = format!("art_tm_{index:02}");
-        let (config, root, staged) = create_artifact_tamper_baseline(&url, &prefix, true).await;
-        let schema = config.schema_name();
         let zero = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         let (table, mutation) = match name {
             "object-content-digest" => (
@@ -5024,8 +5040,7 @@ postgres_test!(artifact_tamper_reopen_matrix, 60, {
             ),
             _ => unreachable!(),
         };
-        let (client, driver) = admin_client(&superuser_url()).await;
-        client.batch_execute(&format!("ALTER TABLE {schema}.{table} DISABLE TRIGGER ALL; {mutation}; ALTER TABLE {schema}.{table} ENABLE TRIGGER ALL")).await.unwrap_or_else(|error|panic!("mutation failed {name}: {error}"));
+        client.batch_execute(&format!("DROP TABLE IF EXISTS pg_temp.tamper_backup; CREATE TEMP TABLE tamper_backup AS TABLE {schema}.{table}; ALTER TABLE {schema}.{table} DISABLE TRIGGER ALL; {mutation}; ALTER TABLE {schema}.{table} ENABLE TRIGGER ALL")).await.unwrap_or_else(|error|panic!("mutation failed {name}: {error}"));
         assert!(
             matches!(
                 PostgresTaskStore::open(config.clone()).await,
@@ -5033,11 +5048,12 @@ postgres_test!(artifact_tamper_reopen_matrix, 60, {
             ),
             "tamper case reopened: {name}"
         );
-        drop(client);
-        driver.abort();
-        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
-        fs::remove_dir_all(root).unwrap();
+        client.batch_execute(&format!("ALTER TABLE {schema}.{table} DISABLE TRIGGER ALL; DELETE FROM {schema}.{table}; INSERT INTO {schema}.{table} SELECT * FROM pg_temp.tamper_backup; ALTER TABLE {schema}.{table} ENABLE TRIGGER ALL; DROP TABLE pg_temp.tamper_backup")).await.unwrap_or_else(|error|panic!("restore failed {name}: {error}"));
     }
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    fs::remove_dir_all(root).unwrap();
 });
 
 postgres_test!(artifact_populated_default_plans_and_batch_bound, {
