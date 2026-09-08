@@ -261,11 +261,12 @@ async fn populated_postgres_migration_rewrites_causal_copies_and_exact_rerun_is_
       INSERT INTO {schema}.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,to_state,event_json,created_at) VALUES('tenant-a','task-1',1,1,'completed','\"TASK_STATE_COMPLETED\"','{}',1);
       SET session_replication_role=origin;
       INSERT INTO {schema}.retained_authority_usage(tenant_scope,scope_kind,scope_id,retained_bytes,updated_at) VALUES
-       ('tenant-a','tenant','tenant-a',0,1),('tenant-a','account','account-a',0,1),('tenant-a','principal','account:account-a',0,1);
+       ('tenant-a','tenant','tenant-a',0,1),('tenant-a','account','account-a',0,1),
+       ('tenant-a','principal','account:account-a',0,1),('tenant-a','principal','legacy-principal',0,1);
       UPDATE {schema}.retained_authority_usage SET retained_bytes=CASE scope_kind
        WHEN 'tenant' THEN {schema}.retained_authority_oracle('tenant-a',NULL)
        WHEN 'account' THEN {schema}.retained_authority_account_oracle('tenant-a','account-a')
-       ELSE {schema}.retained_authority_oracle('tenant-a','account:account-a') END;",
+       ELSE {schema}.retained_authority_oracle('tenant-a',scope_id) END;",
       inline.replace('\'', "''"), inline.replace('\'', "''"))).await.unwrap();
 
     assert!(matches!(
@@ -286,7 +287,8 @@ async fn populated_postgres_migration_rewrites_causal_copies_and_exact_rerun_is_
             .iter()
             .filter(|outcome| outcome.is_ok())
             .count(),
-        1
+        1,
+        "{migration_outcomes:?}"
     );
     assert_eq!(
         migration_outcomes
@@ -1685,9 +1687,135 @@ async fn empty_backup_restore_is_sealed_retryable_and_requires_a_truly_empty_tar
         .await
         .unwrap();
 
-    let restored = PostgresTaskStore::restore_artifacts(target_config.clone(), &restore)
+    // Pause a fully validated concurrent startup immediately before key
+    // reconciliation, then hold a late restore lock so the restore transaction has acquired
+    // every ratification lock. A concurrent key initialization must then queue
+    // at the key-check table before it can modify any ratification bootstrap state.
+    let startup_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let startup_released = std::sync::Arc::new(tokio::sync::Notify::new());
+    let startup = tokio::spawn(PostgresTaskStore::open(
+        target_config
+            .clone()
+            .with_ratification_key(zeroize::Zeroizing::new([0x73; 32]))
+            .with_ratification_reconcile_test_probe(
+                startup_entered.clone(),
+                startup_released.clone(),
+            ),
+    ));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        startup_entered.notified(),
+    )
+    .await
+    .expect("concurrent startup never reached key reconciliation");
+    let (blocker, blocker_connection) = pg.connect(tokio_postgres::NoTls).await.unwrap();
+    let blocker_driver = tokio::spawn(blocker_connection);
+    blocker
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE {target_schema}.callback_attempts IN SHARE MODE"
+        ))
         .await
         .unwrap();
+    let restore_task = tokio::spawn({
+        let target_config = target_config.clone();
+        let restore = restore.clone();
+        async move { PostgresTaskStore::restore_artifacts(target_config, &restore).await }
+    });
+    let restore_pid: i32 = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if let Some(row) = client
+                .query_opt(
+                    "SELECT pid FROM pg_locks
+                     WHERE relation=$1::text::regclass AND mode='AccessExclusiveLock' AND NOT granted",
+                    &[&format!("{target_schema}.callback_attempts")],
+                )
+                .await
+                .unwrap()
+            {
+                break row.get(0);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("restore never reached the journal lock boundary");
+    startup_released.notify_one();
+    let (startup_pid, waiting_relation, key_write_lock): (i32, String, bool) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(row) = client
+                    .query_opt(
+                        "SELECT waiting.pid,blocked.relname,
+                           EXISTS(
+                             SELECT 1 FROM pg_locks held
+                             WHERE held.pid=waiting.pid AND held.granted
+                               AND held.relation=$3::text::regclass
+                               AND held.mode='RowExclusiveLock')
+                         FROM pg_locks waiting
+                         JOIN pg_class blocked ON blocked.oid=waiting.relation
+                         JOIN pg_namespace namespace ON namespace.oid=blocked.relnamespace
+                         WHERE namespace.nspname=$1 AND NOT waiting.granted
+                           AND waiting.pid<>$2
+                           AND blocked.relname IN ('ratification_key_check','ratification_ledger_anchor')
+                         ORDER BY blocked.relname LIMIT 1",
+                        &[
+                            &target_schema,
+                            &restore_pid,
+                            &format!("{target_schema}.ratification_key_check"),
+                        ],
+                    )
+                    .await
+                    .unwrap()
+                {
+                    break (row.get(0), row.get(1), row.get(2));
+                }
+                assert!(!startup.is_finished(), "concurrent startup did not wait for restore");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("concurrent startup never reached a ratification lock boundary");
+    assert!(
+        client
+            .query_one("SELECT pg_cancel_backend($1)", &[&startup_pid])
+            .await
+            .unwrap()
+            .get::<_, bool>(0),
+        "failed to cancel the blocked concurrent startup"
+    );
+    blocker.batch_execute("COMMIT").await.unwrap();
+    drop(blocker);
+    blocker_driver.await.unwrap().unwrap();
+    let startup_result = startup.await.unwrap();
+    let restored = restore_task.await.unwrap().unwrap();
+    let key_rows = client
+        .query_one(
+            &format!("SELECT count(*) FROM {target_schema}.ratification_key_check"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0);
+    let anchor = client
+        .query_one(
+            &format!(
+                "SELECT initialized,key_generation,state_seal
+                 FROM {target_schema}.ratification_ledger_anchor WHERE singleton=1"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(waiting_relation, "ratification_key_check");
+    assert!(
+        !key_write_lock,
+        "concurrent startup modified key state before waiting for restore"
+    );
+    assert!(startup_result.is_err());
+    assert_eq!(key_rows, 0);
+    assert!(!anchor.get::<_, bool>(0));
+    assert!(anchor.get::<_, Option<String>>(1).is_none());
+    assert!(anchor.get::<_, Option<String>>(2).is_none());
     assert_eq!(restored.objects, 0);
     assert!(restored.enabled);
     let callback_bootstrap_after = client

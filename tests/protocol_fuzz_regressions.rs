@@ -370,7 +370,11 @@ async fn task_page_token_mutations_never_cross_query_scope_or_mutate_authority()
     let token = first.next_page_token;
     let mutations = [
         String::new(),
-        format!("{}A", &token[..token.len() - 1]),
+        format!(
+            "{}{}",
+            &token[..token.len() - 1],
+            if token.ends_with('A') { 'B' } else { 'A' }
+        ),
         format!("{token}A"),
         token[..token.len() - 1].to_owned(),
         "!".repeat(token.len()),

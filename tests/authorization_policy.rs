@@ -311,7 +311,45 @@ fn policy_resolves_same_account_across_bearer_and_mtls() {
     let a = policy.resolve(&bearer, None).unwrap();
     let b = policy.resolve(&mtls, None).unwrap();
     assert_eq!(a.account_id(), "agent");
-    assert_eq!(a, b);
+    assert_eq!(a.account_id(), b.account_id());
+    assert_eq!(a.tenant_id(), b.tenant_id());
+    assert_eq!(a.principal_scope(), b.principal_scope());
+    assert_eq!(
+        a.authentication_method(),
+        smesh_a2a::auth::AuthenticationMethod::BearerJwt
+    );
+    assert_eq!(
+        b.authentication_method(),
+        smesh_a2a::auth::AuthenticationMethod::MutualTls
+    );
+    assert_ne!(a.authentication_method(), b.authentication_method());
+    for operation in [
+        Operation::TaskCreate,
+        Operation::TaskContinue,
+        Operation::TaskGet,
+        Operation::TaskList,
+        Operation::TaskSubscribe,
+        Operation::TaskCancel,
+        Operation::HistoryRead,
+        Operation::PushCreate,
+        Operation::PushGet,
+        Operation::PushList,
+        Operation::PushDelete,
+        Operation::ArtifactRead,
+        Operation::ArtifactResolve,
+        Operation::AuditRead,
+        Operation::AuthorizationAdmin,
+        Operation::ExtendedCard,
+        Operation::RatificationRead,
+        Operation::RatificationReview,
+        Operation::RatificationDecide,
+    ] {
+        assert_eq!(
+            a.visibility(operation),
+            b.visibility(operation),
+            "{operation:?}"
+        );
+    }
     assert_eq!(
         a.visibility(Operation::TaskGet).unwrap(),
         VisibilityScope::Own

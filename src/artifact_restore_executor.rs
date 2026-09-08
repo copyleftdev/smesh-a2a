@@ -749,6 +749,7 @@ async fn assert_target_empty_or_resume(
                 "schema_migrations"
                     | "store_identity"
                     | "store_metadata"
+                    | "ratification_ledger_anchor"
                     | "audit_projection_control"
                     | "audit_projection_outbox"
                     | "audit_projection_session_secret"
@@ -780,6 +781,7 @@ async fn assert_target_empty(client: &Client, schema: &str) -> Result<(), Postgr
                 "schema_migrations"
                     | "store_identity"
                     | "store_metadata"
+                    | "ratification_ledger_anchor"
                     | "audit_projection_control"
                     | "audit_projection_outbox"
                     | "audit_projection_session_secret"
@@ -800,6 +802,39 @@ async fn assert_target_empty(client: &Client, schema: &str) -> Result<(), Postgr
         if occupied {
             return Err(PostgresStoreError::ArtifactRestoreTargetNotEmpty);
         }
+    }
+    Ok(())
+}
+
+async fn assert_uninitialized_ratification_bootstrap<C>(
+    client: &C,
+    schema: &str,
+) -> Result<(), PostgresStoreError>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let pristine: bool = client
+        .query_one(
+            &format!(
+                "SELECT
+                   (SELECT count(*)=1 AND bool_and(
+                       singleton=1 AND version=1 AND NOT initialized
+                       AND key_generation IS NULL AND packet_count=0 AND event_count=0
+                       AND retained_bytes=0
+                       AND generation_high_water_hash='sha256:'||repeat('0',64)
+                       AND state_hash='sha256:'||repeat('0',64) AND state_seal IS NULL)
+                    FROM {schema}.ratification_ledger_anchor)
+                   AND NOT ratification_initialized
+                   AND NOT ratification_migration_pending
+                 FROM {schema}.store_identity WHERE singleton=1"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?
+        .get(0);
+    if !pristine {
+        return Err(PostgresStoreError::ArtifactRestoreTargetNotEmpty);
     }
     Ok(())
 }
@@ -828,6 +863,11 @@ async fn commit_restore_journal(
     .map_err(|_| PostgresStoreError::Unavailable)?;
     tx.batch_execute(&format!(
         "LOCK TABLE
+            {schema}.store_identity,
+            {schema}.ratification_key_check,
+            {schema}.ratification_ledger_anchor,
+            {schema}.ratification_packets,
+            {schema}.ratification_events,
             {schema}.callback_attempts,
             {schema}.callback_audits,
             {schema}.callback_configs,
@@ -841,6 +881,10 @@ async fn commit_restore_journal(
     ))
     .await
     .map_err(|error| restore_lock_error(&error))?;
+    // The ratification bootstrap proof is valid only under the same locks and
+    // transaction that commit the restore fence. Keep all five authority tables
+    // and store provenance locked until the journal commit below.
+    assert_uninitialized_ratification_bootstrap(&tx, schema).await?;
     let callback_state = tx
         .query_one(
             &format!(

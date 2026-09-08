@@ -1057,6 +1057,7 @@ async fn postgres_terminal_callback_fault_matrix_rolls_back_and_retries_exactly_
         .unwrap();
         assert!(tx.query_one(&format!("SELECT {schema}.enqueue_terminal_callbacks('smesh-dev-only-tenant',$1,2,$2,$3,$4,2,{schema}.db_millis())"),&[&task.id,&event,&payload,&digest]).await.is_err(),"{fault:?}");
         drop(tx);
+        db.query_one("SELECT set_config('smesh.internal_global','callback-worker-v1',false),set_config('smesh.tenant_scope','smesh-dev-only-tenant',false),set_config('smesh.account_id','smesh-dev-only-account',false)", &[]).await.unwrap();
         let rolled=db.query_one(&format!("SELECT state,(SELECT count(*) FROM {schema}.callback_events WHERE task_id=$1),(SELECT count(*) FROM {schema}.callback_deliveries WHERE task_id=$1),(SELECT COALESCE(max(state),'missing') FROM {schema}.callback_configs WHERE task_id=$1) FROM {schema}.tasks WHERE task_id=$1"),&[&task.id]).await.unwrap();
         assert_eq!(
             (
@@ -1264,6 +1265,7 @@ async fn postgres_startup_rejects_callback_audit_substitution_and_nonrevoked_cap
         .await
         .unwrap();
     let seed_driver = tokio::spawn(seed_driver);
+    seed_db.query_one("SELECT set_config('smesh.internal_global','claim-v1',false),set_config('smesh.tenant_scope','smesh-dev-only-tenant',false),set_config('smesh.account_id','smesh-dev-only-account',false)", &[]).await.unwrap();
     seed_db.execute(&format!("INSERT INTO {audit_schema}.tasks(tenant_scope,task_id,context_id,state,status_timestamp,revision,task_json,owner_account_id) VALUES($1,$2,$3,$4,NULL,1,$5,$6)"), &[&"smesh-dev-only-tenant", &task.id, &task.context_id, &serde_json::to_string(&TaskState::Working).unwrap(), &serde_json::to_string(&task).unwrap(), &"smesh-dev-only-account"]).await.unwrap();
     drop(seed_db);
     seed_driver.abort();
@@ -1295,11 +1297,20 @@ async fn postgres_startup_rejects_callback_audit_substitution_and_nonrevoked_cap
         .await
         .unwrap();
     let audit_driver = tokio::spawn(audit_driver);
+    audit_db.query_one("SELECT set_config('smesh.internal_global','callback-worker-v1',false),set_config('smesh.tenant_scope','smesh-dev-only-tenant',false),set_config('smesh.account_id','smesh-dev-only-account',false)", &[]).await.unwrap();
     audit_db
-        .batch_execute("SET session_replication_role=replica")
+        .batch_execute(&format!(
+            "ALTER TABLE {audit_schema}.callback_audits DISABLE TRIGGER USER"
+        ))
         .await
         .unwrap();
     audit_db.execute(&format!("UPDATE {audit_schema}.callback_audits SET source_pk_digest='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE audit_order=(SELECT min(audit_order) FROM {audit_schema}.callback_audits)"), &[]).await.unwrap();
+    audit_db
+        .batch_execute(&format!(
+            "ALTER TABLE {audit_schema}.callback_audits ENABLE TRIGGER USER"
+        ))
+        .await
+        .unwrap();
     drop(audit_db);
     audit_driver.abort();
     let _ = audit_driver.await;
@@ -1329,8 +1340,11 @@ async fn postgres_startup_rejects_callback_audit_substitution_and_nonrevoked_cap
         .await
         .unwrap();
     let cap_driver = tokio::spawn(cap_driver);
+    cap_db.query_one("SELECT set_config('smesh.tenant_scope','smesh-dev-only-tenant',false),set_config('smesh.account_id','smesh-dev-only-account',false)", &[]).await.unwrap();
     cap_db
-        .batch_execute("SET session_replication_role=replica")
+        .batch_execute(&format!(
+            "ALTER TABLE {cap_schema}.tasks DISABLE TRIGGER USER; ALTER TABLE {cap_schema}.callback_configs DISABLE TRIGGER USER"
+        ))
         .await
         .unwrap();
     for index in 0..21 {
@@ -1347,9 +1361,29 @@ async fn postgres_startup_rejects_callback_audit_substitution_and_nonrevoked_cap
             history: None,
             metadata: None,
         };
+        cap_db
+            .execute(
+                "SELECT set_config('smesh.internal_global','claim-v1',false)",
+                &[],
+            )
+            .await
+            .unwrap();
         cap_db.execute(&format!("INSERT INTO {cap_schema}.tasks(tenant_scope,task_id,context_id,state,status_timestamp,revision,task_json,owner_account_id) VALUES($1,$2,$3,$4,NULL,1,$5,$6)"), &[&"smesh-dev-only-tenant", &task_id, &task.context_id, &serde_json::to_string(&TaskState::Working).unwrap(), &serde_json::to_string(&task).unwrap(), &"smesh-dev-only-account"]).await.unwrap();
+        cap_db
+            .execute(
+                "SELECT set_config('smesh.internal_global','callback-worker-v1',false)",
+                &[],
+            )
+            .await
+            .unwrap();
         cap_db.execute(&format!("INSERT INTO {cap_schema}.callback_configs(tenant_scope,task_id,config_id,owner_account_id,principal_scope,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at,updated_at) VALUES($1,$2,$3,$4,$4,'endpoint',1,'https://example.com:443/events',$5,'active',1,1)"), &[&"smesh-dev-only-tenant", &task_id, &format!("cap-config-{index}"), &"smesh-dev-only-account", &smesh_a2a::content_digest(b"https://example.com:443/events")]).await.unwrap();
     }
+    cap_db
+        .batch_execute(&format!(
+            "ALTER TABLE {cap_schema}.tasks ENABLE TRIGGER USER; ALTER TABLE {cap_schema}.callback_configs ENABLE TRIGGER USER"
+        ))
+        .await
+        .unwrap();
     drop(cap_db);
     cap_driver.abort();
     let _ = cap_driver.await;
@@ -1372,6 +1406,7 @@ async fn postgres_callback_crud_uses_scope_first_rls_paths() {
     };
     let schema = format!("smesh_callback_crud_{:016x}", rand::random::<u64>());
     let admin_insert = admin.clone();
+    let runtime_plan = runtime.clone();
     let schema_insert = schema.clone();
     let store = smesh_a2a::PostgresTaskStore::open(
         smesh_a2a::PostgresStoreConfig::new(admin, runtime, schema)
@@ -1399,7 +1434,7 @@ async fn postgres_callback_crud_uses_scope_first_rls_paths() {
         .unwrap();
     let driver = tokio::spawn(connection);
     client
-        .batch_execute("SELECT set_config('smesh.internal_global','claim-v1',false)")
+        .batch_execute("SELECT set_config('smesh.internal_global','claim-v1',false); SELECT set_config('smesh.tenant_scope','smesh-dev-only-tenant',false); SELECT set_config('smesh.account_id','smesh-dev-only-account',false)")
         .await
         .unwrap();
     client.execute(&format!("INSERT INTO {schema_insert}.tasks(tenant_scope,task_id,context_id,state,status_timestamp,revision,task_json,owner_account_id) VALUES('smesh-dev-only-tenant','pg-task','pg-context',$1,NULL,1,$2,'smesh-dev-only-account')"), &[&serde_json::to_string(&TaskState::Working).unwrap(),&serde_json::to_string(&task).unwrap()]).await.unwrap();
@@ -1451,7 +1486,7 @@ async fn postgres_callback_crud_uses_scope_first_rls_paths() {
         .await
         .unwrap();
     let driver = tokio::spawn(connection);
-    client.batch_execute("SELECT set_config('smesh.internal_global','claim-v1',false),set_config('smesh.tenant_scope','smesh-dev-only-tenant',false)").await.unwrap();
+    client.batch_execute("SELECT set_config('smesh.internal_global','claim-v1',false),set_config('smesh.tenant_scope','smesh-dev-only-tenant',false),set_config('smesh.account_id','smesh-dev-only-account',false)").await.unwrap();
     client.execute(&format!("UPDATE {schema_insert}.tasks SET state=$1,revision=2,task_json=$2 WHERE tenant_scope='smesh-dev-only-tenant' AND task_id='pg-task'"),&[&serde_json::to_string(&TaskState::Completed).unwrap(),&serde_json::to_string(&task).unwrap()]).await.unwrap();
     let payload = b"{}".to_vec();
     let digest = smesh_a2a::content_digest(&payload);
@@ -1472,12 +1507,21 @@ async fn postgres_callback_crud_uses_scope_first_rls_paths() {
             .await
             .unwrap()
     );
-    let superuser = std::env::var("SMESH_TEST_POSTGRES_SUPERUSER_URL").unwrap_or(admin_insert);
-    let (plan_db, plan_connection) = tokio_postgres::connect(&superuser, tokio_postgres::NoTls)
+    let (seed_db, seed_connection) = tokio_postgres::connect(&admin_insert, tokio_postgres::NoTls)
         .await
         .unwrap();
+    let seed_driver = tokio::spawn(seed_connection);
+    seed_db.query_one("SELECT set_config('smesh.internal_global','callback-worker-v1',false),set_config('smesh.tenant_scope','smesh-dev-only-tenant',false),set_config('smesh.account_id','smesh-dev-only-account',false)", &[]).await.unwrap();
+    seed_db.batch_execute(&format!("INSERT INTO {schema_insert}.tasks(tenant_scope,task_id,context_id,state,status_timestamp,revision,task_json,owner_account_id) SELECT 'smesh-dev-only-tenant','plan-task-'||g,'plan-context','\\\"TASK_STATE_WORKING\\\"',NULL,1,'{{}}','smesh-dev-only-account' FROM generate_series(1,2000) g; INSERT INTO {schema_insert}.callback_configs(tenant_scope,task_id,config_id,owner_account_id,principal_scope,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at,updated_at) SELECT 'smesh-dev-only-tenant','plan-task-'||g,'plan-config-'||g,'smesh-dev-only-account','smesh-dev-only-account','endpoint',1,'https://example.com:443/events','{}','active',g,g FROM generate_series(1,2000) g; INSERT INTO {schema_insert}.callback_events(tenant_scope,event_id,task_id,causative_revision,payload,payload_digest,public_egress_bytes,created_at,expires_at) SELECT 'smesh-dev-only-tenant','plan-event-'||g,'plan-task-'||g,1,'{{}}'::bytea,'{}',2,g,9999999999999 FROM generate_series(1,2000) g; INSERT INTO {schema_insert}.callback_deliveries(tenant_scope,event_id,task_id,config_id,state,available_at,created_at,updated_at) SELECT 'smesh-dev-only-tenant','plan-event-'||g,'plan-task-'||g,'plan-config-'||g,'pending',g,g,g FROM generate_series(1,2000) g; ANALYZE {schema_insert}.callback_configs; ANALYZE {schema_insert}.callback_deliveries;",smesh_a2a::content_digest(url.as_bytes()),smesh_a2a::content_digest(b"{}"))).await.unwrap();
+    drop(seed_db);
+    seed_driver.abort();
+    let _ = seed_driver.await;
+
+    let mut plan_config = runtime_plan.parse::<tokio_postgres::Config>().unwrap();
+    plan_config.options(format!("-c role={schema_insert}_runtime"));
+    let (plan_db, plan_connection) = plan_config.connect(tokio_postgres::NoTls).await.unwrap();
     let plan_driver = tokio::spawn(plan_connection);
-    plan_db.batch_execute(&format!("INSERT INTO {schema_insert}.tasks(tenant_scope,task_id,context_id,state,status_timestamp,revision,task_json,owner_account_id) SELECT 'smesh-dev-only-tenant','plan-task-'||g,'plan-context','\\\"TASK_STATE_WORKING\\\"',NULL,1,'{{}}','smesh-dev-only-account' FROM generate_series(1,2000) g; INSERT INTO {schema_insert}.callback_configs(tenant_scope,task_id,config_id,owner_account_id,principal_scope,enrollment_id,enrollment_generation,canonical_url,url_digest,state,created_at,updated_at) SELECT 'smesh-dev-only-tenant','plan-task-'||g,'plan-config-'||g,'smesh-dev-only-account','smesh-dev-only-account','endpoint',1,'https://example.com:443/events','{}','active',g,g FROM generate_series(1,2000) g; INSERT INTO {schema_insert}.callback_events(tenant_scope,event_id,task_id,causative_revision,payload,payload_digest,public_egress_bytes,created_at,expires_at) SELECT 'smesh-dev-only-tenant','plan-event-'||g,'plan-task-'||g,1,'{{}}'::bytea,'{}',2,g,9999999999999 FROM generate_series(1,2000) g; INSERT INTO {schema_insert}.callback_deliveries(tenant_scope,event_id,task_id,config_id,state,available_at,created_at,updated_at) SELECT 'smesh-dev-only-tenant','plan-event-'||g,'plan-task-'||g,'plan-config-'||g,'pending',g,g,g FROM generate_series(1,2000) g; ANALYZE {schema_insert}.callback_configs; ANALYZE {schema_insert}.callback_deliveries;",smesh_a2a::content_digest(url.as_bytes()),smesh_a2a::content_digest(b"{}"))).await.unwrap();
+    plan_db.query_one("SELECT set_config('smesh.tenant_scope','smesh-dev-only-tenant',false),set_config('smesh.account_id','smesh-dev-only-account',false)", &[]).await.unwrap();
     for (name, sql, expected) in [
         (
             "get",

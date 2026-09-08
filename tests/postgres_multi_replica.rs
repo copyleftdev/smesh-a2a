@@ -886,7 +886,7 @@ fn multiprocess_fixture_panic_reaps_children_and_restores_postgres() {
         .env(PANIC_CHILD, "1")
         .env("SMESH_MULTI_PANIC_SCHEMA", &schema)
         .env("SMESH_TEST_POSTGRES_ADMIN_URL", admin)
-        .env("SMESH_TEST_POSTGRES_RUNTIME_URL", runtime)
+        .env("SMESH_TEST_POSTGRES_RUNTIME_URL", &runtime)
         .env("SMESH_TEST_POSTGRES_SUPERUSER_URL", &superuser)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -905,9 +905,10 @@ fn multiprocess_fixture_panic_reaps_children_and_restores_postgres() {
         let pg = tokio_postgres::Config::from_str(&superuser).unwrap();
         let (client, connection) = pg.connect(tokio_postgres::NoTls).await.unwrap();
         let driver = tokio::spawn(async move { let _ = connection.await; });
+        let runtime_role = url::Url::parse(&runtime).unwrap().username().to_owned();
         let row = client.query_one(
-            "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1),EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$2),(SELECT count(*) FROM pg_stat_activity WHERE application_name=$1),has_database_privilege('smesh_test_runtime',current_database(),'CONNECT')",
-            &[&schema, &format!("{schema}_runtime")],
+            "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1),EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$2),(SELECT count(*) FROM pg_stat_activity WHERE application_name=$1),has_database_privilege($3,current_database(),'CONNECT')",
+            &[&schema, &format!("{schema}_runtime"), &runtime_role],
         ).await.unwrap();
         assert!(!row.get::<_, bool>(0));
         assert!(!row.get::<_, bool>(1));

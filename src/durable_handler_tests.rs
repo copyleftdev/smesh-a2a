@@ -17,9 +17,12 @@ use crate::outbox_driver::{
     DriverTestGate, DriverTestHooks, DurableDriverControl, spawn_durable_driver_with_test_hooks,
 };
 use crate::{
-    AdmissionOutcome, AdmissionRecord, AttemptDisposition, DurableDispatchEnvelope,
-    DurableLoopbackEndpoint, GatewayConfig, InjectedClock, InputLimits, ReceiverAdmission,
-    SendMessageAdmission, SqliteTaskStore, TRUSTED_SINGLE_TENANT_SCOPE, TransitionOutcome,
+    AdmissionOutcome, AdmissionRecord, AttemptDisposition, AuthorizationAuditInput,
+    AuthorizationDecisionEffect, CompletionEvidence, DurableDispatchEnvelope,
+    DurableInterruptionKind, DurableLoopbackEndpoint, GatewayConfig, HumanDecision, InjectedClock,
+    InputLimits, MeshEvent, OwnedTaskScope, PolicyCheckpoint, RatificationAuthority,
+    RatificationCommand, ReceiverAdmission, ReviewAcknowledgement, SendMessageAdmission,
+    SqliteTaskStore, TRUSTED_SINGLE_TENANT_SCOPE, TransitionOutcome, VisibilityScope,
     build_durable_loopback_gateway, content_digest,
 };
 
@@ -161,6 +164,334 @@ async fn admit_with_streaming(
         panic!("fresh request must be admitted");
     };
     (request, record)
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // The live driver, durable packet, and corruption proof form one vertical trace.
+async fn receiver_ratification_termination_freezes_packet_in_live_driver() {
+    let path = database_path("ratification-termination");
+    let now = 1_700_000_600_000;
+    let store = tokio::time::timeout(
+        WATCHDOG,
+        SqliteTaskStore::open_with_ratification_key(
+            &path,
+            8,
+            zeroize::Zeroizing::new([0x52; 32]),
+            false,
+        ),
+    )
+    .await
+    .expect("open ratification store watchdog")
+    .expect("open store");
+    let message_id = "ratification-termination";
+    let task_id = format!("task-{message_id}");
+    let context_id = format!("context-{message_id}");
+    let artifact_bytes = br#"{"release":"candidate"}"#;
+    let artifact_digest = content_digest(artifact_bytes);
+    let checkpoint = PolicyCheckpoint {
+        task_id: task_id.clone(),
+        context_id: context_id.clone(),
+        request_digest: content_digest(b"ratification request"),
+        policy_id: "release-policy".to_owned(),
+        policy_version: 7,
+        policy_hash: content_digest(b"release-policy-v7"),
+        evidence_snapshot_hash: content_digest(b"evidence snapshot"),
+        artifact_set_digest: content_digest(b"artifact set"),
+        evidence_hashes: vec![content_digest(b"review evidence")],
+        assurance_bps: 9_500,
+        seal: "checkpoint-seal".to_owned(),
+    };
+    let mut message = Message::new(Role::User, vec![Part::text(message_id)]);
+    message.message_id = message_id.to_owned();
+    let task = Task {
+        id: task_id.clone(),
+        context_id: context_id.clone(),
+        status: TaskStatus {
+            state: TaskState::Submitted,
+            message: None,
+            timestamp: chrono::DateTime::from_timestamp_millis(now),
+        },
+        artifacts: None,
+        history: Some(vec![message.clone()]),
+        metadata: Some(
+            serde_json::from_value(serde_json::json!({
+                "smesh.completionPolicy": {
+                    "status": "awaitingRatification",
+                    "record": checkpoint,
+                }
+            }))
+            .expect("ratification metadata"),
+        ),
+    };
+    let scope = OwnedTaskScope::new_with_principal_and_authentication(
+        TRUSTED_SINGLE_TENANT_SCOPE,
+        "smesh-dev-only-account",
+        "smesh-dev-only-account",
+        VisibilityScope::Tenant,
+        "trusted-local",
+    )
+    .expect("trusted ratifier scope");
+    let admission_audit = AuthorizationAuditInput::new(
+        "live-driver-admission-audit",
+        scope.tenant_scope(),
+        scope.owner_account_id(),
+        "smesh-dev-only-policy",
+        1,
+        content_digest(b"smesh-dev-only-policy/v1"),
+        "taskCreate",
+        AuthorizationDecisionEffect::Allow,
+        "authorized",
+        "task",
+        content_digest(task_id.as_bytes()),
+        Some(task_id.clone()),
+        now,
+    )
+    .expect("admission audit");
+    store
+        .authorize_and_admit(
+            &scope,
+            SendMessageAdmission {
+                request: SendMessageRequest {
+                    message,
+                    configuration: None,
+                    metadata: None,
+                    tenant: None,
+                },
+                streaming: false,
+                task: task.clone(),
+                original_result: SendMessageResponse::Task(task),
+                input_limits: InputLimits::default(),
+                now,
+                max_attempts: 8,
+            },
+            admission_audit,
+        )
+        .await
+        .expect("admit ratification candidate");
+    let events = vec![
+        MeshEvent::Evidence(CompletionEvidence::Review {
+            id: "review-1".to_owned(),
+            issuer: "review-authority".to_owned(),
+            subject_digest: artifact_digest,
+            evidence: b"review evidence".to_vec(),
+            evidence_digest: content_digest(b"review evidence"),
+            approved: true,
+            assurance_bps: 9_500,
+        }),
+        MeshEvent::Artifact {
+            name: "release.json".to_owned(),
+            media_type: "application/json".to_owned(),
+            content: String::from_utf8(artifact_bytes.to_vec()).expect("UTF-8 artifact"),
+        },
+    ];
+    let endpoint = DurableLoopbackEndpoint::with_interruption_events_for_test(
+        message_id,
+        DurableInterruptionKind::InputRequired,
+        "human ratification is required",
+        events.clone(),
+    );
+    let driver = spawn_durable_driver_with_test_hooks(
+        store.clone(),
+        endpoint,
+        InjectedClock::new(now + 1),
+        DriverTestHooks::default(),
+    );
+    let mut state = driver.control().subscribe();
+    bounded("ratification packet commit", async {
+        loop {
+            if store
+                .ratification_packet(TRUSTED_SINGLE_TENANT_SCOPE, &task_id)
+                .await
+                .expect("packet read")
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                state.borrow().failure.is_none(),
+                "driver failed: {:?}",
+                state.borrow().failure
+            );
+            state.changed().await.expect("driver remains observable");
+        }
+    })
+    .await;
+    let awaiting = store.get(&task_id).await.expect("task read").expect("task");
+    assert_eq!(awaiting.status.state, TaskState::InputRequired);
+    assert!(awaiting.artifacts.is_none());
+    let packet = store
+        .ratification_packet(TRUSTED_SINGLE_TENANT_SCOPE, &task_id)
+        .await
+        .expect("packet read")
+        .expect("packet");
+    assert_eq!(packet.completion_policy_id, "release-policy");
+    assert_eq!(packet.evidence_hashes, [content_digest(b"review evidence")]);
+    assert_eq!(packet.artifacts.len(), 1);
+    driver.shutdown().await.expect("first driver shutdown");
+
+    let audit = |id: &str, operation: &str, at: i64| {
+        AuthorizationAuditInput::new(
+            id,
+            scope.tenant_scope(),
+            scope.owner_account_id(),
+            packet.authorization_policy_id.clone(),
+            packet.authorization_policy_revision,
+            packet.authorization_policy_digest.clone(),
+            operation,
+            AuthorizationDecisionEffect::Allow,
+            "authorized",
+            "ratification",
+            packet.packet_hash.clone(),
+            Some(task_id.clone()),
+            at,
+        )
+        .expect("ratification audit")
+    };
+    store
+        .acknowledge_ratification_review(
+            &scope,
+            ReviewAcknowledgement {
+                tenant_id: scope.tenant_scope().to_owned(),
+                task_id: task_id.clone(),
+                generation: packet.generation,
+                account_id: scope.owner_account_id().to_owned(),
+                authorization_policy_id: packet.authorization_policy_id.clone(),
+                authorization_policy_revision: packet.authorization_policy_revision,
+                authorization_policy_digest: packet.authorization_policy_digest.clone(),
+                principal_scope: scope.principal_scope().to_owned(),
+                authentication_method: scope.authentication_method().to_owned(),
+                context_id: packet.context_id.clone(),
+                request_digest: packet.request_digest.clone(),
+                ratification_key_generation: packet.ratification_key_generation.clone(),
+                expected_revision: 0,
+                checkpoint_hash: packet.checkpoint_hash.clone(),
+                packet_hash: packet.packet_hash.clone(),
+                evidence_hashes: packet.evidence_hashes.clone(),
+                artifact_hashes: packet.artifacts.iter().map(|a| a.digest.clone()).collect(),
+                artifact_manifest_digest: packet.artifact_set_digest.clone(),
+                uncertainty_acknowledged: true,
+                idempotency_key: "live-driver-review".to_owned(),
+                reviewed_at_millis: now + 2,
+            },
+            audit("live-driver-review-audit", "ratificationReview", now + 2),
+        )
+        .await
+        .expect("review generation one");
+    let amendment = "generation two amendment";
+    store
+        .decide_ratification(
+            &scope,
+            RatificationCommand {
+                tenant_id: scope.tenant_scope().to_owned(),
+                task_id: task_id.clone(),
+                generation: packet.generation,
+                account_id: scope.owner_account_id().to_owned(),
+                authorization_policy_id: packet.authorization_policy_id.clone(),
+                authorization_policy_revision: packet.authorization_policy_revision,
+                authorization_policy_digest: packet.authorization_policy_digest.clone(),
+                principal_scope: scope.principal_scope().to_owned(),
+                authentication_method: scope.authentication_method().to_owned(),
+                context_id: packet.context_id.clone(),
+                request_digest: packet.request_digest.clone(),
+                ratification_key_generation: packet.ratification_key_generation.clone(),
+                expected_revision: 1,
+                checkpoint_hash: packet.checkpoint_hash.clone(),
+                packet_hash: packet.packet_hash.clone(),
+                artifact_manifest_digest: packet.artifact_set_digest.clone(),
+                idempotency_key: "live-driver-amend".to_owned(),
+                decision: HumanDecision::Amend,
+                rationale: amendment.to_owned(),
+                decided_at_millis: now + 3,
+            },
+            audit("live-driver-amend-audit", "ratificationDecide", now + 3),
+        )
+        .await
+        .expect("amend generation one");
+    let amendment_endpoint = DurableLoopbackEndpoint::with_interruption_events_for_test(
+        amendment,
+        DurableInterruptionKind::InputRequired,
+        "generation two requires ratification",
+        events.clone(),
+    );
+    let amendment_driver = spawn_durable_driver_with_test_hooks(
+        store.clone(),
+        amendment_endpoint,
+        InjectedClock::new(now + 4),
+        DriverTestHooks::default(),
+    );
+    let mut amendment_state = amendment_driver.control().subscribe();
+    bounded("generation two packet commit through live driver", async {
+        loop {
+            let view = store
+                .ratification_view(&scope, &task_id)
+                .await
+                .expect("ratification view")
+                .expect("ratification packet");
+            if view.packet.generation == 2 {
+                break;
+            }
+            assert!(
+                amendment_state.borrow().failure.is_none(),
+                "amendment driver failed: {:?}",
+                amendment_state.borrow().failure
+            );
+            amendment_state
+                .changed()
+                .await
+                .expect("amendment driver remains observable");
+        }
+    })
+    .await;
+    amendment_driver
+        .shutdown()
+        .await
+        .expect("amendment driver shutdown");
+    let connection =
+        rusqlite::Connection::open(&path).expect("open private candidate tamper handle");
+    let originals = connection
+        .query_row(
+            "SELECT approved_task_json,approved_result_json,approved_transcript_json FROM ratification_packets WHERE task_id=?1 AND generation=1",
+            [&task_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        )
+        .expect("private candidate rows");
+    connection
+        .execute_batch("DROP TRIGGER ratification_packets_identity_immutable;")
+        .expect("disable integrity trigger for corruption injection");
+    for (column, original) in [
+        ("approved_task_json", originals.0),
+        ("approved_result_json", originals.1),
+        ("approved_transcript_json", originals.2),
+    ] {
+        connection
+            .execute(
+                &format!(
+                    "UPDATE ratification_packets SET {column}=?1 WHERE task_id=?2 AND generation=1"
+                ),
+                rusqlite::params!["{}", &task_id],
+            )
+            .expect("tamper private candidate");
+        let error = store
+            .ratification_packet(TRUSTED_SINGLE_TENANT_SCOPE, &task_id)
+            .await
+            .expect_err("private candidate tampering must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("ratification ledger integrity validation failed")
+        );
+        connection
+            .execute(
+                &format!(
+                    "UPDATE ratification_packets SET {column}=?1 WHERE task_id=?2 AND generation=1"
+                ),
+                rusqlite::params![original, &task_id],
+            )
+            .expect("restore private candidate");
+    }
+    drop(connection);
+    shutdown_store(&store).await.expect("store shutdown");
+    cleanup(&path);
 }
 
 #[tokio::test]

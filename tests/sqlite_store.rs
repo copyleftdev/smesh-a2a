@@ -3,6 +3,7 @@
 use std::ffi::OsStr;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use a2a::{
@@ -30,6 +31,37 @@ fn task(id: &str, state: TaskState) -> Task {
         history: None,
         metadata: None,
     }
+}
+
+#[tokio::test]
+async fn initialized_file_with_deleted_schema_and_reset_version_is_not_recreated() {
+    let path = database_path();
+    let store = SqliteTaskStore::open(&path, 8).await.unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    connection.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    for table in tables {
+        connection
+            .execute_batch(&format!("DROP TABLE \"{}\"", table.replace('"', "\"\"")))
+            .unwrap();
+    }
+    connection.pragma_update(None, "user_version", 0).unwrap();
+    let application_id: i64 = connection
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .unwrap();
+    assert_ne!(application_id, 0);
+    drop(connection);
+
+    assert!(SqliteTaskStore::open(&path, 8).await.is_err());
+    std::fs::remove_file(path).unwrap();
 }
 
 fn rich_task(id: &str, state: TaskState) -> Task {
@@ -143,13 +175,15 @@ impl Drop for FixturePath {
 }
 
 fn database_path() -> FixturePath {
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
     let directory = std::env::temp_dir().join(format!(
-        "smesh-a2a-store-{}-{}",
+        "smesh-a2a-store-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir(&directory).unwrap();
     #[cfg(unix)]

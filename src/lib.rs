@@ -41,9 +41,12 @@ mod loopback;
 mod outbox_driver;
 mod policy;
 mod postgres_store;
+#[doc(hidden)]
+pub use postgres_store::render_migration_sql_for_test;
 /// Secure operator-enrolled callback policy, SSRF validation, and signing.
 pub mod push;
 mod quota;
+mod ratification;
 mod runtime_config;
 mod runtime_trace;
 mod runtime_worker;
@@ -124,11 +127,12 @@ pub use durable_authority::{
     AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead, CancellationAuthority,
     CancellationOutcome, ChangeObservation, ChangeObserver, DurableAuthority, ExecutionReservation,
     IntoDurableAuthority, LeaseRenewalOutcome, OutboxAuthority, OutboxLease, OwnedTaskScope,
-    PollInterval, QuotaLease, QuotaLeaseAuthority, QuotaReservationInput, ReceiverAdmission,
-    ReceiverAuthority, ReceiverLease, SendMessageAdmission, StreamTranscriptBatch,
-    SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE, TaskAdmission, TaskEventBatch, TaskLifecycle,
-    TelemetryCorrelation, TranscriptAuthority, TransitionOutcome, authorized_message_identity,
-    canonical_send_message_digest, canonical_send_message_digest_v2,
+    PollInterval, QuotaLease, QuotaLeaseAuthority, QuotaReservationInput, RatificationAuthority,
+    RatificationReplayAction, ReceiverAdmission, ReceiverAuthority, ReceiverLease,
+    SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE,
+    TaskAdmission, TaskEventBatch, TaskLifecycle, TelemetryCorrelation, TranscriptAuthority,
+    TransitionOutcome, authorized_message_identity, canonical_send_message_digest,
+    canonical_send_message_digest_v2,
 };
 pub use durable_dispatch::{
     DurableDispatchEnvelope, DurableInterruptionKind, DurableLoopbackEndpoint,
@@ -193,6 +197,11 @@ pub use quota::{
     QuotaLeaseKind, QuotaOperation, QuotaPolicy, QuotaPolicyError, QuotaReconciliationPlan,
     QuotaReconciliationTarget, QuotaScopeKind, QuotaSubject,
 };
+pub use ratification::{
+    AuthoritativeReviewCandidate, HumanDecision, HumanRatificationAction, HumanRatificationReceipt,
+    RatificationCommand, RatificationError, RatificationLedger, RatificationState,
+    RatificationView, ReviewAcknowledgement, ReviewArtifact, ReviewPacket, ReviewPacketInput,
+};
 pub use runtime_config::{GatewayMode, GatewayModeError, RuntimeModeConfig};
 pub use runtime_trace::{
     CorrelatingRuntimeProcessor, RuntimeCancellationOutcome, RuntimeClaimKind, RuntimeEventCapture,
@@ -207,6 +216,8 @@ pub use server::{
     CompletionPolicyStore, DurableGateway, GatewayConfig,
     build_authenticated_durable_loopback_gateway, build_authenticated_router,
     build_authenticated_router_with_trace, build_authorized_durable_loopback_gateway,
+    build_authorized_durable_loopback_gateway_with_ratification,
+    build_authorized_durable_loopback_gateway_with_ratification_and_telemetry,
     build_authorized_durable_loopback_gateway_with_telemetry, build_durable_loopback_gateway,
     build_durable_loopback_gateway_with_telemetry, build_router, build_router_with_policy,
     build_router_with_policy_and_trace, build_router_with_sqlite,

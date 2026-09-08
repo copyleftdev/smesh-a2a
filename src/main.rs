@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+mod private_file;
+
 use smesh_a2a::auth::{
     AuthState, HttpJwksProvider, JwtBearerVerifier, JwtVerifierConfig, SystemAuthClock,
 };
@@ -21,11 +23,183 @@ use smesh_a2a::{
     RuntimeEventCapture, RuntimeModeConfig, RuntimeWorker, SecureCallbackSender, SqliteTaskStore,
     SystemCallbackJitter, SystemClockTicker, build_authenticated_router,
     build_authenticated_router_with_trace,
+    build_authorized_durable_loopback_gateway_with_ratification_and_telemetry,
     build_authorized_durable_loopback_gateway_with_telemetry,
     build_durable_loopback_gateway_with_telemetry, build_router, build_router_with_trace,
 };
 use smesh_core::{Network, Node};
 use smesh_runtime::{MeshConfig, RuntimeConfig, SmeshRuntime};
+
+#[cfg(debug_assertions)]
+#[allow(clippy::too_many_lines)] // Keep the project-owned authentic fixture transaction auditable together.
+async fn seed_ratification_fixture() -> Result<(), Box<dyn std::error::Error>> {
+    use a2a_server::TaskStore as _;
+    use smesh_a2a::OutboxAuthority as _;
+
+    let required_path = |name: &str| {
+        std::env::var_os(name)
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| format!("{name} is required"))
+    };
+    let database = required_path("SMESH_TEST_RATIFICATION_SEED_SQLITE_PATH")?;
+    let key_path = required_path("SMESH_TEST_RATIFICATION_SEED_KEY_PATH")?;
+    let policy_path = required_path("SMESH_TEST_RATIFICATION_SEED_POLICY_PATH")?;
+    let issuer = std::env::var("SMESH_TEST_RATIFICATION_SEED_ISSUER")
+        .map_err(|_| "SMESH_TEST_RATIFICATION_SEED_ISSUER is required")?;
+    let subject = std::env::var("SMESH_TEST_RATIFICATION_SEED_SUBJECT")
+        .map_err(|_| "SMESH_TEST_RATIFICATION_SEED_SUBJECT is required")?;
+    let task_id = std::env::var("SMESH_TEST_RATIFICATION_SEED_TASK_ID")
+        .unwrap_or_else(|_| "task-browser-ratification".to_owned());
+    let authentication = std::env::var("SMESH_TEST_RATIFICATION_SEED_AUTHENTICATION")
+        .unwrap_or_else(|_| "bearer-jwt".to_owned());
+    let policy = AuthorizationPolicy::load(policy_path)?;
+    let principal = match authentication.as_str() {
+        "bearer-jwt" => smesh_a2a::auth::Principal::bearer_for_verifier(
+            issuer,
+            subject,
+            smesh_a2a::auth::PrincipalLimits::default(),
+        )?,
+        "mutual-tls" => smesh_a2a::auth::Principal::mutual_tls(
+            issuer,
+            subject,
+            smesh_a2a::auth::PrincipalLimits::default(),
+        )?,
+        _ => return Err("SMESH_TEST_RATIFICATION_SEED_AUTHENTICATION is invalid".into()),
+    };
+    let context = policy.resolve(&principal, None)?;
+    let binding = LegacyTenantBinding::new(
+        context.tenant_id(),
+        context.account_id(),
+        context.policy_id(),
+        context.policy_revision(),
+        context.policy_digest(),
+    )?;
+    let key = private_file::read_owner_private_exact::<32>(&key_path)?;
+    let store = SqliteTaskStore::open_with_ratification_key_and_legacy_binding(
+        database, 16, binding, key, false,
+    )
+    .await?;
+    let scope = smesh_a2a::OwnedTaskScope::new_with_principal_and_authentication(
+        context.tenant_id(),
+        context.account_id(),
+        context.principal_scope(),
+        smesh_a2a::VisibilityScope::Tenant,
+        &authentication,
+    )?;
+    let now = 1_700_000_010_000_i64;
+    let mut message = a2a::Message::new(
+        a2a::Role::User,
+        vec![a2a::Part::text("qualify human ratification")],
+    );
+    message.message_id = format!("message-{task_id}");
+    let request = a2a::SendMessageRequest {
+        message: message.clone(),
+        configuration: None,
+        metadata: None,
+        tenant: None,
+    };
+    let amended_evidence = b"amended browser evidence";
+    let amended_checkpoint = smesh_a2a::PolicyCheckpoint {
+        task_id: task_id.clone(),
+        context_id: format!("context-{task_id}"),
+        request_digest: smesh_a2a::content_digest(b"amended browser request"),
+        policy_id: "browser-amendment-policy".to_owned(),
+        policy_version: 1,
+        policy_hash: smesh_a2a::content_digest(b"browser-amendment-policy-v1"),
+        evidence_snapshot_hash: smesh_a2a::content_digest(amended_evidence),
+        artifact_set_digest: smesh_a2a::content_digest(b"amended browser artifact set"),
+        evidence_hashes: vec![smesh_a2a::content_digest(amended_evidence)],
+        assurance_bps: 9_500,
+        seal: "browser-amendment-checkpoint".to_owned(),
+    };
+    let amended_metadata = serde_json::from_value(serde_json::json!({
+        "smesh.completionPolicy": {
+            "status": "awaitingRatification",
+            "record": amended_checkpoint,
+        }
+    }))?;
+    let task = a2a::Task {
+        id: task_id.clone(),
+        context_id: format!("context-{task_id}"),
+        status: a2a::TaskStatus {
+            state: a2a::TaskState::Submitted,
+            message: None,
+            timestamp: chrono::DateTime::from_timestamp_millis(now),
+        },
+        artifacts: None,
+        history: Some(vec![message]),
+        metadata: Some(amended_metadata),
+    };
+    let admission = smesh_a2a::SendMessageAdmission {
+        request,
+        streaming: false,
+        task: task.clone(),
+        original_result: a2a::SendMessageResponse::Task(task),
+        input_limits: smesh_a2a::InputLimits::default(),
+        now,
+        max_attempts: 8,
+    };
+    let audit = smesh_a2a::AuthorizationAuditInput::new(
+        format!("seed-audit-{task_id}"),
+        context.tenant_id(),
+        context.account_id(),
+        context.policy_id(),
+        context.policy_revision(),
+        context.policy_digest(),
+        "taskCreate",
+        smesh_a2a::AuthorizationDecisionEffect::Allow,
+        "test-fixture",
+        "task",
+        smesh_a2a::content_digest(task_id.as_bytes()),
+        Some(task_id.clone()),
+        now,
+    )?;
+    store.authorize_and_admit(&scope, admission, audit).await?;
+    let lease = store
+        .claim_outbox("browser-fixture", now + 1, 60_000)
+        .await?
+        .ok_or("browser fixture outbox lease unavailable")?;
+    let initial = store.get(&task_id).await?.ok_or("seed task missing")?;
+    let mut approved = initial.clone();
+    approved.status = a2a::TaskStatus {
+        state: a2a::TaskState::Completed,
+        message: Some(a2a::Message::new(
+            a2a::Role::Agent,
+            vec![a2a::Part::text("candidate ready")],
+        )),
+        timestamp: chrono::DateTime::from_timestamp_millis(now + 2),
+    };
+    approved.artifacts = Some(vec![a2a::Artifact {
+        artifact_id: format!("artifact-{task_id}"),
+        name: Some("release.txt".to_owned()),
+        description: None,
+        parts: vec![a2a::Part::text("sealed candidate")],
+        metadata: None,
+        extensions: None,
+    }]);
+    store
+        .commit_delivery_for_ratification(
+            &lease,
+            approved.clone(),
+            a2a::SendMessageResponse::Task(approved),
+            &[a2a::StreamResponse::Task(initial)],
+            smesh_a2a::AuthoritativeReviewCandidate::new(
+                "browser-qualification-policy",
+                1,
+                smesh_a2a::content_digest(b"browser-qualification-policy-v1"),
+                b"sealed browser checkpoint".to_vec(),
+                vec![b"browser qualification evidence".to_vec()],
+                "bounded browser qualification uncertainty",
+            )?,
+            now + 2,
+        )
+        .await?;
+    Ok(())
+}
+
+struct RatificationConfig {
+    key: zeroize::Zeroizing<[u8; 32]>,
+}
 
 async fn auth_state_from_environment() -> Result<Option<AuthState>, Box<dyn std::error::Error>> {
     let mode = std::env::var("SMESH_A2A_AUTH_MODE").unwrap_or_else(|_| "oidc".to_owned());
@@ -466,6 +640,11 @@ async fn run_artifact_migrate_command() -> Result<(), Box<dyn std::error::Error>
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(debug_assertions)]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("test-seed-ratification"))
+    {
+        return seed_ratification_fixture().await;
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("artifact-restore")) {
         return run_artifact_restore_command().await;
     }
@@ -488,6 +667,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind: SocketAddr = std::env::var("SMESH_A2A_BIND")
         .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
         .parse()?;
+    let ratification_key_path =
+        std::env::var_os("SMESH_A2A_RATIFICATION_HMAC_KEY_PATH").map(std::path::PathBuf::from);
     let public_base_url =
         std::env::var("SMESH_A2A_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
     let oidc_enabled = std::env::var("SMESH_A2A_AUTH_MODE").as_deref() != Ok("disabled");
@@ -689,6 +870,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("authenticated task operations require an authorized durable loopback gateway; generic authenticated handlers are development-only and not tenant-safe".into());
     }
+    if ratification_key_path.is_some()
+        && (!matches!(mode, GatewayMode::Loopback)
+            || !durable_configured
+            || !authentication_enabled
+            || authorization.is_none())
+    {
+        return Err(
+            "ratification requires an authenticated authorized durable loopback gateway".into(),
+        );
+    }
+    if ratification_key_path.is_some() && !bind.ip().is_loopback() {
+        return Err("ratification requires a loopback bind IP".into());
+    }
+    let ratification = ratification_key_path
+        .as_deref()
+        .map(private_file::read_owner_private_exact::<32>)
+        .transpose()?
+        .map(|key| RatificationConfig { key });
 
     let mut auth = auth_state_from_environment().await?;
     if transport_config.client_auth != ClientAuthMode::Disabled {
@@ -725,6 +924,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     legacy_binding,
                     http_transport.clone(),
                     telemetry_handle.clone(),
+                    ratification.map(|config| config.key),
                 )
                 .await?;
             } else if let Some(postgres_config) = postgres_config {
@@ -745,6 +945,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     telemetry_handle.clone(),
                     push_policy.clone(),
                     quota_policy.clone(),
+                    ratification.map(|config| config.key),
                 )
                 .await?;
             } else {
@@ -814,6 +1015,34 @@ fn audit_projector_config() -> Result<AuditProjectorConfig, Box<dyn std::error::
     }
 }
 
+fn durable_loopback_endpoint() -> DurableLoopbackEndpoint {
+    #[cfg(debug_assertions)]
+    if std::env::var("SMESH_TEST_RATIFICATION_AMEND_CANDIDATE").as_deref() == Ok("1") {
+        return DurableLoopbackEndpoint::with_interruption_events_for_test(
+            "amend in real Chromium",
+            smesh_a2a::DurableInterruptionKind::InputRequired,
+            "amended candidate awaits ratification",
+            vec![
+                smesh_a2a::MeshEvent::Evidence(smesh_a2a::CompletionEvidence::Review {
+                    id: "browser-amendment-review".to_owned(),
+                    issuer: "browser-amendment-fixture".to_owned(),
+                    subject_digest: smesh_a2a::content_digest(b"amended browser artifact"),
+                    evidence: b"amended browser evidence".to_vec(),
+                    evidence_digest: smesh_a2a::content_digest(b"amended browser evidence"),
+                    approved: true,
+                    assurance_bps: 9_500,
+                }),
+                smesh_a2a::MeshEvent::Artifact {
+                    name: "amended-release.json".to_owned(),
+                    media_type: "application/json".to_owned(),
+                    content: "{\"amended\":true}".to_owned(),
+                },
+            ],
+        );
+    }
+    DurableLoopbackEndpoint::new()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_durable_loopback_gateway(
     listener: std::net::TcpListener,
@@ -826,39 +1055,74 @@ async fn run_durable_loopback_gateway(
     legacy_binding: Option<LegacyTenantBinding>,
     transport: HttpTransport,
     telemetry: Option<TelemetryHandle>,
+    ratification_key: Option<zeroize::Zeroizing<[u8; 32]>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if auth.is_some() != authorization.is_some() {
         return Err("durable production authentication and tenant authorization must be configured together".into());
     }
-    let store = if let Some(binding) = legacy_binding {
-        if telemetry.is_some() {
+    let ratification_enabled = ratification_key.is_some();
+    let store = match (legacy_binding, ratification_key) {
+        (Some(binding), Some(key)) => {
+            SqliteTaskStore::open_with_ratification_key_and_legacy_binding(
+                sqlite_path,
+                config.max_tasks,
+                binding,
+                key,
+                telemetry.is_some(),
+            )
+            .await?
+        }
+        (None, Some(key)) => {
+            SqliteTaskStore::open_with_ratification_key(
+                sqlite_path,
+                config.max_tasks,
+                key,
+                telemetry.is_some(),
+            )
+            .await?
+        }
+        (Some(binding), None) if telemetry.is_some() => {
             SqliteTaskStore::open_with_legacy_binding_and_audit_projection(
                 sqlite_path,
                 config.max_tasks,
                 binding,
             )
             .await?
-        } else {
+        }
+        (Some(binding), None) => {
             SqliteTaskStore::open_with_legacy_binding(sqlite_path, config.max_tasks, binding)
                 .await?
         }
-    } else if telemetry.is_some() {
-        SqliteTaskStore::open_with_audit_projection(sqlite_path, config.max_tasks).await?
-    } else {
-        SqliteTaskStore::open(sqlite_path, config.max_tasks).await?
+        (None, None) if telemetry.is_some() => {
+            SqliteTaskStore::open_with_audit_projection(sqlite_path, config.max_tasks).await?
+        }
+        (None, None) => SqliteTaskStore::open(sqlite_path, config.max_tasks).await?,
     };
     let clock = InjectedClock::new(chrono::Utc::now().timestamp_millis());
+    let endpoint = durable_loopback_endpoint();
     let mut gateway = if let Some(auth) = auth {
         if let Some(policy) = authorization {
-            build_authorized_durable_loopback_gateway_with_telemetry(
-                config,
-                store,
-                DurableLoopbackEndpoint::new(),
-                clock.clone(),
-                auth,
-                policy,
-                telemetry.clone(),
-            )?
+            if ratification_enabled {
+                build_authorized_durable_loopback_gateway_with_ratification_and_telemetry(
+                    config,
+                    store,
+                    endpoint.clone(),
+                    clock.clone(),
+                    auth,
+                    policy,
+                    telemetry.clone(),
+                )?
+            } else {
+                build_authorized_durable_loopback_gateway_with_telemetry(
+                    config,
+                    store,
+                    endpoint.clone(),
+                    clock.clone(),
+                    auth,
+                    policy,
+                    telemetry.clone(),
+                )?
+            }
         } else {
             unreachable!("authentication without tenant authorization was rejected before SQLite")
         }
@@ -866,7 +1130,7 @@ async fn run_durable_loopback_gateway(
         build_durable_loopback_gateway_with_telemetry(
             config,
             store,
-            DurableLoopbackEndpoint::new(),
+            endpoint,
             clock.clone(),
             telemetry.clone(),
         )?
@@ -903,10 +1167,17 @@ async fn run_postgres_durable_loopback_gateway(
     telemetry: Option<TelemetryHandle>,
     push_policy: Option<Arc<smesh_a2a::push::PushPolicy>>,
     quota_policy: Option<Arc<QuotaPolicy>>,
+    ratification_key: Option<zeroize::Zeroizing<[u8; 32]>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth = auth.ok_or("PostgreSQL durable authority requires authentication")?;
     let policy =
         authorization.ok_or("PostgreSQL durable authority requires authorization policy")?;
+    let ratification_enabled = ratification_key.is_some();
+    let postgres_config = if let Some(key) = ratification_key {
+        postgres_config.with_ratification_key(key)
+    } else {
+        postgres_config
+    };
     let store = PostgresTaskStore::open(postgres_config)
         .await?
         .with_telemetry(telemetry.clone());
@@ -915,15 +1186,27 @@ async fn run_postgres_durable_loopback_gateway(
         "PostgreSQL durable authority opened"
     );
     let clock = InjectedClock::new(chrono::Utc::now().timestamp_millis());
-    let mut gateway = build_authorized_durable_loopback_gateway_with_telemetry(
-        config,
-        store.clone(),
-        DurableLoopbackEndpoint::new(),
-        clock.clone(),
-        auth,
-        policy,
-        telemetry.clone(),
-    )?;
+    let mut gateway = if ratification_enabled {
+        build_authorized_durable_loopback_gateway_with_ratification_and_telemetry(
+            config,
+            store.clone(),
+            DurableLoopbackEndpoint::new(),
+            clock.clone(),
+            auth,
+            policy,
+            telemetry.clone(),
+        )?
+    } else {
+        build_authorized_durable_loopback_gateway_with_telemetry(
+            config,
+            store.clone(),
+            DurableLoopbackEndpoint::new(),
+            clock.clone(),
+            auth,
+            policy,
+            telemetry.clone(),
+        )?
+    };
     if let Some(push) = push_policy.filter(|policy| policy.enabled()) {
         let quota_policy = quota_policy.ok_or("enabled push policy requires quota policy")?;
         let callback_authority: Arc<dyn smesh_a2a::CallbackAuthority> = Arc::new(store.clone());

@@ -30,6 +30,10 @@ SMESH remains the internal coordination substrate: signals diffuse, decay, reinf
   deterministic receipt claims, and optional signed human ratification
 - HMAC sealing and read-path validation for accepted completion receipts; SQLite mode persists the
   sealing key with the task ledger so receipts remain verifiable after restart
+- Operator-keyed human ratification on the authenticated loopback-only production binary, with
+  integrated SQLite/PostgreSQL authority, a public data-free browser bootstrap, protected review and
+  decision APIs, exact-review/same-actor gates, opaque actor-specific strong ETags, and atomic
+  receipts/publication effects
 - Versioned artifact manifests, exact plaintext SHA-256 digests, fixed 4 MiB chunks, manifest-only
   A2A projections, envelope AES-256-GCM hooks, and a private immutable POSIX blob backend
 - PostgreSQL revision 5 catalog for task-bound opaque artifact references, provenance, promotion,
@@ -87,6 +91,7 @@ See:
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - [`docs/ADR-0001-RUNTIME-PROCESS-OWNERSHIP.md`](docs/ADR-0001-RUNTIME-PROCESS-OWNERSHIP.md)
 - [`docs/PROTOCOL_MAPPING.md`](docs/PROTOCOL_MAPPING.md)
+- [`docs/HUMAN_RATIFICATION_RUNBOOK.md`](docs/HUMAN_RATIFICATION_RUNBOOK.md)
 - [`docs/RUNTIME_E2E_HARNESS.md`](docs/RUNTIME_E2E_HARNESS.md)
 - [`docs/RUNTIME_EVENT_CAPTURE.md`](docs/RUNTIME_EVENT_CAPTURE.md)
 - [`docs/RUNTIME_TERMINAL_RACES.md`](docs/RUNTIME_TERMINAL_RACES.md)
@@ -263,6 +268,15 @@ currently provisioned. See [`docs/POSTGRES_TENANT_SCHEMA.md`](docs/POSTGRES_TENA
 [`docs/TENANT_AUTHORIZATION_RUNBOOK.md`](docs/TENANT_AUTHORIZATION_RUNBOOK.md) and
 [`evidence/m2/issue-13.md`](evidence/m2/issue-13.md). Authentication-only library builders remain
 explicit development compatibility APIs and are not multitenant-safe.
+
+Human ratification is an issue #27/M3 readiness path, not a release or milestone-completion claim.
+Set `SMESH_A2A_RATIFICATION_HMAC_KEY_PATH` to an absolute owner-owned, owner-private regular file
+containing exactly 32 raw random bytes to enable it on either the SQLite or PostgreSQL production
+authority. Ratification additionally requires authenticated authorized `loopback` mode and an actual
+IPv4/IPv6 loopback listener; wildcard and external binds fail before durable-resource acquisition.
+The standalone `RatificationLedger` is compatibility/test code, not production authority. Exact
+startup examples, browser/API rules, key continuity, migration/rollback, and qualification limits are
+in [`docs/HUMAN_RATIFICATION_RUNBOOK.md`](docs/HUMAN_RATIFICATION_RUNBOOK.md).
 
 `ListTasks` uses expiring frozen-snapshot pagination. Page one fixes authorized membership,
 canonical order (`statusTimestamp` present first and descending, then task ID ascending), projected

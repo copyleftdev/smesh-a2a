@@ -66,12 +66,12 @@ where
     // This intentionally duplicates the production catalog seal. A revision-8
     // fixture must be indistinguishable from one created by the old executable.
     let queries = [
-        "SELECT concat_ws('|','relation',c.relname,c.relkind,c.relrowsecurity,c.relforcerowsecurity,c.relpersistence) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY 1",
+        "SELECT concat_ws('|','relation',c.relname,c.relkind,c.relrowsecurity,c.relforcerowsecurity,c.relpersistence,owner.rolname,COALESCE(c.relacl::text,'')) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_roles owner ON owner.oid=c.relowner WHERE n.nspname=$1 ORDER BY 1",
         "SELECT concat_ws('|','column',c.relname,a.attnum,a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,a.attidentity,a.attgenerated,COALESCE(pg_get_expr(d.adbin,d.adrelid),'')) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE n.nspname=$1 AND a.attnum>0 AND NOT a.attisdropped ORDER BY c.relname,a.attnum",
         "SELECT concat_ws('|','constraint',c.relname,x.conname,x.contype,pg_get_constraintdef(x.oid,true)) FROM pg_constraint x JOIN pg_class c ON c.oid=x.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY c.relname,x.conname",
         "SELECT concat_ws('|','index',i.relname,pg_get_indexdef(i.oid)) FROM pg_class i JOIN pg_namespace n ON n.oid=i.relnamespace WHERE n.nspname=$1 AND i.relkind='i' ORDER BY i.relname",
         "SELECT concat_ws('|','trigger',c.relname,t.tgname,pg_get_triggerdef(t.oid,true)) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND NOT t.tgisinternal ORDER BY c.relname,t.tgname",
-        "SELECT concat_ws('|','function',p.proname,pg_get_function_identity_arguments(p.oid),owner.rolname,pg_get_functiondef(p.oid)) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles owner ON owner.oid=p.proowner WHERE n.nspname=$1 ORDER BY p.proname,pg_get_function_identity_arguments(p.oid)",
+        "SELECT concat_ws('|','function',p.proname,pg_get_function_identity_arguments(p.oid),owner.rolname,COALESCE(p.proacl::text,''),pg_get_functiondef(p.oid)) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles owner ON owner.oid=p.proowner WHERE n.nspname=$1 ORDER BY p.proname,pg_get_function_identity_arguments(p.oid)",
         "SELECT concat_ws('|','policy',c.relname,p.polname,p.polcmd,p.polpermissive,COALESCE(pg_get_expr(p.polqual,p.polrelid),''),COALESCE(pg_get_expr(p.polwithcheck,p.polrelid),''),p.polroles::text) FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY c.relname,p.polname",
         "SELECT concat_ws('|','grant',table_name,grantee,privilege_type,is_grantable) FROM information_schema.role_table_grants WHERE table_schema=$1 ORDER BY table_name,grantee,privilege_type",
         "SELECT concat_ws('|','sequence-grant',object_name,grantee,privilege_type,is_grantable) FROM information_schema.usage_privileges WHERE object_schema=$1 ORDER BY object_name,grantee,privilege_type",
@@ -563,9 +563,9 @@ async fn populated_revision_eight_upgrades_authorization_projection_evidence_tra
             assert_eq!(counters.get::<_, i64>(4), counters.get::<_, i64>(5));
 
             let ledger = client.query_one(
-                    &format!("SELECT m.schema_version,l.logical_schema_version,l.name,l.checksum FROM {upgrade_schema}.store_metadata m JOIN {upgrade_schema}.schema_migrations l ON l.revision=9 WHERE m.singleton=1"), &[]
+                    &format!("SELECT m.schema_version,l.logical_schema_version,l.name,l.checksum,r.logical_schema_version,r.name,r.checksum,x.logical_schema_version,x.name,x.checksum FROM {upgrade_schema}.store_metadata m JOIN {upgrade_schema}.schema_migrations l ON l.revision=9 JOIN {upgrade_schema}.schema_migrations r ON r.revision=10 JOIN {upgrade_schema}.schema_migrations x ON x.revision=11 WHERE m.singleton=1"), &[]
                 ).await.unwrap();
-            assert_eq!(ledger.get::<_, i64>(0), 9);
+            assert_eq!(ledger.get::<_, i64>(0), 11);
             assert_eq!(ledger.get::<_, i64>(1), 9);
             assert_eq!(
                 ledger.get::<_, &str>(2),
@@ -577,6 +577,36 @@ async fn populated_revision_eight_upgrades_authorization_projection_evidence_tra
                     include_str!("../migrations/postgres/0009_authorization_audit_retention.sql")
                         .as_bytes()
                 )
+            );
+            assert_eq!(ledger.get::<_, i64>(4), 10);
+            assert_eq!(ledger.get::<_, &str>(5), "0010_human_ratification");
+            assert_eq!(
+                ledger.get::<_, String>(6),
+                content_digest(
+                    include_str!("../migrations/postgres/0010_human_ratification.sql").as_bytes()
+                )
+            );
+            assert_eq!(ledger.get::<_, i64>(7), 11);
+            assert_eq!(
+                ledger.get::<_, &str>(8),
+                "0011_ratification_retained_authority"
+            );
+            assert_eq!(
+                ledger.get::<_, String>(9),
+                content_digest(
+                    include_str!("../migrations/postgres/0011_ratification_retained_authority.sql")
+                        .as_bytes()
+                )
+            );
+            let legacy_defaults = client.query(
+                "SELECT column_name,column_default FROM information_schema.columns WHERE table_schema=$1 AND table_name='tasks' AND column_name IN ('principal_scope','authentication_method','authorization_policy_id','authorization_policy_revision') ORDER BY column_name",
+                &[&upgrade_schema],
+            ).await.unwrap();
+            assert_eq!(legacy_defaults.len(), 4);
+            assert!(
+                legacy_defaults
+                    .iter()
+                    .all(|row| row.get::<_, Option<String>>(1).is_some())
             );
             store.shutdown().await.unwrap();
             drop(store);
