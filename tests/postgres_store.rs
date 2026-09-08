@@ -85,8 +85,30 @@ fn superuser_url() -> String {
     required_postgres_url("SMESH_TEST_POSTGRES_SUPERUSER_URL")
 }
 
+fn superuser_database() -> String {
+    Url::parse(&superuser_url())
+        .expect("parse PostgreSQL superuser fixture URL")
+        .path()
+        .trim_start_matches('/')
+        .to_owned()
+}
+
+fn quoted_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn fixture_role_url(role: &str, password: &str) -> String {
+    let mut url = Url::parse(&superuser_url()).expect("parse PostgreSQL superuser fixture URL");
+    url.set_username(role)
+        .expect("set PostgreSQL fixture role username");
+    url.set_password(Some(password))
+        .expect("set PostgreSQL fixture role password");
+    url.to_string()
+}
+
 struct EphemeralRoleGuard {
     superuser_url: String,
+    database: String,
     schema: String,
     migrator: String,
 }
@@ -97,6 +119,7 @@ impl EphemeralRoleGuard {
         assert!(migrator.starts_with("smesh_migrator_"));
         Self {
             superuser_url: superuser_url(),
+            database: superuser_database(),
             schema,
             migrator,
         }
@@ -108,6 +131,7 @@ impl Drop for EphemeralRoleGuard {
         let url = self.superuser_url.clone();
         let schema = self.schema.clone();
         let migrator = self.migrator.clone();
+        let database = quoted_identifier(&self.database);
         let _ = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -124,7 +148,7 @@ impl Drop for EphemeralRoleGuard {
                     .await;
                 let _ = client
                     .batch_execute(&format!(
-                        "DROP SCHEMA IF EXISTS {schema} CASCADE; DROP ROLE IF EXISTS {schema}_runtime; REVOKE CREATE ON DATABASE smesh_test FROM {migrator}; DROP OWNED BY {migrator}; DROP ROLE IF EXISTS {migrator}"
+                        "DROP SCHEMA IF EXISTS {schema} CASCADE; DROP ROLE IF EXISTS {schema}_runtime; REVOKE CREATE ON DATABASE {database} FROM {migrator}; DROP OWNED BY {migrator}; DROP ROLE IF EXISTS {migrator}"
                     ))
                     .await;
                 drop(client);
@@ -656,7 +680,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
     let source = include_str!("../src/postgres_store.rs");
     assert_eq!(
         source.matches(".transaction()").count() + source.matches(".build_transaction()").count(),
-        17,
+        18,
         "new direct transaction site must be routed through the bounded runner or explicitly reviewed"
     );
     assert_eq!(
@@ -681,6 +705,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
         "artifact orphan finalize fences exact ownership",
         "read-only tenant/key-generation snapshot before atomic reload",
         "operator-only bounded authorization retention transaction",
+        "ratification key reconciliation and anchor qualification are one startup transaction",
     ] {
         assert!(
             source.contains(reason),
@@ -880,7 +905,10 @@ postgres_test!(
             if table.starts_with("callback_")
                 || matches!(
                     table,
-                    "ratification_key_check" | "ratification_packets" | "ratification_events"
+                    "ratification_key_check"
+                        | "ratification_ledger_anchor"
+                        | "ratification_packets"
+                        | "ratification_events"
                 )
             {
                 continue;
@@ -892,6 +920,7 @@ postgres_test!(
         }
         for table in [
             "ratification_key_check",
+            "ratification_ledger_anchor",
             "ratification_packets",
             "ratification_events",
         ] {
@@ -1315,13 +1344,13 @@ postgres_test!(non_superuser_migrator_opens_and_runtime_cannot_escalate, {
     let suffix = format!("{:016x}", rand::random::<u64>());
     let migrator = format!("smesh_migrator_{suffix}");
     let schema = format!("smesh_non_super_{suffix}");
+    let database = quoted_identifier(&superuser_database());
     let (client, driver) = admin_client(&superuser_url()).await;
     client.batch_execute(&format!(
-        "CREATE ROLE {migrator} LOGIN PASSWORD 'bounded-migrator' NOSUPERUSER NOBYPASSRLS NOCREATEDB CREATEROLE NOREPLICATION NOINHERIT; GRANT CREATE ON DATABASE smesh_test TO {migrator}"
+        "CREATE ROLE {migrator} LOGIN PASSWORD 'bounded-migrator' NOSUPERUSER NOBYPASSRLS NOCREATEDB CREATEROLE NOREPLICATION NOINHERIT; GRANT CREATE ON DATABASE {database} TO {migrator}"
     )).await.unwrap();
     let _cleanup = EphemeralRoleGuard::new(schema.clone(), migrator.clone());
-    let migrator_url =
-        format!("postgresql://{migrator}:bounded-migrator@127.0.0.1:55432/smesh_test");
+    let migrator_url = fixture_role_url(&migrator, "bounded-migrator");
     let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap_or_else(|_| {
         "postgresql://smesh_test_runtime:smesh_runtime_password@127.0.0.1:55432/smesh_test".into()
     });
@@ -1351,7 +1380,7 @@ postgres_test!(non_superuser_migrator_opens_and_runtime_cannot_escalate, {
     PostgresTaskStore::drop_test_schema(&config).await.unwrap();
     client
         .batch_execute(&format!(
-            "REVOKE CREATE ON DATABASE smesh_test FROM {migrator}; DROP ROLE {migrator}"
+            "REVOKE CREATE ON DATABASE {database} FROM {migrator}; DROP ROLE {migrator}"
         ))
         .await
         .unwrap();
@@ -1366,10 +1395,11 @@ postgres_test!(ephemeral_migrator_guard_cleans_after_injected_failure, {
     let suffix = format!("{:016x}", rand::random::<u64>());
     let migrator = format!("smesh_migrator_{suffix}");
     let schema = format!("smesh_guard_{suffix}");
+    let database = quoted_identifier(&superuser_database());
     let (client, driver) = admin_client(&superuser_url()).await;
     client
         .batch_execute(&format!(
-            "CREATE ROLE {migrator} LOGIN CREATEROLE; GRANT CREATE ON DATABASE smesh_test TO {migrator}; CREATE SCHEMA {schema} AUTHORIZATION {migrator}; CREATE ROLE {schema}_runtime NOLOGIN"
+            "CREATE ROLE {migrator} LOGIN CREATEROLE; GRANT CREATE ON DATABASE {database} TO {migrator}; CREATE SCHEMA {schema} AUTHORIZATION {migrator}; CREATE ROLE {schema}_runtime NOLOGIN"
         ))
         .await
         .unwrap();
@@ -2542,6 +2572,7 @@ postgres_test!(postgres_renews_fenced_outbox_and_receiver_leases, {
             context_id: "context".into(),
             text: "x".into(),
         },
+        ratification_required: false,
         execution_reservation: None,
     };
     assert_eq!(
@@ -3096,14 +3127,15 @@ postgres_test!(
         let suffix = format!("{:016x}", rand::random::<u64>());
         let migrator = format!("smesh_norole_{suffix}");
         let schema = format!("smesh_migration_fault_{suffix}");
+        let database = quoted_identifier(&superuser_database());
         let (client, driver) = admin_client(&superuser_url()).await;
-        client.batch_execute(&format!("CREATE ROLE {migrator} LOGIN PASSWORD 'migration-fault' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT; GRANT CREATE ON DATABASE smesh_test TO {migrator}")).await.unwrap();
+        client.batch_execute(&format!("CREATE ROLE {migrator} LOGIN PASSWORD 'migration-fault' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT; GRANT CREATE ON DATABASE {database} TO {migrator}")).await.unwrap();
         let runtime_url = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap_or_else(|_| {
             "postgresql://smesh_test_runtime:smesh_runtime_password@127.0.0.1:55432/smesh_test"
                 .into()
         });
         let config = PostgresStoreConfig::new(
-            format!("postgresql://{migrator}:migration-fault@127.0.0.1:55432/smesh_test"),
+            fixture_role_url(&migrator, "migration-fault"),
             runtime_url,
             schema.clone(),
         )
@@ -3121,7 +3153,7 @@ postgres_test!(
         assert!(!exists, "failed migration transaction leaked schema");
         client
             .batch_execute(&format!(
-                "REVOKE CREATE ON DATABASE smesh_test FROM {migrator}; DROP ROLE {migrator}"
+                "REVOKE CREATE ON DATABASE {database} FROM {migrator}; DROP ROLE {migrator}"
             ))
             .await
             .unwrap();
@@ -3130,37 +3162,89 @@ postgres_test!(
     }
 );
 
-postgres_test!(postgres_fixture_raii_cleans_schema_and_role_after_panic, {
-    let Some(url) = admin_url() else { return };
-    let config = config(url.clone(), "raii_panic");
-    let schema = config.schema_name().to_owned();
-    let task = tokio::spawn(async move {
-        let _store = PostgresTaskStore::open(config).await.unwrap();
-        panic!("intentional PostgreSQL fixture unwind probe");
-    });
-    assert!(task.await.is_err());
-    let (client, driver) = admin_client(&superuser_url()).await;
-    let schema_exists: bool = client
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)",
-            &[&schema],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    let role = format!("{schema}_runtime");
-    let role_exists: bool = client
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)",
-            &[&role],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert!(!schema_exists && !role_exists);
-    drop(client);
-    driver.abort();
-});
+postgres_test!(
+    postgres_fixture_explicit_cleanup_reads_back_schema_and_role_absence,
+    {
+        let Some(url) = admin_url() else { return };
+        let config = config(url.clone(), "explicit_cleanup");
+        let schema = config.schema_name().to_owned();
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        store.shutdown().await.unwrap();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+        let (client, driver) = admin_client(&superuser_url()).await;
+        let schema_oid: Option<u32> = client
+            .query_one("SELECT to_regnamespace($1)::oid", &[&schema])
+            .await
+            .unwrap()
+            .get(0);
+        let role = format!("{schema}_runtime");
+        let role_exists: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)",
+                &[&role],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(schema_oid, None);
+        assert!(!role_exists);
+        drop(client);
+        driver.abort();
+    }
+);
+
+postgres_test!(
+    postgres_fixture_explicit_cleanup_reports_surviving_dependent_role,
+    {
+        let Some(url) = admin_url() else { return };
+        let config = config(url, "cleanup_dependency");
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        store.shutdown().await.unwrap();
+        let schema = config.schema_name().to_owned();
+        let role = format!("{schema}_runtime");
+        let dependency = format!("{schema}_dependency");
+        let (client, driver) = admin_client(&superuser_url()).await;
+        client
+            .batch_execute(&format!("CREATE SCHEMA {dependency} AUTHORIZATION {role}"))
+            .await
+            .unwrap();
+
+        let error = PostgresTaskStore::drop_test_schema(&config)
+            .await
+            .expect_err("dependent runtime role must make explicit cleanup fail");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&role),
+            "cleanup error did not identify surviving role"
+        );
+        assert!(
+            client
+                .query_one(
+                    "SELECT to_regnamespace($1)::oid IS NOT NULL",
+                    &[&dependency]
+                )
+                .await
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+        assert!(
+            client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)",
+                    &[&role]
+                )
+                .await
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+        client
+            .batch_execute(&format!("DROP SCHEMA {dependency}; DROP ROLE {role}"))
+            .await
+            .unwrap();
+        drop(client);
+        driver.abort();
+    }
+);
 
 postgres_test!(startup_rejects_incompatible_schema_version_before_pool, {
     let Some(url) = admin_url() else { return };
@@ -3554,6 +3638,7 @@ postgres_test!(
         driver.abort();
         store.shutdown().await.unwrap();
         drop(store);
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 );

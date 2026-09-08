@@ -83,6 +83,62 @@ const RATIFICATION_MIGRATION_NAME: &str = "0010_human_ratification";
 const RATIFICATION_RETAINED_MIGRATION_SQL: &str =
     include_str!("../migrations/postgres/0011_ratification_retained_authority.sql");
 const RATIFICATION_RETAINED_MIGRATION_NAME: &str = "0011_ratification_retained_authority";
+
+#[doc(hidden)]
+#[must_use]
+pub fn render_migration_sql_for_test(
+    migration: &str,
+    schema: &str,
+    runtime_role: &str,
+    migrator: &str,
+) -> String {
+    let migrator_identifier = format!("\"{}\"", migrator.replace('"', "\"\""));
+    let migrator_literal = format!("E'{}'", migrator.replace('\\', "\\\\").replace('\'', "''"));
+    render_migration_sql_with_quotes(
+        migration,
+        schema,
+        runtime_role,
+        &migrator_identifier,
+        &migrator_literal,
+    )
+}
+
+fn render_migration_sql_with_quotes(
+    migration: &str,
+    schema: &str,
+    runtime_role: &str,
+    migrator_identifier: &str,
+    migrator_literal: &str,
+) -> String {
+    let mut rendered = String::with_capacity(migration.len() + 256);
+    for source_line in migration.split_inclusive('\n') {
+        let mut line = source_line.to_owned();
+        if line.contains("EXECUTE format(") && line.contains("__MIGRATOR__") {
+            if line.contains("''__MIGRATOR__''") {
+                let argument_count = line.matches("''__MIGRATOR__''").count();
+                line = line.replace("''__MIGRATOR__''", "%L");
+                if let Some(end) = line.rfind(");") {
+                    line.insert_str(end, &format!(",{migrator_literal}").repeat(argument_count));
+                }
+            } else if line.contains("TO __MIGRATOR__") {
+                let argument_count = line.matches("TO __MIGRATOR__").count();
+                line = line.replace("TO __MIGRATOR__", "TO %I");
+                if let Some(end) = line.rfind(");") {
+                    line.insert_str(end, &format!(",{migrator_literal}").repeat(argument_count));
+                }
+            } else {
+                line = line.replace("'__MIGRATOR__'", migrator_literal);
+            }
+        }
+        line = line
+            .replace("'__MIGRATOR__'", migrator_literal)
+            .replace("__MIGRATOR__", migrator_identifier)
+            .replace("__SCHEMA__", schema)
+            .replace("__ROLE__", runtime_role);
+        rendered.push_str(&line);
+    }
+    rendered
+}
 const LEGACY_LOGICAL_SCHEMA_VERSION: i64 = 6;
 const LOGICAL_SCHEMA_VERSION: i64 = 11;
 const CURRENT_SCHEMA_VERSION: i64 = 11;
@@ -194,9 +250,12 @@ pub(crate) const EXPECTED_TABLES: &[&str] = &[
     "quota_receipts",
     "quota_request_receipts",
     "quota_reservations",
+    "ratification_chain_anchors",
     "ratification_events",
     "ratification_key_check",
+    "ratification_ledger_anchor",
     "ratification_packets",
+    "ratification_tenant_anchors",
     "receiver_frames",
     "receiver_inbox",
     "retained_authority_usage",
@@ -261,8 +320,10 @@ const TENANT_TABLES: &[&str] = &[
     "quota_receipts",
     "quota_request_receipts",
     "quota_reservations",
+    "ratification_chain_anchors",
     "ratification_events",
     "ratification_packets",
+    "ratification_tenant_anchors",
     "receiver_frames",
     "receiver_inbox",
     "retained_authority_usage",
@@ -379,6 +440,8 @@ pub struct PostgresStoreConfig {
     transaction_test_faults: Arc<Mutex<VecDeque<PostgresTransactionTestFault>>>,
     artifact_publication_test_fault: Arc<Mutex<Option<ArtifactPublicationTestFault>>>,
     receiver_renewal_test_probe: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    ratification_reconcile_test_probe: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    ratification_startup_test_probe: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     test_cleanup: Option<Arc<PostgresTestCleanup>>,
 }
 
@@ -398,12 +461,22 @@ impl Drop for PostgresTestCleanup {
         let _ = std::thread::spawn(move || {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return; };
             runtime.block_on(async move {
-                let Ok(pg) = tokio_postgres::Config::from_str(&url) else { return; };
-                let Ok((client, connection)) = pg.connect(NoTls).await else { return; };
-                let driver = tokio::spawn(async move { let _ = connection.await; });
-                let _ = client.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE; DROP ROLE IF EXISTS {schema}_runtime")).await;
+                let Ok(pg) = tokio_postgres::Config::from_str(&url) else {
+                    eprintln!("smesh.postgres.test_cleanup_fallback_failed phase=parse");
+                    return;
+                };
+                let Ok((client, connection)) = pg.connect(NoTls).await else {
+                    eprintln!("smesh.postgres.test_cleanup_fallback_failed phase=connect");
+                    return;
+                };
+                let driver = tokio::spawn(connection);
+                if client.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE; DROP ROLE IF EXISTS {schema}_runtime")).await.is_err() {
+                    eprintln!("smesh.postgres.test_cleanup_fallback_failed phase=drop");
+                }
                 drop(client);
-                driver.abort();
+                if !matches!(driver.await, Ok(Ok(()))) {
+                    eprintln!("smesh.postgres.test_cleanup_fallback_failed phase=driver");
+                }
             });
         }).join();
     }
@@ -464,6 +537,14 @@ impl fmt::Debug for PostgresStoreConfig {
                 "receiver_renewal_test_probe_enabled",
                 &self.receiver_renewal_test_probe.is_some(),
             )
+            .field(
+                "ratification_reconcile_test_probe_enabled",
+                &self.ratification_reconcile_test_probe.is_some(),
+            )
+            .field(
+                "ratification_startup_test_probe_enabled",
+                &self.ratification_startup_test_probe.is_some(),
+            )
             .finish()
     }
 }
@@ -517,6 +598,8 @@ impl PostgresStoreConfig {
             transaction_test_faults: Arc::new(Mutex::new(VecDeque::new())),
             artifact_publication_test_fault: Arc::new(Mutex::new(None)),
             receiver_renewal_test_probe: None,
+            ratification_reconcile_test_probe: None,
+            ratification_startup_test_probe: None,
             test_cleanup: None,
         })
     }
@@ -691,6 +774,31 @@ impl PostgresStoreConfig {
         self
     }
 
+    /// Installs entry/release checkpoints between anchor reconciliation and
+    /// semantic validation for deterministic startup snapshot tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_ratification_startup_test_probe(
+        mut self,
+        entered: Arc<tokio::sync::Notify>,
+        released: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.ratification_startup_test_probe = Some((entered, released));
+        self
+    }
+
+    /// Installs entry/release checkpoints immediately before key reconciliation.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_ratification_reconcile_test_probe(
+        mut self,
+        entered: Arc<tokio::sync::Notify>,
+        released: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.ratification_reconcile_test_probe = Some((entered, released));
+        self
+    }
+
     #[must_use]
     pub fn schema_name(&self) -> &str {
         &self.schema
@@ -715,7 +823,7 @@ fn valid_identifier(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PostgresStoreError {
     #[error("invalid PostgreSQL durable-authority configuration")]
     InvalidConfig,
@@ -723,6 +831,8 @@ pub enum PostgresStoreError {
     TlsRequired,
     #[error("PostgreSQL durable-authority initialization failed")]
     Initialization,
+    #[error("PostgreSQL test fixture cleanup left a surviving object: {0}")]
+    TestCleanupSurvivingObject(String),
     #[error("PostgreSQL retained-authority materialization does not match its oracle")]
     RetainedAuthorityMaterializationMismatch,
     #[error("PostgreSQL retained-authority tenant quota exceeded during migration")]
@@ -2005,8 +2115,23 @@ impl PostgresTaskStore {
                 eprintln!("smesh.postgres.validation_failed category=catalog");
             })?;
         let ratification_enabled = config.ratification_key.is_some();
+        // ALLOWLIST: ratification key reconciliation and anchor qualification are one startup transaction.
+        let ratification_transaction = migration
+            .transaction()
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        ratification_transaction
+            .batch_execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='15s'",
+            )
+            .await
+            .map_err(|_| PostgresStoreError::Unavailable)?;
+        if let Some((entered, released)) = config.ratification_reconcile_test_probe.as_ref() {
+            entered.notify_one();
+            released.notified().await;
+        }
         let ratification_key = reconcile_ratification_key(
-            &migration,
+            &ratification_transaction,
             &config.schema,
             config.ratification_key.clone(),
             &receipt_key,
@@ -2015,6 +2140,17 @@ impl PostgresTaskStore {
         .inspect_err(|_| {
             eprintln!("smesh.postgres.validation_failed category=ratification_key");
         })?;
+        if let Some((entered, released)) = config.ratification_startup_test_probe.as_ref() {
+            entered.notify_one();
+            released.notified().await;
+        }
+        // Existing authorities are authenticated in O(1) from the sealed
+        // incremental anchor. Individual chains are qualified on access and
+        // before any ratification-required dispatch can advance.
+        ratification_transaction
+            .commit()
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
 
         if let Some(keyring) = artifact_keyring.as_ref() {
             migration
@@ -2024,8 +2160,8 @@ impl PostgresTaskStore {
             let generations = migration
                 .query(
                     &format!(
-                        "SELECT DISTINCT key_generation FROM {}.content_objects WHERE state<>'deleted' UNION SELECT DISTINCT d.key_generation FROM {}.artifact_backup_key_dependencies d JOIN {}.artifact_backup_jobs b USING(tenant_scope,backup_id) WHERE b.state='sealed' AND d.released_at IS NULL AND d.required_until>{}.db_millis() ORDER BY key_generation",
-                        config.schema, config.schema, config.schema, config.schema
+                        "SELECT * FROM {}.artifact_required_key_generations_bounded()",
+                        config.schema
                     ),
                     &[],
                 )
@@ -2148,6 +2284,19 @@ impl PostgresTaskStore {
             None
         };
 
+        let startup_tenants = migration
+            .query(
+                &format!(
+                    "SELECT * FROM {}.authority_tenants_bounded()",
+                    config.schema
+                ),
+                &[],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
         drop(migration);
         driver.abort();
         let mut pool_builder = Pool::builder(manager)
@@ -2211,10 +2360,7 @@ impl PostgresTaskStore {
             .await
             .map_err(|_| PostgresStoreError::InvalidSchema)?;
         validation
-            .batch_execute(&format!(
-                "SET LOCAL ROLE {}_runtime; SET LOCAL statement_timeout='15s'; SET LOCAL lock_timeout='5s'",
-                config.schema
-            ))
+            .batch_execute("SET LOCAL statement_timeout='15s'; SET LOCAL lock_timeout='5s'")
             .await
             .map_err(|_| PostgresStoreError::InvalidSchema)?;
         let restore_incomplete: bool = validation
@@ -2243,24 +2389,8 @@ impl PostgresTaskStore {
         if usize::try_from(task_count).unwrap_or(usize::MAX) > config.max_tasks {
             return Err(PostgresStoreError::InvalidSchema);
         }
-        let tenants = validation
-            .query(
-                &format!(
-                    "SELECT * FROM {}.authority_tenants_bounded()",
-                    config.schema
-                ),
-                &[],
-            )
-            .await
-            .inspect_err(|error| {
-                eprintln!(
-                    "smesh.postgres.validation_failed category=authority_tenants error={error:?}"
-                );
-            })
-            .map_err(|_| PostgresStoreError::InvalidSchema)?;
         let mut quota_policy_mismatch = false;
-        for row in tenants {
-            let tenant: String = row.get(0);
+        for tenant in startup_tenants {
             validation
                 .query_one(
                     "SELECT set_config('smesh.tenant_scope',$1,true), set_config('smesh.account_id','',true)",
@@ -2411,33 +2541,13 @@ impl PostgresTaskStore {
         tx.batch_execute("SET LOCAL statement_timeout='15s'; SET LOCAL lock_timeout='5s'")
             .await
             .map_err(|_| PostgresStoreError::Unavailable)?;
-        let tenants = tx
+        let generations = tx
             .query(
-                &format!("SELECT * FROM {}.authority_tenants_bounded()", self.schema),
+                &self.q("SELECT * FROM __S__.artifact_required_key_generations_bounded()"),
                 &[],
             )
             .await
             .map_err(|_| PostgresStoreError::InvalidSchema)?;
-        let mut generations = BTreeSet::new();
-        for row in tenants {
-            let tenant: String = row.get(0);
-            tx.query_one(
-                "SELECT set_config('smesh.tenant_scope',$1,true),set_config('smesh.account_id','',true)",
-                &[&tenant],
-            )
-            .await
-            .map_err(|_| PostgresStoreError::Unavailable)?;
-            for generation in tx
-                .query(
-                    &self.q("SELECT DISTINCT key_generation FROM __S__.content_objects WHERE state<>'deleted' UNION SELECT DISTINCT d.key_generation FROM __S__.artifact_backup_key_dependencies d JOIN __S__.artifact_backup_jobs b USING(tenant_scope,backup_id) WHERE b.state='sealed' AND d.released_at IS NULL AND d.required_until>__S__.db_millis() ORDER BY key_generation"),
-                    &[],
-                )
-                .await
-                .map_err(|_| PostgresStoreError::InvalidSchema)?
-            {
-                generations.insert(generation.get::<_, String>(0));
-            }
-        }
         tx.rollback()
             .await
             .map_err(|_| PostgresStoreError::Unavailable)?;
@@ -2445,7 +2555,7 @@ impl PostgresTaskStore {
             .reload_if(|candidate| {
                 if generations
                     .iter()
-                    .any(|generation| candidate.key(generation).is_err())
+                    .any(|generation| candidate.key(generation.get::<_, &str>(0)).is_err())
                 {
                     Err(crate::ArtifactStoreError::Unavailable)
                 } else {
@@ -2465,19 +2575,53 @@ impl PostgresTaskStore {
             .await
             .map_err(|_| PostgresStoreError::Unavailable)?
             .map_err(|_| PostgresStoreError::Unavailable)?;
-        let driver = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        client
-            .batch_execute(&format!(
-                "DROP SCHEMA IF EXISTS {} CASCADE; DROP ROLE IF EXISTS {}_runtime",
-                config.schema, config.schema
-            ))
-            .await
-            .map_err(|_| PostgresStoreError::Initialization)?;
+        let driver = tokio::spawn(connection);
+        let cleanup_result = async {
+            let schema_drop = client
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", config.schema))
+                .await;
+            let role = format!("{}_runtime", config.schema);
+            let role_drop = client
+                .batch_execute(&format!("DROP ROLE IF EXISTS {role}"))
+                .await;
+            let schema_survives = client
+                .query_one(
+                    "SELECT to_regnamespace($1)::text IS NOT NULL",
+                    &[&config.schema.as_ref()],
+                )
+                .await
+                .map_err(|_| PostgresStoreError::Initialization)?
+                .get::<_, bool>(0);
+            let role_survives = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)",
+                    &[&role],
+                )
+                .await
+                .map_err(|_| PostgresStoreError::Initialization)?
+                .get::<_, bool>(0);
+            if schema_survives {
+                return Err(PostgresStoreError::TestCleanupSurvivingObject(
+                    config.schema.to_string(),
+                ));
+            }
+            if role_survives {
+                return Err(PostgresStoreError::TestCleanupSurvivingObject(role));
+            }
+            schema_drop.map_err(|_| PostgresStoreError::Initialization)?;
+            role_drop.map_err(|_| PostgresStoreError::Initialization)?;
+            if let Some(cleanup) = config.test_cleanup.as_ref() {
+                cleanup.armed.store(false, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        .await;
         drop(client);
-        driver.abort();
-        Ok(())
+        driver
+            .await
+            .map_err(|_| PostgresStoreError::Unavailable)?
+            .map_err(|_| PostgresStoreError::Unavailable)?;
+        cleanup_result
     }
 
     async fn connection(&self) -> Result<Object, A2AError> {
@@ -2825,6 +2969,293 @@ impl PostgresTaskStore {
 
     fn q(&self, sql: &str) -> String {
         sql.replace("__S__", &self.schema)
+    }
+
+    async fn validate_integrated_ratification_anchor(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<(), A2AError> {
+        if !self.ratification_enabled {
+            return Ok(());
+        }
+        let key_generation = content_digest(self.ratification_key.as_ref().as_ref());
+        let anchor = tx
+            .query_one(
+                &self.q("SELECT signing_digest,global_seal,tenant_packet_count,tenant_event_count,tenant_key_generation,tenant_seal,chain_packet_count,chain_event_count,chain_key_generation,chain_seal FROM __S__.ratification_anchor_authentication_state($1,$2)"),
+                &[&key_generation, &task_id],
+            )
+            .await
+            .map_err(|_| A2AError::internal("ratification anchor validation failed"))?;
+        let signing_digest: String = anchor.get(0);
+        let global_seal: Option<String> = anchor.get(1);
+        let expected_global = crate::ratification::ratification_mac(
+            &self.ratification_key,
+            b"smesh-postgres-ratification-ledger-anchor/v1\0",
+            signing_digest.as_bytes(),
+        );
+        if global_seal.as_ref().is_none_or(|seal| {
+            !bool::from(subtle::ConstantTimeEq::ct_eq(
+                seal.as_bytes(),
+                expected_global.as_bytes(),
+            ))
+        }) {
+            return Err(A2AError::internal(
+                "ratification global anchor validation failed",
+            ));
+        }
+        let tenant_packets: Option<i64> = anchor.get(2);
+        let tenant_events: Option<i64> = anchor.get(3);
+        let tenant_generation: Option<String> = anchor.get(4);
+        let tenant_seal: Option<String> = anchor.get(5);
+        let target_counts = validate_ratification_target_semantics(
+            tx,
+            &self.schema,
+            tenant,
+            task_id,
+            &self.ratification_key,
+        )
+        .await
+        .map_err(|_| A2AError::internal("ratification target chain validation failed"))?;
+        let tenant_valid = match (
+            tenant_packets,
+            tenant_events,
+            tenant_generation.as_deref(),
+            tenant_seal.as_deref(),
+        ) {
+            (None, None, None, None) => target_counts == (0, 0),
+            (Some(packet_count), Some(event_count), Some(generation), Some(seal))
+                if packet_count >= target_counts.0
+                    && event_count >= target_counts.1
+                    && generation == key_generation =>
+            {
+                let expected = postgres_ratification_tenant_anchor_seal(
+                    &self.ratification_key,
+                    tenant,
+                    packet_count,
+                    event_count,
+                );
+                bool::from(subtle::ConstantTimeEq::ct_eq(
+                    seal.as_bytes(),
+                    expected.as_bytes(),
+                ))
+            }
+            _ => false,
+        };
+        if !tenant_valid {
+            return Err(A2AError::internal(
+                "ratification tenant anchor validation failed",
+            ));
+        }
+        let chain_packets: Option<i64> = anchor.get(6);
+        let chain_events: Option<i64> = anchor.get(7);
+        let chain_generation: Option<String> = anchor.get(8);
+        let chain_seal: Option<String> = anchor.get(9);
+        match (
+            chain_packets,
+            chain_events,
+            chain_generation.as_deref(),
+            chain_seal.as_deref(),
+        ) {
+            (None, None, None, None) if target_counts == (0, 0) => Ok(()),
+            (Some(packet_count), Some(event_count), Some(generation), Some(seal))
+                if (packet_count, event_count) == target_counts && generation == key_generation =>
+            {
+                let expected = postgres_ratification_chain_anchor_seal(
+                    &self.ratification_key,
+                    tenant,
+                    task_id,
+                    packet_count,
+                    event_count,
+                );
+                if bool::from(subtle::ConstantTimeEq::ct_eq(
+                    seal.as_bytes(),
+                    expected.as_bytes(),
+                )) {
+                    Ok(())
+                } else {
+                    Err(A2AError::internal(
+                        "ratification chain anchor validation failed",
+                    ))
+                }
+            }
+            _ => Err(A2AError::internal(
+                "ratification chain anchor validation failed",
+            )),
+        }
+    }
+
+    async fn write_integrated_ratification_anchor(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<(), A2AError> {
+        if !self.ratification_enabled {
+            return Ok(());
+        }
+        let key_generation = content_digest(self.ratification_key.as_ref().as_ref());
+        let signing_digest: String = tx
+            .query_one(
+                &self.q("SELECT __S__.ratification_anchor_signing_digest($1)"),
+                &[&key_generation],
+            )
+            .await
+            .map_err(|_| A2AError::internal("ratification ledger anchor digest failed"))?
+            .get(0);
+        let seal = crate::ratification::ratification_mac(
+            &self.ratification_key,
+            b"smesh-postgres-ratification-ledger-anchor/v1\0",
+            signing_digest.as_bytes(),
+        );
+        tx.execute(
+            &self.q("SELECT __S__.seal_ratification_anchor($1,$2,$3)"),
+            &[&signing_digest, &key_generation, &seal],
+        )
+        .await
+        .map_err(|_| A2AError::internal("ratification ledger anchor seal failed"))?;
+        let tenant_anchor = tx
+            .query_one(
+                &self.q("SELECT packet_count,event_count FROM __S__.ratification_tenant_anchors WHERE tenant_scope=$1"),
+                &[&tenant],
+            )
+            .await
+            .map_err(|_| A2AError::internal("ratification tenant anchor lookup failed"))?;
+        let packet_count: i64 = tenant_anchor.get(0);
+        let event_count: i64 = tenant_anchor.get(1);
+        let tenant_seal = postgres_ratification_tenant_anchor_seal(
+            &self.ratification_key,
+            tenant,
+            packet_count,
+            event_count,
+        );
+        tx.execute(
+            &self.q("SELECT __S__.seal_ratification_tenant_anchor($1,$2,$3,$4)"),
+            &[&packet_count, &event_count, &key_generation, &tenant_seal],
+        )
+        .await
+        .map_err(|_| A2AError::internal("ratification tenant anchor seal failed"))?;
+        let chain_anchor = tx
+            .query_one(
+                &self.q("SELECT packet_count,event_count FROM __S__.ratification_chain_anchors WHERE tenant_scope=$1 AND task_id=$2"),
+                &[&tenant, &task_id],
+            )
+            .await
+            .map_err(|_| A2AError::internal("ratification chain anchor lookup failed"))?;
+        let chain_packets: i64 = chain_anchor.get(0);
+        let chain_events: i64 = chain_anchor.get(1);
+        let chain_seal = postgres_ratification_chain_anchor_seal(
+            &self.ratification_key,
+            tenant,
+            task_id,
+            chain_packets,
+            chain_events,
+        );
+        tx.execute(
+            &self.q("SELECT __S__.seal_ratification_chain_anchor($1,$2,$3,$4,$5)"),
+            &[
+                &task_id,
+                &chain_packets,
+                &chain_events,
+                &key_generation,
+                &chain_seal,
+            ],
+        )
+        .await
+        .map_err(|_| A2AError::internal("ratification chain anchor seal failed"))?;
+        Ok(())
+    }
+
+    async fn next_authenticated_ratification_generation(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<i64, A2AError> {
+        self.validate_integrated_ratification_anchor(tx, tenant, task_id)
+            .await?;
+        let aggregate = self.q("SELECT count(*)::bigint,min(generation),max(generation) FROM __S__.ratification_packets WHERE tenant_scope=$1 AND task_id=$2");
+        let row = tx
+            .query_one(&aggregate, &[&tenant, &task_id])
+            .await
+            .map_err(|_| A2AError::internal("ratification generation lookup failed"))?;
+        let count: i64 = row.get(0);
+        let minimum: Option<i64> = row.get(1);
+        let maximum: Option<i64> = row.get(2);
+        let Some(maximum) = maximum else { return Ok(1) };
+        if minimum != Some(1) || maximum != count {
+            return Err(A2AError::internal(
+                "ratification generation continuity failure",
+            ));
+        }
+        let packet_sql = self.q("SELECT tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,packet_seal,packet_json,state,revision,reviewer_account_id,head_receipt_hash,approved_task_json,approved_result_json,approved_transcript_json FROM __S__.ratification_packets WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3");
+        let packet = tx
+            .query_one(&packet_sql, &[&tenant, &task_id, &maximum])
+            .await
+            .map_err(|_| A2AError::internal("ratification predecessor lookup failed"))?;
+        let packet_row = crate::sqlite_store::RatificationPacketIntegrityRow {
+            tenant_scope: packet.get(0),
+            task_id: packet.get(1),
+            generation: packet.get(2),
+            task_revision: packet.get(3),
+            checkpoint_hash: packet.get(4),
+            packet_hash: packet.get(5),
+            packet_seal: packet.get(6),
+            packet_json: packet.get(7),
+            state: packet.get(8),
+            revision: packet.get(9),
+            reviewer_account_id: packet.get(10),
+            head_receipt_hash: packet.get(11),
+            approved_task_json: packet.get(12),
+            approved_result_json: packet.get(13),
+            approved_transcript_json: packet.get(14),
+        };
+        let event_sql = self.q("SELECT tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at FROM __S__.ratification_events WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 ORDER BY revision");
+        let event_rows = tx
+            .query(&event_sql, &[&tenant, &task_id, &maximum])
+            .await
+            .map_err(|_| A2AError::internal("ratification predecessor lookup failed"))?;
+        let events = event_rows
+            .into_iter()
+            .map(|event| crate::sqlite_store::RatificationEventIntegrityRow {
+                tenant_scope: event.get(0),
+                task_id: event.get(1),
+                generation: event.get(2),
+                revision: event.get(3),
+                account_id: event.get(4),
+                action: event.get(5),
+                command_digest: event.get(6),
+                idempotency_key: event.get(7),
+                receipt_json: event.get(8),
+                receipt_hash: event.get(9),
+                receipt_seal: event.get(10),
+                previous_receipt_hash: event.get(11),
+                occurred_at: event.get(12),
+            })
+            .collect::<Vec<_>>();
+        let (_, history) = crate::sqlite_store::verify_ratification_packet_chain(
+            &packet_row,
+            &events,
+            tenant,
+            task_id,
+            u64::try_from(maximum)
+                .map_err(|_| A2AError::internal("ratification generation corrupt"))?,
+            &self.ratification_key,
+        )?;
+        if !matches!(
+            history.last().map(|receipt| &receipt.action),
+            Some(crate::HumanRatificationAction::Decision(
+                crate::HumanDecision::Amend
+            ))
+        ) {
+            return Err(A2AError::internal(
+                "ratification predecessor is not amended",
+            ));
+        }
+        maximum
+            .checked_add(1)
+            .ok_or_else(|| A2AError::internal("ratification generation corrupt"))
     }
 
     fn transaction_body_error(error: &tokio_postgres::Error, public: A2AError) -> A2AError {
@@ -4775,11 +5206,16 @@ async fn migrate(
         .map_err(|_| PostgresStoreError::Initialization)?;
     tx.batch_execute("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='15s'; SELECT pg_advisory_xact_lock(6001136200062);")
         .await.map_err(|_| PostgresStoreError::Initialization)?;
-    let migrator_user: String = tx
-        .query_one("SELECT current_user", &[])
+    let migrator_row = tx
+        .query_one(
+            "SELECT current_user,quote_ident(current_user),quote_literal(current_user)",
+            &[],
+        )
         .await
-        .map_err(|_| PostgresStoreError::Initialization)?
-        .get(0);
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    let migrator_user: String = migrator_row.get(0);
+    let migrator_identifier: String = migrator_row.get(1);
+    let migrator_literal: String = migrator_row.get(2);
     if runtime_user == migrator_user
         || tx
             .query_one(
@@ -4839,10 +5275,13 @@ async fn migrate(
         .get(0);
     let checksum = content_digest(MIGRATION_SQL.as_bytes());
     if !exists {
-        let sql = MIGRATION_SQL
-            .replace("__SCHEMA__", schema)
-            .replace("__ROLE__", &format!("{schema}_runtime"))
-            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        let sql = render_migration_sql_with_quotes(
+            MIGRATION_SQL,
+            schema,
+            &format!("{schema}_runtime"),
+            &migrator_identifier,
+            &migrator_literal,
+        );
         tx.batch_execute(&sql)
             .await
             .map_err(|_| PostgresStoreError::Initialization)?;
@@ -4951,9 +5390,13 @@ async fn migrate(
             return Err(PostgresStoreError::InvalidSchema);
         }
     } else {
-        let sql = RECEIVER_FENCE_MIGRATION_SQL
-            .replace("__SCHEMA__", schema)
-            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        let sql = render_migration_sql_with_quotes(
+            RECEIVER_FENCE_MIGRATION_SQL,
+            schema,
+            &format!("{schema}_runtime"),
+            &migrator_identifier,
+            &migrator_literal,
+        );
         tx.batch_execute(&sql)
             .await
             .map_err(|_| PostgresStoreError::Initialization)?;
@@ -4998,10 +5441,13 @@ async fn migrate(
             return Err(PostgresStoreError::InvalidSchema);
         }
     } else {
-        let sql = DISTRIBUTED_QUOTA_MIGRATION_SQL
-            .replace("__SCHEMA__", schema)
-            .replace("__ROLE__", &format!("{schema}_runtime"))
-            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        let sql = render_migration_sql_with_quotes(
+            DISTRIBUTED_QUOTA_MIGRATION_SQL,
+            schema,
+            &format!("{schema}_runtime"),
+            &migrator_identifier,
+            &migrator_literal,
+        );
         tx.batch_execute(&sql)
             .await
             .map_err(|_| PostgresStoreError::Initialization)?;
@@ -5049,10 +5495,13 @@ async fn migrate(
             return Err(PostgresStoreError::InvalidSchema);
         }
     } else {
-        let sql = ARTIFACT_MIGRATION_SQL
-            .replace("__SCHEMA__", schema)
-            .replace("__ROLE__", &format!("{schema}_runtime"))
-            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        let sql = render_migration_sql_with_quotes(
+            ARTIFACT_MIGRATION_SQL,
+            schema,
+            &format!("{schema}_runtime"),
+            &migrator_identifier,
+            &migrator_literal,
+        );
         tx.batch_execute(&sql)
             .await
             .map_err(|_| PostgresStoreError::Initialization)?;
@@ -5092,10 +5541,13 @@ async fn migrate(
             return Err(PostgresStoreError::InvalidSchema);
         }
     } else {
-        let sql = AUDIT_PROJECTION_MIGRATION_SQL
-            .replace("__SCHEMA__", schema)
-            .replace("__ROLE__", &format!("{schema}_runtime"))
-            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        let sql = render_migration_sql_with_quotes(
+            AUDIT_PROJECTION_MIGRATION_SQL,
+            schema,
+            &format!("{schema}_runtime"),
+            &migrator_identifier,
+            &migrator_literal,
+        );
         tx.batch_execute(&sql)
             .await
             .map_err(|_| PostgresStoreError::Initialization)?;
@@ -5133,10 +5585,13 @@ async fn migrate(
             return Err(PostgresStoreError::InvalidSchema);
         }
     } else {
-        let sql = CALLBACK_MIGRATION_SQL
-            .replace("__SCHEMA__", schema)
-            .replace("__ROLE__", &format!("{schema}_runtime"))
-            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        let sql = render_migration_sql_with_quotes(
+            CALLBACK_MIGRATION_SQL,
+            schema,
+            &format!("{schema}_runtime"),
+            &migrator_identifier,
+            &migrator_literal,
+        );
         tx.batch_execute(&sql)
             .await
             .map_err(|_| PostgresStoreError::Initialization)?;
@@ -5239,10 +5694,13 @@ async fn migrate(
         if metadata.get::<_, i64>(0) != 8 || sealed_catalog != catalog_digest(&tx, schema).await? {
             return Err(PostgresStoreError::InvalidSchema);
         }
-        let sql = AUTHORIZATION_RETENTION_MIGRATION_SQL
-            .replace("__SCHEMA__", schema)
-            .replace("__ROLE__", &format!("{schema}_runtime"))
-            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        let sql = render_migration_sql_with_quotes(
+            AUTHORIZATION_RETENTION_MIGRATION_SQL,
+            schema,
+            &format!("{schema}_runtime"),
+            &migrator_identifier,
+            &migrator_literal,
+        );
         tx.batch_execute(&sql)
             .await
             .inspect_err(|error| {
@@ -5365,10 +5823,13 @@ async fn migrate(
         if metadata.get::<_, i64>(0) != 10 || sealed_catalog != catalog_digest(&tx, schema).await? {
             return Err(PostgresStoreError::InvalidSchema);
         }
-        let sql = RATIFICATION_RETAINED_MIGRATION_SQL
-            .replace("__SCHEMA__", schema)
-            .replace("__ROLE__", &format!("{schema}_runtime"))
-            .replace("__MIGRATOR__", &migrator_user.replace('\'', "''"));
+        let sql = render_migration_sql_with_quotes(
+            RATIFICATION_RETAINED_MIGRATION_SQL,
+            schema,
+            &format!("{schema}_runtime"),
+            &migrator_identifier,
+            &migrator_literal,
+        );
         tx.batch_execute(&sql)
             .await
             .inspect_err(|error| {
@@ -5414,12 +5875,12 @@ where
     C: tokio_postgres::GenericClient + Sync,
 {
     let queries = [
-        "SELECT concat_ws('|','relation',c.relname,c.relkind,c.relrowsecurity,c.relforcerowsecurity,c.relpersistence) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY 1",
+        "SELECT concat_ws('|','relation',c.relname,c.relkind,c.relrowsecurity,c.relforcerowsecurity,c.relpersistence,owner.rolname,COALESCE(c.relacl::text,'')) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_roles owner ON owner.oid=c.relowner WHERE n.nspname=$1 ORDER BY 1",
         "SELECT concat_ws('|','column',c.relname,a.attnum,a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,a.attidentity,a.attgenerated,COALESCE(pg_get_expr(d.adbin,d.adrelid),'')) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE n.nspname=$1 AND a.attnum>0 AND NOT a.attisdropped ORDER BY c.relname,a.attnum",
         "SELECT concat_ws('|','constraint',c.relname,x.conname,x.contype,pg_get_constraintdef(x.oid,true)) FROM pg_constraint x JOIN pg_class c ON c.oid=x.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY c.relname,x.conname",
         "SELECT concat_ws('|','index',i.relname,pg_get_indexdef(i.oid)) FROM pg_class i JOIN pg_namespace n ON n.oid=i.relnamespace WHERE n.nspname=$1 AND i.relkind='i' ORDER BY i.relname",
         "SELECT concat_ws('|','trigger',c.relname,t.tgname,pg_get_triggerdef(t.oid,true)) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND NOT t.tgisinternal ORDER BY c.relname,t.tgname",
-        "SELECT concat_ws('|','function',p.proname,pg_get_function_identity_arguments(p.oid),owner.rolname,pg_get_functiondef(p.oid)) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles owner ON owner.oid=p.proowner WHERE n.nspname=$1 ORDER BY p.proname,pg_get_function_identity_arguments(p.oid)",
+        "SELECT concat_ws('|','function',p.proname,pg_get_function_identity_arguments(p.oid),owner.rolname,COALESCE(p.proacl::text,''),pg_get_functiondef(p.oid)) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles owner ON owner.oid=p.proowner WHERE n.nspname=$1 ORDER BY p.proname,pg_get_function_identity_arguments(p.oid)",
         "SELECT concat_ws('|','policy',c.relname,p.polname,p.polcmd,p.polpermissive,COALESCE(pg_get_expr(p.polqual,p.polrelid),''),COALESCE(pg_get_expr(p.polwithcheck,p.polrelid),''),p.polroles::text) FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY c.relname,p.polname",
         "SELECT concat_ws('|','grant',table_name,grantee,privilege_type,is_grantable) FROM information_schema.role_table_grants WHERE table_schema=$1 ORDER BY table_name,grantee,privilege_type",
         "SELECT concat_ws('|','sequence-grant',object_name,grantee,privilege_type,is_grantable) FROM information_schema.usage_privileges WHERE object_schema=$1 ORDER BY object_name,grantee,privilege_type",
@@ -5600,16 +6061,42 @@ where
     Ok(())
 }
 
-async fn validate_ratification_semantics<C>(
+async fn validate_ratification_target_semantics<C>(
     client: &C,
     schema: &str,
+    tenant: &str,
+    task_id: &str,
     key: &[u8; 32],
-) -> Result<(), PostgresStoreError>
+) -> Result<(i64, i64), PostgresStoreError>
 where
     C: tokio_postgres::GenericClient + Sync,
 {
-    let packets=client.query(&format!("SELECT p.tenant_scope,p.task_id,p.generation,p.task_revision,p.checkpoint_hash,p.packet_hash,p.packet_seal,p.packet_json,p.state,p.revision,p.reviewer_account_id,p.head_receipt_hash,p.approved_task_json,p.approved_result_json,p.approved_transcript_json,t.state,t.revision,t.task_json,p.generation=max(p.generation) OVER (PARTITION BY p.tenant_scope,p.task_id) FROM {schema}.ratification_packets p JOIN {schema}.tasks t USING(tenant_scope,task_id) ORDER BY p.tenant_scope,p.task_id,p.generation"),&[])
-        .await.map_err(|_|PostgresStoreError::InvalidSchema)?;
+    let packets = client
+        .query(
+            &format!("SELECT p.tenant_scope,p.task_id,p.generation,p.task_revision,p.checkpoint_hash,p.packet_hash,p.packet_seal,p.packet_json,p.state,p.revision,p.reviewer_account_id,p.head_receipt_hash,p.approved_task_json,p.approved_result_json,p.approved_transcript_json,t.state,t.revision,t.task_json,p.generation=max(p.generation) OVER () FROM {schema}.ratification_packets p JOIN {schema}.tasks t USING(tenant_scope,task_id) WHERE p.tenant_scope=$1 AND p.task_id=$2 ORDER BY p.generation"),
+            &[&tenant, &task_id],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if packets.is_empty() {
+        let expected: bool = client
+            .query_one(
+                &format!("SELECT EXISTS(SELECT 1 FROM {schema}.outbox WHERE tenant_scope=$1 AND task_id=$2 AND ratification_required)"),
+                &[&tenant, &task_id],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?
+            .get(0);
+        return if expected {
+            Err(PostgresStoreError::InvalidSchema)
+        } else {
+            Ok((0, 0))
+        };
+    }
+    let packet_count =
+        i64::try_from(packets.len()).map_err(|_| PostgresStoreError::InvalidSchema)?;
+    let mut event_count = 0_i64;
+    let mut prior: Option<(i64, Vec<crate::HumanRatificationReceipt>)> = None;
     for row in packets {
         let packet_row = crate::sqlite_store::RatificationPacketIntegrityRow {
             tenant_scope: row.get(0),
@@ -5628,11 +6115,17 @@ where
             approved_result_json: row.get(13),
             approved_transcript_json: row.get(14),
         };
-        let tenant = packet_row.tenant_scope.clone();
-        let task_id = packet_row.task_id.clone();
         let generation = packet_row.generation;
-        let rows=client.query(&format!("SELECT tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at FROM {schema}.ratification_events WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 ORDER BY revision"),&[&tenant,&task_id,&generation])
-            .await.map_err(|_|PostgresStoreError::InvalidSchema)?;
+        let rows = client
+            .query(
+                &format!("SELECT tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at FROM {schema}.ratification_events WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 ORDER BY revision"),
+                &[&tenant, &task_id, &generation],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        event_count = event_count
+            .checked_add(i64::try_from(rows.len()).map_err(|_| PostgresStoreError::InvalidSchema)?)
+            .ok_or(PostgresStoreError::InvalidSchema)?;
         let events = rows
             .into_iter()
             .map(|event| crate::sqlite_store::RatificationEventIntegrityRow {
@@ -5654,31 +6147,46 @@ where
         let (packet, receipts) = crate::sqlite_store::verify_ratification_packet_chain(
             &packet_row,
             &events,
-            &tenant,
-            &task_id,
+            tenant,
+            task_id,
             u64::try_from(generation).map_err(|_| PostgresStoreError::InvalidSchema)?,
             key,
         )
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        match prior.as_ref() {
+            Some((prior_generation, prior_receipts)) => {
+                if generation != prior_generation.saturating_add(1)
+                    || !matches!(
+                        prior_receipts.last().map(|receipt| &receipt.action),
+                        Some(crate::HumanRatificationAction::Decision(
+                            crate::HumanDecision::Amend
+                        ))
+                    )
+                {
+                    return Err(PostgresStoreError::InvalidSchema);
+                }
+            }
+            None if generation != 1 => return Err(PostgresStoreError::InvalidSchema),
+            None => {}
+        }
         let task_state: String = row.get(15);
         let task_revision: i64 = row.get(16);
         let task_json: String = row.get(17);
         if row.get::<_, bool>(18) {
             if let Some(crate::HumanRatificationAction::Decision(decision)) =
-                receipts.last().map(|r| &r.action)
+                receipts.last().map(|receipt| &receipt.action)
             {
-                let expected = match decision {
-                    crate::HumanDecision::Approve => a2a::TaskState::Completed,
-                    crate::HumanDecision::Reject => a2a::TaskState::Rejected,
-                    crate::HumanDecision::Amend => a2a::TaskState::InputRequired,
-                };
                 let task: Task = serde_json::from_str(&task_json)
                     .map_err(|_| PostgresStoreError::InvalidSchema)?;
                 if task.id != packet.task_id
                     || task.context_id != packet.context_id
-                    || task.status.state != expected
-                    || state_key(&task).ok().as_deref() != Some(task_state.as_str())
-                    || u64::try_from(task_revision).ok() != packet.task_revision.checked_add(1)
+                    || !crate::sqlite_store::terminal_ratification_task_matches(
+                        decision,
+                        &task,
+                        &task_state,
+                        task_revision,
+                        packet.task_revision,
+                    )
                 {
                     return Err(PostgresStoreError::InvalidSchema);
                 }
@@ -5688,16 +6196,297 @@ where
                 return Err(PostgresStoreError::InvalidSchema);
             }
         }
+        prior = Some((generation, receipts));
+    }
+    Ok((packet_count, event_count))
+}
+
+async fn postgres_ratification_qualified_state<C>(
+    client: &C,
+    schema: &str,
+) -> Result<(i64, i64, i64, String, String), PostgresStoreError>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let row = client
+        .query_one(
+            &format!(
+                "SELECT packet_count,event_count,retained_bytes,generation_hash,state_hash
+                 FROM {schema}.ratification_anchor_qualify_bounded()"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    Ok((row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+}
+
+fn ratification_startup_query_error(error: &tokio_postgres::Error) -> PostgresStoreError {
+    match error.code() {
+        Some(code)
+            if code == &tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE
+                || code == &tokio_postgres::error::SqlState::QUERY_CANCELED =>
+        {
+            PostgresStoreError::Unavailable
+        }
+        _ => PostgresStoreError::InvalidSchema,
+    }
+}
+
+fn postgres_ratification_anchor_seal(
+    key: &[u8; 32],
+    generation: &str,
+    state: &(i64, i64, i64, String, String),
+) -> String {
+    let signing_digest = content_digest(
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            generation, state.0, state.1, state.2, state.3, state.4
+        )
+        .as_bytes(),
+    );
+    crate::ratification::ratification_mac(
+        key,
+        b"smesh-postgres-ratification-ledger-anchor/v1\0",
+        signing_digest.as_bytes(),
+    )
+}
+
+fn postgres_ratification_tenant_anchor_seal(
+    key: &[u8; 32],
+    tenant: &str,
+    packet_count: i64,
+    event_count: i64,
+) -> String {
+    let digest = content_digest(format!("{tenant}:{packet_count}:{event_count}").as_bytes());
+    crate::ratification::ratification_mac(
+        key,
+        b"smesh-postgres-ratification-tenant-anchor/v1\0",
+        digest.as_bytes(),
+    )
+}
+
+fn postgres_ratification_chain_anchor_seal(
+    key: &[u8; 32],
+    tenant: &str,
+    task_id: &str,
+    packet_count: i64,
+    event_count: i64,
+) -> String {
+    let digest =
+        content_digest(format!("{tenant}:{task_id}:{packet_count}:{event_count}").as_bytes());
+    crate::ratification::ratification_mac(
+        key,
+        b"smesh-postgres-ratification-chain-anchor/v1\0",
+        digest.as_bytes(),
+    )
+}
+
+async fn qualify_postgres_ratification_tenant_seals<C>(
+    client: &C,
+    schema: &str,
+    key: &[u8; 32],
+    initialize: bool,
+) -> Result<(), PostgresStoreError>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let generation = content_digest(key);
+    client
+        .batch_execute("SELECT set_config('smesh.internal_global','ratification-anchor-v1',true)")
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    let rows = client
+        .query(
+            &format!(
+                "SELECT tenant_scope,packet_count,event_count,key_generation,state_seal FROM {schema}.ratification_tenant_anchors ORDER BY tenant_scope"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    let mut anchored_packets = 0_i64;
+    let mut anchored_events = 0_i64;
+    for row in rows {
+        let tenant: String = row.get(0);
+        let packet_count: i64 = row.get(1);
+        let event_count: i64 = row.get(2);
+        anchored_packets = anchored_packets
+            .checked_add(packet_count)
+            .ok_or(PostgresStoreError::InvalidSchema)?;
+        anchored_events = anchored_events
+            .checked_add(event_count)
+            .ok_or(PostgresStoreError::InvalidSchema)?;
+        let seal =
+            postgres_ratification_tenant_anchor_seal(key, &tenant, packet_count, event_count);
+        if initialize {
+            if row.get::<_, Option<String>>(3).is_some()
+                || row.get::<_, Option<String>>(4).is_some()
+                || client
+                    .execute(
+                        &format!(
+                            "UPDATE {schema}.ratification_tenant_anchors SET key_generation=$1,state_seal=$2 WHERE tenant_scope=$3 AND packet_count=$4 AND event_count=$5 AND key_generation IS NULL AND state_seal IS NULL"
+                        ),
+                        &[&generation, &seal, &tenant, &packet_count, &event_count],
+                    )
+                    .await
+                    .map_err(|_| PostgresStoreError::Initialization)?
+                    != 1
+            {
+                return Err(PostgresStoreError::InvalidSchema);
+            }
+        } else if row.get::<_, Option<String>>(3).as_deref() != Some(generation.as_str())
+            || row.get::<_, Option<String>>(4).as_deref() != Some(seal.as_str())
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    }
+    let ledger = client
+        .query_one(
+            &format!(
+                "SELECT packet_count,event_count FROM {schema}.ratification_ledger_anchor
+                 WHERE singleton=1 AND version=1"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if anchored_packets != ledger.get::<_, i64>(0) || anchored_events != ledger.get::<_, i64>(1) {
+        return Err(PostgresStoreError::InvalidSchema);
+    }
+    if !initialize {
+        return Ok(());
+    }
+    let rows = client
+        .query(
+            &format!(
+                "SELECT tenant_scope,task_id,packet_count,event_count,key_generation,state_seal FROM {schema}.ratification_chain_anchors ORDER BY tenant_scope,task_id"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    for row in rows {
+        let tenant: String = row.get(0);
+        let task_id: String = row.get(1);
+        let packet_count: i64 = row.get(2);
+        let event_count: i64 = row.get(3);
+        let seal = postgres_ratification_chain_anchor_seal(
+            key,
+            &tenant,
+            &task_id,
+            packet_count,
+            event_count,
+        );
+        if initialize {
+            if row.get::<_, Option<String>>(4).is_some()
+                || row.get::<_, Option<String>>(5).is_some()
+                || client
+                    .execute(
+                        &format!(
+                            "UPDATE {schema}.ratification_chain_anchors SET key_generation=$1,state_seal=$2 WHERE tenant_scope=$3 AND task_id=$4 AND packet_count=$5 AND event_count=$6 AND key_generation IS NULL AND state_seal IS NULL"
+                        ),
+                        &[&generation, &seal, &tenant, &task_id, &packet_count, &event_count],
+                    )
+                    .await
+                    .map_err(|_| PostgresStoreError::Initialization)?
+                    != 1
+            {
+                return Err(PostgresStoreError::InvalidSchema);
+            }
+        } else if row.get::<_, Option<String>>(4).as_deref() != Some(generation.as_str())
+            || row.get::<_, Option<String>>(5).as_deref() != Some(seal.as_str())
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
     }
     Ok(())
 }
 
-async fn reconcile_ratification_key(
-    client: &tokio_postgres::Client,
+async fn reconcile_postgres_ratification_anchor<C>(
+    client: &C,
+    schema: &str,
+    key: &[u8; 32],
+    allow_initialize: bool,
+) -> Result<(), PostgresStoreError>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let generation = content_digest(key);
+    let row = client
+        .query_opt(
+            &format!("SELECT initialized,key_generation,packet_count,event_count,retained_bytes,generation_high_water_hash,state_hash,state_seal FROM {schema}.ratification_ledger_anchor WHERE singleton=1 AND version=1 FOR UPDATE"),
+            &[],
+        )
+        .await
+        .map_err(|error| ratification_startup_query_error(&error))?
+        .ok_or(PostgresStoreError::InvalidSchema)?;
+    let provenance = client
+        .query_one(
+            &format!(
+                "SELECT ratification_initialized,ratification_migration_pending FROM {schema}.store_identity WHERE singleton=1"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    let initialized: bool = provenance.get(0);
+    let migration_pending: bool = provenance.get(1);
+    if !row.get::<_, bool>(0) {
+        if initialized || !(allow_initialize || migration_pending) {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+        let state = postgres_ratification_qualified_state(client, schema).await?;
+        let seal = postgres_ratification_anchor_seal(key, &generation, &state);
+        let changed = client
+            .execute(
+                &format!("WITH provenance AS (
+                    UPDATE {schema}.store_identity
+                    SET ratification_initialized=true,ratification_migration_pending=false
+                    WHERE singleton=1 AND ratification_initialized=false
+                      AND (ratification_migration_pending OR $8) RETURNING 1
+                 )
+                 UPDATE {schema}.ratification_ledger_anchor
+                 SET initialized=true,key_generation=$1,packet_count=$2,event_count=$3,retained_bytes=$4,generation_high_water_hash=$5,state_hash=$6,state_seal=$7
+                 WHERE singleton=1 AND version=1 AND initialized=false AND EXISTS(SELECT 1 FROM provenance)"),
+                &[&generation, &state.0, &state.1, &state.2, &state.3, &state.4, &seal, &allow_initialize],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::Initialization)?;
+        if changed != 1 {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+        qualify_postgres_ratification_tenant_seals(client, schema, key, true).await?;
+        return Ok(());
+    }
+    if !initialized || migration_pending {
+        return Err(PostgresStoreError::InvalidSchema);
+    }
+    let stored_state = (
+        row.get::<_, i64>(2),
+        row.get::<_, i64>(3),
+        row.get::<_, i64>(4),
+        row.get::<_, String>(5),
+        row.get::<_, String>(6),
+    );
+    let expected_seal = postgres_ratification_anchor_seal(key, &generation, &stored_state);
+    if row.get::<_, Option<String>>(1).as_deref() != Some(generation.as_str())
+        || row.get::<_, Option<String>>(7).as_deref() != Some(expected_seal.as_str())
+    {
+        return Err(PostgresStoreError::InvalidSchema);
+    }
+    Ok(())
+}
+
+async fn reconcile_ratification_key<C>(
+    client: &C,
     schema: &str,
     supplied: Option<Arc<zeroize::Zeroizing<[u8; 32]>>>,
     compatibility_key: &[u8; 32],
-) -> Result<Arc<zeroize::Zeroizing<[u8; 32]>>, PostgresStoreError> {
+) -> Result<Arc<zeroize::Zeroizing<[u8; 32]>>, PostgresStoreError>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
     let row = client
         .query_opt(
             &format!(
@@ -5711,7 +6500,8 @@ async fn reconcile_ratification_key(
         if row.is_some() {
             return Err(PostgresStoreError::InvalidSchema);
         }
-        return Ok(Arc::new(zeroize::Zeroizing::new(*compatibility_key)));
+        let key = Arc::new(zeroize::Zeroizing::new(*compatibility_key));
+        return Ok(key);
     };
     let generation = content_digest(key.as_ref().as_ref());
     let check = crate::ratification::ratification_mac(
@@ -5719,6 +6509,7 @@ async fn reconcile_ratification_key(
         b"smesh-ratification-key-check/v1\0",
         generation.as_bytes(),
     );
+    let allow_anchor_initialization = row.is_none();
     match row {
         None => {
             client
@@ -5735,6 +6526,13 @@ async fn reconcile_ratification_key(
                 && row.get::<_, String>(2) == check => {}
         Some(_) => return Err(PostgresStoreError::InvalidSchema),
     }
+    reconcile_postgres_ratification_anchor(
+        client,
+        schema,
+        key.as_ref(),
+        allow_anchor_initialization,
+    )
+    .await?;
     Ok(key)
 }
 
@@ -5742,13 +6540,12 @@ async fn validate_semantics<C>(
     client: &C,
     schema: &str,
     cursor_key: &[u8; 32],
-    receipt_key: &[u8; 32],
+    _receipt_key: &[u8; 32],
 ) -> Result<(), PostgresStoreError>
 where
     C: tokio_postgres::GenericClient + Sync,
 {
     validate_artifact_semantics(client, schema).await?;
-    validate_ratification_semantics(client, schema, receipt_key).await?;
     let evidence_gaps: i64 = client.query_one(
         &format!("SELECT (SELECT count(*) FROM {schema}.quota_intents i LEFT JOIN {schema}.quota_policy_versions p ON p.tenant_scope=i.tenant_scope AND p.policy_id=i.policy_id AND p.policy_revision=i.policy_revision WHERE p.policy_id IS NULL OR p.policy_digest<>i.policy_digest) + (SELECT count(*) FROM {schema}.quota_receipts r LEFT JOIN {schema}.quota_intents i USING(tenant_scope,binding_digest) WHERE i.binding_digest IS NULL) + (SELECT count(*) FROM {schema}.quota_allocations a LEFT JOIN {schema}.quota_intents i USING(tenant_scope,binding_digest) WHERE i.binding_digest IS NULL) + (SELECT count(*) FROM {schema}.quota_leases l LEFT JOIN {schema}.quota_intents i USING(tenant_scope,binding_digest) WHERE i.binding_digest IS NULL)"),
         &[],
@@ -6243,6 +7040,7 @@ async fn validate_catalog(
     if definer_names
         != [
             "artifact_inline_migration_required",
+            "artifact_required_key_generations_bounded",
             "artifact_restore_incomplete",
             "artifact_retained_scopes_bounded",
             "artifact_stage_locator_live",
@@ -6271,10 +7069,17 @@ async fn validate_catalog(
             "gc_quota_authority_bounded",
             "mark_authorization_projection_requirement",
             "mark_authorization_projection_terminal",
+            "ratification_anchor_authentication_state",
+            "ratification_anchor_qualify_bounded",
+            "ratification_anchor_signing_digest",
             "record_callback_audit",
             "register_audit_projection_session",
             "register_callback_worker_session",
             "renew_callback_delivery",
+            "seal_ratification_anchor",
+            "seal_ratification_chain_anchor",
+            "seal_ratification_tenant_anchor",
+            "track_ratification_anchor",
         ]
         || definer_rows.iter().any(|row| {
             if row.get::<_, &str>(1) != expected_owner {
@@ -6289,6 +7094,7 @@ async fn validate_catalog(
                         | "claim_artifact_reencryption"
                         | "artifact_stage_locator_live"
                         | "artifact_inline_migration_required"
+                        | "artifact_required_key_generations_bounded"
                         | "artifact_restore_incomplete"
                 ) {
                     settings != ["search_path=pg_catalog", "row_security=on"]
@@ -8316,6 +9122,7 @@ impl TaskAdmission for PostgresTaskStore {
             let quota_reservation = quota_reservation.clone();
             let quota_intent = quota_intent.clone();
             Box::pin(async move {
+        store.validate_integrated_ratification_anchor(tx, &tenant, &command.task.id).await?;
         let quota_now = store.effective_now(tx, command.now).await?;
         let existing=store.q("SELECT request_digest,admission_result_json,final_result_json FROM __S__.idempotency_records WHERE tenant_scope=$1 AND message_id=$2 FOR UPDATE");
         if let Some(row) = tx
@@ -8431,6 +9238,7 @@ impl TaskAdmission for PostgresTaskStore {
         let supersede_packet=store.q("UPDATE __S__.ratification_packets SET state='superseded',updated_at=$1 WHERE tenant_scope=$2 AND task_id=$3 AND state IN ('awaiting_review','reviewed')");
         tx.execute(&supersede_packet,&[&quota_now,&tenant,&task.id]).await
             .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("continuation ratification supersession failed")))?;
+        store.write_integrated_ratification_anchor(tx, &tenant, &task.id).await?;
         let event=store.q("INSERT INTO __S__.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) SELECT $1,$2,COALESCE(max(event_seq),0)+1,$3,'continued',$4,$5,$6,$7 FROM __S__.task_events WHERE tenant_scope=$1 AND task_id=$2");
         tx.execute(
             &event,
@@ -9142,7 +9950,7 @@ impl PostgresTaskStore {
             let ratification = ratification.clone();
             Box::pin(async move {
         let now = store.effective_now(tx, now).await?;
-        let fence=store.q("SELECT message_id,causative_revision FROM __S__.outbox WHERE tenant_scope=$1 AND outbox_id=$2 AND dispatch_id=$3 AND task_id=$4 AND state='leased' AND lease_owner=$5 AND lease_token=$6 AND lease_until=$7 AND attempt_count=$8 AND max_attempts=$9 AND lease_until>$10 FOR UPDATE");
+        let fence=store.q("SELECT message_id,causative_revision,ratification_required FROM __S__.outbox WHERE tenant_scope=$1 AND outbox_id=$2 AND dispatch_id=$3 AND task_id=$4 AND state='leased' AND lease_owner=$5 AND lease_token=$6 AND lease_until=$7 AND attempt_count=$8 AND max_attempts=$9 AND lease_until>$10 FOR UPDATE");
         let Some(row) = tx
             .query_opt(
                 &fence,
@@ -9166,6 +9974,15 @@ impl PostgresTaskStore {
         };
         let message: String = row.get(0);
         let causative_revision: i64 = row.get(1);
+        let ratification_required: bool = row.get(2);
+        if ratification_required && ratification.is_none() {
+            return Err(A2AError::invalid_agent_response());
+        }
+        if ratification_required {
+            store
+                .validate_integrated_ratification_anchor(tx, &lease.tenant_scope, &lease.task_id)
+                .await?;
+        }
         let revision = causative_revision
             .checked_add(1)
             .ok_or_else(|| A2AError::internal("persistent task revision exhausted"))?;
@@ -9178,6 +9995,19 @@ impl PostgresTaskStore {
         if prior.get::<_, i64>(0) != causative_revision {
             return Ok(TransitionOutcome::Stale);
         }
+        let ratification_generation = if ratification.is_some() {
+            Some(
+                store
+                    .next_authenticated_ratification_generation(
+                        tx,
+                        &lease.tenant_scope,
+                        &lease.task_id,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
         store
             .settle_execution_reservation(tx, &lease, "receiver-completed", now)
             .await?;
@@ -9299,9 +10129,8 @@ impl PostgresTaskStore {
                     let binding_sql=store.q("SELECT t.context_id,t.principal_scope,t.authentication_method,i.request_digest,i.message_id,t.authorization_policy_id,t.authorization_policy_revision,t.authorization_policy_digest FROM __S__.tasks t JOIN __S__.idempotency_records i ON i.tenant_scope=t.tenant_scope AND i.task_id=t.task_id AND i.message_id=$3 WHERE t.tenant_scope=$1 AND t.task_id=$2");
                     let binding=tx.query_one(&binding_sql,&[&lease.tenant_scope,&lease.task_id,&message]).await
                         .map_err(|error| Self::transaction_body_error(&error,A2AError::internal("ratification authority binding lookup failed")))?;
-                    let generation_sql=store.q("SELECT COALESCE(MAX(generation),0)+1 FROM __S__.ratification_packets WHERE tenant_scope=$1 AND task_id=$2");
-                    let generation:i64=tx.query_one(&generation_sql,&[&lease.tenant_scope,&lease.task_id]).await
-                        .map_err(|error| Self::transaction_body_error(&error,A2AError::internal("ratification generation lookup failed")))?.get(0);
+                    let generation = ratification_generation
+                        .ok_or_else(|| A2AError::internal("ratification generation missing"))?;
                     pending.packet_input.generation=u64::try_from(generation).map_err(|_|A2AError::internal("ratification generation corrupt"))?;
                     pending.packet_input.task_revision=u64::try_from(revision).map_err(|_|A2AError::internal("ratification revision corrupt"))?;
                     pending.packet_input.context_id=binding.get(0);
@@ -9320,6 +10149,7 @@ impl PostgresTaskStore {
                     let insert=store.q("INSERT INTO __S__.ratification_packets(tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,packet_seal,packet_json,approved_task_json,approved_result_json,approved_transcript_json,state,revision,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'awaiting_review',0,$12,$12)");
                     tx.execute(&insert,&[&lease.tenant_scope,&lease.task_id,&generation,&revision,&packet.checkpoint_hash,&packet.packet_hash,&packet.seal,&packet_json,&pending.approved_task_json,&pending.approved_result_json,&pending.approved_transcript_json,&now]).await
                         .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("ratification packet commit failed")))?;
+                    store.write_integrated_ratification_anchor(tx, &lease.tenant_scope, &lease.task_id).await?;
                 }
                 Ok(TransitionOutcome::Applied)
             })
@@ -9427,6 +10257,26 @@ impl OutboxAuthority for PostgresTaskStore {
         if store.quota_enforcement && execution_reservation.is_none() {
             return Err(A2AError::internal("claimable outbox has no execution reservation"));
         }
+        store.set_tenant(tx, &tenant, None).await?;
+        let ratification_required_sql = store.q(
+            "SELECT ratification_required FROM __S__.outbox WHERE tenant_scope=$1 AND outbox_id=$2 AND dispatch_id=$3",
+        );
+        let ratification_required: bool = tx
+            .query_one(
+                &ratification_required_sql,
+                &[&tenant, &outbox_id, &dispatch_id],
+            )
+            .await
+            .map_err(|error| Self::transaction_body_error(
+                &error,
+                A2AError::internal("outbox ratification fence lookup failed"),
+            ))?
+            .get(0);
+        if ratification_required {
+            store
+                .validate_integrated_ratification_anchor(tx, &tenant, &task_id)
+                .await?;
+        }
 
         if expired_final {
             store.set_tenant(tx, &tenant, None).await?;
@@ -9474,6 +10324,7 @@ impl OutboxAuthority for PostgresTaskStore {
                         lease_token: token,
                         lease_until: until,
                         request,
+                        ratification_required,
                         execution_reservation: execution_reservation.clone(),
                     }));
                 }
@@ -9521,6 +10372,7 @@ impl OutboxAuthority for PostgresTaskStore {
             lease_token: token,
             lease_until: until,
             request,
+            ratification_required,
             execution_reservation,
         };
                 Ok(Some(lease))
@@ -9603,12 +10455,18 @@ impl OutboxAuthority for PostgresTaskStore {
             let disposition = disposition.clone();
             Box::pin(async move {
         let now = store.effective_now(tx, now).await?;
-        let fence = store.q("SELECT message_id,payload_digest FROM __S__.outbox WHERE tenant_scope=$1 AND outbox_id=$2 AND dispatch_id=$3 AND task_id=$4 AND state='leased' AND lease_owner=$5 AND lease_token=$6 AND lease_until=$7 AND attempt_count=$8 AND max_attempts=$9 AND lease_until>$10 FOR UPDATE");
+        let fence = store.q("SELECT message_id,payload_digest,ratification_required FROM __S__.outbox WHERE tenant_scope=$1 AND outbox_id=$2 AND dispatch_id=$3 AND task_id=$4 AND state='leased' AND lease_owner=$5 AND lease_token=$6 AND lease_until=$7 AND attempt_count=$8 AND max_attempts=$9 AND lease_until>$10 FOR UPDATE");
         let Some(row) = tx.query_opt(&fence, &[&lease.tenant_scope, &lease.outbox_id, &lease.dispatch_id, &lease.task_id, &lease.lease_owner, &lease.lease_token, &lease.lease_until, &i64::from(lease.attempt_no), &i64::from(lease.max_attempts), &now]).await
             .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("outbox fence lookup failed")))?
         else { return Ok(TransitionOutcome::Stale); };
         let message_id: String = row.get(0);
         let payload_digest: String = row.get(1);
+        let ratification_required: bool = row.get(2);
+        if ratification_required {
+            store
+                .validate_integrated_ratification_anchor(tx, &lease.tenant_scope, &lease.task_id)
+                .await?;
+        }
         let cancellation: bool = tx.query_one(
             &store.q("SELECT EXISTS(SELECT 1 FROM __S__.cancellation_intents WHERE tenant_scope=$1 AND dispatch_id=$2 AND task_id=$3 AND state='requested')"),
             &[&lease.tenant_scope, &lease.dispatch_id, &lease.task_id],
@@ -10071,6 +10929,7 @@ impl crate::RatificationAuthority for PostgresTaskStore {
             let owner = owner.clone();
             let task_id = task_id.clone();
             Box::pin(async move {
+                store.validate_integrated_ratification_anchor(tx, &tenant, &task_id).await?;
                 let query=store.q("SELECT p.tenant_scope,p.task_id,p.generation,p.task_revision,p.checkpoint_hash,p.packet_hash,p.packet_seal,p.packet_json,p.state,p.revision,p.reviewer_account_id,p.head_receipt_hash,p.approved_task_json,p.approved_result_json,p.approved_transcript_json,t.state,t.revision,t.task_json FROM __S__.tasks t JOIN __S__.ratification_packets p USING(tenant_scope,task_id) WHERE t.tenant_scope=$1 AND t.task_id=$2 AND (NOT $3 OR t.owner_account_id=$4) ORDER BY p.generation DESC LIMIT 1");
                 let Some(row)=tx.query_opt(&query,&[&tenant,&task_id,&own,&owner]).await
                     .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("ratification packet lookup failed")))?
@@ -10081,7 +10940,7 @@ impl crate::RatificationAuthority for PostgresTaskStore {
                     .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("ratification history lookup failed")))?;
                 let event_rows=rows.into_iter().map(|event|crate::sqlite_store::RatificationEventIntegrityRow{tenant_scope:event.get(0),task_id:event.get(1),generation:event.get(2),revision:event.get(3),account_id:event.get(4),action:event.get(5),command_digest:event.get(6),idempotency_key:event.get(7),receipt_json:event.get(8),receipt_hash:event.get(9),receipt_seal:event.get(10),previous_receipt_hash:event.get(11),occurred_at:event.get(12)}).collect::<Vec<_>>();
                 let (packet,history)=crate::sqlite_store::verify_ratification_packet_chain(&packet_row,&event_rows,&tenant,&task_id,u64::try_from(packet_row.generation).map_err(|_|A2AError::internal("ratification generation corrupt"))?,&store.ratification_key)?;
-                if let Some(crate::HumanRatificationAction::Decision(decision))=history.last().map(|r|&r.action){let expected=match decision{crate::HumanDecision::Approve=>a2a::TaskState::Completed,crate::HumanDecision::Reject=>a2a::TaskState::Rejected,crate::HumanDecision::Amend=>a2a::TaskState::InputRequired};let task:Task=serde_json::from_str(row.get(17)).map_err(|_|A2AError::internal("ratification task integrity failure"))?;if task.status.state!=expected||state_key(&task).ok().as_deref()!=Some(row.get::<_,&str>(15))||u64::try_from(row.get::<_,i64>(16)).ok()!=packet.task_revision.checked_add(1){return Err(A2AError::internal("ratification task integrity failure"));}}
+                if let Some(crate::HumanRatificationAction::Decision(decision))=history.last().map(|r|&r.action){let task:Task=serde_json::from_str(row.get(17)).map_err(|_|A2AError::internal("ratification task integrity failure"))?;if !crate::sqlite_store::terminal_ratification_task_matches(decision,&task,row.get(15),row.get(16),packet.task_revision){return Err(A2AError::internal("ratification task integrity failure"));}}
                 let state=match packet_row.state.as_str() {
                     "awaiting_review"=>crate::RatificationState::AwaitingReview,
                     "reviewed"=>crate::RatificationState::Reviewed,
@@ -10095,6 +10954,123 @@ impl crate::RatificationAuthority for PostgresTaskStore {
                 Ok(Some(crate::RatificationView{packet,state,revision:u64::try_from(packet_row.revision).map_err(|_|A2AError::internal("ratification revision corrupt"))?,history}))
             })
         }).await
+    }
+
+    async fn ratification_view_at_generation(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        generation: u64,
+    ) -> Result<Option<crate::RatificationView>, A2AError> {
+        if generation == 0 {
+            return Err(A2AError::invalid_request("ratification generation invalid"));
+        }
+        let tenant = scope.tenant_scope().to_owned();
+        let owner = scope.owner_account_id().to_owned();
+        let own = scope.visibility() == VisibilityScope::Own;
+        let task_id = task_id.to_owned();
+        let generation = i64::try_from(generation)
+            .map_err(|_| A2AError::invalid_request("ratification generation invalid"))?;
+        self.run_retryable_transaction(&tenant, Some(&owner), |store, tx| {
+            let tenant = tenant.clone();
+            let owner = owner.clone();
+            let task_id = task_id.clone();
+            Box::pin(async move {
+                store.validate_integrated_ratification_anchor(tx, &tenant, &task_id).await?;
+                let query=store.q("SELECT p.tenant_scope,p.task_id,p.generation,p.task_revision,p.checkpoint_hash,p.packet_hash,p.packet_seal,p.packet_json,p.state,p.revision,p.reviewer_account_id,p.head_receipt_hash,p.approved_task_json,p.approved_result_json,p.approved_transcript_json,t.state,t.revision,t.task_json FROM __S__.tasks t JOIN __S__.ratification_packets p USING(tenant_scope,task_id) WHERE t.tenant_scope=$1 AND t.task_id=$2 AND p.generation=$3 AND (NOT $4 OR t.owner_account_id=$5)");
+                let Some(row)=tx.query_opt(&query,&[&tenant,&task_id,&generation,&own,&owner]).await
+                    .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("ratification packet lookup failed")))?
+                else{return Ok(None)};
+                let packet_row=crate::sqlite_store::RatificationPacketIntegrityRow{tenant_scope:row.get(0),task_id:row.get(1),generation:row.get(2),task_revision:row.get(3),checkpoint_hash:row.get(4),packet_hash:row.get(5),packet_seal:row.get(6),packet_json:row.get(7),state:row.get(8),revision:row.get(9),reviewer_account_id:row.get(10),head_receipt_hash:row.get(11),approved_task_json:row.get(12),approved_result_json:row.get(13),approved_transcript_json:row.get(14)};
+                let events=store.q("SELECT tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at FROM __S__.ratification_events WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 ORDER BY revision");
+                let rows=tx.query(&events,&[&tenant,&task_id,&generation]).await
+                    .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("ratification history lookup failed")))?;
+                let event_rows=rows.into_iter().map(|event|crate::sqlite_store::RatificationEventIntegrityRow{tenant_scope:event.get(0),task_id:event.get(1),generation:event.get(2),revision:event.get(3),account_id:event.get(4),action:event.get(5),command_digest:event.get(6),idempotency_key:event.get(7),receipt_json:event.get(8),receipt_hash:event.get(9),receipt_seal:event.get(10),previous_receipt_hash:event.get(11),occurred_at:event.get(12)}).collect::<Vec<_>>();
+                let (packet,history)=crate::sqlite_store::verify_ratification_packet_chain(&packet_row,&event_rows,&tenant,&task_id,u64::try_from(packet_row.generation).map_err(|_|A2AError::internal("ratification generation corrupt"))?,&store.ratification_key)?;
+                let state=match packet_row.state.as_str() {
+                    "awaiting_review"=>crate::RatificationState::AwaitingReview,
+                    "reviewed"=>crate::RatificationState::Reviewed,
+                    "approved"=>crate::RatificationState::Approved,
+                    "rejected"=>crate::RatificationState::Rejected,
+                    "amended"=>crate::RatificationState::Amended,
+                    "canceled"=>crate::RatificationState::Canceled,
+                    "superseded"=>crate::RatificationState::Superseded,
+                    _=>return Err(A2AError::internal("ratification state corrupt")),
+                };
+                Ok(Some(crate::RatificationView{packet,state,revision:u64::try_from(packet_row.revision).map_err(|_|A2AError::internal("ratification revision corrupt"))?,history}))
+            })
+        }).await
+    }
+
+    async fn ratification_replay_candidate(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        account_id: &str,
+        idempotency_key: &str,
+        action: crate::RatificationReplayAction,
+    ) -> Result<Option<crate::RatificationView>, A2AError> {
+        let tenant = scope.tenant_scope().to_owned();
+        let owner = scope.owner_account_id().to_owned();
+        let own = scope.visibility() == VisibilityScope::Own;
+        let task_id = task_id.to_owned();
+        let lookup_task_id = task_id.clone();
+        let account_id = account_id.to_owned();
+        let idempotency_key = idempotency_key.to_owned();
+        let action = match action {
+            crate::RatificationReplayAction::Review => "review",
+            crate::RatificationReplayAction::Decision => "decision",
+        };
+        let generation = self
+            .run_retryable_transaction(&tenant, Some(&owner), |store, tx| {
+                let tenant = tenant.clone();
+                let owner = owner.clone();
+                let task_id = lookup_task_id.clone();
+                let account_id = account_id.clone();
+                let idempotency_key = idempotency_key.clone();
+                Box::pin(async move {
+                    let query = store.q("SELECT e.generation
+                         FROM __S__.ratification_events e
+                         JOIN __S__.tasks t USING(tenant_scope,task_id)
+                         WHERE e.tenant_scope=$1 AND e.account_id=$2
+                           AND e.idempotency_key=$3 AND e.task_id=$4
+                           AND (($5='review' AND e.action='review')
+                             OR ($5='decision' AND e.action IN ('approve','reject','amend')))
+                           AND (NOT $6 OR t.owner_account_id=$7)");
+                    tx.query_opt(
+                        &query,
+                        &[
+                            &tenant,
+                            &account_id,
+                            &idempotency_key,
+                            &task_id,
+                            &action,
+                            &own,
+                            &owner,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        Self::transaction_body_error(
+                            &error,
+                            A2AError::internal("ratification replay lookup failed"),
+                        )
+                    })?
+                    .map(|row| {
+                        u64::try_from(row.get::<_, i64>(0))
+                            .map_err(|_| A2AError::internal("ratification generation corrupt"))
+                    })
+                    .transpose()
+                })
+            })
+            .await?;
+        match generation {
+            Some(generation) => {
+                self.ratification_view_at_generation(scope, &task_id, generation)
+                    .await
+            }
+            None => Ok(None),
+        }
     }
 
     async fn acknowledge_ratification_review(
@@ -10123,6 +11099,7 @@ impl crate::RatificationAuthority for PostgresTaskStore {
             let tenant=tenant.clone(); let owner=owner.clone(); let command=command.clone();
             let audit=audit.clone(); let digest=digest.clone();
             Box::pin(async move {
+                store.validate_integrated_ratification_anchor(tx, &tenant, &command.task_id).await?;
                 let generation=i64::try_from(command.generation).map_err(|_|A2AError::invalid_request("ratification generation invalid"))?;
                 let task_sql=store.q("SELECT state,revision,task_json,owner_account_id,context_id,status_timestamp,authorization_policy_id,authorization_policy_revision,authorization_policy_digest,principal_scope,authentication_method FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 FOR UPDATE");
                 let task=tx.query_opt(&task_sql,&[&tenant,&command.task_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification task lookup failed")))?.ok_or_else(||A2AError::task_not_found(&command.task_id))?;
@@ -10167,6 +11144,7 @@ impl crate::RatificationAuthority for PostgresTaskStore {
                 let update=store.q("UPDATE __S__.ratification_packets SET state='reviewed',revision=1,reviewer_account_id=$4,head_receipt_hash=$5,updated_at=$6 WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 AND state='awaiting_review' AND revision=0");
                 if tx.execute(&update,&[&tenant,&command.task_id,&generation,&command.account_id,&receipt.receipt_hash,&now]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification review update failed")))?!=1 { return Err(crate::sqlite_store::ratification_conflict()); }
                 store.insert_audit(tx,audit.decided(AuthorizationDecisionEffect::Allow,"ratification_reviewed",None)).await?;
+                store.write_integrated_ratification_anchor(tx, &tenant, &command.task_id).await?;
                 Ok(receipt)
             })
         }).await
@@ -10221,6 +11199,7 @@ impl crate::RatificationAuthority for PostgresTaskStore {
         self.run_retryable_transaction(&tenant,Some(&owner),|store,tx|{
             let tenant=tenant.clone();let owner=owner.clone();let command=command.clone();let audit=audit.clone();let digest=digest.clone();let quota_intent=quota_intent.clone();
             Box::pin(async move {
+                store.validate_integrated_ratification_anchor(tx, &tenant, &command.task_id).await?;
                 let generation=i64::try_from(command.generation).map_err(|_|A2AError::invalid_request("ratification generation invalid"))?;
                 let task_sql=store.q("SELECT state,revision,task_json,owner_account_id,context_id,status_timestamp,authorization_policy_id,authorization_policy_revision,authorization_policy_digest,principal_scope,authentication_method FROM __S__.tasks WHERE tenant_scope=$1 AND task_id=$2 FOR UPDATE");
                 let task_row=tx.query_opt(&task_sql,&[&tenant,&command.task_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification task lookup failed")))?.ok_or_else(||A2AError::task_not_found(&command.task_id))?;
@@ -10273,9 +11252,11 @@ impl crate::RatificationAuthority for PostgresTaskStore {
                 let packet_state=match command.decision{crate::HumanDecision::Approve=>"approved",crate::HumanDecision::Reject=>"rejected",crate::HumanDecision::Amend=>"amended"};let update_packet=store.q("UPDATE __S__.ratification_packets SET state=$4,revision=2,head_receipt_hash=$5,updated_at=$6 WHERE tenant_scope=$1 AND task_id=$2 AND generation=$3 AND state='reviewed' AND revision=1");if tx.execute(&update_packet,&[&tenant,&command.task_id,&generation,&packet_state,&receipt.receipt_hash,&now]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification packet update failed")))?!=1{return Err(crate::sqlite_store::ratification_conflict());}
                 let event_kind=match command.decision{crate::HumanDecision::Approve=>"ratification_approved",crate::HumanDecision::Reject=>"ratification_rejected",crate::HumanDecision::Amend=>"ratification_amend_requested"};let event=store.q("INSERT INTO __S__.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) SELECT $1,$2,COALESCE(max(event_seq),0)+1,$3,$4,$5,$6,$7,$8 FROM __S__.task_events WHERE tenant_scope=$1 AND task_id=$2");tx.execute(&event,&[&tenant,&command.task_id,&next,&event_kind,&previous,&state,&encoded,&now]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification task event append failed")))?;
                 if let Some(frames)=transcript {let message_id=&task_integrity.causative_idempotency_key;let publish=store.q("UPDATE __S__.idempotency_records SET final_result_json=$1,updated_at=$2 WHERE tenant_scope=$3 AND message_id=$4 AND task_id=$5 AND state='completed'");if tx.execute(&publish,&[&approved_result_json,&now,&tenant,&message_id,&command.task_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification result publication failed")))?!=1{return Err(A2AError::internal("ratification result publication missing"));}let transcript_row=store.q("SELECT EXISTS(SELECT 1 FROM __S__.stream_transcripts WHERE tenant_scope=$1 AND message_id=$2 AND task_id=$3 AND state='terminal')");let has_stream:bool=tx.query_one(&transcript_row,&[&tenant,&message_id,&command.task_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification transcript lookup failed")))?.get(0);if has_stream{let delete=store.q("DELETE FROM __S__.stream_frames WHERE tenant_scope=$1 AND message_id=$2");tx.execute(&delete,&[&tenant,&message_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification transcript replacement failed")))?;for(index,frame)in frames.iter().enumerate(){let seq=i64::try_from(index+1).map_err(|_|A2AError::internal("ratification transcript sequence exhausted"))?;let json=serde_json::to_string(frame).map_err(|_|A2AError::internal("ratification transcript encoding failed"))?;let insert_frame=store.q("INSERT INTO __S__.stream_frames(tenant_scope,message_id,frame_seq,frame_version,frame_kind,frame_json,frame_digest,created_at) VALUES($1,$2,$3,1,$4,$5,$6,$7)");tx.execute(&insert_frame,&[&tenant,&message_id,&seq,&frame_kind(frame),&json,&content_digest(json.as_bytes()),&now]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification transcript publication failed")))?;}let count=i64::try_from(frames.len()).map_err(|_|A2AError::internal("ratification transcript length exhausted"))?;let update=store.q("UPDATE __S__.stream_transcripts SET frame_count=$1,transcript_digest=$2,terminal_seq=$1,updated_at=$3 WHERE tenant_scope=$4 AND message_id=$5 AND state='terminal'");if tx.execute(&update,&[&count,&content_digest(approved_transcript_json.as_bytes()),&now,&tenant,&message_id]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification transcript publication failed")))?!=1{return Err(A2AError::internal("ratification transcript publication missing"));}}}
-                if matches!(command.decision,crate::HumanDecision::Amend){let message=task.history.as_ref().and_then(|h|h.last()).cloned().ok_or_else(||A2AError::internal("ratification amendment missing"))?;let request=SendMessageRequest{message:message.clone(),configuration:None,metadata:None,tenant:None};let payload=MeshRequest::from_a2a(task.id.clone(),task.context_id.clone(),&message,crate::InputLimits::default()).map_err(|_|A2AError::invalid_request("invalid ratification amendment"))?;let payload_json=serde_json::to_string(&payload).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?;let result_json=serde_json::to_string(&SendMessageResponse::Task(task.clone())).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?;let message_id=authorized_message_identity(&tenant,&task_owner,&message.message_id);let request_digest=canonical_send_message_digest_v2(&tenant,&task_owner,&request,false)?;let dispatch_id=content_digest(format!("{tenant}\0send-message\0{message_id}").as_bytes());let request_json=serde_json::to_string(&request).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?;let idem=store.q("INSERT INTO __S__.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id,causative_request_json,invocation_kind) VALUES($1,$2,$3,$4,'in_progress',$5,$6,$6,2,$7,$8,'unary')");tx.execute(&idem,&[&tenant,&message_id,&request_digest,&command.task_id,&result_json,&now,&task_owner,&request_json]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification amendment reservation failed")))?;let execution=if let Some(intent)=quota_intent.as_ref(){store.apply_quota_intent(tx,intent,&tenant,&owner,Some(&command.task_id),now,true,Some(&request),Some(u64::try_from(command.rationale.len()).map_err(|_|A2AError::invalid_request("ratification amendment is too large"))?)).await?;Some(store.bind_execution_reservation(tx,intent,&command.task_id,&message_id,&dispatch_id,now,true).await?)}else{None};let reservation_id=execution.as_ref().map(|(id,_)|id.as_str());let binding=quota_intent.as_ref().map(crate::QuotaIntent::binding_digest);let version=execution.as_ref().map(|_|1_i64);let output=execution.as_ref().map(|(_,b)|i64::try_from(b.max_output_bytes()).unwrap_or(i64::MAX));let events=execution.as_ref().map(|(_,b)|i64::try_from(b.max_event_count()).unwrap_or(i64::MAX));let outbox=store.q("INSERT INTO __S__.outbox(dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version,quota_binding_digest,quota_reservation_id,quota_reservation_version,reserved_output_bytes,reserved_event_count) VALUES($1,$2,$3,$4,$5,$6,$7,'pending',8,$8,$8,$8,2,$9,$10,$11,$12,$13)");tx.execute(&outbox,&[&dispatch_id,&tenant,&command.task_id,&message_id,&next,&payload_json,&content_digest(payload_json.as_bytes()),&now,&binding,&reservation_id,&version,&output,&events]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification amendment dispatch failed")))?;}
+                if matches!(command.decision,crate::HumanDecision::Amend){let message=task.history.as_ref().and_then(|h|h.last()).cloned().ok_or_else(||A2AError::internal("ratification amendment missing"))?;let request=SendMessageRequest{message:message.clone(),configuration:None,metadata:None,tenant:None};let payload=MeshRequest::from_a2a(task.id.clone(),task.context_id.clone(),&message,crate::InputLimits::default()).map_err(|_|A2AError::invalid_request("invalid ratification amendment"))?;let payload_json=serde_json::to_string(&payload).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?;let result_json=serde_json::to_string(&SendMessageResponse::Task(task.clone())).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?;let message_id=authorized_message_identity(&tenant,&task_owner,&message.message_id);let request_digest=canonical_send_message_digest_v2(&tenant,&task_owner,&request,false)?;let dispatch_id=content_digest(format!("{tenant}\0send-message\0{message_id}").as_bytes());let request_json=serde_json::to_string(&request).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?;let idem=store.q("INSERT INTO __S__.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id,causative_request_json,invocation_kind) VALUES($1,$2,$3,$4,'in_progress',$5,$6,$6,2,$7,$8,'unary')");tx.execute(&idem,&[&tenant,&message_id,&request_digest,&command.task_id,&result_json,&now,&task_owner,&request_json]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification amendment reservation failed")))?;let execution=if let Some(intent)=quota_intent.as_ref(){store.apply_quota_intent(tx,intent,&tenant,&owner,Some(&command.task_id),now,true,Some(&request),Some(u64::try_from(command.rationale.len()).map_err(|_|A2AError::invalid_request("ratification amendment is too large"))?)).await?;Some(store.bind_execution_reservation(tx,intent,&command.task_id,&message_id,&dispatch_id,now,true).await?)}else{None};let reservation_id=execution.as_ref().map(|(id,_)|id.as_str());let binding=quota_intent.as_ref().map(crate::QuotaIntent::binding_digest);let version=execution.as_ref().map(|_|1_i64);let output=execution.as_ref().map(|(_,b)|i64::try_from(b.max_output_bytes()).unwrap_or(i64::MAX));let events=execution.as_ref().map(|(_,b)|i64::try_from(b.max_event_count()).unwrap_or(i64::MAX));let outbox=store.q("INSERT INTO __S__.outbox(dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version,quota_binding_digest,quota_reservation_id,quota_reservation_version,reserved_output_bytes,reserved_event_count,ratification_required) VALUES($1,$2,$3,$4,$5,$6,$7,'pending',8,$8,$8,$8,2,$9,$10,$11,$12,$13,TRUE)");tx.execute(&outbox,&[&dispatch_id,&tenant,&command.task_id,&message_id,&next,&payload_json,&content_digest(payload_json.as_bytes()),&now,&binding,&reservation_id,&version,&output,&events]).await.map_err(|e|Self::transaction_body_error(&e,A2AError::internal("ratification amendment dispatch failed")))?;}
                 if matches!(command.decision,crate::HumanDecision::Approve|crate::HumanDecision::Reject){enqueue_postgres_terminal_callbacks(store,tx,&tenant,&task,next,now).await?;}
-                store.insert_audit(tx,audit.decided(AuthorizationDecisionEffect::Allow,event_kind,None)).await?;Ok(receipt)
+                store.insert_audit(tx,audit.decided(AuthorizationDecisionEffect::Allow,event_kind,None)).await?;
+                store.write_integrated_ratification_anchor(tx, &tenant, &command.task_id).await?;
+                Ok(receipt)
             })
         }).await
     }
@@ -10324,7 +11305,7 @@ impl ReceiverAuthority for PostgresTaskStore {
         let until = now
             .checked_add(duration)
             .ok_or_else(|| A2AError::invalid_params("receiver lease overflow"))?;
-        let ownership_sql=store.q("SELECT o.attempt_count,o.lease_token,o.quota_binding_digest,o.quota_reservation_id,o.quota_reservation_version,o.reserved_output_bytes,o.reserved_event_count,q.policy_id,q.policy_revision,q.policy_digest FROM __S__.outbox o LEFT JOIN __S__.quota_execution_reservations q ON q.tenant_scope=o.tenant_scope AND q.reservation_id=o.quota_reservation_id WHERE o.tenant_scope=$1 AND o.dispatch_id=$2 AND o.task_id=$3 AND o.payload_digest=$4 AND o.payload_json=$5 AND o.state='leased' AND o.lease_token IS NOT NULL FOR UPDATE OF o");
+        let ownership_sql=store.q("SELECT o.attempt_count,o.lease_token,o.quota_binding_digest,o.quota_reservation_id,o.quota_reservation_version,o.reserved_output_bytes,o.reserved_event_count,q.policy_id,q.policy_revision,q.policy_digest,o.ratification_required FROM __S__.outbox o LEFT JOIN __S__.quota_execution_reservations q ON q.tenant_scope=o.tenant_scope AND q.reservation_id=o.quota_reservation_id WHERE o.tenant_scope=$1 AND o.dispatch_id=$2 AND o.task_id=$3 AND o.payload_digest=$4 AND o.payload_json=$5 AND o.state='leased' AND o.lease_token IS NOT NULL FOR UPDATE OF o");
         let Some(sender) = tx.query_opt(&ownership_sql, &[&envelope.tenant_scope, &envelope.dispatch_id, &envelope.request.task_id, &envelope.payload_digest, &payload]).await
             .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("receiver outbox ownership lookup failed")))?
         else {
@@ -10332,6 +11313,15 @@ impl ReceiverAuthority for PostgresTaskStore {
         };
         let sender_attempt: i64 = sender.get(0);
         let sender_token: String = sender.get(1);
+        if sender.get::<_, bool>(10) {
+            store
+                .validate_integrated_ratification_anchor(
+                    tx,
+                    &envelope.tenant_scope,
+                    &envelope.request.task_id,
+                )
+                .await?;
+        }
         let sender_reservation = match (
             sender.get::<_, Option<String>>(2), sender.get::<_, Option<String>>(3),
             sender.get::<_, Option<i64>>(4), sender.get::<_, Option<i64>>(5),
@@ -11425,6 +12415,7 @@ impl CancellationAuthority for PostgresTaskStore {
             let audit = audit.clone();
             let quota_reservation = quota_reservation.clone();
             Box::pin(async move {
+        store.validate_integrated_ratification_anchor(tx, &tenant, &task_id).await?;
         let now = store.effective_now(tx, now).await?;
         let sql=store.q("SELECT t.task_json,t.revision,i.message_id,o.dispatch_id,o.state FROM __S__.tasks t JOIN __S__.outbox o ON o.tenant_scope=t.tenant_scope AND o.task_id=t.task_id JOIN __S__.idempotency_records i ON i.tenant_scope=o.tenant_scope AND i.message_id=o.message_id AND i.task_id=o.task_id WHERE t.tenant_scope=$1 AND t.task_id=$2 AND ($3::boolean=false OR t.owner_account_id=$4) ORDER BY (o.state IN ('pending','leased','delivered')) DESC,o.outbox_id DESC LIMIT 1 FOR UPDATE OF t,o");
         let row = tx
@@ -11527,6 +12518,7 @@ impl CancellationAuthority for PostgresTaskStore {
         let cancel_packet=store.q("UPDATE __S__.ratification_packets SET state='canceled',updated_at=$1 WHERE tenant_scope=$2 AND task_id=$3 AND state IN ('awaiting_review','reviewed')");
         tx.execute(&cancel_packet,&[&now,&tenant,&task_id]).await
             .map_err(|error|Self::transaction_body_error(&error,A2AError::internal("cancellation ratification closure failed")))?;
+        store.write_integrated_ratification_anchor(tx, &tenant, &task_id).await?;
         let event=store.q("INSERT INTO __S__.task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,from_state,to_state,event_json,created_at) SELECT $1,$2,COALESCE(max(event_seq),0)+1,$3,'durable_canceled',$4,$5,$6,$7 FROM __S__.task_events WHERE tenant_scope=$1 AND task_id=$2");
         tx.execute(
             &event,

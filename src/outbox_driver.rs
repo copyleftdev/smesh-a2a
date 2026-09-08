@@ -733,13 +733,15 @@ fn spawn_durable_driver_inner(
                     )),
                     timestamp: chrono::DateTime::from_timestamp_millis(clock.now()),
                 };
-                apply_terminal_events(
-                    &mut task,
-                    &lease.dispatch_id,
-                    &events,
-                    &termination,
-                    clock.now(),
-                )?;
+                if !lease.ratification_required {
+                    apply_terminal_events(
+                        &mut task,
+                        &lease.dispatch_id,
+                        &events,
+                        &termination,
+                        clock.now(),
+                    )?;
+                }
                 let public_transcript = build_public_transcript(
                     &admitted_task,
                     &task,
@@ -767,6 +769,18 @@ fn spawn_durable_driver_inner(
                             clock.now(),
                         )
                         .await?
+                } else if lease.ratification_required {
+                    let disposition = AttemptDisposition::Retry {
+                        available_at: clock.now().saturating_add(1_000),
+                        error: "ratification-required amendment returned no valid candidate".to_owned(),
+                    };
+                    let outcome = authority
+                        .finish_outbox_attempt(&lease, disposition, clock.now())
+                        .await?;
+                    if outcome == TransitionOutcome::DeadLettered {
+                        worker_control.changed();
+                    }
+                    continue;
                 } else {
                     let result = SendMessageResponse::Task(task.clone());
                     authority
@@ -1391,6 +1405,7 @@ mod tests {
                 context_id: task.context_id.clone(),
                 text: "candidate".to_owned(),
             },
+            ratification_required: false,
             execution_reservation: None,
         };
         let candidate = crate::AuthoritativeReviewCandidate::new(

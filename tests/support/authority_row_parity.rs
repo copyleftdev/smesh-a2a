@@ -9,7 +9,7 @@ use rusqlite::{Connection, types::ValueRef};
 use serde_json::{Map, Value};
 use tokio_postgres::Client;
 
-pub const AUTHORITY_TABLES: [&str; 28] = [
+pub const AUTHORITY_TABLES: [&str; 29] = [
     "store_metadata",
     "store_identity",
     "tasks",
@@ -26,6 +26,7 @@ pub const AUTHORITY_TABLES: [&str; 28] = [
     "authorization_decisions",
     "audit_projection_outbox",
     "ratification_key_check",
+    "ratification_ledger_anchor",
     "ratification_packets",
     "ratification_events",
     "callback_policy_snapshots",
@@ -133,6 +134,11 @@ pub async fn assert_postgres_tables_match(client: &Client, schema: &str) {
         "quota_receipts",
         "quota_request_receipts",
         "retained_authority_usage",
+        // PostgreSQL authenticates ratification in bounded tenant/task shards for
+        // multi-replica lookups. SQLite serializes one global ledger anchor; that
+        // shared authority object remains in AUTHORITY_TABLES and is row-compared.
+        "ratification_tenant_anchors",
+        "ratification_chain_anchors",
     ] {
         assert!(
             actual.remove(table),
@@ -255,6 +261,12 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn normalize(tables: &mut BTreeMap<String, Vec<Value>>) {
+    // SQLite materializes an uninitialized singleton so its trigger can fence
+    // first use; PostgreSQL materializes the same logical authority only when
+    // ratification is enabled. Compare both disabled states as zero authority rows.
+    if let Some(rows) = tables.get_mut("ratification_ledger_anchor") {
+        rows.retain(|row| row.get("initialized").and_then(Value::as_bool) != Some(false));
+    }
     let decision_ranks: BTreeMap<String, i64> = {
         let mut decisions: Vec<(i64, String)> = tables
             .get("authorization_decisions")
@@ -470,6 +482,13 @@ fn normalize(tables: &mut BTreeMap<String, Vec<Value>>) {
                     );
                 }
                 "outbox" => {
+                    if let Some(Value::Number(value)) = object.get("ratification_required") {
+                        let value = value
+                            .as_i64()
+                            .expect("SQLite ratification fence must be an integer");
+                        assert!(value == 0 || value == 1);
+                        object.insert("ratification_required".into(), Value::Bool(value == 1));
+                    }
                     for field in [
                         "quota_binding_digest",
                         "quota_reservation_id",

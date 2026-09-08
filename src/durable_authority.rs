@@ -630,6 +630,9 @@ pub struct OutboxLease {
     pub lease_token: String,
     pub lease_until: i64,
     pub request: MeshRequest,
+    /// Server-owned fence for amendment continuations. A fenced lease may only
+    /// commit through `commit_delivery_for_ratification`.
+    pub ratification_required: bool,
     pub execution_reservation: Option<ExecutionReservation>,
 }
 
@@ -1674,12 +1677,34 @@ pub trait AuthorityIdentity: Send + Sync {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RatificationReplayAction {
+    Review,
+    Decision,
+}
+
 #[async_trait]
 pub trait RatificationAuthority: Send + Sync {
     async fn ratification_view(
         &self,
         scope: &OwnedTaskScope,
         task_id: &str,
+    ) -> Result<Option<crate::RatificationView>, A2AError>;
+
+    async fn ratification_view_at_generation(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        generation: u64,
+    ) -> Result<Option<crate::RatificationView>, A2AError>;
+
+    async fn ratification_replay_candidate(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        account_id: &str,
+        idempotency_key: &str,
+        action: RatificationReplayAction,
     ) -> Result<Option<crate::RatificationView>, A2AError>;
 
     async fn acknowledge_ratification_review(

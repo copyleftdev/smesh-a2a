@@ -6,7 +6,10 @@ use a2a_server::TaskStore as _;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use base64::Engine as _;
+use hmac::{Hmac, Mac as _};
 use http_body_util::BodyExt as _;
+use sha2::Sha256;
 use smesh_a2a::auth::{
     AuthState, AuthenticationError, BearerVerifier, PresentedBearer, Principal, PrincipalLimits,
 };
@@ -1089,6 +1092,7 @@ impl BearerVerifier for RouteVerifier {
         let subject = match token.as_str() {
             "ratifier-token" => "ratifier",
             "ratifier-two-token" => "ratifier-two",
+            "ratifier-b-token" => "ratifier-b",
             "viewer-token" => "viewer",
             _ => return Err(AuthenticationError::InvalidToken),
         };
@@ -1427,21 +1431,25 @@ async fn ratification_mutation_prebody_matrix_is_ordered_and_hardened() {
 async fn browser_dto_etag_review_decision_stale_and_replay_contract() {
     use smesh_a2a::{
         AuthorizationAuditInput, AuthorizationDecisionEffect, LegacyTenantBinding, OwnedTaskScope,
-        VisibilityScope,
+        RatificationAuthority as _, VisibilityScope,
     };
 
     let fixture = Fixture::new();
     let authorization = Arc::new(AuthorizationPolicy::from_json(
         br#"{
           "schemaVersion":"smesh-authz-policy/v1","policyId":"ratification-authz","revision":1,
-          "tenants":[{"id":"tenant-a","enabled":true}],
+          "tenants":[{"id":"tenant-a","enabled":true},{"id":"tenant-b","enabled":true}],
           "accounts":[
             {"id":"ratifier","kind":"human","memberships":[{"tenantId":"tenant-a","roles":["humanRatifier"]}]},
-            {"id":"ratifier-two","kind":"human","memberships":[{"tenantId":"tenant-a","roles":["humanRatifier"]}]}
+            {"id":"ratifier-two","kind":"human","memberships":[{"tenantId":"tenant-a","roles":["humanRatifier"]}]},
+            {"id":"ratifier-b","kind":"human","memberships":[{"tenantId":"tenant-b","roles":["humanRatifier"]}]},
+            {"id":"viewer","kind":"human","memberships":[{"tenantId":"tenant-a","roles":["taskViewer"]}]}
           ],
           "principalBindings":[
             {"principal":{"issuer":"test:ratification","subject":"ratifier"},"accountId":"ratifier"},
-            {"principal":{"issuer":"test:ratification","subject":"ratifier-two"},"accountId":"ratifier-two"}
+            {"principal":{"issuer":"test:ratification","subject":"ratifier-two"},"accountId":"ratifier-two"},
+            {"principal":{"issuer":"test:ratification","subject":"ratifier-b"},"accountId":"ratifier-b"},
+            {"principal":{"issuer":"test:ratification","subject":"viewer"},"accountId":"viewer"}
           ]
         }"#,
     ).unwrap());
@@ -1546,13 +1554,14 @@ async fn browser_dto_etag_review_decision_stale_and_replay_contract() {
         .unwrap()
         .unwrap();
     let task_id = lease.task_id.clone();
+    let store_probe = store.clone();
     let gateway = build_authorized_durable_loopback_gateway_with_ratification_and_telemetry(
         GatewayConfig::new("http://127.0.0.1:1", "ratification-test"),
         store,
         DurableLoopbackEndpoint::new(),
         InjectedClock::new(1_700_000_020_100),
         AuthState::new(Arc::new(RouteVerifier), [31; 32]),
-        authorization,
+        Arc::clone(&authorization),
         None,
     )
     .unwrap();
@@ -1578,6 +1587,94 @@ async fn browser_dto_etag_review_decision_stale_and_replay_contract() {
     assert_eq!(json["phase"], "awaitingReview");
     assert_eq!(json["reviewedByCurrentActor"], false);
     assert!(json["terminalDecision"].is_null());
+    let historical = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/ratification/v1/tasks/{task_id}/generations/{}",
+                packet.generation
+            ))
+            .header(header::AUTHORIZATION, "Bearer ratifier-token")
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical.status(), StatusCode::OK);
+    let historical_json: serde_json::Value =
+        serde_json::from_slice(&historical.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(historical_json["packet"]["generation"], packet.generation);
+    for (name, path, token, expected) in [
+        (
+            "unauthenticated",
+            format!("/ratification/v1/tasks/{task_id}/generations/1"),
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "role-denied",
+            format!("/ratification/v1/tasks/{task_id}/generations/1"),
+            Some("viewer-token"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "missing-task",
+            "/ratification/v1/tasks/missing/generations/1".to_owned(),
+            Some("ratifier-token"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "cross-tenant",
+            format!("/ratification/v1/tasks/{task_id}/generations/1"),
+            Some("ratifier-b-token"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "missing-generation",
+            format!("/ratification/v1/tasks/{task_id}/generations/2"),
+            Some("ratifier-token"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "generation-zero",
+            format!("/ratification/v1/tasks/{task_id}/generations/0"),
+            Some("ratifier-token"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "generation-overflow",
+            format!("/ratification/v1/tasks/{task_id}/generations/18446744073709551616"),
+            Some("ratifier-token"),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let mut request = Request::get(path);
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{name}");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store",
+            "{name}"
+        );
+        assert_eq!(
+            response.headers()["x-content-type-options"],
+            "nosniff",
+            "{name}"
+        );
+        assert_eq!(
+            response.headers()["referrer-policy"],
+            "no-referrer",
+            "{name}"
+        );
+    }
     let malformed_body = app
         .clone()
         .oneshot(
@@ -1687,12 +1784,46 @@ async fn browser_dto_etag_review_decision_stale_and_replay_contract() {
             .unwrap()
             .contains("idempotency")
     );
+    let audits_before_replay = store_probe.authorization_decision_count().await.unwrap();
+    for (name, unauthorized_etag) in [
+        (
+            "arbitrary",
+            "\"ratification-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+        ),
+        ("post-mutation", etag1.as_str()),
+    ] {
+        let rejected = app
+            .clone()
+            .oneshot(review_request("review-http-1", unauthorized_etag))
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "{name} ETag must not authorize review replay"
+        );
+    }
+    assert_eq!(
+        store_probe.authorization_decision_count().await.unwrap(),
+        audits_before_replay,
+        "rejected review preconditions must not append authorization audits"
+    );
     let replay = app
         .clone()
         .oneshot(review_request("review-http-1", &etag0))
         .await
         .unwrap();
-    assert_eq!(replay.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(replay.headers()[header::ETAG], etag1);
+    assert_eq!(
+        replay.into_body().collect().await.unwrap().to_bytes(),
+        reviewed_bytes
+    );
+    assert_eq!(
+        store_probe.authorization_decision_count().await.unwrap(),
+        audits_before_replay + 1,
+        "an exact browser replay must atomically append a fresh authorization audit"
+    );
     let stale = app
         .clone()
         .oneshot(review_request("review-http-stale", &etag0))
@@ -1700,7 +1831,78 @@ async fn browser_dto_etag_review_decision_stale_and_replay_contract() {
         .unwrap();
     assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
 
-    let decision = app
+    let decision_request = || {
+        Request::post(format!("/ratification/v1/tasks/{task_id}/decision"))
+            .header(header::AUTHORIZATION, "Bearer ratifier-token")
+            .header(header::ORIGIN, "http://127.0.0.1:1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::IF_MATCH, &etag1)
+            .header("idempotency-key", "decision-http-1")
+            .body(Body::from(
+                r#"{"decision":"amend","rationale":"exact evidence reviewed"}"#,
+            ))
+            .unwrap()
+    };
+    let decision = app.clone().oneshot(decision_request()).await.unwrap();
+    assert_eq!(decision.status(), StatusCode::CREATED);
+    let etag2 = decision.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let decision_bytes = decision.into_body().collect().await.unwrap().to_bytes();
+    assert_ne!(etag2, etag1);
+    let audits_before_decision_replay = store_probe.authorization_decision_count().await.unwrap();
+    for (name, unauthorized_etag) in [
+        (
+            "arbitrary",
+            "\"ratification-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+        ),
+        ("post-mutation", etag2.as_str()),
+    ] {
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/ratification/v1/tasks/{task_id}/decision"))
+                    .header(header::AUTHORIZATION, "Bearer ratifier-token")
+                    .header(header::ORIGIN, "http://127.0.0.1:1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::IF_MATCH, unauthorized_etag)
+                    .header("idempotency-key", "decision-http-1")
+                    .body(Body::from(
+                        r#"{"decision":"amend","rationale":"exact evidence reviewed"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "{name} ETag must not authorize decision replay"
+        );
+    }
+    assert_eq!(
+        store_probe.authorization_decision_count().await.unwrap(),
+        audits_before_decision_replay,
+        "rejected decision preconditions must not append authorization audits"
+    );
+    let decision_replay = app.clone().oneshot(decision_request()).await.unwrap();
+    assert_eq!(decision_replay.status(), StatusCode::CREATED);
+    assert_eq!(decision_replay.headers()[header::ETAG], etag2);
+    assert_eq!(
+        decision_replay
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+        decision_bytes
+    );
+    assert_eq!(
+        store_probe.authorization_decision_count().await.unwrap(),
+        audits_before_decision_replay + 1
+    );
+    let changed_payload = app
         .clone()
         .oneshot(
             Request::post(format!("/ratification/v1/tasks/{task_id}/decision"))
@@ -1710,24 +1912,566 @@ async fn browser_dto_etag_review_decision_stale_and_replay_contract() {
                 .header(header::IF_MATCH, &etag1)
                 .header("idempotency-key", "decision-http-1")
                 .body(Body::from(
-                    r#"{"decision":"approve","rationale":"exact evidence reviewed"}"#,
+                    r#"{"decision":"amend","rationale":"changed semantics"}"#,
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(decision.status(), StatusCode::CREATED);
-    let etag2 = decision.headers()[header::ETAG]
-        .to_str()
-        .unwrap()
-        .to_owned();
-    assert_ne!(etag2, etag1);
+    assert_eq!(changed_payload.status(), StatusCode::PRECONDITION_FAILED);
+    let changed_key = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/ratification/v1/tasks/{task_id}/decision"))
+                .header(header::AUTHORIZATION, "Bearer ratifier-token")
+                .header(header::ORIGIN, "http://127.0.0.1:1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, &etag1)
+                .header("idempotency-key", "decision-http-new-key")
+                .body(Body::from(
+                    r#"{"decision":"amend","rationale":"exact evidence reviewed"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed_key.status(), StatusCode::PRECONDITION_FAILED);
     let terminal = app.clone().oneshot(get_request()).await.unwrap();
     assert_eq!(terminal.headers()[header::ETAG], etag2);
     let terminal_json: serde_json::Value =
         serde_json::from_slice(&terminal.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(terminal_json["reviewedByCurrentActor"], true);
-    assert_eq!(terminal_json["terminalDecision"], "approve");
+    assert_eq!(terminal_json["terminalDecision"], "amend");
+    gateway.shutdown().await.unwrap();
+    drop(store_probe);
+    let store_probe = SqliteTaskStore::open_with_ratification_key_and_legacy_binding(
+        &fixture.0,
+        16,
+        LegacyTenantBinding::new(
+            context.tenant_id(),
+            context.account_id(),
+            context.policy_id(),
+            context.policy_revision(),
+            context.policy_digest(),
+        )
+        .unwrap(),
+        zeroize::Zeroizing::new([0x52; 32]),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let amendment_lease = store_probe
+        .claim_outbox(
+            "http-generation-two-worker".to_owned(),
+            1_700_000_200_101,
+            60_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let payload = serde_json::to_vec(&amendment_lease.request).unwrap();
+    let envelope = DurableDispatchEnvelope {
+        tenant_scope: amendment_lease.tenant_scope.clone(),
+        dispatch_id: amendment_lease.dispatch_id.clone(),
+        payload_digest: smesh_a2a::content_digest(&payload),
+        request: amendment_lease.request.clone(),
+        execution_reservation: amendment_lease.execution_reservation.clone(),
+    };
+    match store_probe
+        .begin_receive(
+            envelope,
+            "http-generation-two-receiver",
+            1_700_000_200_101,
+            60_000,
+        )
+        .await
+        .unwrap()
+    {
+        ReceiverAdmission::Execute(receiver) => {
+            store_probe
+                .complete_loopback_receive(
+                    &receiver,
+                    &[smesh_a2a::MeshEvent::Completed {
+                        summary: "HTTP generation two candidate".to_owned(),
+                    }],
+                    1_700_000_200_102,
+                )
+                .await
+                .unwrap();
+        }
+        ReceiverAdmission::Replay(events) => assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, smesh_a2a::MeshEvent::Completed { .. }))
+        ),
+        ReceiverAdmission::ReplayOutcome(outcome) => assert!(
+            outcome
+                .events
+                .iter()
+                .any(|event| { matches!(event, smesh_a2a::MeshEvent::Completed { .. }) })
+        ),
+        ReceiverAdmission::Busy => panic!("stopped gateway retained an active receiver lease"),
+    }
+    let initial_two = store_probe
+        .task_for_outbox(&amendment_lease)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut candidate_two = initial_two.clone();
+    candidate_two.status.state = a2a::TaskState::Completed;
+    candidate_two.status.timestamp = chrono::DateTime::from_timestamp_millis(1_700_000_200_102);
+    candidate_two.artifacts = Some(vec![a2a::Artifact {
+        artifact_id: "http-generation-two-artifact".to_owned(),
+        name: Some("generation-two.txt".to_owned()),
+        description: None,
+        parts: vec![a2a::Part::text("HTTP generation two candidate")],
+        metadata: None,
+        extensions: None,
+    }]);
+    store_probe
+        .commit_delivery_for_ratification(
+            &amendment_lease,
+            candidate_two.clone(),
+            a2a::SendMessageResponse::Task(candidate_two),
+            &[a2a::StreamResponse::Task(initial_two)],
+            AuthoritativeReviewCandidate::new(
+                "release-policy",
+                7,
+                smesh_a2a::content_digest(b"release-policy-v7"),
+                b"sealed-http-checkpoint-generation-two".to_vec(),
+                vec![b"http generation two evidence".to_vec()],
+                "bounded uncertainty",
+            )
+            .unwrap(),
+            1_700_000_200_102,
+        )
+        .await
+        .unwrap();
+    let generation_two = store_probe
+        .ratification_view(&scope, &task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(generation_two.packet.generation, 2);
+
+    // Produce enough real amendment continuations to prove that HTTP replay has
+    // no generation-window expiry. Every generation traverses the same durable
+    // review, decision, quota/outbox, receive, and ratification commit paths.
+    for generation in 2_u64..=65 {
+        let view = store_probe
+            .ratification_view(&scope, &task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.packet.generation, generation);
+        let review_at = 1_700_000_300_000 + i64::try_from(generation).unwrap() * 10;
+        let mut review_command = integrated_review(
+            &view.packet,
+            &scope,
+            &task_id,
+            &format!("historical-review-{generation}"),
+        );
+        review_command.reviewed_at_millis = review_at;
+        store_probe
+            .acknowledge_ratification_review(
+                &scope,
+                review_command,
+                integrated_audit(
+                    &view.packet,
+                    &scope,
+                    &task_id,
+                    &format!("historical-review-audit-{generation}"),
+                    "ratificationReview",
+                    review_at,
+                ),
+            )
+            .await
+            .unwrap();
+        let decision_at = review_at + 1;
+        let mut decision_command = integrated_decision(
+            &view.packet,
+            &scope,
+            &task_id,
+            &format!("historical-decision-{generation}"),
+            HumanDecision::Amend,
+        );
+        decision_command.decided_at_millis = decision_at;
+        store_probe
+            .decide_ratification(
+                &scope,
+                decision_command,
+                integrated_audit(
+                    &view.packet,
+                    &scope,
+                    &task_id,
+                    &format!("historical-decision-audit-{generation}"),
+                    "ratificationDecide",
+                    decision_at,
+                ),
+            )
+            .await
+            .unwrap();
+        let lease = store_probe
+            .claim_outbox(
+                format!("historical-worker-{generation}"),
+                1_700_000_300_002 + i64::try_from(generation).unwrap() * 10,
+                60_000,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = serde_json::to_vec(&lease.request).unwrap();
+        let envelope = DurableDispatchEnvelope {
+            tenant_scope: lease.tenant_scope.clone(),
+            dispatch_id: lease.dispatch_id.clone(),
+            payload_digest: smesh_a2a::content_digest(&payload),
+            request: lease.request.clone(),
+            execution_reservation: lease.execution_reservation.clone(),
+        };
+        let ReceiverAdmission::Execute(receiver) = store_probe
+            .begin_receive(
+                envelope,
+                &format!("historical-receiver-{generation}"),
+                1_700_000_300_002 + i64::try_from(generation).unwrap() * 10,
+                60_000,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("historical continuation was not executable")
+        };
+        store_probe
+            .complete_loopback_receive(
+                &receiver,
+                &[smesh_a2a::MeshEvent::Completed {
+                    summary: format!("generation {} candidate", generation + 1),
+                }],
+                1_700_000_300_003 + i64::try_from(generation).unwrap() * 10,
+            )
+            .await
+            .unwrap();
+        let initial = store_probe.task_for_outbox(&lease).await.unwrap().unwrap();
+        let mut candidate = initial.clone();
+        candidate.status.state = a2a::TaskState::Completed;
+        candidate.status.timestamp = chrono::DateTime::from_timestamp_millis(
+            1_700_000_300_003 + i64::try_from(generation).unwrap() * 10,
+        );
+        candidate.artifacts = Some(vec![a2a::Artifact {
+            artifact_id: format!("historical-artifact-{}", generation + 1),
+            name: Some(format!("generation-{}.txt", generation + 1)),
+            description: None,
+            parts: vec![a2a::Part::text(format!(
+                "generation {} candidate",
+                generation + 1
+            ))],
+            metadata: None,
+            extensions: None,
+        }]);
+        store_probe
+            .commit_delivery_for_ratification(
+                &lease,
+                candidate.clone(),
+                a2a::SendMessageResponse::Task(candidate),
+                &[a2a::StreamResponse::Task(initial)],
+                AuthoritativeReviewCandidate::new(
+                    "release-policy",
+                    7,
+                    smesh_a2a::content_digest(b"release-policy-v7"),
+                    format!("historical-checkpoint-{}", generation + 1).into_bytes(),
+                    vec![format!("generation {} evidence", generation + 1).into_bytes()],
+                    "bounded uncertainty",
+                )
+                .unwrap(),
+                1_700_000_300_003 + i64::try_from(generation).unwrap() * 10,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store_probe
+            .ratification_view(&scope, &task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .packet
+            .generation,
+        66
+    );
+    let mut other_admission = durable_admission();
+    other_admission.request.message.message_id = "historical-other-message".to_owned();
+    other_admission.task.id = "historical-other-task".to_owned();
+    other_admission.task.context_id = "historical-other-context".to_owned();
+    other_admission.task.history = Some(vec![other_admission.request.message.clone()]);
+    other_admission.original_result = a2a::SendMessageResponse::Task(other_admission.task.clone());
+    let other_task_id = other_admission.task.id.clone();
+    store_probe
+        .authorize_and_admit(
+            &scope,
+            other_admission,
+            AuthorizationAuditInput::new(
+                "historical-other-admission-audit",
+                context.tenant_id(),
+                context.account_id(),
+                context.policy_id(),
+                context.policy_revision(),
+                context.policy_digest(),
+                "taskCreate",
+                AuthorizationDecisionEffect::Allow,
+                "authorized",
+                "task",
+                smesh_a2a::content_digest(other_task_id.as_bytes()),
+                Some(other_task_id.clone()),
+                1_700_000_400_000,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let other_lease = store_probe
+        .claim_outbox(
+            "historical-other-worker".to_owned(),
+            1_700_000_400_001,
+            60_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let other_initial = store_probe
+        .task_for_outbox(&other_lease)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut other_candidate = other_initial.clone();
+    other_candidate.status.state = a2a::TaskState::Completed;
+    other_candidate.status.timestamp = chrono::DateTime::from_timestamp_millis(1_700_000_400_002);
+    other_candidate.artifacts = Some(vec![a2a::Artifact {
+        artifact_id: "historical-other-artifact".to_owned(),
+        name: Some("historical-other.txt".to_owned()),
+        description: None,
+        parts: vec![a2a::Part::text("historical other candidate")],
+        metadata: None,
+        extensions: None,
+    }]);
+    store_probe
+        .commit_delivery_for_ratification(
+            &other_lease,
+            other_candidate.clone(),
+            a2a::SendMessageResponse::Task(other_candidate),
+            &[a2a::StreamResponse::Task(other_initial)],
+            AuthoritativeReviewCandidate::new(
+                "release-policy",
+                7,
+                smesh_a2a::content_digest(b"release-policy-v7"),
+                b"historical-other-checkpoint".to_vec(),
+                vec![b"historical other evidence".to_vec()],
+                "bounded uncertainty",
+            )
+            .unwrap(),
+            1_700_000_400_002,
+        )
+        .await
+        .unwrap();
+    let gateway = build_authorized_durable_loopback_gateway_with_ratification_and_telemetry(
+        GatewayConfig::new("http://127.0.0.1:1", "ratification-test"),
+        store_probe.clone(),
+        DurableLoopbackEndpoint::new(),
+        InjectedClock::new(1_700_000_220_100),
+        AuthState::new(Arc::new(RouteVerifier), [31; 32]),
+        Arc::clone(&authorization),
+        None,
+    )
+    .unwrap();
+    let app = gateway.router();
+    let generation_two_latest = app.clone().oneshot(get_request()).await.unwrap();
+    assert_eq!(generation_two_latest.status(), StatusCode::OK);
+    let generation_two_etag = generation_two_latest.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let audits_before_historical_replay = store_probe.authorization_decision_count().await.unwrap();
+    let durable_before_historical_replay = store_probe.atomic_record_counts().await.unwrap();
+    let workflow_before_historical_replay = store_probe
+        .ratification_view(&scope, &task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    for (name, unauthorized_etag) in [
+        (
+            "arbitrary",
+            "\"ratification-v1:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"",
+        ),
+        ("generation-one-post-mutation", etag2.as_str()),
+        ("current-generation", generation_two_etag.as_str()),
+    ] {
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/ratification/v1/tasks/{task_id}/decision"))
+                    .header(header::AUTHORIZATION, "Bearer ratifier-token")
+                    .header(header::ORIGIN, "http://127.0.0.1:1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::IF_MATCH, unauthorized_etag)
+                    .header("idempotency-key", "decision-http-1")
+                    .body(Body::from(
+                        r#"{"decision":"amend","rationale":"exact evidence reviewed"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "{name} ETag must not authorize historical decision replay"
+        );
+    }
+    assert_eq!(
+        store_probe.authorization_decision_count().await.unwrap(),
+        audits_before_historical_replay,
+        "rejected historical preconditions must not append authorization audits"
+    );
+    let historical_generation_one = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/ratification/v1/tasks/{task_id}/generations/1"))
+                .header(header::AUTHORIZATION, "Bearer ratifier-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical_generation_one.status(), StatusCode::OK);
+    assert_eq!(historical_generation_one.headers()[header::ETAG], etag2);
+    let historical_replay = app.clone().oneshot(decision_request()).await.unwrap();
+    assert_eq!(historical_replay.status(), StatusCode::CREATED);
+    assert_eq!(historical_replay.headers()[header::ETAG], etag2);
+    assert_eq!(
+        historical_replay
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+        decision_bytes
+    );
+    assert_eq!(
+        store_probe.authorization_decision_count().await.unwrap(),
+        audits_before_historical_replay + 1
+    );
+    let changed_historical_body = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/ratification/v1/tasks/{task_id}/decision"))
+                .header(header::AUTHORIZATION, "Bearer ratifier-token")
+                .header(header::ORIGIN, "http://127.0.0.1:1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, &etag1)
+                .header("idempotency-key", "decision-http-1")
+                .body(Body::from(
+                    r#"{"decision":"amend","rationale":"changed after generation two"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changed_historical_body.status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    let changed_historical_key = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/ratification/v1/tasks/{task_id}/decision"))
+                .header(header::AUTHORIZATION, "Bearer ratifier-token")
+                .header(header::ORIGIN, "http://127.0.0.1:1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, &etag1)
+                .header("idempotency-key", "decision-http-after-generation-two")
+                .body(Body::from(
+                    r#"{"decision":"amend","rationale":"exact evidence reviewed"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changed_historical_key.status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    let cross_actor_historical = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/ratification/v1/tasks/{task_id}/decision"))
+                .header(header::AUTHORIZATION, "Bearer ratifier-two-token")
+                .header(header::ORIGIN, "http://127.0.0.1:1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, &etag1)
+                .header("idempotency-key", "decision-http-1")
+                .body(Body::from(
+                    r#"{"decision":"amend","rationale":"exact evidence reviewed"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cross_actor_historical.status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    let changed_action = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/ratification/v1/tasks/{task_id}/decision"))
+                .header(header::AUTHORIZATION, "Bearer ratifier-token")
+                .header(header::ORIGIN, "http://127.0.0.1:1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, &etag1)
+                .header("idempotency-key", "decision-http-1")
+                .body(Body::from(
+                    r#"{"decision":"reject","rationale":"exact evidence reviewed"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed_action.status(), StatusCode::PRECONDITION_FAILED);
+    let changed_task = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/ratification/v1/tasks/{other_task_id}/decision"))
+                .header(header::AUTHORIZATION, "Bearer ratifier-token")
+                .header(header::ORIGIN, "http://127.0.0.1:1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, &etag1)
+                .header("idempotency-key", "decision-http-1")
+                .body(Body::from(
+                    r#"{"decision":"amend","rationale":"exact evidence reviewed"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed_task.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        store_probe.authorization_decision_count().await.unwrap(),
+        audits_before_historical_replay + 1,
+        "failed historical replay variants must not append authorization audits"
+    );
+    assert_eq!(
+        store_probe.atomic_record_counts().await.unwrap(),
+        durable_before_historical_replay,
+        "historical replay must not mutate task/event/idempotency/outbox cardinality"
+    );
+    assert_eq!(
+        store_probe
+            .ratification_view(&scope, &task_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        workflow_before_historical_replay,
+        "historical replay must not mutate the current workflow"
+    );
     gateway.shutdown().await.unwrap();
 }
 
@@ -1737,15 +2481,7 @@ async fn authorized_durable_builder_does_not_use_the_standalone_ratification_led
     let task_fixture = Fixture::new();
     let ratification_fixture = Fixture::new();
     let ledger = RatificationLedger::open(&ratification_fixture.0, [30; 32]).unwrap();
-    let frozen = ledger.freeze_packet(packet()).unwrap();
-    let store = SqliteTaskStore::open_with_ratification_key(
-        &task_fixture.0,
-        16,
-        zeroize::Zeroizing::new([0x52; 32]),
-        false,
-    )
-    .await
-    .unwrap();
+    let _standalone_frozen = ledger.freeze_packet(packet()).unwrap();
     let authorization = AuthorizationPolicy::from_json(
         br#"{
           "schemaVersion":"smesh-authz-policy/v1","policyId":"ratification-authz","revision":1,
@@ -1761,11 +2497,101 @@ async fn authorized_durable_builder_does_not_use_the_standalone_ratification_led
         }"#,
     )
     .unwrap();
+    let context = authorization.resolve(&principal("ratifier"), None).unwrap();
+    let store = SqliteTaskStore::open_with_ratification_key_and_legacy_binding(
+        &task_fixture.0,
+        16,
+        smesh_a2a::LegacyTenantBinding::new(
+            context.tenant_id(),
+            context.account_id(),
+            context.policy_id(),
+            context.policy_revision(),
+            context.policy_digest(),
+        )
+        .unwrap(),
+        zeroize::Zeroizing::new([0x52; 32]),
+        false,
+    )
+    .await
+    .unwrap();
+    let scope = smesh_a2a::OwnedTaskScope::new_with_principal_and_authentication(
+        context.tenant_id(),
+        context.account_id(),
+        context.principal_scope(),
+        smesh_a2a::VisibilityScope::Tenant,
+        "bearer-jwt",
+    )
+    .unwrap();
+    let mut admission = durable_admission();
+    admission.task.id = "task-27".to_owned();
+    admission.task.context_id = "context-27".to_owned();
+    admission.task.history = Some(vec![admission.request.message.clone()]);
+    admission.original_result = a2a::SendMessageResponse::Task(admission.task.clone());
+    let admission_audit = smesh_a2a::AuthorizationAuditInput::new(
+        "production-route-admission-audit",
+        context.tenant_id(),
+        context.account_id(),
+        context.policy_id(),
+        context.policy_revision(),
+        context.policy_digest(),
+        "taskCreate",
+        smesh_a2a::AuthorizationDecisionEffect::Allow,
+        "authorized",
+        "task",
+        smesh_a2a::content_digest(b"task-27"),
+        Some("task-27".to_owned()),
+        admission.now,
+    )
+    .unwrap();
+    smesh_a2a::TaskAdmission::authorize_and_admit(&store, &scope, admission, admission_audit)
+        .await
+        .unwrap();
+    let lease = store
+        .claim_outbox("production-route-worker", 1_700_000_010_001, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let initial = store.get(&lease.task_id).await.unwrap().unwrap();
+    let mut approved = initial.clone();
+    approved.status.state = a2a::TaskState::Completed;
+    approved.status.timestamp = chrono::DateTime::from_timestamp_millis(1_700_000_010_002);
+    approved.artifacts = Some(vec![a2a::Artifact {
+        artifact_id: "production-route-artifact".to_owned(),
+        name: Some("release.html".to_owned()),
+        description: None,
+        parts: vec![a2a::Part::text("<script>alert(1)</script>")],
+        metadata: None,
+        extensions: None,
+    }]);
+    store
+        .commit_delivery_for_ratification(
+            &lease,
+            approved.clone(),
+            a2a::SendMessageResponse::Task(approved),
+            &[a2a::StreamResponse::Task(initial)],
+            AuthoritativeReviewCandidate::new(
+                "policy-7",
+                7,
+                smesh_a2a::content_digest(b"policy"),
+                b"checkpoint bytes".to_vec(),
+                vec![b"review-evidence".to_vec()],
+                "Uncertainty remains",
+            )
+            .unwrap(),
+            1_700_000_010_002,
+        )
+        .await
+        .unwrap();
+    let frozen = store
+        .ratification_packet("tenant-a", "task-27")
+        .await
+        .unwrap()
+        .unwrap();
     let gateway = build_authorized_durable_loopback_gateway_with_ratification_and_telemetry(
         GatewayConfig::new("http://127.0.0.1:1", "ratification-test"),
         store,
         DurableLoopbackEndpoint::new(),
-        InjectedClock::new(1_700_000_000_100),
+        InjectedClock::new(1_700_000_020_100),
         AuthState::new(Arc::new(RouteVerifier), [31; 32]),
         Arc::new(authorization),
         None,
@@ -1776,34 +2602,38 @@ async fn authorized_durable_builder_does_not_use_the_standalone_ratification_led
     let console = app
         .clone()
         .oneshot(
-            Request::get("/ratification/console/task-27")
-                .header(header::AUTHORIZATION, "Bearer ratifier-token")
+            Request::get("/ratification/console")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    if matches!(
-        console.status(),
-        StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
-    ) {
-        gateway.shutdown().await.unwrap();
-        return;
-    }
     assert_eq!(console.status(), StatusCode::OK);
     assert_eq!(
         console.headers()[header::CONTENT_SECURITY_POLICY],
-        "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+        "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     );
     let console_body = console.into_body().collect().await.unwrap().to_bytes();
     let console_body = std::str::from_utf8(&console_body).unwrap();
-    assert!(console_body.contains("Uncertainty"));
-    assert!(console_body.contains(&frozen.checkpoint_hash));
-    assert!(console_body.contains(&frozen.evidence_hashes[0]));
-    assert!(console_body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(console_body.contains("Human Ratification"));
+    assert!(console_body.contains("id=\"review-submit\""));
+    assert!(!console_body.contains(&frozen.checkpoint_hash));
     assert!(!console_body.contains("<script>alert(1)</script>"));
-    assert!(console_body.contains("id=\"approve\""));
-    assert!(!console_body.contains("innerHTML"));
+
+    let script = app
+        .clone()
+        .oneshot(
+            Request::get("/ratification/console.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(script.status(), StatusCode::OK);
+    let script_body = script.into_body().collect().await.unwrap().to_bytes();
+    let script_body = std::str::from_utf8(&script_body).unwrap();
+    assert!(script_body.contains("textContent"));
+    assert!(!script_body.contains("innerHTML"));
 
     let unauthenticated = app
         .clone()
@@ -1841,6 +2671,10 @@ async fn authorized_durable_builder_does_not_use_the_standalone_ratification_led
         review_page.headers()[header::CACHE_CONTROL],
         "private, no-store"
     );
+    let etag0 = review_page.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_owned();
     let review_json: serde_json::Value =
         serde_json::from_slice(&review_page.into_body().collect().await.unwrap().to_bytes())
             .unwrap();
@@ -1848,14 +2682,20 @@ async fn authorized_durable_builder_does_not_use_the_standalone_ratification_led
         review_json["packet"]["uncertaintySummary"],
         frozen.uncertainty_summary
     );
+    assert_eq!(
+        review_json["packet"]["checkpointHash"],
+        frozen.checkpoint_hash
+    );
+    assert_eq!(
+        review_json["packet"]["evidenceHashes"][0],
+        frozen.evidence_hashes[0]
+    );
 
     let review_body = serde_json::json!({
-        "packetHash": frozen.packet_hash,
         "evidenceHashes": frozen.evidence_hashes,
         "artifactHashes": frozen.artifacts.iter().map(|item| item.digest.clone()).collect::<Vec<_>>(),
         "artifactManifestDigest": frozen.artifact_set_digest,
-        "uncertaintyAcknowledged": true,
-        "idempotencyKey": "wire-review-1"
+        "uncertaintyAcknowledged": true
     });
     let cross_origin = app
         .clone()
@@ -1864,16 +2704,29 @@ async fn authorized_durable_builder_does_not_use_the_standalone_ratification_led
                 .header(header::AUTHORIZATION, "Bearer ratifier-token")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ORIGIN, "https://attacker.example")
-                .header(
-                    header::IF_MATCH,
-                    format!("\"{}:0\"", frozen.checkpoint_hash),
-                )
+                .header(header::IF_MATCH, &etag0)
+                .header("idempotency-key", "wire-review-cross-origin")
                 .body(Body::from(review_body.to_string()))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+    let fresh_review_page = app
+        .clone()
+        .oneshot(
+            Request::get("/ratification/v1/tasks/task-27")
+                .header(header::AUTHORIZATION, "Bearer ratifier-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh_review_page.status(), StatusCode::OK);
+    let etag0 = fresh_review_page.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_owned();
     let reviewed = app
         .clone()
         .oneshot(
@@ -1881,16 +2734,18 @@ async fn authorized_durable_builder_does_not_use_the_standalone_ratification_led
                 .header(header::AUTHORIZATION, "Bearer ratifier-token")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ORIGIN, "http://127.0.0.1:1")
-                .header(
-                    header::IF_MATCH,
-                    format!("\"{}:0\"", frozen.checkpoint_hash),
-                )
+                .header(header::IF_MATCH, &etag0)
+                .header("idempotency-key", "wire-review-1")
                 .body(Body::from(review_body.to_string()))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(reviewed.status(), StatusCode::CREATED);
+    let etag1 = reviewed.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_owned();
     let first_review = reviewed.into_body().collect().await.unwrap().to_bytes();
     let review_replay = app
         .clone()
@@ -1899,16 +2754,15 @@ async fn authorized_durable_builder_does_not_use_the_standalone_ratification_led
                 .header(header::AUTHORIZATION, "Bearer ratifier-token")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ORIGIN, "http://127.0.0.1:1")
-                .header(
-                    header::IF_MATCH,
-                    format!("\"{}:0\"", frozen.checkpoint_hash),
-                )
+                .header(header::IF_MATCH, &etag0)
+                .header("idempotency-key", "wire-review-1")
                 .body(Body::from(review_body.to_string()))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(review_replay.status(), StatusCode::CREATED);
+    assert_eq!(review_replay.headers()[header::ETAG], etag1);
     assert_eq!(
         review_replay
             .into_body()
@@ -1925,21 +2779,9 @@ async fn authorized_durable_builder_does_not_use_the_standalone_ratification_led
                 .header(header::AUTHORIZATION, "Bearer ratifier-token")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ORIGIN, "http://127.0.0.1:1")
-                .header(
-                    header::IF_MATCH,
-                    format!("\"{}:0\"", frozen.checkpoint_hash),
-                )
-                .body(Body::from(
-                    serde_json::json!({
-                        "packetHash": frozen.packet_hash,
-                        "evidenceHashes": frozen.evidence_hashes,
-                        "artifactHashes": frozen.artifacts.iter().map(|item| item.digest.clone()).collect::<Vec<_>>(),
-                        "artifactManifestDigest": frozen.artifact_set_digest,
-                        "uncertaintyAcknowledged": true,
-                        "idempotencyKey": "wire-review-stale"
-                    })
-                    .to_string(),
-                ))
+                .header(header::IF_MATCH, &etag0)
+                .header("idempotency-key", "wire-review-stale")
+                .body(Body::from(review_body.to_string()))
                 .unwrap(),
         )
         .await
@@ -1951,15 +2793,12 @@ async fn authorized_durable_builder_does_not_use_the_standalone_ratification_led
                 .header(header::AUTHORIZATION, "Bearer ratifier-token")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ORIGIN, "http://127.0.0.1:1")
-                .header(
-                    header::IF_MATCH,
-                    format!("\"{}:1\"", frozen.checkpoint_hash),
-                )
+                .header(header::IF_MATCH, &etag1)
+                .header("idempotency-key", "wire-decision-1")
                 .body(Body::from(
                     serde_json::json!({
                         "decision":"approve",
-                        "rationale":"Reviewed exact evidence and artifacts.",
-                        "idempotencyKey":"wire-decision-1"
+                        "rationale":"Reviewed exact evidence and artifacts."
                     })
                     .to_string(),
                 ))
@@ -1968,10 +2807,15 @@ async fn authorized_durable_builder_does_not_use_the_standalone_ratification_led
         .await
         .unwrap();
     assert_eq!(decision.status(), StatusCode::CREATED);
-    let receipt: HumanRatificationReceipt =
+    let etag2 = decision.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let receipt: serde_json::Value =
         serde_json::from_slice(&decision.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(receipt.account_id, "ratifier");
-    assert_eq!(receipt.tenant_id, "tenant-a");
+    assert_eq!(receipt["revision"], 2);
+    assert_eq!(receipt["etag"], etag2);
+    assert_eq!(receipt["action"]["decision"], "approve");
     gateway.shutdown().await.unwrap();
 }
 
@@ -2072,6 +2916,63 @@ fn standalone_open_binds_key_and_rejects_malformed_schema() {
 }
 
 #[test]
+fn standalone_total_schema_deletion_with_ledger_markers_fails_integrity() {
+    let fixture = Fixture::new();
+    drop(RatificationLedger::open(&fixture.0, [0x83; 32]).unwrap());
+    let connection = rusqlite::Connection::open(&fixture.0).unwrap();
+    let application_id: i64 = connection
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .unwrap();
+    let user_version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let objects = {
+        let mut statement = connection
+            .prepare(
+                "SELECT type,name FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_%'
+                 ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'index' THEN 1
+                                    WHEN 'view' THEN 2 ELSE 3 END",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    for (kind, name) in objects {
+        connection
+            .execute_batch(&format!(
+                "DROP {} IF EXISTS \"{}\";",
+                kind.to_ascii_uppercase(),
+                name.replace('"', "\"\"")
+            ))
+            .unwrap();
+    }
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "application_id", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        application_id
+    );
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        user_version
+    );
+    drop(connection);
+
+    let Err(error) = RatificationLedger::open(&fixture.0, [0x83; 32]) else {
+        panic!("standalone ledger recreated a previously initialized deleted schema")
+    };
+    assert_eq!(error, RatificationError::Integrity);
+}
+
+#[test]
 fn standalone_generations_require_authenticated_contiguous_amendments_and_survive_restart() {
     let fixture = Fixture::new();
     let ledger = RatificationLedger::open(&fixture.0, [85; 32]).unwrap();
@@ -2106,6 +3007,19 @@ fn standalone_generations_require_authenticated_contiguous_amendments_and_surviv
     assert_eq!(
         ledger.packet("tenant-a", "task-27").unwrap(),
         Some(second.clone())
+    );
+    assert_eq!(
+        ledger
+            .packet_at_generation("tenant-a", "task-27", 1)
+            .unwrap(),
+        Some(first.clone())
+    );
+    assert_eq!(
+        ledger
+            .history_at_generation("tenant-a", "task-27", 1)
+            .unwrap()
+            .len(),
+        2
     );
     assert_eq!(ledger.history("tenant-a", "task-27").unwrap().len(), 1);
     drop(ledger);
@@ -3713,16 +4627,17 @@ async fn sqlite_cross_generation_ratification_idempotency_conflict_is_authentica
         )
         .await
         .unwrap();
-    store
+    let generation_one_amend = integrated_decision(
+        &first_packet,
+        &scope,
+        &task_id,
+        "generation-one-amend",
+        HumanDecision::Amend,
+    );
+    let first_amend_receipt = store
         .decide_ratification(
             &scope,
-            integrated_decision(
-                &first_packet,
-                &scope,
-                &task_id,
-                "generation-one-amend",
-                HumanDecision::Amend,
-            ),
+            generation_one_amend.clone(),
             integrated_audit(
                 &first_packet,
                 &scope,
@@ -3834,6 +4749,35 @@ async fn sqlite_cross_generation_ratification_idempotency_conflict_is_authentica
         .unwrap()
         .packet;
     assert_eq!(second_packet.generation, 2);
+    let first_view = store
+        .ratification_view_at_generation(&scope, &task_id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_view.packet, first_packet);
+    assert_eq!(first_view.state, smesh_a2a::RatificationState::Amended);
+    assert_eq!(first_view.history.len(), 2);
+    let audits_before_exact_replay = store.authorization_decision_count().await.unwrap();
+    let replayed_amend_receipt = store
+        .decide_ratification(
+            &scope,
+            generation_one_amend,
+            integrated_audit(
+                &first_packet,
+                &scope,
+                &task_id,
+                "generation-one-amend-replay-audit",
+                "ratificationDecide",
+                1_700_000_020_007,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed_amend_receipt, first_amend_receipt);
+    assert_eq!(
+        store.authorization_decision_count().await.unwrap(),
+        audits_before_exact_replay + 1
+    );
     let connection = rusqlite::Connection::open(&fixture.0).unwrap();
     let before = integrated_ratification_state(&connection);
     drop(connection);
@@ -3854,6 +4798,121 @@ async fn sqlite_cross_generation_ratification_idempotency_conflict_is_authentica
         .await
         .unwrap_err();
     assert_eq!(error.code, -32_621);
+    let connection = rusqlite::Connection::open(&fixture.0).unwrap();
+    assert_eq!(integrated_ratification_state(&connection), before);
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+         DROP TRIGGER ratification_events_no_delete;
+         DROP TRIGGER ratification_packets_no_delete;
+         DELETE FROM ratification_events WHERE generation=1;
+         DELETE FROM ratification_packets WHERE generation=1;
+         CREATE TRIGGER ratification_packets_no_delete BEFORE DELETE ON ratification_packets
+          BEGIN SELECT RAISE(ABORT,'ratification packet is durable'); END;
+         CREATE TRIGGER ratification_events_no_delete BEFORE DELETE ON ratification_events
+          BEGIN SELECT RAISE(ABORT,'ratification event is immutable'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    drop(store);
+    assert!(
+        SqliteTaskStore::open_with_ratification_key(
+            &fixture.0,
+            16,
+            zeroize::Zeroizing::new([0x52; 32]),
+            false,
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_missing_whole_ledger_anchor_after_ratification_fails_reopen() {
+    let (fixture, store, _task_id, _approved, _scope, _packet) =
+        integrated_ratification_fixture(304).await;
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.0).unwrap();
+    connection.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         DROP TRIGGER ratification_key_check_no_delete;
+         DROP TRIGGER ratification_ledger_anchor_no_delete;
+         DROP TRIGGER ratification_events_no_delete;
+         DROP TRIGGER ratification_packets_no_delete;
+         DELETE FROM ratification_events;
+         DELETE FROM ratification_packets;
+         DELETE FROM ratification_key_check;
+         DELETE FROM ratification_ledger_anchor;
+         CREATE TRIGGER ratification_key_check_no_delete BEFORE DELETE ON ratification_key_check
+          BEGIN SELECT RAISE(ABORT,'ratification key check is immutable'); END;
+         CREATE TRIGGER ratification_ledger_anchor_no_delete BEFORE DELETE ON ratification_ledger_anchor
+          BEGIN SELECT RAISE(ABORT,'ratification ledger anchor is durable'); END;
+         CREATE TRIGGER ratification_packets_no_delete BEFORE DELETE ON ratification_packets
+          BEGIN SELECT RAISE(ABORT,'ratification packet is durable'); END;
+         CREATE TRIGGER ratification_events_no_delete BEFORE DELETE ON ratification_events
+          BEGIN SELECT RAISE(ABORT,'ratification event is immutable'); END;"
+    ).unwrap();
+    drop(connection);
+    assert!(
+        SqliteTaskStore::open_with_ratification_key(
+            &fixture.0,
+            16,
+            zeroize::Zeroizing::new([0x52; 32]),
+            false,
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_live_reads_and_review_reject_privileged_whole_ledger_deletion_without_mutation() {
+    use smesh_a2a::RatificationAuthority as _;
+
+    let (fixture, store, task_id, _approved, scope, packet) =
+        integrated_ratification_fixture(305).await;
+    let connection = rusqlite::Connection::open(&fixture.0).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TRIGGER ratification_events_no_delete;
+             DROP TRIGGER ratification_packets_no_delete;
+             DELETE FROM ratification_events;
+             DELETE FROM ratification_packets;
+             CREATE TRIGGER ratification_packets_no_delete BEFORE DELETE ON ratification_packets
+              BEGIN SELECT RAISE(ABORT,'ratification packet is durable'); END;
+             CREATE TRIGGER ratification_events_no_delete BEFORE DELETE ON ratification_events
+              BEGIN SELECT RAISE(ABORT,'ratification event is immutable'); END;",
+        )
+        .unwrap();
+    let before = integrated_ratification_state(&connection);
+    drop(connection);
+
+    assert!(store.ratification_view(&scope, &task_id).await.is_err());
+    assert!(
+        store
+            .ratification_view_at_generation(&scope, &task_id, 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .acknowledge_ratification_review(
+                &scope,
+                integrated_review(&packet, &scope, &task_id, "deleted-ledger-review"),
+                integrated_audit(
+                    &packet,
+                    &scope,
+                    &task_id,
+                    "deleted-ledger-review-audit",
+                    "ratificationReview",
+                    1_700_000_020_003,
+                ),
+            )
+            .await
+            .is_err()
+    );
+
     let connection = rusqlite::Connection::open(&fixture.0).unwrap();
     assert_eq!(integrated_ratification_state(&connection), before);
 }
@@ -3913,6 +4972,84 @@ async fn sqlite_cancellation_and_continuation_close_active_ratification_packets(
             .unwrap()
             .state,
         RatificationState::Superseded
+    );
+}
+
+#[tokio::test]
+async fn sqlite_corruption_before_amendment_claim_returns_no_lease_or_receiver_effect() {
+    use smesh_a2a::RatificationAuthority as _;
+
+    let (fixture, store, task_id, _approved, scope, packet) =
+        integrated_ratification_fixture(27).await;
+    store
+        .acknowledge_ratification_review(
+            &scope,
+            integrated_review(&packet, &scope, &task_id, "claim-corruption-review"),
+            integrated_audit(
+                &packet,
+                &scope,
+                &task_id,
+                "claim-corruption-review-audit",
+                "ratificationReview",
+                1_700_000_020_003,
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .decide_ratification(
+            &scope,
+            integrated_decision(
+                &packet,
+                &scope,
+                &task_id,
+                "claim-corruption-amend",
+                HumanDecision::Amend,
+            ),
+            integrated_audit(
+                &packet,
+                &scope,
+                &task_id,
+                "claim-corruption-amend-audit",
+                "ratificationDecide",
+                1_700_000_020_004,
+            ),
+        )
+        .await
+        .unwrap();
+
+    let connection = rusqlite::Connection::open(&fixture.0).unwrap();
+    connection
+        .execute(
+            "UPDATE ratification_ledger_anchor SET packet_count=packet_count+1 WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+    let before: (String, i64, i64) = connection
+        .query_row(
+            "SELECT state,attempt_count,(SELECT count(*) FROM receiver_inbox)
+             FROM outbox WHERE task_id=?1 AND ratification_required=1",
+            [&task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(
+        store
+            .claim_outbox("corrupt-amend-worker".to_owned(), 1_700_000_020_005, 60_000)
+            .await
+            .is_err()
+    );
+    let after: (String, i64, i64) = connection
+        .query_row(
+            "SELECT state,attempt_count,(SELECT count(*) FROM receiver_inbox)
+             FROM outbox WHERE task_id=?1 AND ratification_required=1",
+            [&task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "claim failure must leave no lease or receiver effect"
     );
 }
 
@@ -3986,13 +5123,60 @@ async fn sqlite_ratification_reject_amend_race_restart_and_atomic_rollback() {
             expected_state
         );
         if expected_state == RatificationState::Amended {
+            let lease = store
+                .claim_outbox("amend-worker".to_owned(), 1_700_000_020_005, 60_000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(lease.ratification_required);
+            let before = store.atomic_record_counts().await.unwrap();
+            let still_private = store.get(&task_id).await.unwrap().unwrap();
+            let mut downgraded = lease.clone();
+            downgraded.ratification_required = false;
+            let mut forged_terminal = still_private.clone();
+            forged_terminal.status = a2a::TaskStatus {
+                state: a2a::TaskState::Completed,
+                message: Some(a2a::Message::new(
+                    a2a::Role::Agent,
+                    vec![a2a::Part::text("unratified amendment result")],
+                )),
+                timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_020_006),
+            };
+            let forged_transcript = [
+                a2a::StreamResponse::Task(still_private.clone()),
+                a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+                    task_id: forged_terminal.id.clone(),
+                    context_id: forged_terminal.context_id.clone(),
+                    status: forged_terminal.status.clone(),
+                    metadata: None,
+                }),
+            ];
             assert!(
                 store
-                    .claim_outbox("amend-worker".to_owned(), 1_700_000_020_005, 60_000)
+                    .commit_delivery(
+                        &downgraded,
+                        forged_terminal.clone(),
+                        a2a::SendMessageResponse::Task(forged_terminal),
+                        &forged_transcript,
+                        1_700_000_020_006,
+                    )
                     .await
-                    .unwrap()
-                    .is_some()
+                    .is_err(),
+                "cloning and downgrading a durable amendment lease must not enable generic commit"
             );
+            assert!(
+                store
+                    .commit_delivery(
+                        &lease,
+                        still_private.clone(),
+                        a2a::SendMessageResponse::Task(still_private),
+                        &[],
+                        1_700_000_020_006,
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.atomic_record_counts().await.unwrap(), before);
         }
         drop(store);
         let reopened = SqliteTaskStore::open_with_ratification_key(
@@ -4012,6 +5196,36 @@ async fn sqlite_ratification_reject_amend_race_restart_and_atomic_rollback() {
                 .state,
             expected_state
         );
+        if expected_state == RatificationState::Amended {
+            let reclaimed = reopened
+                .claim_outbox("amend-worker-restart".to_owned(), 1_700_000_080_006, 60_000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(reclaimed.ratification_required);
+            let mut downgraded = reclaimed.clone();
+            downgraded.ratification_required = false;
+            let connection = rusqlite::Connection::open(&fixture.0).unwrap();
+            connection
+                .execute(
+                    "UPDATE ratification_ledger_anchor SET packet_count=packet_count+1 WHERE singleton=1",
+                    [],
+                )
+                .unwrap();
+            assert!(
+                reopened
+                    .finish_outbox_attempt(
+                        &downgraded,
+                        smesh_a2a::AttemptDisposition::Permanent {
+                            error: "sabotaged amendment failure".to_owned(),
+                        },
+                        1_700_000_080_007,
+                    )
+                    .await
+                    .is_err(),
+                "downgrading the cloned lease must not bypass amendment anchor authentication"
+            );
+        }
     }
 
     let (_fixture, store, task_id, _approved, scope, packet) =
@@ -4474,41 +5688,164 @@ async fn sqlite_ratification_review_and_approval_publish_the_sealed_candidate() 
 }
 
 const RATIFICATION_BYTES_SQL: &str = "SELECT
- (SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB))+length(CAST(task_id AS BLOB))+length(CAST(checkpoint_hash AS BLOB))+length(CAST(packet_hash AS BLOB))+length(CAST(packet_seal AS BLOB))+length(CAST(packet_json AS BLOB))+length(CAST(approved_task_json AS BLOB))+length(CAST(approved_result_json AS BLOB))+length(CAST(approved_transcript_json AS BLOB))+length(CAST(state AS BLOB))+COALESCE(length(CAST(reviewer_account_id AS BLOB)),0)+COALESCE(length(CAST(head_receipt_hash AS BLOB)),0)),0) FROM ratification_packets)+
- (SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB))+length(CAST(task_id AS BLOB))+length(CAST(account_id AS BLOB))+length(CAST(action AS BLOB))+length(CAST(command_digest AS BLOB))+length(CAST(idempotency_key AS BLOB))+length(CAST(receipt_json AS BLOB))+length(CAST(receipt_hash AS BLOB))+length(CAST(receipt_seal AS BLOB))+COALESCE(length(CAST(previous_receipt_hash AS BLOB)),0)),0) FROM ratification_events)";
+ (SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB))+length(CAST(task_id AS BLOB))+length(CAST(checkpoint_hash AS BLOB))+length(CAST(packet_hash AS BLOB))+length(CAST(packet_seal AS BLOB))+length(CAST(packet_json AS BLOB))+length(CAST(approved_task_json AS BLOB))+length(CAST(approved_result_json AS BLOB))+length(CAST(approved_transcript_json AS BLOB))+length(CAST(state AS BLOB))+COALESCE(length(CAST(reviewer_account_id AS BLOB)),0)+COALESCE(length(CAST(head_receipt_hash AS BLOB)),0)+40),0) FROM ratification_packets)+
+ (SELECT COALESCE(SUM(length(CAST(tenant_scope AS BLOB))+length(CAST(task_id AS BLOB))+length(CAST(account_id AS BLOB))+length(CAST(action AS BLOB))+length(CAST(command_digest AS BLOB))+length(CAST(idempotency_key AS BLOB))+length(CAST(receipt_json AS BLOB))+length(CAST(receipt_hash AS BLOB))+length(CAST(receipt_seal AS BLOB))+COALESCE(length(CAST(previous_receipt_hash AS BLOB)),0)+24),0) FROM ratification_events)";
 
-fn pad_integrated_ratification_to_limit(path: &std::path::Path) {
+fn ratification_test_mac(domain: &[u8], payload: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(&[0x52; 32]).unwrap();
+    mac.update(domain);
+    mac.update(payload);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RatificationPacketStatement<'a> {
+    input: &'a ReviewPacketInput,
+    revision: u64,
+}
+
+fn reseal_ratification_test_packet(packet: &mut smesh_a2a::ReviewPacket) {
+    let statement = RatificationPacketStatement {
+        input: &packet.input,
+        revision: packet.revision,
+    };
+    packet.packet_hash = smesh_a2a::content_digest(&serde_json::to_vec(&statement).unwrap());
+    packet.seal = ratification_test_mac(
+        b"smesh-human-ratification-packet/v1\0",
+        packet.packet_hash.as_bytes(),
+    );
+}
+
+fn reseal_integrated_ratification_anchor(db: &rusqlite::Connection) {
+    let retained_bytes: i64 = db
+        .query_row(RATIFICATION_BYTES_SQL, [], |row| row.get(0))
+        .unwrap();
+    let mut canonical = Vec::new();
+    let mut packet_count = 0_i64;
+    for query in [
+        "SELECT json_array(tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,packet_seal,packet_json,approved_task_json,approved_result_json,approved_transcript_json,state,revision,reviewer_account_id,head_receipt_hash,created_at,updated_at) FROM ratification_packets ORDER BY tenant_scope,task_id,generation",
+        "SELECT json_array(tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at) FROM ratification_events ORDER BY tenant_scope,task_id,generation,revision",
+    ] {
+        let mut statement = db.prepare(query).unwrap();
+        for row in statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+        {
+            let encoded = row.unwrap();
+            canonical.extend_from_slice(&u64::try_from(encoded.len()).unwrap().to_be_bytes());
+            canonical.extend_from_slice(encoded.as_bytes());
+            if query.contains("ratification_packets") {
+                packet_count += 1;
+            }
+        }
+    }
+    let event_count: i64 = db
+        .query_row("SELECT count(*) FROM ratification_events", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    canonical.extend_from_slice(&packet_count.to_be_bytes());
+    canonical.extend_from_slice(&event_count.to_be_bytes());
+    canonical.extend_from_slice(&retained_bytes.to_be_bytes());
+    let state_hash = smesh_a2a::content_digest(&canonical);
+    let key_generation = smesh_a2a::content_digest(&[0x52; 32]);
+    let payload =
+        format!("{key_generation}:{packet_count}:{event_count}:{retained_bytes}:{state_hash}");
+    let state_seal = ratification_test_mac(
+        b"smesh-integrated-ratification-ledger-anchor/v1\0",
+        payload.as_bytes(),
+    );
+    db.execute(
+        "UPDATE ratification_ledger_anchor SET packet_count=?1,event_count=?2,retained_bytes=?3,state_hash=?4,state_seal=?5 WHERE singleton=1",
+        rusqlite::params![packet_count,event_count,retained_bytes,state_hash,state_seal],
+    )
+    .unwrap();
+}
+
+fn pad_integrated_ratification_to_limit(path: &std::path::Path, limit: i64) {
     let mut db = rusqlite::Connection::open(path).unwrap();
     db.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
-    let (tenant, task): (String, String) = db
+    let (source_packet_json, source_approved_task_json): (String, String) = db
         .query_row(
-            "SELECT tenant_scope,task_id FROM tasks LIMIT 1",
+            "SELECT packet_json,approved_task_json FROM ratification_packets WHERE generation=1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    db.execute(
-        "INSERT INTO ratification_packets(tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,packet_seal,packet_json,approved_task_json,approved_result_json,approved_transcript_json,state,revision,created_at,updated_at)
-         VALUES(?1,?2,2,1,?3,?4,'','{}','{}','{}','[]','canceled',0,1,1)",
-        rusqlite::params![
-            tenant,
-            task,
-            format!("sha256:{}", "1".repeat(64)),
-            format!("sha256:{}", "2".repeat(64))
-        ],
-    )
-    .unwrap();
+    let source_packet: smesh_a2a::ReviewPacket = serde_json::from_str(&source_packet_json).unwrap();
+    let source_task: serde_json::Value = serde_json::from_str(&source_approved_task_json).unwrap();
+    let mut clone_index = 0_u64;
+    loop {
+        let current: i64 = db
+            .query_row(RATIFICATION_BYTES_SQL, [], |row| row.get(0))
+            .unwrap();
+        if limit - current <= 900_000 {
+            break;
+        }
+        clone_index += 1;
+        let clone_task_id = format!("capacity-padding-{clone_index}");
+        let mut approved_task = source_task.clone();
+        approved_task["id"] = serde_json::Value::String(clone_task_id.clone());
+        approved_task["metadata"] = serde_json::json!({"capacityPadding": "x".repeat(800_000)});
+        let approved_task_json = serde_json::to_string(&approved_task).unwrap();
+        assert!(approved_task_json.len() <= 1024 * 1024);
+        let mut packet = source_packet.clone();
+        packet.input.task_id.clone_from(&clone_task_id);
+        packet.input.approved_task_digest =
+            smesh_a2a::content_digest(approved_task_json.as_bytes());
+        reseal_ratification_test_packet(&mut packet);
+        db.execute(
+            "INSERT INTO tasks(task_id,context_id,state,status_timestamp,revision,task_json,tenant_scope,owner_account_id,principal_scope,authentication_method)
+             SELECT ?1,context_id,state,status_timestamp,revision,task_json,tenant_scope,owner_account_id,principal_scope,authentication_method
+             FROM tasks ORDER BY created_order LIMIT 1",
+            [&clone_task_id],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO ratification_packets(tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,packet_seal,packet_json,approved_task_json,approved_result_json,approved_transcript_json,state,revision,reviewer_account_id,head_receipt_hash,created_at,updated_at)
+             SELECT tenant_scope,?1,1,task_revision,checkpoint_hash,?2,?3,?4,?5,approved_result_json,approved_transcript_json,state,revision,reviewer_account_id,head_receipt_hash,created_at,updated_at
+             FROM ratification_packets WHERE generation=1 ORDER BY task_id LIMIT 1",
+            rusqlite::params![
+                clone_task_id,
+                packet.packet_hash,
+                packet.seal,
+                serde_json::to_string(&packet).unwrap(),
+                approved_task_json
+            ],
+        )
+        .unwrap();
+    }
     let current: i64 = db
         .query_row(RATIFICATION_BYTES_SQL, [], |row| row.get(0))
         .unwrap();
-    let padding = usize::try_from(64_i64 * 1024 * 1024 - current).unwrap();
+    let padding = usize::try_from(limit - current).unwrap();
     assert!(padding > 0);
+    let (packet_json, mut approved_result_json): (String, String) = db
+        .query_row(
+            "SELECT packet_json,approved_result_json FROM ratification_packets WHERE task_id='capacity-padding-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    approved_result_json.push_str(&" ".repeat(padding));
+
+    let mut packet: smesh_a2a::ReviewPacket = serde_json::from_str(&packet_json).unwrap();
+    packet.input.approved_result_digest =
+        smesh_a2a::content_digest(approved_result_json.as_bytes());
+    reseal_ratification_test_packet(&mut packet);
     let tx = db.transaction().unwrap();
     tx.execute_batch("DROP TRIGGER ratification_packets_identity_immutable;")
         .unwrap();
     tx.execute(
-        "UPDATE ratification_packets SET packet_seal=?1 WHERE generation=2",
-        ["x".repeat(padding)],
+        "UPDATE ratification_packets SET packet_hash=?1,packet_seal=?2,packet_json=?3,approved_result_json=?4 WHERE task_id=?5 AND generation=1",
+        rusqlite::params![
+            packet.packet_hash,
+            packet.seal,
+            serde_json::to_string(&packet).unwrap(),
+            approved_result_json,
+            "capacity-padding-1"
+        ],
     )
     .unwrap();
     tx.execute_batch(
@@ -4517,10 +5854,11 @@ fn pad_integrated_ratification_to_limit(path: &std::path::Path) {
     )
     .unwrap();
     tx.commit().unwrap();
+    reseal_integrated_ratification_anchor(&db);
     assert_eq!(
         db.query_row::<i64, _, _>(RATIFICATION_BYTES_SQL, [], |row| row.get(0))
             .unwrap(),
-        64_i64 * 1024 * 1024
+        limit
     );
 }
 
@@ -4529,7 +5867,7 @@ async fn sqlite_review_capacity_denial_rolls_back_event_packet_and_audit() {
     use smesh_a2a::RatificationAuthority as _;
     let (fixture, store, task_id, _approved, scope, packet) =
         integrated_ratification_fixture(80).await;
-    pad_integrated_ratification_to_limit(&fixture.0);
+    pad_integrated_ratification_to_limit(&fixture.0, 64_i64 * 1024 * 1024);
     let result = store
         .acknowledge_ratification_review(
             &scope,
@@ -4563,10 +5901,46 @@ async fn sqlite_review_capacity_denial_rolls_back_event_packet_and_audit() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn sqlite_decision_capacity_denial_rolls_back_every_effect() {
     use smesh_a2a::RatificationAuthority as _;
+    let (probe_fixture, probe_store, probe_task_id, _approved, probe_scope, probe_packet) =
+        integrated_ratification_fixture(83).await;
+    let before_review: i64 = rusqlite::Connection::open(&probe_fixture.0)
+        .unwrap()
+        .query_row(RATIFICATION_BYTES_SQL, [], |row| row.get(0))
+        .unwrap();
+    probe_store
+        .acknowledge_ratification_review(
+            &probe_scope,
+            integrated_review(
+                &probe_packet,
+                &probe_scope,
+                &probe_task_id,
+                "capacity-decision-review",
+            ),
+            integrated_audit(
+                &probe_packet,
+                &probe_scope,
+                &probe_task_id,
+                "capacity-decision-review-audit",
+                "ratificationReview",
+                1_700_000_020_003,
+            ),
+        )
+        .await
+        .unwrap();
+    let after_review: i64 = rusqlite::Connection::open(&probe_fixture.0)
+        .unwrap()
+        .query_row(RATIFICATION_BYTES_SQL, [], |row| row.get(0))
+        .unwrap();
+    let review_bytes = after_review - before_review;
+    drop(probe_store);
+    drop(probe_fixture);
+
     let (fixture, store, task_id, _approved, scope, packet) =
         integrated_ratification_fixture(81).await;
+    pad_integrated_ratification_to_limit(&fixture.0, 64_i64 * 1024 * 1024 - review_bytes);
     store
         .acknowledge_ratification_review(
             &scope,
@@ -4582,7 +5956,13 @@ async fn sqlite_decision_capacity_denial_rolls_back_every_effect() {
         )
         .await
         .unwrap();
-    pad_integrated_ratification_to_limit(&fixture.0);
+    assert_eq!(
+        rusqlite::Connection::open(&fixture.0)
+            .unwrap()
+            .query_row::<i64, _, _>(RATIFICATION_BYTES_SQL, [], |row| row.get(0))
+            .unwrap(),
+        64_i64 * 1024 * 1024
+    );
     let before = store.atomic_record_counts().await.unwrap();
     let result = store
         .decide_ratification(

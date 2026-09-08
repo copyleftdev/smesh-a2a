@@ -365,9 +365,10 @@ impl DurableLoopbackEndpoint {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
     #[must_use]
-    pub(crate) fn with_interruption_events_for_test(
+    pub fn with_interruption_events_for_test(
         text: impl Into<String>,
         kind: DurableInterruptionKind,
         message: impl Into<String>,

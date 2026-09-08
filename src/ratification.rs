@@ -1292,6 +1292,15 @@ impl RatificationLedger {
             )
             .map_err(|_| RatificationError::Unavailable)?;
         if object_count == 0 {
+            let application_id: i64 = connection
+                .pragma_query_value(None, "application_id", |row| row.get(0))
+                .map_err(|_| RatificationError::Integrity)?;
+            let user_version: i64 = connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .map_err(|_| RatificationError::Integrity)?;
+            if application_id != 0 || user_version != 0 {
+                return Err(RatificationError::Integrity);
+            }
             initialize_ledger_schema(&connection, &key)?;
         }
         validate_ledger_schema(&connection)?;
@@ -1456,6 +1465,46 @@ impl RatificationLedger {
             .transpose()
     }
 
+    /// Read and authenticate one tenant-scoped frozen packet generation.
+    ///
+    /// # Errors
+    /// Returns a validation, integrity, or storage error.
+    pub fn packet_at_generation(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+        generation: u64,
+    ) -> Result<Option<ReviewPacket>, RatificationError> {
+        validate_id(tenant_id)?;
+        validate_id(task_id)?;
+        if generation == 0 {
+            return Err(RatificationError::InvalidInput);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RatificationError::Unavailable)?;
+        authenticate_all_connection(&connection, self.key.as_ref())?;
+        connection
+            .query_row(
+                "SELECT 1 FROM ratification_packets WHERE tenant_id=?1 AND task_id=?2 AND generation=?3",
+                params![tenant_id, task_id, generation],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| RatificationError::Integrity)?
+            .map(|()| {
+                authenticate_packet_connection(
+                    &connection,
+                    self.key.as_ref(),
+                    tenant_id,
+                    task_id,
+                    generation,
+                )
+            })
+            .transpose()
+    }
+
     /// Append an acknowledgement only when every frozen evidence and artifact hash is named.
     ///
     /// # Errors
@@ -1603,6 +1652,33 @@ impl RatificationLedger {
             task_id,
             generation,
         )?;
+        authenticate_history_connection(
+            &connection,
+            self.key.as_ref(),
+            tenant_id,
+            task_id,
+            generation,
+            &packet,
+        )
+    }
+
+    /// Return and authenticate the event history for one packet generation.
+    ///
+    /// # Errors
+    /// Returns a validation, integrity, or storage error.
+    pub fn history_at_generation(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+        generation: u64,
+    ) -> Result<Vec<HumanRatificationReceipt>, RatificationError> {
+        let Some(packet) = self.packet_at_generation(tenant_id, task_id, generation)? else {
+            return Ok(Vec::new());
+        };
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RatificationError::Unavailable)?;
         authenticate_history_connection(
             &connection,
             self.key.as_ref(),

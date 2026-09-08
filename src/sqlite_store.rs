@@ -30,7 +30,8 @@ use crate::{
     canonical_send_message_digest_v2, content_digest, durable_authority::valid_bounded_identity,
 };
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
+const V10_SCHEMA_VERSION: i64 = 10;
 const V9_SCHEMA_VERSION: i64 = 9;
 const V8_SCHEMA_VERSION: i64 = 8;
 const V7_SCHEMA_VERSION: i64 = 7;
@@ -68,7 +69,7 @@ const RATIFICATION_ACCOUNTING_SELECT_SQL: &str = "SELECT
           length(CAST(approved_task_json AS BLOB)) + length(CAST(approved_result_json AS BLOB)) +
           length(CAST(approved_transcript_json AS BLOB)) + length(CAST(state AS BLOB)) +
           COALESCE(length(CAST(reviewer_account_id AS BLOB)), 0) +
-          COALESCE(length(CAST(head_receipt_hash AS BLOB)), 0)), 0)
+          COALESCE(length(CAST(head_receipt_hash AS BLOB)), 0) + 40), 0)
         FROM ratification_packets) +
        (SELECT COALESCE(SUM(
           length(CAST(tenant_scope AS BLOB)) + length(CAST(task_id AS BLOB)) +
@@ -76,7 +77,7 @@ const RATIFICATION_ACCOUNTING_SELECT_SQL: &str = "SELECT
           length(CAST(command_digest AS BLOB)) + length(CAST(idempotency_key AS BLOB)) +
           length(CAST(receipt_json AS BLOB)) + length(CAST(receipt_hash AS BLOB)) +
           length(CAST(receipt_seal AS BLOB)) +
-          COALESCE(length(CAST(previous_receipt_hash AS BLOB)), 0)), 0)
+          COALESCE(length(CAST(previous_receipt_hash AS BLOB)), 0) + 24), 0)
         FROM ratification_events)";
 const PAGE_TOKEN_VERSION: i64 = 1;
 const PAGE_TOKEN_KEY_GENERATION: i64 = 1;
@@ -313,6 +314,22 @@ CREATE TRIGGER ratification_events_no_update BEFORE UPDATE ON ratification_event
  BEGIN SELECT RAISE(ABORT,'ratification event is immutable'); END;
 CREATE TRIGGER ratification_events_no_delete BEFORE DELETE ON ratification_events
  BEGIN SELECT RAISE(ABORT,'ratification event is immutable'); END;";
+
+const RATIFICATION_ANCHOR_SCHEMA_SQL: &str = "CREATE TABLE ratification_ledger_anchor (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL CHECK(version=1),
+ key_generation TEXT NOT NULL CHECK(length(CAST(key_generation AS BLOB))=71),
+ packet_count INTEGER NOT NULL CHECK(packet_count>=0), event_count INTEGER NOT NULL CHECK(event_count>=0),
+ retained_bytes INTEGER NOT NULL CHECK(retained_bytes>=0), state_hash TEXT NOT NULL, state_seal TEXT NOT NULL
+) STRICT;
+CREATE TRIGGER ratification_ledger_anchor_identity BEFORE UPDATE ON ratification_ledger_anchor
+ WHEN NEW.singleton<>OLD.singleton OR NEW.version<>OLD.version OR NEW.key_generation<>OLD.key_generation
+ BEGIN SELECT RAISE(ABORT,'ratification ledger anchor identity is immutable'); END;
+CREATE TRIGGER ratification_ledger_anchor_no_delete BEFORE DELETE ON ratification_ledger_anchor
+ BEGIN SELECT RAISE(ABORT,'ratification ledger anchor is durable'); END;";
+const RATIFICATION_OUTBOX_FENCE_SQL: &str = "ALTER TABLE outbox ADD COLUMN ratification_required INTEGER NOT NULL DEFAULT 0 CHECK(ratification_required IN (0,1));
+CREATE TRIGGER outbox_ratification_fence_immutable BEFORE UPDATE OF ratification_required ON outbox
+ WHEN NEW.ratification_required IS NOT OLD.ratification_required
+ BEGIN SELECT RAISE(ABORT,'outbox ratification fence is immutable'); END;";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyTenantBinding {
@@ -1946,10 +1963,12 @@ impl SqliteTaskStore {
         let invocation_kind =
             (identity_version == 2).then_some(if streaming { "streaming" } else { "unary" });
         let input_limits = command.input_limits;
+        let ratification_key = self.ratification_key.clone();
         self.run(move |connection| {
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("continuation transaction failed"))?;
+            ensure_integrated_ratification_integrity_if_enabled(&tx, &ratification_key)?;
             let existing: Option<(String, String, Option<String>)> = tx
                 .query_row(
                     "SELECT request_digest, admission_result_json, final_result_json
@@ -2027,11 +2046,14 @@ impl SqliteTaskStore {
                     task.status.timestamp.map(|value| value.to_rfc3339()), next_revision,
                     task_json, revision, state, tenant_scope],
             ).map_err(|_| A2AError::internal("continuation task update failed"))?;
-            tx.execute(
+            let superseded = tx.execute(
                 "UPDATE ratification_packets SET state='superseded',updated_at=?3
                  WHERE tenant_scope=?1 AND task_id=?2 AND state IN ('awaiting_review','reviewed')",
                 params![tenant_scope, task.id, now],
             ).map_err(|_| A2AError::internal("continuation ratification supersede failed"))?;
+            if superseded > 0 {
+                write_integrated_ratification_anchor(&tx, &ratification_key)?;
+            }
             let event_seq: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(event_seq), 0) + 1 FROM task_events
                  WHERE tenant_scope = ?1 AND task_id = ?2",
@@ -2116,6 +2138,7 @@ impl SqliteTaskStore {
         lease_duration: i64,
     ) -> Result<Option<OutboxLease>, A2AError> {
         let lease_owner = lease_owner.into();
+        let ratification_key = self.ratification_key.clone();
         if lease_owner.is_empty()
             || lease_owner.len() > MAX_ATOMIC_TEXT_BYTES
             || lease_duration <= 0
@@ -2128,10 +2151,10 @@ impl SqliteTaskStore {
                 .map_err(|_| A2AError::internal("outbox claim transaction failed"))?;
             validate_atomic_records(&transaction)
                 .map_err(|_| A2AError::internal("durable outbox binding is corrupt"))?;
-            let expired_final: Option<(i64, String, String, String, i64, i64, String, String)> = transaction
+            let expired_final: Option<(i64, String, String, String, i64, i64, String, String, bool)> = transaction
                 .query_row(
                     "SELECT outbox_id, tenant_scope, dispatch_id, task_id, attempt_count, max_attempts,
-                            payload_json, payload_digest
+                            payload_json, payload_digest, ratification_required
                      FROM outbox
                      WHERE state = 'leased' AND lease_until <= ?1
                        AND (attempt_count >= max_attempts OR EXISTS (
@@ -2153,12 +2176,16 @@ impl SqliteTaskStore {
                             row.get(5)?,
                             row.get(6)?,
                             row.get(7)?,
+                            row.get(8)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(|_| A2AError::internal("expired final attempt lookup failed"))?;
-            if let Some((outbox_id, tenant_scope, dispatch_id, task_id, attempt_no, max_attempts, payload, payload_digest)) = expired_final {
+            if let Some((outbox_id, tenant_scope, dispatch_id, task_id, attempt_no, max_attempts, payload, payload_digest, ratification_required)) = expired_final {
+                if ratification_required {
+                    ensure_integrated_ratification_integrity(&transaction, &ratification_key)?;
+                }
                 let receiver: Option<(String, String, Option<i64>)> = transaction
                     .query_row(
                         "SELECT payload_digest, state, lease_until FROM receiver_inbox
@@ -2227,6 +2254,7 @@ impl SqliteTaskStore {
                         lease_token,
                         lease_until,
                         request,
+                        ratification_required,
                         execution_reservation: None,
                     }));
                 }
@@ -2262,9 +2290,9 @@ impl SqliteTaskStore {
                     .map_err(|_| A2AError::internal("expired final attempt commit failed"))?;
                 return Ok(None);
             }
-            let row: Option<(i64, String, String, String, i64, i64, String)> = transaction
+            let row: Option<(i64, String, String, String, i64, i64, String, bool)> = transaction
                 .query_row(
-                    "SELECT outbox_id, tenant_scope, dispatch_id, task_id, attempt_count, max_attempts, payload_json
+                    "SELECT outbox_id, tenant_scope, dispatch_id, task_id, attempt_count, max_attempts, payload_json, ratification_required
                      FROM outbox
                      WHERE ((state = 'pending' AND available_at <= ?1)
                          OR (state = 'leased' AND lease_until <= ?1))
@@ -2280,14 +2308,18 @@ impl SqliteTaskStore {
                             row.get(4)?,
                             row.get(5)?,
                             row.get(6)?,
+                            row.get(7)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(|_| A2AError::internal("outbox claim lookup failed"))?;
-            let Some((outbox_id, tenant_scope, dispatch_id, task_id, attempts, max_attempts, payload)) = row else {
+            let Some((outbox_id, tenant_scope, dispatch_id, task_id, attempts, max_attempts, payload, ratification_required)) = row else {
                 return Ok(None);
             };
+            if ratification_required {
+                ensure_integrated_ratification_integrity(&transaction, &ratification_key)?;
+            }
             let attempt_no = attempts
                 .checked_add(1)
                 .ok_or_else(|| A2AError::internal("outbox attempt counter exhausted"))?;
@@ -2346,6 +2378,7 @@ impl SqliteTaskStore {
                 lease_token,
                 lease_until,
                 request,
+                ratification_required,
                 execution_reservation: None,
             }))
         })
@@ -2415,14 +2448,15 @@ impl SqliteTaskStore {
         now: i64,
     ) -> Result<TransitionOutcome, A2AError> {
         let lease = lease.clone();
+        let ratification_key = self.ratification_key.clone();
         self.run(move |connection| {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("outbox finish transaction failed"))?;
-            let durable: Option<(i64, i64, String, i64, String, String)> = transaction
+            let durable: Option<(i64, i64, String, i64, String, String, bool)> = transaction
                 .query_row(
                     "SELECT attempt_count, max_attempts, lease_owner, lease_until, task_id,
-                            payload_digest FROM outbox
+                            payload_digest, ratification_required FROM outbox
                      WHERE outbox_id = ?1 AND state = 'leased' AND lease_token = ?2
                        AND tenant_scope = ?3 AND dispatch_id = ?4 AND task_id = ?5",
                     params![
@@ -2440,13 +2474,21 @@ impl SqliteTaskStore {
                             row.get(3)?,
                             row.get(4)?,
                             row.get(5)?,
+                            row.get(6)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(|_| A2AError::internal("outbox fence lookup failed"))?;
-            let Some((attempt_no, max_attempts, owner, lease_until, task_id, payload_digest)) =
-                durable
+            let Some((
+                attempt_no,
+                max_attempts,
+                owner,
+                lease_until,
+                task_id,
+                payload_digest,
+                ratification_required,
+            )) = durable
             else {
                 return Ok(TransitionOutcome::Stale);
             };
@@ -2458,6 +2500,9 @@ impl SqliteTaskStore {
                 || lease_until <= now
             {
                 return Ok(TransitionOutcome::Stale);
+            }
+            if ratification_required {
+                ensure_integrated_ratification_integrity(&transaction, &ratification_key)?;
             }
             let cancellation_won: bool = transaction
                 .query_row(
@@ -2862,10 +2907,12 @@ impl SqliteTaskStore {
         let owner_account_id = scope.owner_account_id;
         let own_only = scope.visibility == crate::authorization::VisibilityScope::Own;
         let task_id = task_id.to_owned();
+        let ratification_key = self.ratification_key.clone();
         self.run(move |connection| {
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("cancellation transaction failed"))?;
+            ensure_integrated_ratification_integrity_if_enabled(&tx, &ratification_key)?;
             let row: Option<(String, i64, String, String, String)> = tx.query_row(
                 "SELECT task.task_json, task.revision, identity.message_id,
                         outbox.dispatch_id, outbox.state
@@ -2936,11 +2983,14 @@ impl SqliteTaskStore {
                     next_revision, canceled_json, revision, tenant_scope],
             ).map_err(|_| A2AError::internal("cancellation task commit failed"))?;
             if changed != 1 { return Err(A2AError::task_not_cancelable(&task_id)); }
-            tx.execute(
+            let canceled_packet = tx.execute(
                 "UPDATE ratification_packets SET state='canceled',updated_at=?3
                  WHERE tenant_scope=?1 AND task_id=?2 AND state IN ('awaiting_review','reviewed')",
                 params![tenant_scope, task_id, now],
             ).map_err(|_| A2AError::internal("cancellation ratification close failed"))?;
+            if canceled_packet > 0 {
+                write_integrated_ratification_anchor(&tx, &ratification_key)?;
+            }
             let event_seq: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(event_seq), 0) + 1 FROM task_events
                  WHERE tenant_scope = ?1 AND task_id = ?2",
@@ -3381,6 +3431,7 @@ impl SqliteTaskStore {
         lease_duration: i64,
     ) -> Result<ReceiverAdmission, A2AError> {
         let lease_owner = lease_owner.to_owned();
+        let ratification_key = self.ratification_key.clone();
         let payload_json = serde_json::to_string(&envelope.request)
             .map_err(|_| A2AError::internal("failed to encode receiver payload"))?;
         if !valid_bounded_identity(&envelope.tenant_scope)
@@ -3403,9 +3454,9 @@ impl SqliteTaskStore {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("receiver admission transaction failed"))?;
             let tenant_scope = envelope.tenant_scope.clone();
-            let owned_outbox: Option<(i64, String)> = tx
+            let owned_outbox: Option<(i64, String, bool)> = tx
                 .query_row(
-                    "SELECT attempt_count, lease_token FROM outbox WHERE tenant_scope=?1 AND dispatch_id=?2
+                    "SELECT attempt_count, lease_token, ratification_required FROM outbox WHERE tenant_scope=?1 AND dispatch_id=?2
                  AND task_id=?3 AND payload_digest=?4 AND state='leased' AND lease_token IS NOT NULL",
                     params![
                         tenant_scope,
@@ -3413,15 +3464,18 @@ impl SqliteTaskStore {
                         envelope.request.task_id,
                         envelope.payload_digest
                     ],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .map_err(|_| A2AError::internal("receiver outbox ownership lookup failed"))?;
-            let Some((sender_attempt, sender_token)) = owned_outbox else {
+            let Some((sender_attempt, sender_token, ratification_required)) = owned_outbox else {
                 return Err(A2AError::invalid_params(
                     "invalid durable receiver envelope",
                 ));
             };
+            if ratification_required {
+                ensure_integrated_ratification_integrity(&tx, &ratification_key)?;
+            }
             #[allow(clippy::type_complexity)]
             let existing: Option<(
                 String,
@@ -3880,18 +3934,24 @@ impl SqliteTaskStore {
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("durable delivery transaction failed"))?;
-            let causative: Option<i64> = tx.query_row(
-                "SELECT causative_revision FROM outbox WHERE outbox_id = ?1 AND dispatch_id = ?2
+            let causative: Option<(i64, bool)> = tx.query_row(
+                "SELECT causative_revision, ratification_required FROM outbox WHERE outbox_id = ?1 AND dispatch_id = ?2
                      AND task_id = ?3 AND state = 'leased' AND lease_owner = ?4
                      AND lease_token = ?5 AND attempt_count = ?6 AND lease_until = ?7
                      AND lease_until > ?8 AND tenant_scope = ?9",
                 params![lease.outbox_id, lease.dispatch_id, lease.task_id, lease.lease_owner,
                     lease.lease_token, lease.attempt_no, lease.lease_until, now, lease.tenant_scope],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             ).optional().map_err(|_| A2AError::internal("durable delivery fence lookup failed"))?;
-            let Some(revision) = causative else {
+            let Some((revision, ratification_required)) = causative else {
                 return Ok(TransitionOutcome::Stale);
             };
+            if ratification_required && ratification.is_none() {
+                return Err(A2AError::invalid_agent_response());
+            }
+            if ratification_required {
+                ensure_integrated_ratification_integrity(&tx, &ratification_key)?;
+            }
             let (current, previous_state): (i64, String) = tx
                 .query_row(
                     "SELECT revision, state FROM tasks WHERE tenant_scope = ?1 AND task_id = ?2",
@@ -4073,13 +4133,12 @@ impl SqliteTaskStore {
                         },
                     )
                     .map_err(|_| A2AError::internal("ratification authority binding lookup failed"))?;
-                let generation: i64 = tx
-                    .query_row(
-                        "SELECT COALESCE(MAX(generation),0)+1 FROM ratification_packets WHERE tenant_scope=?1 AND task_id=?2",
-                        params![lease.tenant_scope, lease.task_id],
-                        |row| row.get(0),
-                    )
-                    .map_err(|_| A2AError::internal("ratification generation lookup failed"))?;
+                let generation = next_authenticated_ratification_generation(
+                    &tx,
+                    &lease.tenant_scope,
+                    &lease.task_id,
+                    &ratification_key,
+                )?;
                 pending.packet_input.generation = u64::try_from(generation)
                     .map_err(|_| A2AError::internal("ratification generation corrupt"))?;
                 pending.packet_input.task_revision = u64::try_from(next_revision)
@@ -4116,6 +4175,7 @@ impl SqliteTaskStore {
                         pending.approved_transcript_json, now
                     ],
                 ).map_err(|_| A2AError::internal("ratification packet commit failed"))?;
+                write_integrated_ratification_anchor(&tx, &ratification_key)?;
             }
             ensure_atomic_capacity(&tx)?;
             ensure_stream_capacity(&tx)?;
@@ -4149,7 +4209,7 @@ impl SqliteTaskStore {
             VisibilityScope::Tenant,
         )?;
         Ok(self
-            .ratification_view_inner(&scope, task_id)
+            .ratification_view_inner(&scope, task_id, None)
             .await?
             .map(|view| view.packet))
     }
@@ -4158,23 +4218,27 @@ impl SqliteTaskStore {
         &self,
         scope: &OwnedTaskScope,
         task_id: &str,
+        generation: Option<u64>,
     ) -> Result<Option<crate::RatificationView>, A2AError> {
         let tenant = scope.tenant_scope.clone();
         let owner = scope.owner_account_id.clone();
         let own = scope.visibility == VisibilityScope::Own;
         let task_id = task_id.to_owned();
         let key = self.ratification_key.clone();
+        let latest = generation.is_none();
         self.run(move |connection| {
+            ensure_integrated_ratification_integrity(connection, &key)?;
             let task_exists: bool = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM tasks WHERE tenant_scope=?1 AND task_id=?2 AND (?3=0 OR owner_account_id=?4))",
                 params![tenant, task_id, i64::from(own), owner], |row| row.get(0),
             ).map_err(|_| A2AError::internal("ratification task lookup failed"))?;
             if !task_exists { return Ok(None); }
-            let row=connection.query_row("SELECT p.tenant_scope,p.task_id,p.generation,p.task_revision,p.checkpoint_hash,p.packet_hash,p.packet_seal,p.packet_json,p.state,p.revision,p.reviewer_account_id,p.head_receipt_hash,p.approved_task_json,p.approved_result_json,p.approved_transcript_json,t.state,t.revision,t.task_json FROM ratification_packets p JOIN tasks t USING(tenant_scope,task_id) WHERE p.tenant_scope=?1 AND p.task_id=?2 ORDER BY p.generation DESC LIMIT 1",params![tenant,task_id],|r|Ok((RatificationPacketIntegrityRow{tenant_scope:r.get(0)?,task_id:r.get(1)?,generation:r.get(2)?,task_revision:r.get(3)?,checkpoint_hash:r.get(4)?,packet_hash:r.get(5)?,packet_seal:r.get(6)?,packet_json:r.get(7)?,state:r.get(8)?,revision:r.get(9)?,reviewer_account_id:r.get(10)?,head_receipt_hash:r.get(11)?,approved_task_json:r.get(12)?,approved_result_json:r.get(13)?,approved_transcript_json:r.get(14)?},r.get::<_,String>(15)?,r.get::<_,i64>(16)?,r.get::<_,String>(17)?))).optional().map_err(|_|A2AError::internal("ratification packet lookup failed"))?;
+            let generation = generation.map(|value| i64::try_from(value).map_err(|_| A2AError::invalid_request("ratification generation invalid"))).transpose()?;
+            let row=connection.query_row("SELECT p.tenant_scope,p.task_id,p.generation,p.task_revision,p.checkpoint_hash,p.packet_hash,p.packet_seal,p.packet_json,p.state,p.revision,p.reviewer_account_id,p.head_receipt_hash,p.approved_task_json,p.approved_result_json,p.approved_transcript_json,t.state,t.revision,t.task_json FROM ratification_packets p JOIN tasks t USING(tenant_scope,task_id) WHERE p.tenant_scope=?1 AND p.task_id=?2 AND (?3 IS NULL OR p.generation=?3) ORDER BY p.generation DESC LIMIT 1",params![tenant,task_id,generation],|r|Ok((RatificationPacketIntegrityRow{tenant_scope:r.get(0)?,task_id:r.get(1)?,generation:r.get(2)?,task_revision:r.get(3)?,checkpoint_hash:r.get(4)?,packet_hash:r.get(5)?,packet_seal:r.get(6)?,packet_json:r.get(7)?,state:r.get(8)?,revision:r.get(9)?,reviewer_account_id:r.get(10)?,head_receipt_hash:r.get(11)?,approved_task_json:r.get(12)?,approved_result_json:r.get(13)?,approved_transcript_json:r.get(14)?},r.get::<_,String>(15)?,r.get::<_,i64>(16)?,r.get::<_,String>(17)?))).optional().map_err(|_|A2AError::internal("ratification packet lookup failed"))?;
             let Some((packet_row,task_state,task_revision,task_json))=row else{return Ok(None)};
             let events=load_ratification_event_rows_from_connection(connection,&tenant,&task_id,packet_row.generation).map_err(|_|A2AError::internal("ratification history lookup failed"))?;
             let (packet,history)=verify_ratification_packet_chain(&packet_row,&events,&tenant,&task_id,u64::try_from(packet_row.generation).map_err(|_|A2AError::internal("ratification generation corrupt"))?,&key)?;
-            if let Some(crate::HumanRatificationAction::Decision(decision))=history.last().map(|r|&r.action){let expected=match decision{crate::HumanDecision::Approve=>a2a::TaskState::Completed,crate::HumanDecision::Reject=>a2a::TaskState::Rejected,crate::HumanDecision::Amend=>a2a::TaskState::InputRequired};let task:Task=serde_json::from_str(&task_json).map_err(|_|A2AError::internal("ratification task integrity failure"))?;if task.status.state!=expected||state_key(&task).ok().as_deref()!=Some(task_state.as_str())||u64::try_from(task_revision).ok()!=packet.task_revision.checked_add(1){return Err(A2AError::internal("ratification task integrity failure"));}}
+            if latest && let Some(crate::HumanRatificationAction::Decision(decision))=history.last().map(|r|&r.action){let task:Task=serde_json::from_str(&task_json).map_err(|_|A2AError::internal("ratification task integrity failure"))?;if !terminal_ratification_task_matches(decision,&task,&task_state,task_revision,packet.task_revision){return Err(A2AError::internal("ratification task integrity failure"));}}
             let state=ratification_state(&packet_row.state)?;
             Ok(Some(crate::RatificationView{packet,state,revision:u64::try_from(packet_row.revision).map_err(|_|A2AError::internal("ratification revision corrupt"))?,history}))
         }).await
@@ -4207,6 +4271,7 @@ impl SqliteTaskStore {
         self.run(move |connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| A2AError::internal("ratification review transaction failed"))?;
+            ensure_integrated_ratification_integrity(&tx, &key)?;
             let packet_row: RatificationPacketIntegrityRow = tx.query_row(
                 "SELECT tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,packet_seal,packet_json,state,revision,reviewer_account_id,head_receipt_hash,approved_task_json,approved_result_json,approved_transcript_json FROM ratification_packets WHERE tenant_scope=?1 AND task_id=?2 AND generation=?3",
                 params![tenant,task_id,command.generation], |r| Ok(RatificationPacketIntegrityRow {
@@ -4251,6 +4316,7 @@ impl SqliteTaskStore {
                 params![tenant,task_id,command.generation,command.account_id,receipt.receipt_hash,command.reviewed_at_millis]).map_err(|_|A2AError::internal("ratification review update failed"))?;
             if changed != 1 { return Err(ratification_conflict()); }
             insert_authorization_audit(&tx,&audit.clone().decided(AuthorizationDecisionEffect::Allow,"ratification_reviewed",None))?;
+            write_integrated_ratification_anchor(&tx, &key)?;
             ensure_atomic_capacity(&tx)?;
             tx.commit().map_err(|_|A2AError::internal("ratification review commit failed"))?;
             Ok(receipt)
@@ -4284,6 +4350,7 @@ impl SqliteTaskStore {
         let key = self.ratification_key.clone();
         self.run(move|connection|{
             let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_|A2AError::internal("ratification decision transaction failed"))?;
+            ensure_integrated_ratification_integrity(&tx, &key)?;
             let packet_row:RatificationPacketIntegrityRow=tx.query_row("SELECT tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,packet_seal,packet_json,state,revision,reviewer_account_id,head_receipt_hash,approved_task_json,approved_result_json,approved_transcript_json FROM ratification_packets WHERE tenant_scope=?1 AND task_id=?2 AND generation=?3",params![tenant,task_id,command.generation],|r|Ok(RatificationPacketIntegrityRow{tenant_scope:r.get(0)?,task_id:r.get(1)?,generation:r.get(2)?,task_revision:r.get(3)?,checkpoint_hash:r.get(4)?,packet_hash:r.get(5)?,packet_seal:r.get(6)?,packet_json:r.get(7)?,state:r.get(8)?,revision:r.get(9)?,reviewer_account_id:r.get(10)?,head_receipt_hash:r.get(11)?,approved_task_json:r.get(12)?,approved_result_json:r.get(13)?,approved_transcript_json:r.get(14)?})).optional().map_err(|_|A2AError::internal("ratification packet lookup failed"))?.ok_or_else(||A2AError::invalid_request("ratification packet not found"))?;
             let packet=verify_ratification_packet_row(&packet_row,&tenant,&task_id,command.generation,&key)?;
             let causative_revision=packet.task_revision.checked_sub(1).ok_or_else(||A2AError::internal("ratification task integrity failure"))?;
@@ -4364,10 +4431,11 @@ impl SqliteTaskStore {
                 let request_digest=canonical_send_message_digest_v2(&tenant,task_owner,&request,false)?;
                 let dispatch_id=content_digest(format!("{tenant}\0send-message\0{message_id}").as_bytes());
                 tx.execute("INSERT INTO idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id,causative_request_json,invocation_kind) VALUES(?1,?2,?3,?4,'in_progress',?5,?6,?6,2,?7,?8,'unary')",params![tenant,message_id,request_digest,task_id,result_json,command.decided_at_millis,task_owner,serde_json::to_string(&request).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?]).map_err(|_|A2AError::internal("ratification amendment reservation failed"))?;
-                tx.execute("INSERT INTO outbox(dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',8,?8,?8,?8,2)",params![dispatch_id,tenant,task_id,message_id,next_revision,payload_json,content_digest(payload_json.as_bytes()),command.decided_at_millis]).map_err(|_|A2AError::internal("ratification amendment dispatch failed"))?;
+                tx.execute("INSERT INTO outbox(dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version,ratification_required) VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',8,?8,?8,?8,2,1)",params![dispatch_id,tenant,task_id,message_id,next_revision,payload_json,content_digest(payload_json.as_bytes()),command.decided_at_millis]).map_err(|_|A2AError::internal("ratification amendment dispatch failed"))?;
             }
             if matches!(command.decision,crate::HumanDecision::Approve|crate::HumanDecision::Reject){enqueue_terminal_callbacks(&tx,&tenant,&task,u64::try_from(next_revision).map_err(|_|A2AError::internal("ratification revision corrupt"))?,command.decided_at_millis)?;}
             insert_authorization_audit(&tx,&audit.clone().decided(AuthorizationDecisionEffect::Allow,event_kind,None))?;
+            write_integrated_ratification_anchor(&tx, &key)?;
             ensure_atomic_capacity(&tx)?;
             ensure_stream_capacity(&tx)?;
             tx.commit().map_err(|_|A2AError::internal("ratification decision commit failed"))?; Ok(receipt)
@@ -5055,10 +5123,21 @@ fn ensure_atomic_capacity(connection: &Connection) -> Result<(), A2AError> {
 }
 
 fn ensure_ratification_capacity(connection: &Connection) -> Result<(), A2AError> {
-    let bytes: i64 = connection
+    ensure_ratification_capacity_limit(connection, MAX_STORE_JSON_BYTES)
+}
+
+fn ratification_retained_bytes(connection: &Connection) -> Result<i64, A2AError> {
+    connection
         .query_row(RATIFICATION_ACCOUNTING_SELECT_SQL, [], |row| row.get(0))
-        .map_err(|_| A2AError::internal("ratification aggregate size query failed"))?;
-    if usize::try_from(bytes).unwrap_or(usize::MAX) > MAX_STORE_JSON_BYTES {
+        .map_err(|_| A2AError::internal("ratification aggregate size query failed"))
+}
+
+fn ensure_ratification_capacity_limit(
+    connection: &Connection,
+    limit: usize,
+) -> Result<(), A2AError> {
+    let bytes = ratification_retained_bytes(connection)?;
+    if usize::try_from(bytes).unwrap_or(usize::MAX) > limit {
         return Err(A2AError::internal(
             "ratification durable byte capacity reached",
         ));
@@ -5291,6 +5370,7 @@ fn open_database(
             | V7_SCHEMA_VERSION
             | V8_SCHEMA_VERSION
             | V9_SCHEMA_VERSION
+            | V10_SCHEMA_VERSION
             | SCHEMA_VERSION
     ) {
         return Err(SqliteStoreError::InvalidSchema);
@@ -5302,6 +5382,9 @@ fn open_database(
         return Err(SqliteStoreError::InvalidSchema);
     }
     if version == 0 {
+        if application_id != 0 {
+            return Err(SqliteStoreError::InvalidSchema);
+        }
         let user_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -5355,7 +5438,7 @@ fn open_database(
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v10(&mut connection)
+            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
         }
         V2_SCHEMA_VERSION => {
             migrate_v2_to_v3(&mut connection, max_tasks)?;
@@ -5365,7 +5448,7 @@ fn open_database(
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v10(&mut connection)
+            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
         }
         V3_SCHEMA_VERSION => {
             migrate_v3_to_v4(&mut connection, max_tasks)?;
@@ -5374,7 +5457,7 @@ fn open_database(
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v10(&mut connection)
+            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
         }
         V4_SCHEMA_VERSION => {
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
@@ -5382,38 +5465,43 @@ fn open_database(
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v10(&mut connection)
+            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
         }
         V5_SCHEMA_VERSION => {
             migrate_v5_to_v6(&mut connection)?;
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v10(&mut connection)
+            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
         }
         V6_SCHEMA_VERSION => {
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v10(&mut connection)
+            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
         }
         V7_SCHEMA_VERSION => {
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v10(&mut connection)
+            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
         }
         V8_SCHEMA_VERSION => {
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v10(&mut connection)
+            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
         }
-        V9_SCHEMA_VERSION => migrate_v9_to_v10(&mut connection),
+        V9_SCHEMA_VERSION => {
+            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
+        }
+        V10_SCHEMA_VERSION => {
+            migrate_v10_to_v11(&mut connection, supplied_ratification_key.as_deref())
+        }
         SCHEMA_VERSION => validate_schema(&connection),
         _ => Err(SqliteStoreError::InvalidSchema),
     }?;
 
     let ratification_enabled = supplied_ratification_key.is_some();
     let ratification_key =
-        reconcile_ratification_key(&connection, supplied_ratification_key, &receipt_key)?;
+        reconcile_ratification_key(&mut connection, supplied_ratification_key, &receipt_key)?;
     validate_foreign_keys(&connection)?;
     validate_snapshot_chains(&connection, None)?;
     validate_persisted_records(&connection, max_tasks)?;
@@ -5424,6 +5512,9 @@ fn open_database(
     validate_tenant_authorization_records(&connection)?;
     validate_ratification_capacity(&connection)?;
     validate_ratification_records(&connection, &ratification_key)?;
+    if ratification_enabled {
+        validate_integrated_ratification_anchor(&connection, &ratification_key)?;
+    }
     recover_orphaned_tasks(&mut connection)?;
 
     let callback_policy = reconcile_callback_policy(&mut connection, push_policy.as_ref())?;
@@ -5446,10 +5537,254 @@ fn open_database(
     ))
 }
 
-fn reconcile_ratification_key(
+pub(crate) fn terminal_ratification_task_matches(
+    decision: &crate::HumanDecision,
+    task: &Task,
+    stored_state: &str,
+    task_revision: i64,
+    packet_task_revision: u64,
+) -> bool {
+    if state_key(task).ok().as_deref() != Some(stored_state) {
+        return false;
+    }
+    let Some(decision_revision) = packet_task_revision
+        .checked_add(1)
+        .and_then(|revision| i64::try_from(revision).ok())
+    else {
+        return false;
+    };
+    match decision {
+        crate::HumanDecision::Approve => {
+            task_revision == decision_revision && task.status.state == a2a::TaskState::Completed
+        }
+        crate::HumanDecision::Reject => {
+            task_revision == decision_revision && task.status.state == a2a::TaskState::Rejected
+        }
+        crate::HumanDecision::Amend => {
+            task_revision > decision_revision
+                || (task_revision == decision_revision
+                    && task.status.state == a2a::TaskState::InputRequired)
+        }
+    }
+}
+
+fn integrated_ratification_anchor_state(
     connection: &Connection,
+) -> Result<(i64, i64, i64, String), SqliteStoreError> {
+    let retained_bytes: i64 = connection
+        .query_row(RATIFICATION_ACCOUNTING_SELECT_SQL, [], |row| row.get(0))
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let mut canonical = Vec::new();
+    let mut packet_count = 0_i64;
+    for query in [
+        "SELECT json_array(tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,packet_seal,packet_json,approved_task_json,approved_result_json,approved_transcript_json,state,revision,reviewer_account_id,head_receipt_hash,created_at,updated_at) FROM ratification_packets ORDER BY tenant_scope,task_id,generation",
+        "SELECT json_array(tenant_scope,task_id,generation,revision,account_id,action,command_digest,idempotency_key,receipt_json,receipt_hash,receipt_seal,previous_receipt_hash,occurred_at) FROM ratification_events ORDER BY tenant_scope,task_id,generation,revision",
+    ] {
+        let mut statement = connection
+            .prepare(query)
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        for row in rows {
+            let encoded = row.map_err(|_| SqliteStoreError::InvalidSchema)?;
+            let length =
+                u64::try_from(encoded.len()).map_err(|_| SqliteStoreError::InvalidSchema)?;
+            canonical.extend_from_slice(&length.to_be_bytes());
+            canonical.extend_from_slice(encoded.as_bytes());
+            if query.contains("ratification_packets") {
+                packet_count = packet_count
+                    .checked_add(1)
+                    .ok_or(SqliteStoreError::InvalidSchema)?;
+            }
+        }
+    }
+    let event_count: i64 = connection
+        .query_row("SELECT count(*) FROM ratification_events", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    canonical.extend_from_slice(&packet_count.to_be_bytes());
+    canonical.extend_from_slice(&event_count.to_be_bytes());
+    canonical.extend_from_slice(&retained_bytes.to_be_bytes());
+    Ok((
+        packet_count,
+        event_count,
+        retained_bytes,
+        content_digest(&canonical),
+    ))
+}
+
+fn integrated_ratification_anchor_seal(
+    key: &[u8; 32],
+    key_generation: &str,
+    state: &(i64, i64, i64, String),
+) -> String {
+    let payload = format!(
+        "{}:{}:{}:{}:{}",
+        key_generation, state.0, state.1, state.2, state.3
+    );
+    crate::ratification::ratification_mac(
+        key,
+        b"smesh-integrated-ratification-ledger-anchor/v1\0",
+        payload.as_bytes(),
+    )
+}
+
+fn write_integrated_ratification_anchor(
+    connection: &Connection,
+    key: &[u8; 32],
+) -> Result<(), A2AError> {
+    let key_generation = content_digest(key);
+    let state = integrated_ratification_anchor_state(connection)
+        .map_err(|_| A2AError::internal("ratification ledger anchor failed"))?;
+    let seal = integrated_ratification_anchor_seal(key, &key_generation, &state);
+    let changed = connection.execute(
+        "UPDATE ratification_ledger_anchor SET packet_count=?1,event_count=?2,retained_bytes=?3,state_hash=?4,state_seal=?5 WHERE singleton=1 AND key_generation=?6",
+        params![state.0,state.1,state.2,state.3,seal,key_generation],
+    ).map_err(|_| A2AError::internal("ratification ledger anchor failed"))?;
+    if changed != 1 {
+        return Err(A2AError::internal("ratification ledger anchor missing"));
+    }
+    Ok(())
+}
+
+fn initialize_integrated_ratification_anchor(
+    connection: &Connection,
+    key: &[u8; 32],
+) -> Result<(), SqliteStoreError> {
+    let key_generation = content_digest(key);
+    let state = integrated_ratification_anchor_state(connection)?;
+    let seal = integrated_ratification_anchor_seal(key, &key_generation, &state);
+    connection.execute(
+        "INSERT INTO ratification_ledger_anchor(singleton,version,key_generation,packet_count,event_count,retained_bytes,state_hash,state_seal) VALUES(1,1,?1,?2,?3,?4,?5,?6)",
+        params![key_generation,state.0,state.1,state.2,state.3,seal],
+    ).map_err(|_| SqliteStoreError::Initialization)?;
+    Ok(())
+}
+
+fn validate_integrated_ratification_anchor(
+    connection: &Connection,
+    key: &[u8; 32],
+) -> Result<(), SqliteStoreError> {
+    let stored: (String, i64, i64, i64, String, String) = connection.query_row(
+        "SELECT key_generation,packet_count,event_count,retained_bytes,state_hash,state_seal FROM ratification_ledger_anchor WHERE singleton=1 AND version=1",
+        [],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+    ).map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let state = integrated_ratification_anchor_state(connection)?;
+    let expected_generation = content_digest(key);
+    let expected_seal = integrated_ratification_anchor_seal(key, &expected_generation, &state);
+    if stored.0 != expected_generation
+        || (stored.1, stored.2, stored.3, stored.4.as_str())
+            != (state.0, state.1, state.2, state.3.as_str())
+        || stored.5 != expected_seal
+    {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    Ok(())
+}
+
+fn ensure_integrated_ratification_integrity(
+    connection: &Connection,
+    key: &[u8; 32],
+) -> Result<(), A2AError> {
+    validate_integrated_ratification_anchor(connection, key)
+        .and_then(|()| validate_ratification_records(connection, key))
+        .map_err(|_| A2AError::internal("ratification ledger integrity validation failed"))
+}
+
+fn ensure_integrated_ratification_integrity_if_enabled(
+    connection: &Connection,
+    key: &[u8; 32],
+) -> Result<(), A2AError> {
+    let enabled: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM ratification_ledger_anchor WHERE singleton=1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| A2AError::internal("ratification ledger integrity validation failed"))?;
+    if enabled {
+        ensure_integrated_ratification_integrity(connection, key)?;
+    }
+    Ok(())
+}
+
+fn next_authenticated_ratification_generation(
+    connection: &Connection,
+    tenant: &str,
+    task_id: &str,
+    key: &[u8; 32],
+) -> Result<i64, A2AError> {
+    ensure_integrated_ratification_integrity(connection, key)?;
+    let (count, minimum, maximum): (i64, Option<i64>, Option<i64>) = connection
+        .query_row(
+            "SELECT count(*),min(generation),max(generation) FROM ratification_packets WHERE tenant_scope=?1 AND task_id=?2",
+            params![tenant, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| A2AError::internal("ratification generation lookup failed"))?;
+    let Some(maximum) = maximum else {
+        return Ok(1);
+    };
+    if minimum != Some(1) || maximum != count {
+        return Err(A2AError::internal(
+            "ratification generation continuity failure",
+        ));
+    }
+    let packet_row = connection
+        .query_row(
+            "SELECT tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,packet_seal,packet_json,state,revision,reviewer_account_id,head_receipt_hash,approved_task_json,approved_result_json,approved_transcript_json FROM ratification_packets WHERE tenant_scope=?1 AND task_id=?2 AND generation=?3",
+            params![tenant, task_id, maximum],
+            |row| Ok(RatificationPacketIntegrityRow {
+                tenant_scope: row.get(0)?, task_id: row.get(1)?, generation: row.get(2)?,
+                task_revision: row.get(3)?, checkpoint_hash: row.get(4)?, packet_hash: row.get(5)?,
+                packet_seal: row.get(6)?, packet_json: row.get(7)?, state: row.get(8)?,
+                revision: row.get(9)?, reviewer_account_id: row.get(10)?, head_receipt_hash: row.get(11)?,
+                approved_task_json: row.get(12)?, approved_result_json: row.get(13)?, approved_transcript_json: row.get(14)?,
+            }),
+        )
+        .map_err(|_| A2AError::internal("ratification predecessor lookup failed"))?;
+    let events = load_ratification_event_rows_from_connection(connection, tenant, task_id, maximum)
+        .map_err(|_| A2AError::internal("ratification predecessor lookup failed"))?;
+    let (_, history) = verify_ratification_packet_chain(
+        &packet_row,
+        &events,
+        tenant,
+        task_id,
+        u64::try_from(maximum)
+            .map_err(|_| A2AError::internal("ratification generation corrupt"))?,
+        key,
+    )?;
+    if !matches!(
+        history.last().map(|receipt| &receipt.action),
+        Some(crate::HumanRatificationAction::Decision(
+            crate::HumanDecision::Amend
+        ))
+    ) {
+        return Err(A2AError::internal(
+            "ratification predecessor is not amended",
+        ));
+    }
+    maximum
+        .checked_add(1)
+        .ok_or_else(|| A2AError::internal("ratification generation corrupt"))
+}
+
+fn reconcile_ratification_key(
+    connection: &mut Connection,
     supplied: Option<zeroize::Zeroizing<[u8; 32]>>,
     compatibility_key: &[u8; 32],
+) -> Result<zeroize::Zeroizing<[u8; 32]>, SqliteStoreError> {
+    reconcile_ratification_key_inner(connection, supplied, compatibility_key, false)
+}
+
+fn reconcile_ratification_key_inner(
+    connection: &mut Connection,
+    supplied: Option<zeroize::Zeroizing<[u8; 32]>>,
+    compatibility_key: &[u8; 32],
+    inject_failure_after_key_check: bool,
 ) -> Result<zeroize::Zeroizing<[u8; 32]>, SqliteStoreError> {
     let stored: Option<(i64, String, String)> = connection
         .query_row(
@@ -5459,8 +5794,15 @@ fn reconcile_ratification_key(
         )
         .optional()
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    let anchor_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM ratification_ledger_anchor WHERE singleton=1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
     let Some(key) = supplied else {
-        if stored.is_some() {
+        if stored.is_some() || anchor_exists {
             return Err(SqliteStoreError::InvalidSchema);
         }
         return Ok(zeroize::Zeroizing::new(*compatibility_key));
@@ -5472,15 +5814,39 @@ fn reconcile_ratification_key(
         generation.as_bytes(),
     );
     match stored {
-        None => connection
-            .execute(
-                "INSERT INTO ratification_key_check(singleton,version,key_generation,check_seal) VALUES(1,1,?1,?2)",
-                params![generation, check],
-            )
-            .map(|_| ())
-            .map_err(|_| SqliteStoreError::Initialization)?,
+        None => {
+            if anchor_exists {
+                return Err(SqliteStoreError::InvalidSchema);
+            }
+            let ratification_existed: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task_events WHERE event_json LIKE '%Human ratification required%')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| SqliteStoreError::InvalidSchema)?;
+            if ratification_existed {
+                return Err(SqliteStoreError::InvalidSchema);
+            }
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| SqliteStoreError::Initialization)?;
+            transaction
+                .execute(
+                    "INSERT INTO ratification_key_check(singleton,version,key_generation,check_seal) VALUES(1,1,?1,?2)",
+                    params![generation, check],
+                )
+                .map_err(|_| SqliteStoreError::Initialization)?;
+            if inject_failure_after_key_check {
+                return Err(SqliteStoreError::Initialization);
+            }
+            initialize_integrated_ratification_anchor(&transaction, &key)?;
+            transaction
+                .commit()
+                .map_err(|_| SqliteStoreError::Initialization)?;
+        }
         Some((1, stored_generation, stored_check))
-            if stored_generation == generation && stored_check == check => {}
+            if stored_generation == generation && stored_check == check && anchor_exists => {}
         Some(_) => return Err(SqliteStoreError::InvalidSchema),
     }
     Ok(key)
@@ -5522,6 +5888,7 @@ fn validate_ratification_records(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
     drop(packets);
+    let mut prior: Option<(String, String, i64, Vec<crate::HumanRatificationReceipt>)> = None;
     for (packet_row, task_state, task_revision, task_json, is_latest) in rows {
         let events = load_ratification_event_rows_from_connection(
             connection,
@@ -5538,22 +5905,40 @@ fn validate_ratification_records(
             key,
         )
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
+        match prior.as_ref() {
+            Some((tenant, task, generation, history))
+                if tenant == &packet_row.tenant_scope && task == &packet_row.task_id =>
+            {
+                if packet_row.generation != generation.saturating_add(1)
+                    || history.len() != 2
+                    || !matches!(
+                        history.last().map(|receipt| &receipt.action),
+                        Some(crate::HumanRatificationAction::Decision(
+                            crate::HumanDecision::Amend
+                        ))
+                    )
+                {
+                    return Err(SqliteStoreError::InvalidSchema);
+                }
+            }
+            _ if packet_row.generation != 1 => return Err(SqliteStoreError::InvalidSchema),
+            _ => {}
+        }
         if is_latest {
             if let Some(crate::HumanRatificationAction::Decision(decision)) =
                 receipts.last().map(|r| &r.action)
             {
-                let expected_state = match decision {
-                    crate::HumanDecision::Approve => a2a::TaskState::Completed,
-                    crate::HumanDecision::Reject => a2a::TaskState::Rejected,
-                    crate::HumanDecision::Amend => a2a::TaskState::InputRequired,
-                };
                 let task: Task = serde_json::from_str(&task_json)
                     .map_err(|_| SqliteStoreError::InvalidSchema)?;
                 if task.id != packet.task_id
                     || task.context_id != packet.context_id
-                    || task.status.state != expected_state
-                    || state_key(&task).ok().as_deref() != Some(task_state.as_str())
-                    || u64::try_from(task_revision).ok() != packet.task_revision.checked_add(1)
+                    || !terminal_ratification_task_matches(
+                        decision,
+                        &task,
+                        &task_state,
+                        task_revision,
+                        packet.task_revision,
+                    )
                 {
                     return Err(SqliteStoreError::InvalidSchema);
                 }
@@ -5563,6 +5948,12 @@ fn validate_ratification_records(
                 return Err(SqliteStoreError::InvalidSchema);
             }
         }
+        prior = Some((
+            packet_row.tenant_scope,
+            packet_row.task_id,
+            packet_row.generation,
+            receipts,
+        ));
     }
     Ok(())
 }
@@ -6660,6 +7051,18 @@ fn validate_tenant_authorization_records(connection: &Connection) -> Result<(), 
     }
 }
 
+fn create_current_ratification_schema(connection: &Connection) -> Result<(), SqliteStoreError> {
+    connection
+        .execute_batch(RATIFICATION_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    connection
+        .execute_batch(RATIFICATION_ANCHOR_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    connection
+        .execute_batch(RATIFICATION_OUTBOX_FENCE_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)
+}
+
 fn initialize_schema(
     connection: &mut Connection,
     binding: &LegacyTenantBinding,
@@ -6676,7 +7079,7 @@ fn initialize_schema(
     }
     let cursor_key: [u8; 32] = rand::random();
     let receipt_key: [u8; 32] = rand::random();
-    let migration_hash = schema_v10_hash();
+    let migration_hash = schema_v11_hash();
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| SqliteStoreError::Initialization)?;
@@ -6733,9 +7136,7 @@ fn initialize_schema(
     transaction
         .execute_batch(V9_AUTHORIZATION_ACCOUNTING_TRIGGERS_SQL)
         .map_err(|_| SqliteStoreError::Initialization)?;
-    transaction
-        .execute_batch(RATIFICATION_SCHEMA_SQL)
-        .map_err(|_| SqliteStoreError::Initialization)?;
+    create_current_ratification_schema(&transaction)?;
     transaction.execute(
         "INSERT INTO store_identity(singleton, tenant_scope, owner_account_id, policy_id, policy_revision, policy_digest)
          VALUES(1, ?1, ?2, ?3, ?4, ?5)",
@@ -7112,6 +7513,18 @@ fn schema_v10_hash() -> String {
     )
 }
 
+fn schema_v11_hash() -> String {
+    content_digest(
+        [
+            schema_v10_hash().as_bytes(),
+            RATIFICATION_ANCHOR_SCHEMA_SQL.as_bytes(),
+            RATIFICATION_OUTBOX_FENCE_SQL.as_bytes(),
+        ]
+        .concat()
+        .as_slice(),
+    )
+}
+
 const CALLBACK_OBJECTS: &[&str] = &[
     "callback_policy_snapshots",
     "callback_enrollments",
@@ -7177,6 +7590,13 @@ const RATIFICATION_OBJECTS: &[&str] = &[
     "ratification_events_no_delete",
 ];
 
+const RATIFICATION_ANCHOR_OBJECTS: &[&str] = &[
+    "ratification_ledger_anchor",
+    "ratification_ledger_anchor_identity",
+    "ratification_ledger_anchor_no_delete",
+];
+const RATIFICATION_OUTBOX_FENCE_OBJECTS: &[&str] = &["outbox_ratification_fence_immutable"];
+
 #[allow(clippy::too_many_lines)]
 fn validate_schema_version(
     connection: &Connection,
@@ -7210,11 +7630,12 @@ fn validate_schema_version(
             .or_else(|| expected_schema_sql(CALLBACK_SCHEMA_SQL, object_name))
             .or_else(|| expected_schema_sql(V9_AUTHORIZATION_ACCOUNTING_TABLE_SQL, object_name))
             .or_else(|| expected_schema_sql(V9_AUTHORIZATION_ACCOUNTING_TRIGGERS_SQL, object_name))
-            .or_else(|| expected_schema_sql(RATIFICATION_SCHEMA_SQL, object_name));
+            .or_else(|| expected_schema_sql(RATIFICATION_SCHEMA_SQL, object_name))
+            .or_else(|| expected_schema_sql(RATIFICATION_ANCHOR_SCHEMA_SQL, object_name));
         let actual = normalize_schema_sql(&actual);
         let matches_expected = if version >= V5_SCHEMA_VERSION && *object_name == "tasks" {
             let base = expected_schema_sql(V2_SCHEMA_SQL, "tasks").expect("v2 tasks schema");
-            let expected_tasks = if version == SCHEMA_VERSION {
+            let expected_tasks = if version >= V10_SCHEMA_VERSION {
                 format!(
                     "{},tenant_scopetextnotnulldefault'smesh-dev-only-tenant',owner_account_idtextnotnulldefault'smesh-dev-only-account',principal_scopetextnotnulldefault'legacy-principal',authentication_methodtextnotnulldefault'trusted-local')",
                     base.strip_suffix(')').expect("tasks schema closes")
@@ -7238,8 +7659,13 @@ fn validate_schema_version(
             let base = normalize_schema_sql(V4_OUTBOX_TABLE_SQL)
                 .replace("outbox_v4", "outbox")
                 .replace('"', "");
+            let suffix = if version >= SCHEMA_VERSION {
+                ",dispatch_identity_versionintegernotnulldefault2check(dispatch_identity_versionin(1,2)),ratification_requiredintegernotnulldefault0check(ratification_requiredin(0,1)))"
+            } else {
+                ",dispatch_identity_versionintegernotnulldefault2check(dispatch_identity_versionin(1,2)))"
+            };
             let expected_outbox = format!(
-                "{},dispatch_identity_versionintegernotnulldefault2check(dispatch_identity_versionin(1,2)))",
+                "{}{suffix}",
                 base.strip_suffix(')').expect("outbox schema closes")
             );
             actual.replace('"', "") == expected_outbox
@@ -7281,7 +7707,8 @@ fn validate_schema_version(
         )
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
     let expected_hash = match version {
-        SCHEMA_VERSION => schema_v10_hash(),
+        SCHEMA_VERSION => schema_v11_hash(),
+        V10_SCHEMA_VERSION => schema_v10_hash(),
         V9_SCHEMA_VERSION => schema_v9_hash(),
         V8_SCHEMA_VERSION => schema_v8_hash(),
         V7_SCHEMA_VERSION => schema_v7_hash(),
@@ -7296,7 +7723,7 @@ fn validate_schema_version(
         || metadata.2.len() != 32
         || metadata.3.len() != 32
         || actual_task_columns
-            != if version == SCHEMA_VERSION {
+            != if version >= V10_SCHEMA_VERSION {
                 "created_order:INTEGER:0:1,task_id:TEXT:1:0,context_id:TEXT:1:0,state:TEXT:1:0,status_timestamp:TEXT:0:0,revision:INTEGER:1:0,task_json:TEXT:1:0,tenant_scope:TEXT:1:0,owner_account_id:TEXT:1:0,principal_scope:TEXT:1:0,authentication_method:TEXT:1:0"
             } else if version >= V5_SCHEMA_VERSION {
                 "created_order:INTEGER:0:1,task_id:TEXT:1:0,context_id:TEXT:1:0,state:TEXT:1:0,status_timestamp:TEXT:0:0,revision:INTEGER:1:0,task_json:TEXT:1:0,tenant_scope:TEXT:1:0,owner_account_id:TEXT:1:0"
@@ -7312,8 +7739,15 @@ fn validate_schema_version(
                     } else {
                         0
                     }
-                    + if version == SCHEMA_VERSION {
-                        AUTHORIZATION_ACCOUNTING_OBJECTS.len() + RATIFICATION_OBJECTS.len()
+                    + if version >= V10_SCHEMA_VERSION {
+                        AUTHORIZATION_ACCOUNTING_OBJECTS.len()
+                            + RATIFICATION_OBJECTS.len()
+                            + if version == SCHEMA_VERSION {
+                                RATIFICATION_ANCHOR_OBJECTS.len()
+                                    + RATIFICATION_OUTBOX_FENCE_OBJECTS.len()
+                            } else {
+                                0
+                            }
                     } else if version == V9_SCHEMA_VERSION {
                         AUTHORIZATION_ACCOUNTING_OBJECTS.len()
                     } else {
@@ -7406,6 +7840,24 @@ fn validate_authorization_accounting(connection: &Connection) -> Result<(), Sqli
     Ok(())
 }
 
+fn validate_schema_v10(connection: &Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_version(connection, V10_SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
+    validate_schema_objects(connection, CALLBACK_SCHEMA_SQL, CALLBACK_OBJECTS)?;
+    validate_schema_objects(
+        connection,
+        V9_AUTHORIZATION_ACCOUNTING_TABLE_SQL,
+        &AUTHORIZATION_ACCOUNTING_OBJECTS[..1],
+    )?;
+    validate_schema_objects(
+        connection,
+        V9_AUTHORIZATION_ACCOUNTING_TRIGGERS_SQL,
+        &AUTHORIZATION_ACCOUNTING_OBJECTS[1..],
+    )?;
+    validate_authorization_accounting(connection)?;
+    validate_schema_objects(connection, RATIFICATION_SCHEMA_SQL, RATIFICATION_OBJECTS)?;
+    Ok(keys)
+}
+
 fn validate_schema(connection: &Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
     let keys = validate_schema_version(connection, SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
     validate_schema_objects(connection, CALLBACK_SCHEMA_SQL, CALLBACK_OBJECTS)?;
@@ -7421,6 +7873,16 @@ fn validate_schema(connection: &Connection) -> Result<([u8; 32], [u8; 32]), Sqli
     )?;
     validate_authorization_accounting(connection)?;
     validate_schema_objects(connection, RATIFICATION_SCHEMA_SQL, RATIFICATION_OBJECTS)?;
+    validate_schema_objects(
+        connection,
+        RATIFICATION_ANCHOR_SCHEMA_SQL,
+        RATIFICATION_ANCHOR_OBJECTS,
+    )?;
+    validate_schema_objects(
+        connection,
+        RATIFICATION_OUTBOX_FENCE_SQL,
+        RATIFICATION_OUTBOX_FENCE_OBJECTS,
+    )?;
     Ok(keys)
 }
 
@@ -7886,7 +8348,91 @@ fn migrate_v9_to_v10(
     transaction
         .execute(
             "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
-            params![SCHEMA_VERSION, schema_v10_hash()],
+            params![V10_SCHEMA_VERSION, schema_v10_hash()],
+        )
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .pragma_update(None, "user_version", V10_SCHEMA_VERSION)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    let validated = validate_schema_v10(&transaction)?;
+    if validated != keys {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    transaction
+        .commit()
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    Ok(validated)
+}
+
+fn migrate_v9_to_v11(
+    connection: &mut Connection,
+    supplied_key: Option<&[u8; 32]>,
+) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    migrate_v9_to_v10(connection)?;
+    migrate_v10_to_v11(connection, supplied_key)
+}
+
+fn migrate_v10_to_v11(
+    connection: &mut Connection,
+    supplied_key: Option<&[u8; 32]>,
+) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    migrate_v10_to_v11_inner(connection, supplied_key, false)
+}
+
+fn migrate_v10_to_v11_inner(
+    connection: &mut Connection,
+    supplied_key: Option<&[u8; 32]>,
+    inject_failure_after_anchor_schema: bool,
+) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_v10(connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(RATIFICATION_ANCHOR_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(RATIFICATION_OUTBOX_FENCE_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    if inject_failure_after_anchor_schema {
+        return Err(SqliteStoreError::Initialization);
+    }
+    let stored: Option<(i64, String, String)> = transaction
+        .query_row(
+            "SELECT version,key_generation,check_seal FROM ratification_key_check WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|_| SqliteStoreError::InvalidSchema)?;
+    match (stored, supplied_key) {
+        (None, None) => {}
+        (Some(_), None) => return Err(SqliteStoreError::InvalidSchema),
+        (stored, Some(key)) => {
+            let generation = content_digest(key);
+            let check = crate::ratification::ratification_mac(
+                key,
+                b"smesh-ratification-key-check/v1\0",
+                generation.as_bytes(),
+            );
+            match stored {
+                None => {
+                    transaction.execute(
+                        "INSERT INTO ratification_key_check(singleton,version,key_generation,check_seal) VALUES(1,1,?1,?2)",
+                        params![generation, check],
+                    ).map_err(|_| SqliteStoreError::Initialization)?;
+                }
+                Some((1, stored_generation, stored_check))
+                    if stored_generation == generation && stored_check == check => {}
+                Some(_) => return Err(SqliteStoreError::InvalidSchema),
+            }
+            initialize_integrated_ratification_anchor(&transaction, key)?;
+        }
+    }
+    transaction
+        .execute(
+            "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
+            params![SCHEMA_VERSION, schema_v11_hash()],
         )
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
@@ -9487,28 +10033,36 @@ pub(crate) fn verify_ratification_replay(
             Some(crate::HumanRatificationAction::Decision(_))
         )))
         .ok_or_else(|| A2AError::internal("ratification task revision corrupt"))?;
+    let historical_amend_lifecycle = matches!(
+        final_receipt.map(|receipt| &receipt.action),
+        Some(crate::HumanRatificationAction::Decision(
+            crate::HumanDecision::Amend
+        ))
+    ) && u64::try_from(task_row.revision)
+        .is_ok_and(|revision| revision > expected_task_revision);
     if packet_row.state != expected_packet_state
         || task_row.task_json.len() > MAX_RATIFICATION_STORED_JSON_BYTES
-        || u64::try_from(task_row.revision).ok() != Some(expected_task_revision)
         || task_row.context_id != packet.context_id
-        || task_row.owner_account_id != task_row.causative_owner_account_id
-        || expected_task_owner.is_some_and(|owner| owner != task_row.causative_owner_account_id)
-        || task_row.causative_request_digest != packet.request_digest
-        || content_digest(task_row.causative_idempotency_key.as_bytes())
-            != packet.idempotency_key_digest
-        || task_row
-            .authorization_policy_id
-            .as_ref()
-            .is_some_and(|value| value != &packet.authorization_policy_id)
-        || task_row.authorization_policy_revision.is_some_and(|value| {
-            u64::try_from(value).ok() != Some(packet.authorization_policy_revision)
-        })
-        || task_row
-            .authorization_policy_digest
-            .as_ref()
-            .is_some_and(|value| value != &packet.authorization_policy_digest)
-        || task_row.principal_scope != packet.principal_scope
-        || task_row.authentication_method != packet.authentication_method
+        || expected_task_owner.is_some_and(|owner| owner != task_row.owner_account_id)
+        || (!historical_amend_lifecycle
+            && (u64::try_from(task_row.revision).ok() != Some(expected_task_revision)
+                || task_row.owner_account_id != task_row.causative_owner_account_id
+                || task_row.causative_request_digest != packet.request_digest
+                || content_digest(task_row.causative_idempotency_key.as_bytes())
+                    != packet.idempotency_key_digest
+                || task_row
+                    .authorization_policy_id
+                    .as_ref()
+                    .is_some_and(|value| value != &packet.authorization_policy_id)
+                || task_row.authorization_policy_revision.is_some_and(|value| {
+                    u64::try_from(value).ok() != Some(packet.authorization_policy_revision)
+                })
+                || task_row
+                    .authorization_policy_digest
+                    .as_ref()
+                    .is_some_and(|value| value != &packet.authorization_policy_digest)
+                || task_row.principal_scope != packet.principal_scope
+                || task_row.authentication_method != packet.authentication_method))
     {
         return Err(A2AError::internal("ratification task integrity failure"));
     }
@@ -9516,14 +10070,15 @@ pub(crate) fn verify_ratification_replay(
         .map_err(|_| A2AError::internal("ratification task integrity failure"))?;
     if task.id != packet.task_id
         || task.context_id != packet.context_id
-        || task.status.state != expected_task_state
-        || state_key(&task).ok().as_deref() != Some(task_row.state.as_str())
-        || task
-            .status
-            .timestamp
-            .map(|value| value.to_rfc3339())
-            .as_deref()
-            != task_row.status_timestamp.as_deref()
+        || (!historical_amend_lifecycle
+            && (task.status.state != expected_task_state
+                || state_key(&task).ok().as_deref() != Some(task_row.state.as_str())
+                || task
+                    .status
+                    .timestamp
+                    .map(|value| value.to_rfc3339())
+                    .as_deref()
+                    != task_row.status_timestamp.as_deref()))
     {
         return Err(A2AError::internal("ratification task integrity failure"));
     }
@@ -10706,7 +11261,79 @@ impl crate::RatificationAuthority for SqliteTaskStore {
         scope: &OwnedTaskScope,
         task_id: &str,
     ) -> Result<Option<crate::RatificationView>, A2AError> {
-        self.ratification_view_inner(scope, task_id).await
+        self.ratification_view_inner(scope, task_id, None).await
+    }
+
+    async fn ratification_view_at_generation(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        generation: u64,
+    ) -> Result<Option<crate::RatificationView>, A2AError> {
+        if generation == 0 {
+            return Err(A2AError::invalid_request("ratification generation invalid"));
+        }
+        self.ratification_view_inner(scope, task_id, Some(generation))
+            .await
+    }
+
+    async fn ratification_replay_candidate(
+        &self,
+        scope: &OwnedTaskScope,
+        task_id: &str,
+        account_id: &str,
+        idempotency_key: &str,
+        action: crate::RatificationReplayAction,
+    ) -> Result<Option<crate::RatificationView>, A2AError> {
+        let tenant = scope.tenant_scope().to_owned();
+        let owner = scope.owner_account_id().to_owned();
+        let own = scope.visibility() == VisibilityScope::Own;
+        let task_id = task_id.to_owned();
+        let lookup_task_id = task_id.clone();
+        let account_id = account_id.to_owned();
+        let idempotency_key = idempotency_key.to_owned();
+        let generation = self
+            .run(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT e.generation
+                         FROM ratification_events e
+                         JOIN tasks t USING(tenant_scope,task_id)
+                         WHERE e.tenant_scope=?1 AND e.account_id=?2
+                           AND e.idempotency_key=?3 AND e.task_id=?4
+                           AND ((?5='review' AND e.action='review')
+                             OR (?5='decision' AND e.action IN ('approve','reject','amend')))
+                           AND (?6=0 OR t.owner_account_id=?7)",
+                        params![
+                            tenant,
+                            account_id,
+                            idempotency_key,
+                            lookup_task_id,
+                            match action {
+                                crate::RatificationReplayAction::Review => "review",
+                                crate::RatificationReplayAction::Decision => "decision",
+                            },
+                            i64::from(own),
+                            owner,
+                        ],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(|_| A2AError::internal("ratification replay lookup failed"))?
+                    .map(|value| {
+                        u64::try_from(value)
+                            .map_err(|_| A2AError::internal("ratification generation corrupt"))
+                    })
+                    .transpose()
+            })
+            .await?;
+        match generation {
+            Some(generation) => {
+                self.ratification_view_inner(scope, task_id.as_str(), Some(generation))
+                    .await
+            }
+            None => Ok(None),
+        }
     }
 
     async fn acknowledge_ratification_review(
@@ -11159,6 +11786,35 @@ mod tests {
     }
 
     #[test]
+    fn ratification_retained_bytes_include_fixed_width_columns_at_boundary() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ratification_packets(
+                tenant_scope TEXT,task_id TEXT,generation INTEGER,task_revision INTEGER,
+                checkpoint_hash TEXT,packet_hash TEXT,packet_seal TEXT,packet_json TEXT,
+                approved_task_json TEXT,approved_result_json TEXT,approved_transcript_json TEXT,
+                state TEXT,revision INTEGER,reviewer_account_id TEXT,head_receipt_hash TEXT,
+                created_at INTEGER,updated_at INTEGER);
+             CREATE TABLE ratification_events(
+                tenant_scope TEXT,task_id TEXT,generation INTEGER,revision INTEGER,
+                account_id TEXT,action TEXT,command_digest TEXT,idempotency_key TEXT,
+                receipt_json TEXT,receipt_hash TEXT,receipt_seal TEXT,
+                previous_receipt_hash TEXT,occurred_at INTEGER);
+             INSERT INTO ratification_packets VALUES(
+                't','p',1,2,'c','h','s','{}','{}','{}','[]','reviewed',1,NULL,NULL,3,4);
+             INSERT INTO ratification_events VALUES(
+                't','p',1,1,'a','review','d','i','{}','h','s',NULL,5);",
+            )
+            .unwrap();
+        let exact = ratification_retained_bytes(&connection).unwrap();
+        assert_eq!(exact, 100);
+        let exact = usize::try_from(exact).unwrap();
+        assert!(ensure_ratification_capacity_limit(&connection, exact).is_ok());
+        assert!(ensure_ratification_capacity_limit(&connection, exact - 1).is_err());
+    }
+
+    #[test]
     fn authorization_accounting_uses_singleton_lookups_without_decision_scans() {
         let mut connection = Connection::open_in_memory().unwrap();
         initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
@@ -11313,7 +11969,9 @@ mod tests {
         }
         connection
             .execute_batch(
-                "DROP TRIGGER authorization_decision_accounting_no_insert;
+                "DROP TRIGGER outbox_ratification_fence_immutable;
+                 ALTER TABLE outbox DROP COLUMN ratification_required;
+                 DROP TRIGGER authorization_decision_accounting_no_insert;
                  DROP TRIGGER authorization_decision_accounting_no_delete;
                  DROP TRIGGER authorization_decision_accounting_monotonic;
                  DROP TRIGGER authorization_decisions_capacity;
@@ -11325,6 +11983,9 @@ mod tests {
                  DROP TRIGGER ratification_events_no_delete;
                  DROP TRIGGER ratification_key_check_no_update;
                  DROP TRIGGER ratification_key_check_no_delete;
+                 DROP TRIGGER ratification_ledger_anchor_identity;
+                 DROP TRIGGER ratification_ledger_anchor_no_delete;
+                 DROP TABLE ratification_ledger_anchor;
                  DROP INDEX ratification_events_packet;
                  DROP TABLE ratification_events;
                  DROP INDEX ratification_packets_active;
@@ -11511,6 +12172,36 @@ mod tests {
     }
 
     #[test]
+    fn amended_ratification_allows_an_authenticated_later_task_revision() {
+        let amended = task("amended", a2a::TaskState::InputRequired);
+        let amended_state = state_key(&amended).unwrap();
+        assert!(terminal_ratification_task_matches(
+            &crate::HumanDecision::Amend,
+            &amended,
+            &amended_state,
+            8,
+            7,
+        ));
+
+        let progressed = task("amended", a2a::TaskState::Completed);
+        let progressed_state = state_key(&progressed).unwrap();
+        assert!(!terminal_ratification_task_matches(
+            &crate::HumanDecision::Amend,
+            &progressed,
+            &progressed_state,
+            8,
+            7,
+        ));
+        assert!(terminal_ratification_task_matches(
+            &crate::HumanDecision::Amend,
+            &progressed,
+            &progressed_state,
+            9,
+            7,
+        ));
+    }
+
+    #[test]
     fn recovery_failure_rolls_back_every_orphan_transition() {
         let mut connection = Connection::open_in_memory().unwrap();
         initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
@@ -11555,6 +12246,162 @@ mod tests {
                 "\"TASK_STATE_SUBMITTED\"".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn v10_to_v11_anchor_migration_rolls_back_and_retries() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ratification_packets(
+                    tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,
+                    packet_seal,packet_json,approved_task_json,approved_result_json,
+                    approved_transcript_json,state,revision,created_at,updated_at)
+                 VALUES('tenant-v10','task-v10',1,1,?1,?2,'seal','{}','{}','{}','[]',
+                        'awaiting_review',0,1,1)",
+                params![
+                    content_digest(b"checkpoint-v10"),
+                    content_digest(b"packet-v10")
+                ],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER outbox_ratification_fence_immutable;
+                 ALTER TABLE outbox DROP COLUMN ratification_required;
+                 DROP TRIGGER ratification_ledger_anchor_identity;
+                 DROP TRIGGER ratification_ledger_anchor_no_delete;
+                 DROP TABLE ratification_ledger_anchor;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE store_metadata SET schema_version=10,migration_hash=?1 WHERE singleton=1",
+                [schema_v10_hash()],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 10).unwrap();
+
+        assert!(migrate_v10_to_v11_inner(&mut connection, Some(&[41; 32]), true).is_err());
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let anchor_objects: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'ratification_ledger_anchor%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((version, anchor_objects), (10, 0));
+
+        migrate_v10_to_v11(&mut connection, Some(&[41; 32])).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT packet_count FROM ratification_ledger_anchor",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        validate_schema(&connection).unwrap();
+    }
+
+    #[test]
+    fn ratification_key_and_anchor_initialization_is_atomic() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let (_, compatibility_key) =
+            initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
+        assert!(
+            reconcile_ratification_key_inner(
+                &mut connection,
+                Some(zeroize::Zeroizing::new([42; 32])),
+                &compatibility_key,
+                true,
+            )
+            .is_err()
+        );
+        let counts = connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM ratification_key_check),
+                        (SELECT count(*) FROM ratification_ledger_anchor)",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+        reconcile_ratification_key(
+            &mut connection,
+            Some(zeroize::Zeroizing::new([42; 32])),
+            &compatibility_key,
+        )
+        .unwrap();
+        let counts = connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM ratification_key_check),
+                        (SELECT count(*) FROM ratification_ledger_anchor)",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1));
+    }
+
+    #[test]
+    fn authenticated_generation_rejects_deleted_whole_ledger_without_mutation() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let (_, compatibility_key) =
+            initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
+        let key = [43; 32];
+        reconcile_ratification_key(
+            &mut connection,
+            Some(zeroize::Zeroizing::new(key)),
+            &compatibility_key,
+        )
+        .unwrap();
+        connection
+            .execute(
+                "UPDATE ratification_ledger_anchor SET packet_count=1 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        let before: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM ratification_packets),
+                        (SELECT count(*) FROM ratification_events),
+                        packet_count FROM ratification_ledger_anchor WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            next_authenticated_ratification_generation(
+                &connection,
+                "tenant-a",
+                "deleted-task",
+                &key,
+            )
+            .is_err()
+        );
+        let after: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM ratification_packets),
+                        (SELECT count(*) FROM ratification_events),
+                        packet_count FROM ratification_ledger_anchor WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]

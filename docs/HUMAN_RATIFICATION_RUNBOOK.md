@@ -128,7 +128,7 @@ cargo run --bin smesh-a2a-gateway
 
 SQLite is Unix-only, owner-private, exclusive single-writer local durability.
 Its parent directory must be owner-owned with no group/world permissions. The
-database and sidecars are held at `0600`. Current schema is v10; opening an
+database and sidecars are held at `0600`. Current schema is v11; opening an
 older supported schema performs the append-only startup migration and validates
 the migrated catalog, ratification key check, packet/event chains, state, and
 revisions before readiness. Legacy tenant migration still requires both
@@ -231,6 +231,7 @@ The ratification router exposes exactly:
 - public, fixed, data-free `GET /ratification/console`;
 - public, fixed, data-free `GET /ratification/console.js`;
 - protected `GET /ratification/v1/tasks/{task_id}`;
+- protected `GET /ratification/v1/tasks/{task_id}/generations/{generation}`;
 - protected `POST /ratification/v1/tasks/{task_id}/review`;
 - protected `POST /ratification/v1/tasks/{task_id}/decision`.
 
@@ -240,6 +241,19 @@ history, actor, policy, or credentials. Every protected route authenticates and
 authorizes first. Every ratification response, including errors, is private
 `no-store`, has a restrictive CSP, `nosniff`, `no-referrer`, and restrictive
 Permissions-Policy, and emits no permissive CORS headers.
+
+The generation route has the same authentication, tenant-membership,
+`humanRatifier`, ownership/tenant visibility, privacy, and security-header
+contract as the latest-view route. `{generation}` is a base-10 nonzero `u64`;
+zero is 400 and parser overflow is rejected without an authority lookup. A
+missing task, missing generation, foreign tenant, or owner-invisible task is the
+same opaque 404. Success returns the immutable historical generation with its
+complete authenticated receipt history, private `Cache-Control: no-store`, and
+the same strong actor-specific ETag in both the `ETag` header and JSON `etag`
+field. Historical reads never reinterpret an old terminal generation using the
+current task state and never mutate, supersede, or publish it. The browser always
+loads the latest generation and intentionally provides no generation chooser;
+the historical route is for authorized audit/API clients.
 
 In bearer mode, open the console at the exact `SMESH_A2A_PUBLIC_URL` origin,
 enter task/optional tenant/token, and load. The token is copied from the password
@@ -387,7 +401,7 @@ the migrator role. Startup migrations are forward, sealed, and append-only.
 There is no ratification down-migration command and no supported destructive
 row-by-row rollback.
 
-If application rollback is required after SQLite schema v10 or PostgreSQL
+If application rollback is required after SQLite schema v11 or PostgreSQL
 revision 11 is installed, first verify that the older binary explicitly
 supports that schema. Otherwise restore the
 pre-upgrade database **and matching key** as one offline unit. Never point an old
@@ -423,22 +437,36 @@ not production PostgreSQL runtime evidence. The production browser
 suite is part of `npm --prefix demo test` and requires Chrome/Chromium plus its
 fixture prerequisites.
 
-With a running bearer deployment, keep the token out of command history:
+With a running bearer deployment, keep the token out of command history and
+store the private response only in an owner-private temporary directory. Treat
+all ratification views, headers, and bearer credentials as sensitive:
 
 ```bash
+umask 077
+TMP_DIR=$(mktemp -d)
+chmod 700 "$TMP_DIR"
+cleanup() {
+  rm -f "$TMP_DIR/curl.conf" "$TMP_DIR/headers" "$TMP_DIR/view.json"
+  rmdir "$TMP_DIR"
+  unset TOKEN
+}
+trap cleanup EXIT
 read -rsp 'Bearer token: ' TOKEN; printf '\n'
+printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$TMP_DIR/curl.conf"
+chmod 600 "$TMP_DIR/curl.conf"
+unset TOKEN
 ORIGIN=http://127.0.0.1:4000
 TASK_ID='replace-with-task-id'
-curl --fail-with-body --silent --show-error \
-  -H "Authorization: Bearer $TOKEN" \
+curl --config "$TMP_DIR/curl.conf" --fail-with-body --silent --show-error \
   "$ORIGIN/ratification/v1/tasks/$TASK_ID" \
-  -D /tmp/smesh-ratification-headers -o /tmp/smesh-ratification-view.json
+  -D "$TMP_DIR/headers" -o "$TMP_DIR/view.json"
+chmod 600 "$TMP_DIR/headers" "$TMP_DIR/view.json"
 unset TOKEN
-grep -i '^etag:' /tmp/smesh-ratification-headers
+grep -i '^etag:' "$TMP_DIR/headers"
+# Inspect "$TMP_DIR/view.json" before this shell exits and the trap removes it.
 ```
 
-Use an owner-private temporary directory instead of `/tmp` when the view itself
-is sensitive, and remove temporary response files after inspection. For mTLS,
+For mTLS,
 use curl's protected client identity options and omit `Authorization`:
 
 ```bash

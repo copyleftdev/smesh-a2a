@@ -259,11 +259,12 @@ test('delayed actor response cannot render after identity changes', { timeout: 3
     page.on('request',async request=>{
       if(!request.url().includes('/ratification/v1/'))return request.continue();
       await barrier; const value=packet(); value.packet.checkpoint='actor-a-private';
-      return request.respond({status:200,contentType:'application/json',body:JSON.stringify(value)}).catch(()=>{});
+      await request.respond({status:200,contentType:'application/json',body:JSON.stringify(value)}).catch(()=>{});
     });
     await page.goto(`${f.url}/ratification/console`,{waitUntil:'domcontentloaded',timeout:5000});
+    await page.evaluate(()=>{window.__requestHandled=new Promise(resolve=>document.querySelector('#status').addEventListener('smesh-ratification-request-complete',resolve,{once:true}));});
     await page.type('#task','task-1'); await page.type('#token','actor-a'); await page.click('#load');
-    await page.type('#token','actor-b'); release(); await new Promise(resolve=>setTimeout(resolve,100));
+    await page.type('#token','actor-b'); release(); await page.evaluate(()=>window.__requestHandled);
     assert.deepEqual(await page.evaluate(()=>({hidden:document.querySelector('#review-surface').hidden,packet:document.querySelector('#packet').textContent,state:document.querySelector('#status').dataset.state})),{hidden:true,packet:'',state:'BOOTSTRAP_LOCKED'});
   } finally { release?.(); if(browser)await browser.close(); await close(f.server); }
 });

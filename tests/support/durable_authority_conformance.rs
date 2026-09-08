@@ -180,6 +180,7 @@ fn outbox_lease() -> OutboxLease {
             context_id: "context-conformance".to_owned(),
             text: "work-conformance".to_owned(),
         },
+        ratification_required: false,
         execution_reservation: None,
     }
 }

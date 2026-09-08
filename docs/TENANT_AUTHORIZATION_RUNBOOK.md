@@ -16,7 +16,7 @@ single-writer authority or the PostgreSQL multi-replica authority. Set:
 
 The policy is loaded and completely validated before the listener and durable/runtime resources are acquired. The file is bounded to 256 KiB and rejects symlinks, unknown fields, duplicate identifiers/bindings, disabled or missing memberships, and human/service role confusion. Authentication-only generic handlers remain development-only because upstream spawned execution does not retain explicit tenant context. The production listener is bound before opening the selected durable authority, so an occupied bind cannot migrate or recover it.
 
-The current SQLite authority revision is schema v10 and the PostgreSQL authority revision is v11. Opening an older supported SQLite
+The current SQLite authority revision is schema v11 and the PostgreSQL authority revision is v11. Opening an older supported SQLite
 database that predates tenant binding requires both:
 
 ```text

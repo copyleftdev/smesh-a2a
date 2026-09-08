@@ -77,7 +77,7 @@ async function gateway(root, database, key, policyPath, issuer, port) {
     SMESH_A2A_PUBLIC_URL: `http://127.0.0.1:${port}`, SMESH_A2A_DURABLE_BACKEND: 'sqlite',
     SMESH_A2A_SQLITE_PATH: database, SMESH_A2A_RATIFICATION_HMAC_KEY_PATH: key,
     SMESH_A2A_AUTHORIZATION_POLICY_PATH: policyPath, SMESH_A2A_TRANSPORT_MODE: 'loopback-plain',
-    SMESH_A2A_CLIENT_AUTH_MODE: 'disabled' };
+    SMESH_A2A_CLIENT_AUTH_MODE: 'disabled', SMESH_TEST_RATIFICATION_AMEND_CANDIDATE: '1' };
   const child = spawn(BIN, [], { cwd: ROOT, env, stdio: ['ignore', 'ignore', 'pipe'] });
   let logs = ''; child.stderr.setEncoding('utf8'); child.stderr.on('data', chunk => { logs += chunk; });
   await new Promise((ok, no) => {
@@ -137,6 +137,46 @@ async function load(page, base, taskId, token) {
   await page.waitForSelector('#ack-uncertainty', { timeout: WATCHDOG });
 }
 async function acknowledge(page) { await page.evaluate(() => { for (const box of document.querySelectorAll('#review-items input[type=checkbox]')) box.click(); }); }
+function sqliteValue(database, sql) {
+  const result = spawnSync('sqlite3', [database, sql], { encoding: 'utf8', timeout: WATCHDOG });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+async function waitForSqliteValue(database, sql, expected, label) {
+  const deadline = Date.now() + WATCHDOG;
+  let actual = sqliteValue(database, sql);
+  while (actual !== expected && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 25));
+    actual = sqliteValue(database, sql);
+  }
+  assert.equal(actual, expected, `${label} did not reach its exact durable barrier`);
+}
+async function assertSuppressedPublicSurfaces(page, base, token, taskId, database) {
+  const headers = { authorization: `Bearer ${token}`, 'x-smesh-tenant': 'tenant-browser' };
+  const ratification = await fetch(`${base}/ratification/v1/tasks/${taskId}`, { headers });
+  assert.equal(ratification.status, 200);
+  await ratification.arrayBuffer();
+  const rest = await fetch(`${base}/rest/tasks/${taskId}`, { headers });
+  assert.equal(rest.status, 200);
+  const rpc = await jsonrpc(base, token, 'GetTask', { id: taskId });
+  const surfaces = [
+    ['rest', await rest.text()],
+    ['jsonrpc', JSON.stringify(rpc)],
+    ['dom', await page.content()],
+    ['durable-public', sqliteValue(database, `SELECT group_concat(value,'') FROM (
+      SELECT task_json AS value FROM tasks WHERE task_id='${taskId}'
+      UNION ALL SELECT event_json FROM task_events WHERE task_id='${taskId}'
+      UNION ALL SELECT payload_json FROM outbox WHERE task_id='${taskId}'
+      UNION ALL SELECT payload_json FROM receiver_inbox WHERE task_id='${taskId}'
+      UNION ALL SELECT COALESCE(termination_json,'') FROM receiver_inbox WHERE task_id='${taskId}'
+      UNION ALL SELECT frame_json FROM stream_frames WHERE message_id='message-${taskId}'
+    );`)],
+  ];
+  for (const [name, surface] of surfaces) {
+    assert.equal(surface.includes('sealed candidate'), false, `${name} exposed sealed artifact content`);
+    assert.equal(surface.includes('candidate ready'), false, `${name} exposed suppressed candidate result`);
+  }
+}
 function scanFiles(root, forbidden) {
   const paths = readdirSync(root).filter(name => name.includes('.sqlite3')).map(name => join(root, name));
   for (const path of paths) { const bytes = readFileSync(path); for (const value of forbidden) assert.equal(bytes.includes(Buffer.from(value)), false, `canary leaked to ${path}`); }
@@ -208,31 +248,60 @@ test('real production binary bearer console records all decisions, restarts stab
       browser = await puppeteer.launch({ executablePath: process.env.CHROME || '/usr/bin/google-chrome', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
       const decisionPage = await browser.newPage(); await load(decisionPage, running.base, decisionTask, token); await acknowledge(decisionPage); await decisionPage.click('#review-submit');
       await decisionPage.waitForFunction(() => document.querySelector('#status').dataset.state === 'REVIEWED', { polling: 'mutation', timeout: WATCHDOG });
+      const beforeDecision = await fetch(`${running.base}/ratification/v1/tasks/${decisionTask}`, { headers: { authorization: `Bearer ${token}`, 'x-smesh-tenant': 'tenant-browser' } });
+      assert.equal(beforeDecision.status, 200);
+      const beforeDecisionView = await beforeDecision.json();
+      assert.equal(beforeDecisionView.packet.generation, 1);
+      assert.equal(beforeDecisionView.terminalDecision, null);
+      assert.equal(beforeDecisionView.history.length, 1);
       await decisionPage.type('#rationale', `${decision} in real Chromium`); await decisionPage.click(`#${decision}`);
       await decisionPage.waitForFunction(() => document.querySelector('#status').dataset.state === 'TERMINAL', { polling: 'mutation', timeout: WATCHDOG });
-      const recorded = await fetch(`${running.base}/ratification/v1/tasks/${decisionTask}`, { headers: { authorization: `Bearer ${token}`, 'x-smesh-tenant': 'tenant-browser' } });
-      assert.equal(recorded.status, 200); const recordedView = await recorded.json(); assert.equal(recordedView.terminalDecision, decision); assert.equal(recordedView.history.length, 2);
-      const decisionTaskView = await jsonrpc(running.base, token, 'GetTask', { id: decisionTask });
-      assert.equal(decisionTaskView.result.status.state, expectedTaskState);
+      let amendmentRevision;
       if (decision === 'amend') {
-        assert.equal(JSON.stringify(decisionTaskView).includes('sealed candidate'), false);
-        assert.equal(decisionTaskView.result.artifacts == null, true);
+        await assertSuppressedPublicSurfaces(decisionPage, running.base, token, decisionTask, decisionDb);
+        amendmentRevision = beforeDecisionView.packet.taskRevision + 1;
+        const awaitingDelivery = await jsonrpc(running.base, token, 'GetTask', { id: decisionTask });
+        assert.equal(awaitingDelivery.result.status.state, 'TASK_STATE_INPUT_REQUIRED');
+        assert.equal(awaitingDelivery.result.artifacts == null, true);
+      } else {
+        const recorded = await fetch(`${running.base}/ratification/v1/tasks/${decisionTask}`, { headers: { authorization: `Bearer ${token}`, 'x-smesh-tenant': 'tenant-browser' } });
+        assert.equal(recorded.status, 200, `${decision} live read`); const recordedView = await recorded.json(); assert.equal(recordedView.terminalDecision, decision); assert.equal(recordedView.history.length, 2);
+        const decisionTaskView = await jsonrpc(running.base, token, 'GetTask', { id: decisionTask });
+        assert.equal(decisionTaskView.result.status.state, expectedTaskState);
       }
       const decisionLogs = running.logs(); await running.stop(); running = undefined; await browser.close(); browser = undefined;
       assert.equal(decisionLogs.includes(token), false); assert.equal(decisionLogs.includes(keyCanary), false); assert.equal(decisionLogs.includes(pathCanary), false); scanFiles(root, [token, keyCanary, pathCanary]);
-      if (decision === 'amend') {
-        const work = spawnSync('sqlite3', [decisionDb, `SELECT count(*)||':'||min(state)||':'||max(causative_revision) FROM outbox WHERE task_id='${decisionTask}' AND causative_revision>1;`], { encoding: 'utf8', timeout: WATCHDOG });
-        assert.equal(work.status, 0, work.stderr);
-        const [count, state, revision] = work.stdout.trim().split(':');
-        assert.equal(count, '1'); assert.ok(['pending', 'leased', 'delivered'].includes(state)); assert.ok(Number(revision) > 1);
-      }
       running = await gateway(root, decisionDb, key, policyPath, oidc.issuer, decisionPort).catch(error => { error.message = `${decision} restart: ${error.message}`; throw error; });
-      const persisted = await fetch(`${running.base}/ratification/v1/tasks/${decisionTask}`, { headers: { authorization: 'Bearer ' + token, 'x-smesh-tenant': 'tenant-browser' } });
-      assert.equal(persisted.status, 200); const persistedView = await persisted.json(); assert.equal(persistedView.terminalDecision, decision); assert.equal(persistedView.history.length, 2);
       if (decision !== 'amend') {
-        const persistedTask = await jsonrpc(running.base, token, 'GetTask', { id: decisionTask }); assert.equal(persistedTask.result.status.state, expectedTaskState);
+        const persisted = await fetch(`${running.base}/ratification/v1/tasks/${decisionTask}`, { headers: { authorization: 'Bearer ' + token, 'x-smesh-tenant': 'tenant-browser' } });
+        assert.equal(persisted.status, 200); const persistedView = await persisted.json(); assert.equal(persistedView.terminalDecision, decision); assert.equal(persistedView.history.length, 2);
       }
       browser = await puppeteer.launch({ executablePath: process.env.CHROME || '/usr/bin/google-chrome', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+      if (decision === 'amend') {
+        await waitForSqliteValue(
+          decisionDb,
+          `SELECT count(*)||':'||min(state)||':'||min(causative_revision)||':'||max(causative_revision) FROM outbox WHERE task_id='${decisionTask}' AND causative_revision=${amendmentRevision};`,
+          `1:delivered:${amendmentRevision}:${amendmentRevision}`,
+          'amendment outbox delivery after recovery',
+        );
+        const reopenedView = await fetch(`${running.base}/ratification/v1/tasks/${decisionTask}`, { headers: { authorization: `Bearer ${token}`, 'x-smesh-tenant': 'tenant-browser' } });
+        assert.equal(reopenedView.status, 200);
+        const generationTwo = await reopenedView.json();
+        assert.equal(generationTwo.packet.generation, 2);
+        assert.equal(generationTwo.phase, 'awaitingReview');
+        assert.equal(generationTwo.terminalDecision, null);
+        assert.equal(generationTwo.history.length, 0);
+        const reopened = await browser.newPage();
+        await reopened.setExtraHTTPHeaders({ authorization: `Bearer ${token}`, 'x-smesh-tenant': 'tenant-browser' });
+        await reopened.goto(`${running.base}/rest/tasks/${decisionTask}`, { waitUntil: 'domcontentloaded', timeout: WATCHDOG });
+        const persistedTask = await jsonrpc(running.base, token, 'GetTask', { id: decisionTask });
+        assert.equal(persistedTask.result.status.state, 'TASK_STATE_INPUT_REQUIRED');
+        assert.equal(persistedTask.result.artifacts == null, true);
+        await assertSuppressedPublicSurfaces(reopened, running.base, token, decisionTask, decisionDb);
+        await reopened.close();
+      } else {
+        const persistedTask = await jsonrpc(running.base, token, 'GetTask', { id: decisionTask }); assert.equal(persistedTask.result.status.state, expectedTaskState);
+      }
     }
 
     if (running) { await running.stop(); running = undefined; }

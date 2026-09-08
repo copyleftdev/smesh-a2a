@@ -1,13 +1,14 @@
 use std::{env, str::FromStr, time::Duration};
 
 use smesh_a2a::{
-    AuthoritativeReviewCandidate, AuthorityIdentity as _, AuthorizationAuditInput,
-    AuthorizationDecisionEffect, AuthorizedMutation, CallbackAuthority as _, CallbackConfigId,
-    CallbackTerminalTestFault, CancellationAuthority as _, ConfigCreateCommand, HumanDecision,
-    OutboxAuthority as _, OwnedTaskScope, PostgresStoreConfig, PostgresStoreError,
-    PostgresTaskStore, QuotaOperation, QuotaPolicy, QuotaSubject, RatificationAuthority as _,
-    RatificationCommand, ReceiverAdmission, ReceiverAuthority as _, ReviewAcknowledgement,
-    SendMessageAdmission, SqliteTaskStore, TaskAdmission as _, VisibilityScope,
+    AttemptDisposition, AuthoritativeReviewCandidate, AuthorityDiagnostics as _,
+    AuthorityIdentity as _, AuthorizationAuditInput, AuthorizationDecisionEffect,
+    AuthorizedMutation, CallbackAuthority as _, CallbackConfigId, CallbackTerminalTestFault,
+    CancellationAuthority as _, ConfigCreateCommand, HumanDecision, OutboxAuthority as _,
+    OwnedTaskScope, PostgresStoreConfig, PostgresStoreError, PostgresTaskStore, QuotaOperation,
+    QuotaPolicy, QuotaSubject, RatificationAuthority as _, RatificationCommand, ReceiverAdmission,
+    ReceiverAuthority as _, ReviewAcknowledgement, SendMessageAdmission, SqliteTaskStore,
+    TaskAdmission as _, TransitionOutcome, VisibilityScope,
 };
 use tokio_postgres::NoTls;
 
@@ -79,12 +80,12 @@ where
     C: tokio_postgres::GenericClient + Sync,
 {
     let queries = [
-        "SELECT concat_ws('|','relation',c.relname,c.relkind,c.relrowsecurity,c.relforcerowsecurity,c.relpersistence) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY 1",
+        "SELECT concat_ws('|','relation',c.relname,c.relkind,c.relrowsecurity,c.relforcerowsecurity,c.relpersistence,owner.rolname,COALESCE(c.relacl::text,'')) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_roles owner ON owner.oid=c.relowner WHERE n.nspname=$1 ORDER BY 1",
         "SELECT concat_ws('|','column',c.relname,a.attnum,a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,a.attidentity,a.attgenerated,COALESCE(pg_get_expr(d.adbin,d.adrelid),'')) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE n.nspname=$1 AND a.attnum>0 AND NOT a.attisdropped ORDER BY c.relname,a.attnum",
         "SELECT concat_ws('|','constraint',c.relname,x.conname,x.contype,pg_get_constraintdef(x.oid,true)) FROM pg_constraint x JOIN pg_class c ON c.oid=x.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY c.relname,x.conname",
         "SELECT concat_ws('|','index',i.relname,pg_get_indexdef(i.oid)) FROM pg_class i JOIN pg_namespace n ON n.oid=i.relnamespace WHERE n.nspname=$1 AND i.relkind='i' ORDER BY i.relname",
         "SELECT concat_ws('|','trigger',c.relname,t.tgname,pg_get_triggerdef(t.oid,true)) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND NOT t.tgisinternal ORDER BY c.relname,t.tgname",
-        "SELECT concat_ws('|','function',p.proname,pg_get_function_identity_arguments(p.oid),owner.rolname,pg_get_functiondef(p.oid)) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles owner ON owner.oid=p.proowner WHERE n.nspname=$1 ORDER BY p.proname,pg_get_function_identity_arguments(p.oid)",
+        "SELECT concat_ws('|','function',p.proname,pg_get_function_identity_arguments(p.oid),owner.rolname,COALESCE(p.proacl::text,''),pg_get_functiondef(p.oid)) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles owner ON owner.oid=p.proowner WHERE n.nspname=$1 ORDER BY p.proname,pg_get_function_identity_arguments(p.oid)",
         "SELECT concat_ws('|','policy',c.relname,p.polname,p.polcmd,p.polpermissive,COALESCE(pg_get_expr(p.polqual,p.polrelid),''),COALESCE(pg_get_expr(p.polwithcheck,p.polrelid),''),p.polroles::text) FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY c.relname,p.polname",
         "SELECT concat_ws('|','grant',table_name,grantee,privilege_type,is_grantable) FROM information_schema.role_table_grants WHERE table_schema=$1 ORDER BY table_name,grantee,privilege_type",
         "SELECT concat_ws('|','sequence-grant',object_name,grantee,privilege_type,is_grantable) FROM information_schema.usage_privileges WHERE object_schema=$1 ORDER BY object_name,grantee,privilege_type",
@@ -203,12 +204,13 @@ async fn clone_ratification_rows_into_revision_ten(
          ALTER TABLE {target_schema}.ratification_events DISABLE ROW LEVEL SECURITY;
          INSERT INTO {target_schema}.tasks OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.tasks WHERE tenant_scope='tenant-ratification' AND task_id='postgres-ratification-task';
          INSERT INTO {target_schema}.idempotency_records OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.idempotency_records WHERE tenant_scope='tenant-ratification' AND task_id='postgres-ratification-task';
-         INSERT INTO {target_schema}.outbox OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.outbox WHERE tenant_scope='tenant-ratification' AND task_id='postgres-ratification-task';
+         INSERT INTO {target_schema}.outbox(outbox_id,dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,attempt_count,max_attempts,available_at,lease_owner,lease_token,lease_until,last_error,created_at,updated_at,dispatch_identity_version,quota_binding_digest,quota_reservation_id,quota_reservation_version,reserved_output_bytes,reserved_event_count) OVERRIDING SYSTEM VALUE SELECT outbox_id,dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,attempt_count,max_attempts,available_at,lease_owner,lease_token,lease_until,last_error,created_at,updated_at,dispatch_identity_version,quota_binding_digest,quota_reservation_id,quota_reservation_version,reserved_output_bytes,reserved_event_count FROM {source_schema}.outbox WHERE tenant_scope='tenant-ratification' AND task_id='postgres-ratification-task';
          INSERT INTO {target_schema}.task_events OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.task_events WHERE tenant_scope='tenant-ratification';
          INSERT INTO {target_schema}.outbox_attempts OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.outbox_attempts WHERE tenant_scope='tenant-ratification';
          INSERT INTO {target_schema}.stream_transcripts OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.stream_transcripts WHERE tenant_scope='tenant-ratification';
          INSERT INTO {target_schema}.stream_frames OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.stream_frames WHERE tenant_scope='tenant-ratification';
          INSERT INTO {target_schema}.authorization_decisions OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.authorization_decisions WHERE tenant_scope='tenant-ratification';
+         INSERT INTO {target_schema}.ratification_key_check SELECT * FROM {source_schema}.ratification_key_check;
          INSERT INTO {target_schema}.ratification_packets SELECT * FROM {source_schema}.ratification_packets WHERE tenant_scope='tenant-ratification' AND task_id='postgres-ratification-task';
          INSERT INTO {target_schema}.ratification_events SELECT * FROM {source_schema}.ratification_events WHERE tenant_scope='tenant-ratification' AND task_id='postgres-ratification-task';
          ALTER TABLE {source_schema}.tasks ENABLE ROW LEVEL SECURITY; ALTER TABLE {source_schema}.tasks FORCE ROW LEVEL SECURITY;
@@ -299,7 +301,7 @@ async fn revision_ten_final_totals(
         .await
         .unwrap();
     let row = client.query_one(
-        &format!("SELECT ({schema}.retained_authority_oracle('tenant-ratification',NULL)+(SELECT COALESCE(sum({schema}.row_retained_bytes(p)),0) FROM {schema}.ratification_packets p)+(SELECT COALESCE(sum({schema}.row_retained_bytes(e)),0) FROM {schema}.ratification_events e))::bigint,({schema}.retained_authority_account_oracle('tenant-ratification','owner-ratification')+(SELECT COALESCE(sum({schema}.row_retained_bytes(p)),0) FROM {schema}.ratification_packets p)+(SELECT COALESCE(sum({schema}.row_retained_bytes(e)),0) FROM {schema}.ratification_events e))::bigint,({schema}.retained_authority_oracle('tenant-ratification',$1)+(SELECT COALESCE(sum({schema}.row_retained_bytes(p)),0) FROM {schema}.ratification_packets p))::bigint"),
+        &format!("SELECT ({schema}.retained_authority_oracle('tenant-ratification',NULL)+(SELECT COALESCE(sum({schema}.row_retained_bytes(p)),0) FROM {schema}.ratification_packets p)+(SELECT COALESCE(sum({schema}.row_retained_bytes(e)),0) FROM {schema}.ratification_events e)+(SELECT COALESCE(sum(octet_length((to_jsonb(o)||jsonb_build_object('ratification_required',false))::text)::bigint-{schema}.row_retained_bytes(o)),0) FROM {schema}.outbox o))::bigint,({schema}.retained_authority_account_oracle('tenant-ratification','owner-ratification')+(SELECT COALESCE(sum({schema}.row_retained_bytes(p)),0) FROM {schema}.ratification_packets p)+(SELECT COALESCE(sum({schema}.row_retained_bytes(e)),0) FROM {schema}.ratification_events e)+(SELECT COALESCE(sum(octet_length((to_jsonb(o)||jsonb_build_object('ratification_required',false))::text)::bigint-{schema}.row_retained_bytes(o)),0) FROM {schema}.outbox o WHERE {schema}.retained_account(to_jsonb(o))='owner-ratification'))::bigint,({schema}.retained_authority_oracle('tenant-ratification',$1)+(SELECT COALESCE(sum({schema}.row_retained_bytes(p)),0) FROM {schema}.ratification_packets p))::bigint"),
         &[&owner_principal],
     ).await.unwrap();
     client.batch_execute(&format!(
@@ -533,6 +535,18 @@ fn config(admin: &str, runtime: &str, suffix: &str) -> PostgresStoreConfig {
         .with_ratification_key(zeroize::Zeroizing::new([0x60; 32]))
 }
 
+fn test_tenant_anchor_seal(tenant: &str, packet_count: i64, event_count: i64) -> String {
+    use base64::Engine as _;
+    use hmac::Mac as _;
+
+    let digest =
+        smesh_a2a::content_digest(format!("{tenant}:{packet_count}:{event_count}").as_bytes());
+    let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(&[0x60; 32]).unwrap();
+    mac.update(b"smesh-postgres-ratification-tenant-anchor/v1\0");
+    mac.update(digest.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
 #[test]
 fn postgres_ci_serializes_ratification_authority_and_exact_binary_qualification() {
     let workflow = include_str!("../.github/workflows/ci.yml");
@@ -569,6 +583,28 @@ fn revision_ten_declares_the_ratification_boundary() {
     assert!(!adapter.contains("PostgreSQL ratification decisions are not implemented"));
     assert!(adapter.contains("FOR UPDATE OF t"));
     assert!(adapter.contains("FOR UPDATE OF p"));
+}
+
+#[test]
+fn postgres_startup_ratification_verdict_is_one_repeatable_read_transaction() {
+    let adapter = include_str!("../src/postgres_store.rs");
+    let begin = adapter
+        .find("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
+    let reconcile = adapter[begin..]
+        .find("reconcile_ratification_key(")
+        .map(|offset| begin + offset)
+        .unwrap();
+    let commit = adapter[reconcile..]
+        .find("ratification_transaction\n            .commit()")
+        .map(|offset| reconcile + offset)
+        .unwrap();
+    assert!(begin < reconcile && reconcile < commit);
+    let reconcile_key = &adapter[adapter.find("async fn reconcile_ratification_key").unwrap()..];
+    assert!(reconcile_key.contains("reconcile_postgres_ratification_anchor("));
+
+    let general_validation = &adapter[adapter.find("async fn validate_semantics").unwrap()..];
+    assert!(!general_validation.contains("validate_ratification_semantics(client"));
 }
 
 #[tokio::test]
@@ -624,7 +660,27 @@ async fn populated_revision_ten_upgrade_attributes_packet_and_receipt_principals
         drop(source.store);
         PostgresTaskStore::drop_test_schema(&source.config).await.unwrap();
 
+        let wrong_key = PostgresStoreConfig::new(
+            &admin,
+            &runtime,
+            target_schema.clone(),
+        )
+        .unwrap()
+        .with_test_only_insecure_loopback(true)
+        .with_test_only_parent_managed_cleanup()
+        .with_ratification_key(zeroize::Zeroizing::new([0x61; 32]));
+        assert!(PostgresTaskStore::open(wrong_key).await.is_err());
+
         let upgraded = PostgresTaskStore::open(target.clone()).await.unwrap();
+        let provenance = client
+            .query_one(
+                &format!("SELECT ratification_initialized,ratification_migration_pending FROM {target_schema}.store_identity WHERE singleton=1"),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(provenance.get::<_, bool>(0));
+        assert!(!provenance.get::<_, bool>(1));
         let attribution = client.query_one(
             &format!("SELECT {target_schema}.retained_principal(to_jsonb(p)),{target_schema}.retained_principal(to_jsonb(e)),{target_schema}.row_retained_bytes(p),{target_schema}.row_retained_bytes(e) FROM {target_schema}.ratification_packets p JOIN {target_schema}.ratification_events e USING(tenant_scope,task_id,generation)"),
             &[],
@@ -809,6 +865,112 @@ fn revision_eleven_permanently_exposes_only_tenant_discovery_rows_to_migrator() 
     assert!(migration.contains("CREATE POLICY retained_diagnostics ON __SCHEMA__.%I FOR SELECT TO __MIGRATOR__ USING(current_setting(''smesh.internal_global'',true)=''diag-v1'')"));
 }
 
+#[test]
+fn revision_eleven_preserves_callback_principal_attribution() {
+    let migration = include_str!("../migrations/postgres/0011_ratification_retained_authority.sql");
+    assert!(
+        migration
+            .contains("SELECT c.principal_scope INTO principal FROM __SCHEMA__.callback_configs c")
+    );
+    assert!(
+        migration
+            .contains("JOIN __SCHEMA__.callback_configs c USING(tenant_scope,task_id,config_id)")
+    );
+}
+
+#[test]
+fn revision_eleven_keeps_ratification_hmac_key_outside_postgres() {
+    let migration = include_str!("../migrations/postgres/0011_ratification_retained_authority.sql");
+    assert!(!migration.contains("key_bytes bytea"));
+    assert!(migration.contains(
+        "CREATE FUNCTION __SCHEMA__.ratification_anchor_signing_digest(key_generation_arg text) RETURNS text"
+    ));
+    assert!(migration.contains(
+        "REVOKE ALL ON FUNCTION __SCHEMA__.ratification_anchor_signing_digest(text) FROM PUBLIC"
+    ));
+    assert!(migration.contains(
+        "GRANT EXECUTE ON FUNCTION __SCHEMA__.ratification_anchor_signing_digest(text) TO __ROLE__"
+    ));
+    assert!(migration.contains(
+        "CREATE FUNCTION __SCHEMA__.seal_ratification_anchor(expected_digest text,key_generation_arg text,state_seal_arg text) RETURNS void"
+    ));
+    assert!(migration.contains("actual_digest<>expected_digest"));
+}
+
+#[tokio::test]
+async fn quoted_migrator_role_installs_fresh_and_reopens_revision_eleven() {
+    let Ok(admin) = env::var("SMESH_TEST_POSTGRES_QUOTED_MIGRATOR_URL") else {
+        return;
+    };
+    let Some((_bootstrap_admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let row = client
+        .query_one("SELECT current_user,quote_ident(current_user),current_setting('standard_conforming_strings')", &[])
+        .await
+        .unwrap();
+    let role: String = row.get(0);
+    let identifier: String = row.get(1);
+    assert_ne!(role, identifier);
+    if env::var_os("CI").is_some() {
+        assert!(role.contains('\''));
+        assert!(role.contains('\\'));
+        assert_eq!(row.get::<_, String>(2), "off");
+    }
+    drop(client);
+    driver.abort();
+
+    let config = config(&admin, &runtime, "quoted_migrator_fresh_v11");
+    let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+    drop(store);
+    let reopened = PostgresTaskStore::open(config.clone()).await.unwrap();
+    drop(reopened);
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+}
+
+#[test]
+fn revision_eleven_renders_quoted_migrator_as_identifier_and_literal() {
+    let migration = include_str!("../migrations/postgres/0011_ratification_retained_authority.sql");
+    assert!(migration.contains("__MIGRATOR__"));
+    let rendered = smesh_a2a::render_migration_sql_for_test(
+        migration,
+        "review_schema",
+        "review_schema_runtime",
+        "Ratifier Role's \\QA",
+    );
+    assert!(!rendered.contains("__MIGRATOR__"));
+    assert!(rendered.contains("TO %I"));
+    assert!(rendered.contains("current_user=E'Ratifier Role''s \\\\QA'"));
+}
+
+#[test]
+fn every_migrator_placeholder_is_context_safely_rendered() {
+    for migration in [
+        include_str!("../migrations/postgres/0001_authority_schema_v6.sql"),
+        include_str!("../migrations/postgres/0003_receiver_sender_fence.sql"),
+        include_str!("../migrations/postgres/0004_distributed_quota_authority.sql"),
+        include_str!("../migrations/postgres/0005_artifact_authority.sql"),
+        include_str!("../migrations/postgres/0006_audit_projection.sql"),
+        include_str!("../migrations/postgres/0007_callback_authority.sql"),
+        include_str!("../migrations/postgres/0009_authorization_audit_retention.sql"),
+        include_str!("../migrations/postgres/0011_ratification_retained_authority.sql"),
+    ] {
+        let rendered = smesh_a2a::render_migration_sql_for_test(
+            migration,
+            "review_schema",
+            "review_schema_runtime",
+            "hostile'role\\name",
+        );
+        assert!(!rendered.contains("__MIGRATOR__"));
+        assert!(
+            rendered.contains("hostile''role\\\\name")
+                || rendered.contains("\"hostile'role\\name\"")
+        );
+    }
+}
+
 #[tokio::test]
 async fn post_v11_artifact_and_callback_only_tenants_require_usage_rows_on_restart() {
     let Some((admin, runtime)) = postgres_urls() else {
@@ -955,6 +1117,473 @@ async fn populated_revision_ten_enforces_each_retained_scope_at_exact_boundary()
 }
 
 #[tokio::test]
+async fn fresh_unkeyed_postgres_can_enable_ratification_later() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let base = unkeyed_config(&admin, &runtime, "enable_later");
+    let disabled = PostgresTaskStore::open(base.clone()).await.unwrap();
+    assert!(disabled.ratification_authority().is_none());
+    drop(disabled);
+
+    let enabled_config = base
+        .clone()
+        .with_ratification_key(zeroize::Zeroizing::new([0x71; 32]));
+    let enabled = PostgresTaskStore::open(enabled_config.clone())
+        .await
+        .unwrap();
+    assert!(enabled.ratification_authority().is_some());
+    drop(enabled);
+    assert!(PostgresTaskStore::open(base.clone()).await.is_err());
+    assert!(
+        PostgresTaskStore::open(
+            base.clone()
+                .with_ratification_key(zeroize::Zeroizing::new([0x72; 32]))
+        )
+        .await
+        .is_err()
+    );
+    let reopened = PostgresTaskStore::open(enabled_config).await.unwrap();
+    drop(reopened);
+    PostgresTaskStore::drop_test_schema(&base).await.unwrap();
+}
+
+#[tokio::test]
+async fn initialized_postgres_ratification_anchor_rejects_null_seal() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let config = config(&admin, &runtime, "initialized-null-anchor-seal");
+    let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+    drop(store);
+
+    let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    assert_eq!(
+        client
+            .execute(
+                &format!(
+                    "UPDATE {}.ratification_ledger_anchor SET state_seal=NULL WHERE singleton=1 AND initialized=true",
+                    config.schema_name()
+                ),
+                &[],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        PostgresTaskStore::open(config.clone()).await.is_err(),
+        "an initialized anchor with a missing seal is corruption"
+    );
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_startup_anchor_lock_is_bounded_and_reports_unavailable() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let config = config(&admin, &runtime, "startup-anchor-lock-timeout");
+    let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+    drop(store);
+
+    let (mut client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let transaction = client.transaction().await.unwrap();
+    transaction
+        .query_one(
+            &format!(
+                "SELECT singleton FROM {}.ratification_ledger_anchor WHERE singleton=1 FOR UPDATE",
+                config.schema_name()
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        PostgresTaskStore::open(config.clone()),
+    )
+    .await
+    .expect("startup anchor lock watchdog expired");
+    let Err(error) = result else {
+        panic!("startup unexpectedly acquired a locked anchor")
+    };
+    assert_eq!(error, PostgresStoreError::Unavailable);
+
+    transaction.rollback().await.unwrap();
+    let reopened = PostgresTaskStore::open(config.clone()).await.unwrap();
+    drop(reopened);
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_startup_snapshot_serializes_a_concurrent_valid_ratification_mutation() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(30), async move {
+        let fixture = integrated_postgres_ratification(
+            &admin,
+            &runtime,
+            "startup-snapshot-barrier",
+            false,
+            false,
+        )
+        .await;
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let released = std::sync::Arc::new(tokio::sync::Notify::new());
+        let startup_config = fixture
+            .config
+            .clone()
+            .with_ratification_startup_test_probe(entered.clone(), released.clone());
+        let startup = tokio::spawn(PostgresTaskStore::open(startup_config));
+        entered.notified().await;
+
+        let store = std::sync::Arc::new(fixture.store);
+        let mutation_store = store.clone();
+        let scope = fixture.scope.clone();
+        let packet = fixture.packet.clone();
+        let task_id = fixture.task_id.clone();
+        let mutation = tokio::spawn(async move {
+            mutation_store
+                .acknowledge_ratification_review(
+                    &scope,
+                    review(&packet, &scope, &task_id),
+                    ratification_audit(
+                        &packet,
+                        &scope,
+                        &task_id,
+                        "startup-snapshot-review-audit",
+                        "ratificationReview",
+                        1_700_000_010_003,
+                    ),
+                )
+                .await
+        });
+
+        let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+        let driver = tokio::spawn(connection);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = client
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid<>pg_backend_pid() AND cardinality(pg_blocking_pids(pid))>0)",
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if blocked {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("concurrent ratification mutation never waited on startup snapshot");
+
+        released.notify_one();
+        let reopened = startup.await.unwrap().unwrap();
+        mutation.await.unwrap().unwrap();
+        assert_eq!(
+            reopened
+                .ratification_view(&fixture.scope, &fixture.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            smesh_a2a::RatificationState::Reviewed
+        );
+        drop(reopened);
+        drop(store);
+        drop(client);
+        driver.abort();
+        PostgresTaskStore::drop_test_schema(&fixture.config)
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("startup snapshot serialization watchdog expired");
+}
+
+#[tokio::test]
+async fn postgres_initialized_restart_does_not_scan_tenant_anchor_cardinality() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let config = config(&admin, &runtime, "tenant-cardinality-restart");
+    drop(PostgresTaskStore::open(config.clone()).await.unwrap());
+    let schema = config.schema_name().to_owned();
+    let key_generation = smesh_a2a::content_digest(&[0x60; 32]);
+    let tenants = (0..4096)
+        .map(|index| format!("scale-tenant-{index:04}"))
+        .collect::<Vec<_>>();
+    let seals = tenants
+        .iter()
+        .map(|tenant| test_tenant_anchor_seal(tenant, 0, 0))
+        .collect::<Vec<_>>();
+    let (mut client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let insert = client.transaction().await.unwrap();
+    insert
+        .batch_execute("SET LOCAL smesh.internal_global='ratification-anchor-v1'")
+        .await
+        .unwrap();
+    insert
+        .execute(
+            &format!(
+                "INSERT INTO {schema}.ratification_tenant_anchors(
+                   tenant_scope,packet_count,event_count,key_generation,state_seal)
+                 SELECT tenant_scope,0,0,$2,state_seal
+                 FROM unnest($1::text[],$3::text[]) AS rows(tenant_scope,state_seal)"
+            ),
+            &[&tenants, &key_generation, &seals],
+        )
+        .await
+        .unwrap();
+    insert.commit().await.unwrap();
+    client
+        .batch_execute("SELECT set_config('smesh.internal_global','ratification-anchor-v1',false)")
+        .await
+        .unwrap();
+    let count: i64 = client
+        .query_one(
+            &format!("SELECT count(*)::bigint FROM {schema}.ratification_tenant_anchors"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 4096);
+
+    let lock = client.transaction().await.unwrap();
+    lock.batch_execute(&format!(
+        "LOCK TABLE {schema}.ratification_tenant_anchors IN ACCESS EXCLUSIVE MODE"
+    ))
+    .await
+    .unwrap();
+    let restart_config = config.clone();
+    let restart_task = tokio::spawn(async move { PostgresTaskStore::open(restart_config).await });
+    let blocked_query = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(row) = lock
+                .query_opt(
+                    "SELECT query FROM pg_stat_activity
+                     WHERE pid<>pg_backend_pid() AND wait_event_type='Lock'
+                       AND query LIKE '%'||$1||'%' LIMIT 1",
+                    &[&schema],
+                )
+                .await
+                .unwrap()
+            {
+                break row.get::<_, String>(0);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    lock.rollback().await.unwrap();
+    let restart = tokio::time::timeout(Duration::from_secs(15), restart_task).await;
+    let (restarted_without_scan, failure) = match (blocked_query, restart) {
+        (Err(_), Ok(Ok(Ok(store)))) => {
+            drop(store);
+            (true, "none".to_owned())
+        }
+        (Ok(query), _) => (false, format!("blocked query: {query}")),
+        (_, Ok(Ok(Err(error)))) => (false, format!("restart error: {error:?}")),
+        (_, Ok(Err(error))) => (false, format!("restart task error: {error}")),
+        (_, Err(_)) => (false, "restart completion timed out".to_owned()),
+    };
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    assert!(
+        restarted_without_scan,
+        "initialized restart must not read or iterate the tenant-anchor table: {failure}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One real corpus owns setup, restart evidence, targeted rejection, and cleanup.
+async fn postgres_production_scale_restart_authenticates_anchor_then_qualifies_target() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(300), async move {
+        let fixture = integrated_postgres_ratification(
+            &admin,
+            &runtime,
+            "qualification-pre-cap",
+            false,
+            false,
+        )
+        .await;
+        let schema = fixture.config.schema_name().to_owned();
+        drop(fixture.store);
+        let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+        let driver = tokio::spawn(connection);
+        client
+            .batch_execute(&format!(
+                "SELECT set_config('smesh.tenant_scope','tenant-ratification',false);
+                 SELECT set_config('smesh.internal_global','claim-v1',false);
+                 ALTER TABLE {schema}.ratification_packets DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.ratification_packets DISABLE TRIGGER ratification_packet_anchor;
+                 ALTER TABLE {schema}.ratification_packets DISABLE TRIGGER retained_authority_accounting;
+                 INSERT INTO {schema}.ratification_packets(
+                   tenant_scope,task_id,generation,task_revision,checkpoint_hash,packet_hash,
+                   packet_seal,packet_json,approved_task_json,approved_result_json,
+                   approved_transcript_json,state,revision,created_at,updated_at)
+                 SELECT t.tenant_scope,t.task_id,g,1,
+                   'sha256:{}','sha256:'||encode(sha256(convert_to(g::text,'UTF8')),'hex'),
+                   'x',jsonb_build_object('principalScope',t.principal_scope)::text,
+                   '{{}}','{{}}','{{}}','canceled',0,1,1
+                 FROM generate_series(2,100002) g
+                 CROSS JOIN (SELECT tenant_scope,task_id,principal_scope FROM {schema}.tasks
+                             WHERE tenant_scope='tenant-ratification' LIMIT 1) t;
+                 WITH added AS (
+                   SELECT p.tenant_scope,t.owner_account_id,t.principal_scope,
+                          COALESCE(sum({schema}.row_retained_bytes(p)),0)::bigint bytes
+                   FROM {schema}.ratification_packets p
+                   JOIN {schema}.tasks t USING(tenant_scope,task_id)
+                   WHERE p.generation>1
+                   GROUP BY p.tenant_scope,t.owner_account_id,t.principal_scope
+                 )
+                 UPDATE {schema}.retained_authority_usage u
+                 SET retained_bytes=u.retained_bytes+added.bytes
+                 FROM added
+                 WHERE u.tenant_scope=added.tenant_scope AND (
+                   (u.scope_kind='tenant' AND u.scope_id=added.tenant_scope) OR
+                   (u.scope_kind='account' AND u.scope_id=added.owner_account_id) OR
+                   (u.scope_kind='principal' AND u.scope_id=added.principal_scope));
+                 ALTER TABLE {schema}.ratification_packets ENABLE TRIGGER retained_authority_accounting;
+                 ALTER TABLE {schema}.ratification_packets ENABLE TRIGGER ratification_packet_anchor;
+                 ALTER TABLE {schema}.ratification_packets ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.ratification_packets FORCE ROW LEVEL SECURITY",
+                "0".repeat(64)
+            ))
+            .await
+            .unwrap();
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.ratification_packets DISABLE ROW LEVEL SECURITY"
+            ))
+            .await
+            .unwrap();
+        let corpus: i64 = client
+            .query_one(
+                &format!("SELECT count(*)::bigint FROM {schema}.ratification_packets"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(corpus, 100_002);
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.ratification_packets ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.ratification_packets FORCE ROW LEVEL SECURITY"
+            ))
+            .await
+            .unwrap();
+        let reopened = tokio::time::timeout(
+            Duration::from_secs(15),
+            PostgresTaskStore::open(fixture.config.clone()),
+        )
+        .await
+        .expect("constant-size startup qualification watchdog expired")
+        .expect("a valid sealed authority must remain restartable beyond 100,000 rows");
+        assert!(
+            reopened
+                .ratification_view(&fixture.scope, &fixture.task_id)
+                .await
+                .is_err(),
+            "targeted qualification must reject the deliberately unauthenticated corpus"
+        );
+
+        drop(reopened);
+        drop(client);
+        driver.abort();
+        PostgresTaskStore::drop_test_schema(&fixture.config)
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("production-scale qualification watchdog expired");
+}
+
+#[tokio::test]
+async fn postgres_runtime_anchor_sealing_exposes_only_an_opaque_digest_and_reopens() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let fixture = integrated_postgres_ratification(
+        &admin,
+        &runtime,
+        "opaque-anchor-signing-digest",
+        false,
+        false,
+    )
+    .await;
+    let schema = fixture.config.schema_name().to_owned();
+    let key_generation = smesh_a2a::content_digest(&[0x60; 32]);
+    let mut runtime_config = tokio_postgres::Config::from_str(&runtime).unwrap();
+    runtime_config.options(format!(
+        "-c role={schema}_runtime -c smesh.tenant_scope=tenant-ratification"
+    ));
+    let (client, connection) = runtime_config.connect(NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let signing_digest: String = client
+        .query_one(
+            &format!("SELECT {schema}.ratification_anchor_signing_digest($1)"),
+            &[&key_generation],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(signing_digest.len(), 71);
+    assert!(signing_digest.starts_with("sha256:"));
+    assert!(
+        signing_digest[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
+    let bogus = client
+        .query_one(
+            &format!("SELECT {schema}.seal_ratification_anchor($1,$2,$3)"),
+            &[&signing_digest, &key_generation, &"A".repeat(43)],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        bogus.code(),
+        Some(&tokio_postgres::error::SqlState::RAISE_EXCEPTION)
+    );
+    drop(client);
+    driver.abort();
+    drop(fixture.store);
+    let reopened = PostgresTaskStore::open(fixture.config.clone())
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .ratification_view(&fixture.scope, &fixture.task_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(reopened);
+    PostgresTaskStore::drop_test_schema(&fixture.config)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn external_key_binds_an_empty_postgres_ratification_authority() {
     let Some((admin, runtime)) = postgres_urls() else {
         return;
@@ -991,6 +1620,7 @@ async fn external_key_binds_an_empty_postgres_ratification_authority() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One catalog boundary owns grants, two tenants, and reopen.
 async fn fresh_catalog_is_v11_rls_forced_and_runtime_least_privileged() {
     let Some((admin, runtime)) = postgres_urls() else {
         return;
@@ -1059,7 +1689,52 @@ async fn fresh_catalog_is_v11_rls_forced_and_runtime_least_privileged() {
             ("ratification_packets".into(), "UPDATE".into()),
         ]);
 
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.retained_authority_usage DISABLE ROW LEVEL SECURITY;
+                 INSERT INTO {schema}.retained_authority_usage VALUES
+                   ('tenant-a','tenant','tenant-a',0,1),
+                   ('tenant-b-secret','tenant','tenant-b-secret',0,1);
+                 ALTER TABLE {schema}.retained_authority_usage ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage FORCE ROW LEVEL SECURITY"
+            ))
+            .await
+            .unwrap();
+
+        let mut runtime_config = tokio_postgres::Config::from_str(&runtime).unwrap();
+        runtime_config.options(format!(
+            "-c role={schema}_runtime -c smesh.tenant_scope=tenant-a"
+        ));
+        let (runtime_client, runtime_connection) = runtime_config.connect(NoTls).await.unwrap();
+        let runtime_driver = tokio::spawn(runtime_connection);
+        let tenant_a_bytes: i64 = runtime_client
+            .query_one(
+                &format!("SELECT retained_bytes FROM {schema}.retained_authority_usage WHERE tenant_scope='tenant-a' AND scope_kind='tenant'"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(tenant_a_bytes, 0);
+        for invocation in [
+            format!("SELECT * FROM {schema}.authority_tenants_bounded()"),
+            format!(
+                "SELECT * FROM {schema}.artifact_retained_scopes_bounded('tenant-b-secret','account')"
+            ),
+        ] {
+            let error = runtime_client.query(&invocation, &[]).await.unwrap_err();
+            assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+            );
+            assert!(!error.to_string().contains("tenant-b-secret"));
+        }
+        drop(runtime_client);
+        runtime_driver.abort();
+
         drop(store);
+        let reopened = PostgresTaskStore::open(config.clone()).await.unwrap();
+        drop(reopened);
         drop(client);
         driver.abort();
         PostgresTaskStore::drop_test_schema(&config).await.unwrap();
@@ -1461,6 +2136,152 @@ async fn integrated_postgres_ratification(
         scope,
         packet,
     }
+}
+
+async fn amended_postgres_ratification(
+    admin: &str,
+    runtime: &str,
+    suffix: &str,
+) -> IntegratedPostgresRatification {
+    let fixture = integrated_postgres_ratification(admin, runtime, suffix, false, true).await;
+    fixture
+        .store
+        .acknowledge_ratification_review(
+            &fixture.scope,
+            review(&fixture.packet, &fixture.scope, &fixture.task_id),
+            ratification_audit(
+                &fixture.packet,
+                &fixture.scope,
+                &fixture.task_id,
+                &format!("{suffix}-amend-review-audit"),
+                "ratificationReview",
+                1_700_000_010_003,
+            ),
+        )
+        .await
+        .unwrap();
+    let amend = decision(
+        &fixture.packet,
+        &fixture.scope,
+        &fixture.task_id,
+        &format!("{suffix}-amend"),
+        HumanDecision::Amend,
+    );
+    let subject = QuotaSubject::new(
+        fixture.scope.tenant_scope(),
+        fixture.scope.owner_account_id(),
+        fixture.scope.principal_scope(),
+    )
+    .unwrap();
+    let intent = ratification_quota_policy()
+        .operation_intent(
+            &subject,
+            QuotaOperation::TaskContinue,
+            &amend.idempotency_key,
+            amend.rationale.len() as u64,
+        )
+        .unwrap();
+    fixture
+        .store
+        .decide_ratification_with_quota(
+            &fixture.scope,
+            amend,
+            ratification_audit(
+                &fixture.packet,
+                &fixture.scope,
+                &fixture.task_id,
+                &format!("{suffix}-amend-decision-audit"),
+                "ratificationDecide",
+                1_700_000_010_004,
+            ),
+            Some(&intent),
+        )
+        .await
+        .unwrap();
+    fixture
+}
+
+async fn add_postgres_ratification_tenant(
+    store: &PostgresTaskStore,
+    tenant: &str,
+    owner: &str,
+    suffix: &str,
+    now: i64,
+) -> (OwnedTaskScope, String) {
+    let scope = OwnedTaskScope::new_with_principal_and_authentication(
+        tenant,
+        owner,
+        smesh_a2a::content_digest(format!("principal-{suffix}").as_bytes()),
+        VisibilityScope::Own,
+        "bearer-jwt",
+    )
+    .unwrap();
+    let mut command = admission(now);
+    command.task.id = format!("postgres-ratification-task-{suffix}");
+    command.task.context_id = format!("postgres-ratification-context-{suffix}");
+    command.request.message.message_id = format!("postgres-ratification-message-{suffix}");
+    command.task.history = Some(vec![command.request.message.clone()]);
+    command.original_result = a2a::SendMessageResponse::Task(command.task.clone());
+    let task_id = command.task.id.clone();
+    let audit = AuthorizationAuditInput::new(
+        format!("postgres-ratification-admission-{suffix}"),
+        tenant,
+        owner,
+        "smesh-dev-only-policy",
+        1,
+        smesh_a2a::content_digest(b"smesh-dev-only-policy/v1"),
+        "TaskSend",
+        AuthorizationDecisionEffect::Allow,
+        "ratification fixture admission",
+        "task",
+        smesh_a2a::content_digest(task_id.as_bytes()),
+        Some(task_id.clone()),
+        now,
+    )
+    .unwrap();
+    store
+        .authorize_and_admit(&scope, command, audit)
+        .await
+        .unwrap();
+    let worker = format!("ratification-worker-{suffix}");
+    let lease = store
+        .claim_outbox(&worker, now + 1, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.tenant_scope, tenant);
+    let initial = store.task_for_outbox(&lease).await.unwrap().unwrap();
+    let mut approved = initial.clone();
+    approved.status.state = a2a::TaskState::Completed;
+    approved.status.timestamp = chrono::DateTime::from_timestamp_millis(now + 2);
+    approved.artifacts = Some(vec![a2a::Artifact {
+        artifact_id: format!("artifact-{suffix}"),
+        name: Some(format!("release-{suffix}.txt")),
+        description: None,
+        parts: vec![a2a::Part::text(format!("candidate-{suffix}"))],
+        metadata: None,
+        extensions: None,
+    }]);
+    store
+        .commit_delivery_for_ratification(
+            &lease,
+            approved.clone(),
+            a2a::SendMessageResponse::Task(approved),
+            &[a2a::StreamResponse::Task(initial)],
+            AuthoritativeReviewCandidate::new(
+                "release-policy",
+                7,
+                smesh_a2a::content_digest(b"release-policy-v7"),
+                format!("sealed-checkpoint-{suffix}").into_bytes(),
+                vec![format!("evidence-{suffix}").into_bytes()],
+                "bounded uncertainty",
+            )
+            .unwrap(),
+            now + 2,
+        )
+        .await
+        .unwrap();
+    (scope, task_id)
 }
 
 #[tokio::test]
@@ -3316,6 +4137,792 @@ async fn rejection_is_atomic_private_and_exactly_replayable() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One guarded corpus proves both read and mutation bounds.
+async fn postgres_live_ratification_work_is_bounded_to_the_target_chain() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), async move {
+        const ROW_ACCESS_LIMIT: i64 = 12;
+        let fixture = integrated_postgres_ratification(
+            &admin,
+            &runtime,
+            "target-chain-row-bound",
+            false,
+            false,
+        )
+        .await;
+        for unrelated in 0..20 {
+            add_postgres_ratification_tenant(
+                &fixture.store,
+                fixture.scope.tenant_scope(),
+                fixture.scope.owner_account_id(),
+                &format!("unrelated-{unrelated}"),
+                1_700_000_020_000 + i64::from(unrelated) * 10,
+            )
+            .await;
+        }
+
+        let schema = fixture.config.schema_name();
+        let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+        let driver = tokio::spawn(connection);
+        client
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {schema}.ratification_row_access_guard;
+                 CREATE FUNCTION {schema}.ratification_guard_row_access() RETURNS boolean
+                 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog AS $guard$
+                 BEGIN
+                   IF nextval('{schema}.ratification_row_access_guard')>{ROW_ACCESS_LIMIT} THEN
+                     RAISE EXCEPTION 'ratification row access guard exceeded' USING ERRCODE='program_limit_exceeded';
+                   END IF;
+                   RETURN true;
+                 END $guard$;
+                 REVOKE ALL ON FUNCTION {schema}.ratification_guard_row_access() FROM PUBLIC;
+                 GRANT EXECUTE ON FUNCTION {schema}.ratification_guard_row_access() TO {schema}_runtime;
+                 ALTER POLICY tenant_isolation ON {schema}.ratification_packets TO {schema}_runtime
+                   USING(tenant_scope=NULLIF(current_setting('smesh.tenant_scope',true),'') AND {schema}.ratification_guard_row_access())
+                   WITH CHECK(tenant_scope=NULLIF(current_setting('smesh.tenant_scope',true),'') AND {schema}.ratification_guard_row_access());
+                 ALTER POLICY tenant_isolation ON {schema}.ratification_events TO {schema}_runtime
+                   USING(tenant_scope=NULLIF(current_setting('smesh.tenant_scope',true),'') AND {schema}.ratification_guard_row_access())
+                   WITH CHECK(tenant_scope=NULLIF(current_setting('smesh.tenant_scope',true),'') AND {schema}.ratification_guard_row_access())"
+            ))
+            .await
+            .unwrap();
+
+        let read = fixture
+            .store
+            .ratification_view(&fixture.scope, &fixture.task_id)
+            .await;
+        let read_accesses: i64 = client
+            .query_one(
+                &format!("SELECT last_value FROM {schema}.ratification_row_access_guard"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        client
+            .batch_execute(&format!(
+                "ALTER SEQUENCE {schema}.ratification_row_access_guard RESTART WITH 1"
+            ))
+            .await
+            .unwrap();
+        let mutation = fixture
+            .store
+            .acknowledge_ratification_review(
+                &fixture.scope,
+                review(&fixture.packet, &fixture.scope, &fixture.task_id),
+                ratification_audit(
+                    &fixture.packet,
+                    &fixture.scope,
+                    &fixture.task_id,
+                    "target-chain-row-bound-review",
+                    "ratificationReview",
+                    1_700_000_010_003,
+                ),
+            )
+            .await;
+        let mutation_accesses: i64 = client
+            .query_one(
+                &format!("SELECT last_value FROM {schema}.ratification_row_access_guard"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+
+        assert!(
+            read.is_ok() && mutation.is_ok(),
+            "target read/mutation exceeded the fixed row bound: read_ok={} read_accesses={read_accesses} mutation_ok={} mutation_accesses={mutation_accesses} limit={ROW_ACCESS_LIMIT}",
+            read.is_ok(),
+            mutation.is_ok(),
+        );
+        assert!(read_accesses <= ROW_ACCESS_LIMIT);
+        assert!(mutation_accesses <= ROW_ACCESS_LIMIT);
+
+        drop(client);
+        driver.abort();
+        drop(fixture.store);
+        PostgresTaskStore::drop_test_schema(&fixture.config)
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("target-chain row-bound watchdog expired");
+}
+
+#[tokio::test]
+async fn postgres_whole_ledger_deletion_fails_live_historical_mutation_and_reopen() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let fixture =
+        integrated_postgres_ratification(&admin, &runtime, "whole-ledger-delete", false, false)
+            .await;
+    let IntegratedPostgresRatification {
+        config,
+        store,
+        task_id,
+        scope,
+        packet,
+        ..
+    } = fixture;
+    let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {}.ratification_packets DISABLE ROW LEVEL SECURITY;
+             ALTER TABLE {}.ratification_packets DISABLE TRIGGER USER",
+            config.schema_name(),
+            config.schema_name(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .execute(
+                &format!(
+                    "DELETE FROM {}.ratification_packets WHERE task_id=$1",
+                    config.schema_name()
+                ),
+                &[&task_id],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let tampered = postgres_ratification_state(&client, config.schema_name()).await;
+    assert!(store.ratification_view(&scope, &task_id).await.is_err());
+    assert!(
+        store
+            .ratification_view_at_generation(&scope, &task_id, packet.generation)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .acknowledge_ratification_review(
+                &scope,
+                review(&packet, &scope, &task_id),
+                ratification_audit(
+                    &packet,
+                    &scope,
+                    &task_id,
+                    "whole-ledger-delete-review",
+                    "ratificationReview",
+                    1_700_000_010_003,
+                ),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        postgres_ratification_state(&client, config.schema_name()).await,
+        tampered
+    );
+    drop(store);
+    assert!(PostgresTaskStore::open(config.clone()).await.is_err());
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_missing_current_tenant_anchor_fails_live_reads_and_mutations() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let fixture = integrated_postgres_ratification(
+        &admin,
+        &runtime,
+        "missing-current-tenant-anchor",
+        false,
+        false,
+    )
+    .await;
+    let IntegratedPostgresRatification {
+        config,
+        store,
+        task_id,
+        scope,
+        packet,
+        ..
+    } = fixture;
+    let audits_before = store.authorization_decision_count().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {}.ratification_tenant_anchors DISABLE ROW LEVEL SECURITY",
+            config.schema_name()
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .execute(
+                &format!(
+                    "DELETE FROM {}.ratification_tenant_anchors WHERE tenant_scope=$1",
+                    config.schema_name()
+                ),
+                &[&scope.tenant_scope()],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {}.ratification_tenant_anchors ENABLE ROW LEVEL SECURITY; ALTER TABLE {}.ratification_tenant_anchors FORCE ROW LEVEL SECURITY",
+            config.schema_name(),
+            config.schema_name()
+        ))
+        .await
+        .unwrap();
+    assert!(store.ratification_view(&scope, &task_id).await.is_err());
+    assert!(
+        store
+            .acknowledge_ratification_review(
+                &scope,
+                review(&packet, &scope, &task_id),
+                ratification_audit(
+                    &packet,
+                    &scope,
+                    &task_id,
+                    "missing-current-anchor-review",
+                    "ratificationReview",
+                    1_700_000_010_003,
+                ),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.authorization_decision_count().await.unwrap(),
+        audits_before
+    );
+    drop(store);
+    let reopened = PostgresTaskStore::open(config.clone()).await.unwrap();
+    assert!(reopened.ratification_view(&scope, &task_id).await.is_err());
+    drop(reopened);
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_valid_multi_tenant_anchors_reopen_and_other_tenant_deletion_fails_on_access() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let fixture = integrated_postgres_ratification(
+        &admin,
+        &runtime,
+        "multi-tenant-anchor-membership",
+        false,
+        false,
+    )
+    .await;
+    let (other_scope, other_task) = add_postgres_ratification_tenant(
+        &fixture.store,
+        "tenant-ratification-other",
+        "owner-ratification-other",
+        "other-tenant",
+        1_700_000_011_000,
+    )
+    .await;
+    assert!(
+        fixture
+            .store
+            .ratification_view(&fixture.scope, &fixture.task_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .store
+            .ratification_view(&other_scope, &other_task)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(fixture.store);
+    let reopened = PostgresTaskStore::open(fixture.config.clone())
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .ratification_view(&fixture.scope, &fixture.task_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        reopened
+            .ratification_view(&other_scope, &other_task)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(reopened);
+
+    let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {}.ratification_tenant_anchors DISABLE ROW LEVEL SECURITY",
+            fixture.config.schema_name()
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .execute(
+                &format!(
+                    "DELETE FROM {}.ratification_tenant_anchors WHERE tenant_scope=$1",
+                    fixture.config.schema_name()
+                ),
+                &[&other_scope.tenant_scope()],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {}.ratification_tenant_anchors ENABLE ROW LEVEL SECURITY; ALTER TABLE {}.ratification_tenant_anchors FORCE ROW LEVEL SECURITY",
+            fixture.config.schema_name(),
+            fixture.config.schema_name()
+        ))
+        .await
+        .unwrap();
+    let reopened = PostgresTaskStore::open(fixture.config.clone())
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .ratification_view(&other_scope, &other_task)
+            .await
+            .is_err()
+    );
+    drop(reopened);
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&fixture.config)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn postgres_phantom_and_mismatched_tenant_anchors_fail_targeted_access() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let phantom_config = config(&admin, &runtime, "phantom-tenant-anchor");
+    drop(
+        PostgresTaskStore::open(phantom_config.clone())
+            .await
+            .unwrap(),
+    );
+    let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {}.ratification_tenant_anchors DISABLE ROW LEVEL SECURITY;
+             INSERT INTO {}.ratification_tenant_anchors(tenant_scope,packet_count,event_count) VALUES('phantom-tenant',0,0);
+             ALTER TABLE {}.ratification_tenant_anchors ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {}.ratification_tenant_anchors FORCE ROW LEVEL SECURITY",
+            phantom_config.schema_name(),
+            phantom_config.schema_name(),
+            phantom_config.schema_name(),
+            phantom_config.schema_name()
+        ))
+        .await
+        .unwrap();
+    let reopened = PostgresTaskStore::open(phantom_config.clone())
+        .await
+        .unwrap();
+    let phantom_scope = OwnedTaskScope::new_with_principal_and_authentication(
+        "phantom-tenant",
+        "phantom-owner",
+        smesh_a2a::content_digest(b"phantom-principal"),
+        VisibilityScope::Own,
+        "bearer-jwt",
+    )
+    .unwrap();
+    assert!(
+        reopened
+            .ratification_view(&phantom_scope, "phantom-task")
+            .await
+            .is_err()
+    );
+    drop(reopened);
+    PostgresTaskStore::drop_test_schema(&phantom_config)
+        .await
+        .unwrap();
+
+    let fixture = integrated_postgres_ratification(
+        &admin,
+        &runtime,
+        "mismatched-tenant-anchor",
+        false,
+        false,
+    )
+    .await;
+    drop(fixture.store);
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {}.ratification_tenant_anchors DISABLE ROW LEVEL SECURITY;
+             UPDATE {}.ratification_tenant_anchors SET packet_count=packet_count+1 WHERE tenant_scope='tenant-ratification';
+             ALTER TABLE {}.ratification_tenant_anchors ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {}.ratification_tenant_anchors FORCE ROW LEVEL SECURITY",
+            fixture.config.schema_name(),
+            fixture.config.schema_name(),
+            fixture.config.schema_name(),
+            fixture.config.schema_name()
+        ))
+        .await
+        .unwrap();
+    let reopened = PostgresTaskStore::open(fixture.config.clone())
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .ratification_view(&fixture.scope, &fixture.task_id)
+            .await
+            .is_err()
+    );
+    drop(reopened);
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&fixture.config)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn runtime_cannot_forge_global_ratification_anchor_visibility() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let fixture =
+        integrated_postgres_ratification(&admin, &runtime, "anchor-rls-forgery", false, false)
+            .await;
+    let schema = fixture.config.schema_name().to_owned();
+    let mut runtime_config = tokio_postgres::Config::from_str(&runtime).unwrap();
+    runtime_config.options(format!(
+        "-c role={schema}_runtime -c smesh.tenant_scope=attacker-tenant"
+    ));
+    let (client, connection) = runtime_config.connect(NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    client
+        .batch_execute("SET smesh.internal_global='ratification-anchor-v1'")
+        .await
+        .unwrap();
+    let visible: i64 = client
+        .query_one(
+            &format!("SELECT count(*)::bigint FROM {schema}.ratification_packets"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        visible, 0,
+        "caller-settable state must not bypass tenant RLS"
+    );
+    for invocation in [
+        format!("SELECT * FROM {schema}.ratification_ledger_anchor"),
+        format!("SELECT * FROM {schema}.ratification_anchor_qualify_bounded()"),
+        format!(
+            "SELECT {schema}.ratification_xor_hash('sha256:{}','sha256:{}')",
+            "0".repeat(64),
+            "0".repeat(64)
+        ),
+        format!("SELECT {schema}.track_ratification_anchor()"),
+    ] {
+        let error = client.query(&invocation, &[]).await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        );
+    }
+    let (mut admin_client, admin_connection) =
+        tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let admin_driver = tokio::spawn(admin_connection);
+    let admin_tx = admin_client.transaction().await.unwrap();
+    admin_tx
+        .batch_execute("SET LOCAL smesh.internal_global='ratification-anchor-v1'")
+        .await
+        .unwrap();
+    admin_tx
+        .batch_execute(&format!(
+            "INSERT INTO {schema}.ratification_tenant_anchors(tenant_scope,packet_count,event_count)
+             VALUES('attacker-tenant',7,11),('victim-tenant',13,17)"
+        ))
+        .await
+        .unwrap();
+    admin_tx.commit().await.unwrap();
+    let visible_anchor = client
+        .query_one(
+            &format!(
+                "SELECT count(*)::bigint,sum(packet_count)::bigint,sum(event_count)::bigint
+                 FROM {schema}.ratification_tenant_anchors"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(visible_anchor.get::<_, i64>(0), 1);
+    assert_eq!(visible_anchor.get::<_, i64>(1), 7);
+    assert_eq!(visible_anchor.get::<_, i64>(2), 11);
+    let cleanup_tx = admin_client.transaction().await.unwrap();
+    cleanup_tx
+        .batch_execute("SET LOCAL smesh.internal_global='ratification-anchor-v1'")
+        .await
+        .unwrap();
+    cleanup_tx
+        .execute(
+            &format!(
+                "DELETE FROM {schema}.ratification_tenant_anchors
+                 WHERE tenant_scope IN ('attacker-tenant','victim-tenant')"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    cleanup_tx.commit().await.unwrap();
+    admin_driver.abort();
+    drop(client);
+    driver.abort();
+    drop(fixture.store);
+    PostgresTaskStore::drop_test_schema(&fixture.config)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn postgres_anchor_reset_after_ledger_deletion_cannot_rebootstrap() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let config = config(&admin, &runtime, "anchor-reset-bootstrap");
+    let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+    let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let schema = config.schema_name();
+    let identity = client
+        .query_one(
+            &format!("SELECT store_id,created_at FROM {schema}.store_identity WHERE singleton=1"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let store_id: Vec<u8> = identity.get(0);
+    let created_at: i64 = identity.get(1);
+    client
+        .batch_execute(&format!(
+            "TRUNCATE {schema}.ratification_events,{schema}.ratification_packets;
+         TRUNCATE {schema}.ratification_ledger_anchor;
+         TRUNCATE {schema}.store_identity;
+         INSERT INTO {schema}.ratification_ledger_anchor(singleton,version,initialized)
+         VALUES(1,1,false);"
+        ))
+        .await
+        .unwrap();
+    client
+        .execute(
+            &format!("INSERT INTO {schema}.store_identity(singleton,store_id,created_at,ratification_initialized) VALUES(1,$1,$2,false)"),
+            &[&store_id, &created_at],
+        )
+        .await
+        .unwrap();
+    drop(store);
+    assert!(
+        PostgresTaskStore::open(config.clone()).await.is_err(),
+        "an initialized authority must not reseal attacker-reset empty state"
+    );
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_corruption_before_amendment_claim_returns_no_lease_or_receiver_effect() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let fixture = amended_postgres_ratification(&admin, &runtime, "claim-corruption").await;
+    let schema = fixture.config.schema_name().to_owned();
+    let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    client
+        .batch_execute("SELECT set_config('smesh.tenant_scope','tenant-ratification',false)")
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .execute(
+                &format!(
+                    "UPDATE {schema}.ratification_chain_anchors SET state_seal=$1
+                     WHERE tenant_scope='tenant-ratification' AND task_id=$2"
+                ),
+                &[&"A".repeat(43), &fixture.task_id],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let before = client
+        .query_one(
+            &format!(
+                "SELECT state,attempt_count,
+                   (SELECT count(*)::bigint FROM {schema}.receiver_inbox r
+                    WHERE r.tenant_scope=o.tenant_scope AND r.dispatch_id=o.dispatch_id)
+                 FROM {schema}.outbox o WHERE task_id=$1 AND ratification_required"
+            ),
+            &[&fixture.task_id],
+        )
+        .await
+        .unwrap();
+    let before: (String, i64, i64) = (before.get(0), before.get(1), before.get(2));
+    assert!(
+        fixture
+            .store
+            .claim_outbox("corrupt-amend-worker", 1_700_000_010_005, 60_000)
+            .await
+            .is_err()
+    );
+    let after = client
+        .query_one(
+            &format!(
+                "SELECT state,attempt_count,
+                   (SELECT count(*)::bigint FROM {schema}.receiver_inbox r
+                    WHERE r.tenant_scope=o.tenant_scope AND r.dispatch_id=o.dispatch_id)
+                 FROM {schema}.outbox o WHERE task_id=$1 AND ratification_required"
+            ),
+            &[&fixture.task_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!((after.get(0), after.get(1), after.get(2)), before);
+    drop(fixture.store);
+    drop(client);
+    driver.abort();
+    PostgresTaskStore::drop_test_schema(&fixture.config)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Sabotage, authenticated failure, restart, and cleanup share one leased fixture.
+async fn postgres_dead_lettered_amendment_restarts_and_remains_authenticated() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    let fixture = amended_postgres_ratification(&admin, &runtime, "amend-dead-letter").await;
+    let lease = fixture
+        .store
+        .claim_outbox("dead-letter-worker", 1_700_000_010_005, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(lease.ratification_required);
+    let schema = fixture.config.schema_name().to_owned();
+    let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    client
+        .batch_execute("SELECT set_config('smesh.tenant_scope','tenant-ratification',false)")
+        .await
+        .unwrap();
+    let original_seal: String = client
+        .query_one(
+            &format!(
+                "SELECT state_seal FROM {schema}.ratification_chain_anchors
+                 WHERE tenant_scope='tenant-ratification' AND task_id=$1"
+            ),
+            &[&fixture.task_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    client
+        .execute(
+            &format!(
+                "UPDATE {schema}.ratification_chain_anchors SET state_seal=$1
+                 WHERE tenant_scope='tenant-ratification' AND task_id=$2"
+            ),
+            &[&"A".repeat(43), &fixture.task_id],
+        )
+        .await
+        .unwrap();
+    let mut downgraded = lease.clone();
+    downgraded.ratification_required = false;
+    assert!(
+        fixture
+            .store
+            .finish_outbox_attempt(
+                &downgraded,
+                AttemptDisposition::Permanent {
+                    error: "sabotaged amendment failure".to_owned(),
+                },
+                1_700_000_010_006,
+            )
+            .await
+            .is_err(),
+        "downgrading a cloned lease must not bypass amendment anchor authentication"
+    );
+    client
+        .execute(
+            &format!(
+                "UPDATE {schema}.ratification_chain_anchors SET state_seal=$1
+                 WHERE tenant_scope='tenant-ratification' AND task_id=$2"
+            ),
+            &[&original_seal, &fixture.task_id],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    driver.abort();
+    assert_eq!(
+        fixture
+            .store
+            .finish_outbox_attempt(
+                &lease,
+                AttemptDisposition::Permanent {
+                    error: "deterministic amendment failure".to_owned(),
+                },
+                1_700_000_010_006,
+            )
+            .await
+            .unwrap(),
+        TransitionOutcome::DeadLettered
+    );
+    drop(fixture.store);
+    let reopened = PostgresTaskStore::open(fixture.config.clone())
+        .await
+        .expect("dead-lettered amendment must remain restartable");
+    let view = reopened
+        .ratification_view(&fixture.scope, &fixture.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.state, smesh_a2a::RatificationState::Amended);
+    assert_eq!(
+        scoped_postgres_task(&runtime, fixture.config.schema_name(), &fixture.task_id)
+            .await
+            .status
+            .state,
+        a2a::TaskState::Failed
+    );
+    drop(reopened);
+    PostgresTaskStore::drop_test_schema(&fixture.config)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines, clippy::large_futures)]
 async fn amendment_is_quota_bound_claimable_and_produces_generation_two() {
     let Some((admin, runtime)) = postgres_urls() else {
@@ -3339,7 +4946,7 @@ async fn amendment_is_quota_bound_claimable_and_produces_generation_two() {
         ).unwrap();
         let amended_receipt = store.decide_ratification_with_quota(
             &scope,
-            amend,
+            amend.clone(),
             ratification_audit(&packet, &scope, &task_id, "amend-decision-audit", "ratificationDecide", 1_700_000_010_004),
             Some(&intent),
         ).await.unwrap();
@@ -3369,6 +4976,7 @@ async fn amendment_is_quota_bound_claimable_and_produces_generation_two() {
         drop(store);
         let reopened = PostgresTaskStore::open(config.clone()).await.unwrap();
         let amendment_lease = reopened.claim_outbox("amend-worker", 1_700_000_010_005, 60_000).await.unwrap().unwrap();
+        assert!(amendment_lease.ratification_required);
         assert!(amendment_lease.execution_reservation.is_some());
         let payload = serde_json::to_vec(&amendment_lease.request).unwrap();
         let envelope = smesh_a2a::DurableDispatchEnvelope {
@@ -3395,6 +5003,19 @@ async fn amendment_is_quota_bound_claimable_and_produces_generation_two() {
             .unwrap();
         let amended_task = reopened.task_for_outbox(&amendment_lease).await.unwrap().unwrap();
         assert_eq!(amended_task.status.state, a2a::TaskState::InputRequired);
+        assert!(reopened
+            .commit_delivery(
+                &amendment_lease,
+                amended_task.clone(),
+                a2a::SendMessageResponse::Task(amended_task.clone()),
+                &[],
+                1_700_000_010_006,
+            )
+            .await
+            .is_err());
+        let still_amended = reopened.ratification_view(&scope, &task_id).await.unwrap().unwrap();
+        assert_eq!(still_amended.packet.generation, 1);
+        assert_eq!(still_amended.state, smesh_a2a::RatificationState::Amended);
         assert!(amended_task.history.as_ref().unwrap().last().unwrap().parts.iter().any(|part| serde_json::to_string(part).unwrap().contains("approved exact candidate")));
 
         let mut generation_two_candidate = amended_task.clone();
@@ -3428,6 +5049,15 @@ async fn amendment_is_quota_bound_claimable_and_produces_generation_two() {
                 metadata: None,
             }),
         ];
+        let mut downgraded = amendment_lease.clone();
+        downgraded.ratification_required = false;
+        assert!(reopened.commit_delivery(
+            &downgraded,
+            generation_two_candidate.clone(),
+            a2a::SendMessageResponse::Task(generation_two_candidate.clone()),
+            &transcript,
+            1_700_000_010_006,
+        ).await.is_err(), "cloning and downgrading the amendment lease must not enable generic commit");
         assert_eq!(reopened.commit_delivery_for_ratification(
             &amendment_lease,
             generation_two_candidate.clone(),
@@ -3442,6 +5072,116 @@ async fn amendment_is_quota_bound_claimable_and_produces_generation_two() {
         let generation_two = reopened.ratification_view(&scope, &task_id).await.unwrap().unwrap();
         assert_eq!(generation_two.packet.generation, 2);
         assert_eq!(generation_two.state, smesh_a2a::RatificationState::AwaitingReview);
+        let generation_one = reopened
+            .ratification_view_at_generation(&scope, &task_id, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(generation_one.packet.generation, 1);
+        assert_eq!(generation_one.state, smesh_a2a::RatificationState::Amended);
+        assert_eq!(generation_one.history.len(), 2);
+        let selected_generation_one = reopened
+            .ratification_replay_candidate(
+                &scope,
+                &task_id,
+                scope.owner_account_id(),
+                &amend.idempotency_key,
+                smesh_a2a::RatificationReplayAction::Decision,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected_generation_one, generation_one);
+        let (replay_client, replay_connection) =
+            tokio_postgres::connect(&admin, NoTls).await.unwrap();
+        let replay_driver = tokio::spawn(replay_connection);
+        let before_failed_replay =
+            postgres_ratification_state(&replay_client, config.schema_name()).await;
+        replay_client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {}.fail_amend_replay_audit() RETURNS trigger
+                   LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+                   BEGIN RAISE EXCEPTION 'injected amend replay audit failure'; END $$;
+                 CREATE TRIGGER fail_amend_replay_audit
+                   BEFORE INSERT ON {}.authorization_decisions
+                   FOR EACH ROW EXECUTE FUNCTION {}.fail_amend_replay_audit()",
+                config.schema_name(),
+                config.schema_name(),
+                config.schema_name(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .decide_ratification_with_quota(
+                    &scope,
+                    amend.clone(),
+                    ratification_audit(
+                        &packet,
+                        &scope,
+                        &task_id,
+                        "amend-generation-one-failed-replay-audit",
+                        "ratificationDecide",
+                        1_700_000_010_007,
+                    ),
+                    Some(&intent),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            postgres_ratification_state(&replay_client, config.schema_name()).await,
+            before_failed_replay,
+            "audit failure must roll the exact replay attempt back completely"
+        );
+        replay_client
+            .batch_execute(&format!(
+                "DROP TRIGGER fail_amend_replay_audit ON {}.authorization_decisions;
+                 DROP FUNCTION {}.fail_amend_replay_audit()",
+                config.schema_name(),
+                config.schema_name(),
+            ))
+            .await
+            .unwrap();
+        let mut before_exact_replay =
+            postgres_ratification_state(&replay_client, config.schema_name()).await;
+        before_exact_replay.retain(|(table, _)| {
+            table != "authorization_decisions"
+                && table != "audit_projection_outbox"
+                && table != "retained_authority_usage"
+        });
+        let audits_before_exact_replay = reopened.authorization_decision_count().await.unwrap();
+        let exact_replay = reopened
+            .decide_ratification_with_quota(
+                &scope,
+                amend,
+                ratification_audit(
+                    &packet,
+                    &scope,
+                    &task_id,
+                    "amend-generation-one-exact-replay-audit",
+                    "ratificationDecide",
+                    1_700_000_010_007,
+                ),
+                Some(&intent),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_replay, amended_receipt);
+        assert_eq!(
+            reopened.authorization_decision_count().await.unwrap(),
+            audits_before_exact_replay + 1
+        );
+        let mut after_exact_replay =
+            postgres_ratification_state(&replay_client, config.schema_name()).await;
+        after_exact_replay.retain(|(table, _)| {
+            table != "authorization_decisions"
+                && table != "audit_projection_outbox"
+                && table != "retained_authority_usage"
+        });
+        assert_eq!(after_exact_replay, before_exact_replay);
+        drop(replay_client);
+        replay_driver.abort();
         drop(reopened);
         let reopened = PostgresTaskStore::open(config.clone()).await.unwrap();
         assert_eq!(

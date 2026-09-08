@@ -248,10 +248,10 @@ function headers(id,mutation){const value={accept:'application/json'};if(id.bear
 function text(parent,name,value){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=name;dd.textContent=String(value??'');parent.append(dt,dd);}
 function checkbox(id,labelText,value,kind){const label=document.createElement('label'),box=document.createElement('input'),span=document.createElement('span');box.type='checkbox';box.id=id;box.dataset.kind=kind;box.value=value;span.textContent=labelText;label.append(box,span);items.append(label);box.addEventListener('change',gate);}
 function gate(){if(!view||busy||terminal)return lock();const boxes=[...items.querySelectorAll('input[type=checkbox]')];review.disabled=view.reviewedByCurrentActor||boxes.length===0||boxes.some(box=>!box.checked);const allow=view.reviewedByCurrentActor;for(const button of decisions)button.disabled=!allow;}
-function render(dto,responseEtag){view=dto;etag=responseEtag||dto.etag;representation++;surface.hidden=false;packet.replaceChildren();items.replaceChildren(items.querySelector('legend'));text(packet,'Task',dto.packet.taskId);text(packet,'Checkpoint',dto.packet.checkpoint);text(packet,'Policy',dto.packet.completionPolicyId);dto.packet.evidence.forEach((value,index)=>text(packet,`Evidence ${index+1}`,value));dto.packet.artifacts.forEach((artifact,index)=>{text(packet,`Artifact ${index+1}`,`${artifact.name} (${artifact.mediaType}) ${artifact.digest}`);text(packet,`Artifact ${index+1} exact publication JSON`,artifact.canonicalJson);});text(packet,'Artifact manifest digest',dto.packet.artifactSetDigest);text(packet,'Uncertainty',dto.packet.uncertaintySummary);dto.packet.evidenceHashes.forEach((hash,index)=>checkbox(`ack-evidence-${index}`,`Acknowledge evidence ${index+1}: ${hash}`,hash,'evidence'));dto.packet.artifacts.forEach((artifact,index)=>checkbox(`ack-artifact-${index}`,`Acknowledge artifact ${index+1}: ${artifact.digest}`,artifact.digest,'artifact'));checkbox('ack-manifest','Acknowledge exact publication manifest',dto.packet.artifactSetDigest,'manifest');checkbox('ack-uncertainty','Acknowledge uncertainty','true','uncertainty');terminal=Boolean(dto.terminalDecision)||dto.phase==='canceled'||dto.phase==='superseded';busy=false;pending=null;retry.hidden=true;if(terminal){lock();setState('TERMINAL',dto.terminalDecision?`Terminal decision: ${dto.terminalDecision}`:`Ratification ${dto.phase}.`);}else if(dto.reviewedByCurrentActor){setState('REVIEWED','Review recorded. Choose a decision.');gate();}else{setState('AWAITING_REVIEW','Acknowledge every item to record review.');gate();}}
+function render(dto,responseEtag){view=dto;etag=responseEtag||dto.etag;representation++;surface.hidden=false;packet.replaceChildren();items.replaceChildren(items.querySelector('legend'));text(packet,'Task',dto.packet.taskId);text(packet,'Checkpoint',dto.packet.checkpoint);text(packet,'Policy',dto.packet.completionPolicyId);dto.packet.evidence.forEach((value,index)=>text(packet,`Evidence ${index+1}`,value));dto.packet.artifacts.forEach((artifact,index)=>{text(packet,`Artifact ${index+1}`,`${artifact.name} (${artifact.mediaType}) ${artifact.digest}`);text(packet,`Artifact ${index+1} exact publication JSON`,artifact.canonicalJson);});text(packet,'Artifact manifest digest',dto.packet.artifactSetDigest);text(packet,'Uncertainty',dto.packet.uncertaintySummary);dto.packet.evidenceHashes.forEach((hash,index)=>checkbox(`ack-evidence-${index}`,`Acknowledge evidence ${index+1}: ${hash}`,hash,'evidence'));dto.packet.artifacts.forEach((artifact,index)=>checkbox(`ack-artifact-${index}`,`Acknowledge artifact ${index+1}: ${artifact.digest}`,artifact.digest,'artifact'));checkbox('ack-manifest','Acknowledge exact publication manifest',dto.packet.artifactSetDigest,'manifest');checkbox('ack-uncertainty','Acknowledge uncertainty','true','uncertainty');terminal=Boolean(dto.terminalDecision)||dto.phase==='canceled'||dto.phase==='superseded';busy=false;pending=null;retry.hidden=true;if(terminal){surface.hidden=true;packet.replaceChildren();items.replaceChildren(items.querySelector('legend'));rationale.value='';lock();setState('TERMINAL',dto.terminalDecision?`Terminal decision: ${dto.terminalDecision}`:`Ratification ${dto.phase}.`);}else if(dto.reviewedByCurrentActor){setState('REVIEWED','Review recorded. Choose a decision.');gate();}else{setState('AWAITING_REVIEW','Acknowledge every item to record review.');gate();}}
 function requestLock(state,message,operation,canRetry){erase();pending=operation;retry.hidden=!canRetry;setState(state,message);}
-async function load(id=identity()){erase();const requestEpoch=epoch;busy=true;const operation=()=>load(id);pending=operation;controller=new AbortController();lock();setState('LOADING','Loading review packet.');try{const response=await fetch(`/ratification/v1/tasks/${encodeURIComponent(id.taskId)}`,{headers:headers(id),cache:'no-store',credentials:'same-origin',signal:controller.signal});if(!current(requestEpoch,id))return;if(response.status===401||response.status===403)return requestLock('AUTH_LOCKED','Authentication required. Enter credentials and load again.',null,false);if(!response.ok)return requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',operation,true);const dto=await response.json();if(current(requestEpoch,id))render(dto,response.headers.get('etag'));}catch(error){if(current(requestEpoch,id)&&error.name!=='AbortError')requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',operation,true);}}
-async function send(operation){if(busy||terminal)return;const requestEpoch=epoch;busy=true;pending=()=>send(operation);controller=new AbortController();lock();retry.hidden=true;setState(operation.action==='review'?'REVIEW_SUBMITTING':'DECISION_SUBMITTING',operation.action==='review'?'Recording review.':'Recording decision.');try{const response=await fetch(operation.url,{method:'POST',headers:headers(operation.identity,operation),body:operation.body,cache:'no-store',credentials:'same-origin',signal:controller.signal});if(!current(requestEpoch,operation.identity))return;if(response.status===401||response.status===403)return requestLock('AUTH_LOCKED','Authentication required. Enter credentials and load again.',null,false);if(response.status===412){erase();setState('STALE','Review packet changed; reloading.');return load(operation.identity);}if(!response.ok)return requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',()=>send(operation),true);const receipt=await response.json();if(!current(requestEpoch,operation.identity))return;etag=response.headers.get('etag')||receipt.etag;view.revision=receipt.revision;busy=false;pending=null;if(operation.action==='review'){view.reviewedByCurrentActor=true;setState('REVIEWED','Review recorded. Choose a decision.');gate();}else{terminal=true;lock();setState('TERMINAL','Decision recorded.');}}catch(error){if(current(requestEpoch,operation.identity)&&error.name!=='AbortError')requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',()=>send(operation),true);}}
+async function load(id=identity()){erase();const requestEpoch=epoch;busy=true;const operation=()=>load(id);pending=operation;controller=new AbortController();lock();setState('LOADING','Loading review packet.');try{const response=await fetch(`/ratification/v1/tasks/${encodeURIComponent(id.taskId)}`,{headers:headers(id),cache:'no-store',credentials:'same-origin',signal:controller.signal});if(!current(requestEpoch,id))return;if(response.status===401||response.status===403)return requestLock('AUTH_LOCKED','Authentication required. Enter credentials and load again.',null,false);if(!response.ok)return requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',operation,true);const dto=await response.json();if(current(requestEpoch,id))render(dto,response.headers.get('etag'));}catch(error){if(current(requestEpoch,id)&&error.name!=='AbortError')requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',operation,true);}finally{status.dispatchEvent(new Event('smesh-ratification-request-complete'));}}
+async function send(operation){if(busy||terminal)return;const requestEpoch=epoch;busy=true;pending=()=>send(operation);controller=new AbortController();lock();retry.hidden=true;setState(operation.action==='review'?'REVIEW_SUBMITTING':'DECISION_SUBMITTING',operation.action==='review'?'Recording review.':'Recording decision.');try{const response=await fetch(operation.url,{method:'POST',headers:headers(operation.identity,operation),body:operation.body,cache:'no-store',credentials:'same-origin',signal:controller.signal});if(!current(requestEpoch,operation.identity))return;if(response.status===401||response.status===403)return requestLock('AUTH_LOCKED','Authentication required. Enter credentials and load again.',null,false);if(response.status===412){erase();setState('STALE','Review packet changed; reloading.');return load(operation.identity);}if(!response.ok)return requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',()=>send(operation),true);const receipt=await response.json();if(!current(requestEpoch,operation.identity))return;etag=response.headers.get('etag')||receipt.etag;view.revision=receipt.revision;busy=false;pending=null;if(operation.action==='review'){view.reviewedByCurrentActor=true;setState('REVIEWED','Review recorded. Choose a decision.');gate();}else{terminal=true;surface.hidden=true;packet.replaceChildren();items.replaceChildren(items.querySelector('legend'));rationale.value='';lock();setState('TERMINAL','Decision recorded.');}}catch(error){if(current(requestEpoch,operation.identity)&&error.name!=='AbortError')requestLock('ERROR_LOCKED','Request failed. Retry explicitly.',()=>send(operation),true);}}
 function mutate(action,body){if(busy||terminal||!view)return;const encoded=JSON.stringify(body),id=identity(),capturedEtag=etag;const semantic=JSON.stringify([id.bearer,id.tenantId,id.taskId,view.packet.generation,representation,capturedEtag,action,encoded]);const operation=Object.freeze({action,body:encoded,identity:id,etag:capturedEtag,nonce:crypto.randomUUID(),semantic,url:`/ratification/v1/tasks/${encodeURIComponent(id.taskId)}/${action==='review'?'review':'decision'}`});send(operation);}
 review.addEventListener('click',()=>{if(review.disabled)return;const checked=[...items.querySelectorAll('input:checked')];mutate('review',{evidenceHashes:checked.filter(x=>x.dataset.kind==='evidence').map(x=>x.value),artifactHashes:checked.filter(x=>x.dataset.kind==='artifact').map(x=>x.value),artifactManifestDigest:checked.find(x=>x.dataset.kind==='manifest')?.value??'',uncertaintyAcknowledged:checked.some(x=>x.dataset.kind==='uncertainty')});});
 for(const button of decisions)button.addEventListener('click',()=>{if(!button.disabled)mutate(button.id,{decision:button.id,rationale:rationale.value});});
@@ -280,8 +280,11 @@ fn ratification_static_response(content_type: &'static str, body: String) -> Res
 struct RatificationMutation {
     view: crate::RatificationView,
     idempotency_key: String,
+    expected_revision: u64,
+    replay_candidate: bool,
 }
 
+#[allow(clippy::too_many_lines)] // Ordered mutation gates and replay exception form one boundary.
 async fn ratification_mutation_policy(
     Extension(expected_origin): Extension<RatificationOrigin>,
     request: axum::extract::Request,
@@ -361,7 +364,7 @@ async fn ratification_mutation_policy(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let mut request = axum::extract::Request::from_parts(parts, body);
-    let view = match ratification.ratification_view(&scope, &task_id).await {
+    let mut view = match ratification.ratification_view(&scope, &task_id).await {
         Ok(Some(view)) => view,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -369,12 +372,131 @@ async fn ratification_mutation_policy(
     let Ok(current_etag) = ratification_etag(&view, &context) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    if if_match.as_bytes() != current_etag.as_bytes() {
-        return StatusCode::PRECONDITION_FAILED.into_response();
+    let can_replay = |candidate: &crate::RatificationView| match operation {
+        Operation::RatificationReview => candidate.history.iter().any(|receipt| {
+            matches!(
+                receipt.action,
+                crate::HumanRatificationAction::ReviewAcknowledged
+            )
+        }),
+        Operation::RatificationDecide => candidate
+            .history
+            .iter()
+            .any(|receipt| matches!(receipt.action, crate::HumanRatificationAction::Decision(_))),
+        _ => false,
+    };
+    let replay_precondition_etag = |candidate: &crate::RatificationView| {
+        let mut precondition_view = candidate.clone();
+        match operation {
+            Operation::RatificationReview => {
+                precondition_view.history.clear();
+                precondition_view.state = crate::RatificationState::AwaitingReview;
+                precondition_view.revision = 0;
+            }
+            Operation::RatificationDecide
+                if matches!(
+                    precondition_view
+                        .history
+                        .last()
+                        .map(|receipt| &receipt.action),
+                    Some(crate::HumanRatificationAction::Decision(_))
+                ) =>
+            {
+                precondition_view.history.pop();
+                precondition_view.state = crate::RatificationState::Reviewed;
+                precondition_view.revision = 1;
+            }
+            _ => {}
+        }
+        ratification_etag(&precondition_view, &context)
+    };
+    let current_can_replay = can_replay(&view);
+    let mut replay_candidate = false;
+    if current_can_replay {
+        let Ok(precondition_etag) = replay_precondition_etag(&view) else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        replay_candidate = if_match.as_bytes() == precondition_etag.as_bytes();
+    } else if if_match.as_bytes() == current_etag.as_bytes() {
+        let valid_current_phase = match operation {
+            Operation::RatificationReview => {
+                matches!(view.state, crate::RatificationState::AwaitingReview)
+            }
+            Operation::RatificationDecide => {
+                matches!(view.state, crate::RatificationState::Reviewed)
+            }
+            _ => false,
+        };
+        if !valid_current_phase {
+            return StatusCode::PRECONDITION_FAILED.into_response();
+        }
+        replay_candidate = false;
     }
+    if !replay_candidate && (current_can_replay || if_match.as_bytes() != current_etag.as_bytes()) {
+        let action = match operation {
+            Operation::RatificationReview => crate::RatificationReplayAction::Review,
+            Operation::RatificationDecide => crate::RatificationReplayAction::Decision,
+            _ => return StatusCode::PRECONDITION_FAILED.into_response(),
+        };
+        let Ok(historical) = ratification
+            .ratification_replay_candidate(
+                &scope,
+                &task_id,
+                context.account_id(),
+                &idempotency_key,
+                action,
+            )
+            .await
+        else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        if let Some(historical) = historical {
+            let Ok(precondition_etag) = replay_precondition_etag(&historical) else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            if !can_replay(&historical) || if_match.as_bytes() != precondition_etag.as_bytes() {
+                return StatusCode::PRECONDITION_FAILED.into_response();
+            }
+            view = historical;
+            replay_candidate = true;
+        } else {
+            return StatusCode::PRECONDITION_FAILED.into_response();
+        }
+    }
+    let expected_revision = if replay_candidate {
+        // A precondition for a generation with this action already committed
+        // reaches the durable authority only as a replay candidate. The
+        // authority authenticates the exact actor/key/body semantics before
+        // returning the original receipt and appending this attempt's audit.
+        match operation {
+            Operation::RatificationReview
+                if view.history.iter().any(|receipt| {
+                    matches!(
+                        receipt.action,
+                        crate::HumanRatificationAction::ReviewAcknowledged
+                    )
+                }) =>
+            {
+                0
+            }
+            Operation::RatificationDecide
+                if view.history.iter().any(|receipt| {
+                    matches!(receipt.action, crate::HumanRatificationAction::Decision(_))
+                }) =>
+            {
+                1
+            }
+            _ => return StatusCode::PRECONDITION_FAILED.into_response(),
+        }
+    } else {
+        view.revision
+    };
+
     request.extensions_mut().insert(RatificationMutation {
         view,
         idempotency_key,
+        expected_revision,
+        replay_candidate,
     });
     next.run(request).await
 }
@@ -591,6 +713,40 @@ async fn ratification_view(
     }
 }
 
+async fn ratification_view_at_generation(
+    Path((task_id, generation)): Path<(String, u64)>,
+    Extension(authority): Extension<Arc<dyn DurableAuthority>>,
+    Extension(context): Extension<Arc<crate::AuthorizationContext>>,
+) -> Response {
+    let Ok(scope) = ratification_scope(&context, Operation::RatificationRead) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if generation == 0 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(ratification) = authority.ratification_authority() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match ratification
+        .ratification_view_at_generation(&scope, &task_id, generation)
+        .await
+    {
+        Ok(Some(view)) => {
+            let Ok(browser) = BrowserRatificationView::from_authority(view, &context) else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let Ok(etag) = HeaderValue::from_str(&browser.etag) else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let mut response = axum::Json(browser).into_response();
+            response.headers_mut().insert(header::ETAG, etag);
+            response
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 async fn ratification_review(
     Path(task_id): Path<String>,
     Extension(authority): Extension<Arc<dyn DurableAuthority>>,
@@ -605,7 +761,7 @@ async fn ratification_review(
     let Some(ratification) = authority.ratification_authority() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let expected_revision = mutation.view.revision;
+    let expected_revision = mutation.expected_revision;
     let packet = mutation.view.packet;
     let artifact_hashes = packet
         .artifacts
@@ -679,7 +835,8 @@ async fn ratification_decision(
     let Some(ratification) = authority.ratification_authority() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let expected_revision = mutation.view.revision;
+    let expected_revision = mutation.expected_revision;
+    let replay_candidate = mutation.replay_candidate;
     let packet = mutation.view.packet;
     let now = clock.now();
     let command = crate::RatificationCommand {
@@ -704,6 +861,7 @@ async fn ratification_decision(
         rationale: body.rationale,
         decided_at_millis: now,
     };
+
     let Ok(audit) = ratification_audit(
         &authority,
         &context,
@@ -737,16 +895,13 @@ async fn ratification_decision(
     } else {
         None
     };
-    ratification_result(
-        ratification
-            .decide_ratification_with_quota(&scope, command, audit, amendment_quota_intent.as_ref())
-            .await,
-        ratification,
-        &scope,
-        &context,
-        &task_id,
-    )
-    .await
+    let result = ratification
+        .decide_ratification_with_quota(&scope, command, audit, amendment_quota_intent.as_ref())
+        .await;
+    if replay_candidate && result.as_ref().is_err_and(|error| error.code == -32_621) {
+        return StatusCode::PRECONDITION_FAILED.into_response();
+    }
+    ratification_result(result, ratification, &scope, &context, &task_id).await
 }
 
 #[derive(serde::Serialize)]
@@ -813,7 +968,10 @@ async fn ratification_result(
 ) -> Response {
     match result {
         Ok(receipt) => {
-            let Ok(Some(view)) = ratification.ratification_view(scope, task_id).await else {
+            let Ok(Some(view)) = ratification
+                .ratification_view_at_generation(scope, task_id, receipt.generation)
+                .await
+            else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
             let Ok(etag) = ratification_etag(&view, context) else {
@@ -1054,9 +1212,97 @@ pub struct DurableGateway {
     gc: Option<ArtifactGcHandle>,
     orphan_scanner: Option<ArtifactOrphanScannerHandle>,
     authority: Option<Arc<dyn DurableAuthority>>,
+    #[cfg(test)]
+    shutdown_test_probes: Vec<GatewayShutdownTestProbe>,
+}
+
+#[cfg(test)]
+struct GatewayShutdownTestProbe {
+    cancel: tokio_util::sync::CancellationToken,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl GatewayShutdownTestProbe {
+    fn spawn() -> (
+        Self,
+        tokio::sync::oneshot::Receiver<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let stopped = cancel.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let joined = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_joined = Arc::clone(&joined);
+        let join = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            stopped.cancelled().await;
+            worker_joined.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        (
+            Self {
+                cancel,
+                join: Some(join),
+            },
+            started_rx,
+            joined,
+        )
+    }
+
+    async fn shutdown(mut self) -> Result<(), A2AError> {
+        self.cancel.cancel();
+        let mut join = self
+            .join
+            .take()
+            .expect("gateway shutdown test probe owns its join");
+        match tokio::time::timeout(Duration::from_secs(5), &mut join).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(A2AError::internal(
+                "gateway shutdown test probe join failed",
+            )),
+            Err(_) => {
+                join.abort();
+                let _ = join.await;
+                Err(A2AError::internal("gateway shutdown test probe timed out"))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for GatewayShutdownTestProbe {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
+    }
 }
 
 impl DurableGateway {
+    #[cfg(test)]
+    async fn inject_missing_driver_ownership_for_test(
+        &mut self,
+        remaining_worker_count: usize,
+    ) -> Vec<Arc<std::sync::atomic::AtomicBool>> {
+        self.driver
+            .take()
+            .expect("real gateway owns its required driver before injection")
+            .shutdown()
+            .await
+            .expect("injected ownership loss first joins the real driver");
+        let mut joined = Vec::with_capacity(remaining_worker_count);
+        for _ in 0..remaining_worker_count {
+            let (probe, started, probe_joined) = GatewayShutdownTestProbe::spawn();
+            self.shutdown_test_probes.push(probe);
+            tokio::time::timeout(Duration::from_secs(5), started)
+                .await
+                .expect("gateway shutdown test probe start timed out")
+                .expect("gateway shutdown test probe exited before start");
+            joined.push(probe_joined);
+        }
+        joined
+    }
     #[must_use]
     pub fn push_readiness(&self) -> Arc<crate::push::PushReadiness> {
         Arc::clone(&self.push_readiness)
@@ -1152,7 +1398,9 @@ impl DurableGateway {
     ///
     /// # Errors
     ///
-    /// Returns an internal protocol error if the owned driver fails or panics.
+    /// Returns an internal protocol error if required driver or authority ownership is missing,
+    /// or if an owned shutdown path fails or panics. Every remaining owner is still shut down
+    /// and joined before the error is returned.
     pub async fn shutdown(mut self) -> Result<(), A2AError> {
         let callback_result = if let Some(worker) = self.callback_worker.take() {
             worker.shutdown(Duration::from_secs(5)).await
@@ -1171,15 +1419,15 @@ impl DurableGateway {
         if projector_result.is_err() {
             eprintln!("smesh.telemetry.shutdown_failed category=audit_projector");
         }
-        let driver = self
-            .driver
-            .take()
-            .ok_or_else(|| A2AError::internal("durable gateway is already shut down"))?;
-        let authority = self
-            .authority
-            .take()
-            .ok_or_else(|| A2AError::internal("durable gateway is already shut down"))?;
-        let driver_result = driver.shutdown().await;
+        let driver = self.driver.take();
+        let authority = self.authority.take();
+        let driver_result = if let Some(driver) = driver {
+            driver.shutdown().await
+        } else {
+            Err(A2AError::internal(
+                "durable gateway driver ownership is missing",
+            ))
+        };
         let promoter_result = if let Some(promoter) = self.promoter.take() {
             promoter.shutdown().await
         } else {
@@ -1195,9 +1443,27 @@ impl DurableGateway {
         } else {
             Ok(())
         };
+        #[cfg(test)]
+        let probe_result = {
+            let mut result = Ok(());
+            for probe in std::mem::take(&mut self.shutdown_test_probes) {
+                if let Err(error) = probe.shutdown().await
+                    && result.is_ok()
+                {
+                    result = Err(error);
+                }
+            }
+            result
+        };
         // Closing shared state invalidates handler/router clones and drops both
         // SQLite and the process ownership lock before shutdown returns.
-        let authority_result = authority.shutdown().await;
+        let authority_result = if let Some(authority) = authority {
+            authority.shutdown().await
+        } else {
+            Err(A2AError::internal(
+                "durable gateway authority ownership is missing",
+            ))
+        };
         self.router.take();
         // A callback panic is already contained: readiness stays fatal, every
         // callback task has been joined, and no further callback mutation can
@@ -1208,6 +1474,8 @@ impl DurableGateway {
         promoter_result?;
         gc_result?;
         orphan_result?;
+        #[cfg(test)]
+        probe_result?;
         authority_result?;
         projector_result.map_err(|_| A2AError::internal("optional telemetry shutdown failed"))?;
         Ok(())
@@ -1408,6 +1676,10 @@ pub fn build_authorized_durable_loopback_gateway_with_ratification_and_telemetry
         .layer(RequestBodyLimitLayer::new(128 * 1024));
     let protected = Router::new()
         .route("/ratification/v1/tasks/{task_id}", get(ratification_view))
+        .route(
+            "/ratification/v1/tasks/{task_id}/generations/{generation}",
+            get(ratification_view_at_generation),
+        )
         .merge(mutations)
         .layer(Extension(clock))
         .layer(Extension(origin))
@@ -1583,6 +1855,8 @@ fn build_durable_gateway_inner(
         gc,
         orphan_scanner,
         authority: Some(authority),
+        #[cfg(test)]
+        shutdown_test_probes: Vec::new(),
     }
 }
 
@@ -1897,5 +2171,86 @@ mod artifact_resolver_path_tests {
             &canonical,
             "artifact-0123_ab.~"
         ));
+    }
+}
+
+#[cfg(test)]
+mod durable_gateway_shutdown_tests {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    const WATCHDOG: Duration = Duration::from_secs(10);
+
+    async fn open(path: &std::path::Path) -> SqliteTaskStore {
+        tokio::time::timeout(WATCHDOG, SqliteTaskStore::open(path, 16))
+            .await
+            .expect("SQLite open watchdog expired")
+            .expect("SQLite test authority opens")
+    }
+
+    fn gateway(store: SqliteTaskStore, generation: i64) -> DurableGateway {
+        build_durable_loopback_gateway(
+            GatewayConfig::new("http://127.0.0.1:1", format!("shutdown-{generation}")),
+            store,
+            DurableLoopbackEndpoint::new(),
+            InjectedClock::new(generation),
+        )
+        .expect("real durable gateway builds")
+    }
+
+    #[tokio::test]
+    async fn missing_driver_ownership_fails_closed_after_reaping_every_remaining_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "smesh-durable-shutdown-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&root).expect("create shutdown test root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .expect("secure shutdown test root");
+        }
+        let path = root.join("authority.sqlite3");
+
+        tokio::time::timeout(WATCHDOG, gateway(open(&path).await, 1).shutdown())
+            .await
+            .expect("normal gateway shutdown watchdog expired")
+            .expect("normal gateway shutdown succeeds");
+
+        let mut damaged = gateway(open(&path).await, 2);
+        let joined = damaged.inject_missing_driver_ownership_for_test(5).await;
+        let error = tokio::time::timeout(WATCHDOG, damaged.shutdown())
+            .await
+            .expect("fail-closed gateway shutdown watchdog expired")
+            .expect_err("missing required driver ownership must fail closed");
+        assert_eq!(error.code, -32_603);
+        assert_eq!(error.message, "durable gateway driver ownership is missing");
+        assert!(
+            joined.iter().all(|probe| probe.load(Ordering::SeqCst)),
+            "every remaining owned worker must be terminated and joined before the error"
+        );
+
+        tokio::time::timeout(WATCHDOG, gateway(open(&path).await, 3).shutdown())
+            .await
+            .expect("restarted gateway shutdown watchdog expired")
+            .expect("gateway reopens and shuts down normally after fail-closed cleanup");
+        let reopened = open(&path).await;
+        tokio::time::timeout(WATCHDOG, reopened.shutdown_shared())
+            .await
+            .expect("final authority shutdown watchdog expired")
+            .expect("final authority shutdown succeeds");
+
+        for suffix in ["", "-wal", "-shm", ".lock"] {
+            let candidate = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            if candidate.exists() {
+                std::fs::remove_file(&candidate).expect("remove shutdown test database fixture");
+            }
+            assert!(!candidate.exists(), "shutdown test fixture was not removed");
+        }
+        std::fs::remove_dir(&root).expect("remove shutdown test root");
+        assert!(!root.exists(), "shutdown test root was not removed");
     }
 }

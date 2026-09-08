@@ -98,6 +98,26 @@ async fn seed_ratification_fixture() -> Result<(), Box<dyn std::error::Error>> {
         metadata: None,
         tenant: None,
     };
+    let amended_evidence = b"amended browser evidence";
+    let amended_checkpoint = smesh_a2a::PolicyCheckpoint {
+        task_id: task_id.clone(),
+        context_id: format!("context-{task_id}"),
+        request_digest: smesh_a2a::content_digest(b"amended browser request"),
+        policy_id: "browser-amendment-policy".to_owned(),
+        policy_version: 1,
+        policy_hash: smesh_a2a::content_digest(b"browser-amendment-policy-v1"),
+        evidence_snapshot_hash: smesh_a2a::content_digest(amended_evidence),
+        artifact_set_digest: smesh_a2a::content_digest(b"amended browser artifact set"),
+        evidence_hashes: vec![smesh_a2a::content_digest(amended_evidence)],
+        assurance_bps: 9_500,
+        seal: "browser-amendment-checkpoint".to_owned(),
+    };
+    let amended_metadata = serde_json::from_value(serde_json::json!({
+        "smesh.completionPolicy": {
+            "status": "awaitingRatification",
+            "record": amended_checkpoint,
+        }
+    }))?;
     let task = a2a::Task {
         id: task_id.clone(),
         context_id: format!("context-{task_id}"),
@@ -108,7 +128,7 @@ async fn seed_ratification_fixture() -> Result<(), Box<dyn std::error::Error>> {
         },
         artifacts: None,
         history: Some(vec![message]),
-        metadata: None,
+        metadata: Some(amended_metadata),
     };
     let admission = smesh_a2a::SendMessageAdmission {
         request,
@@ -995,6 +1015,34 @@ fn audit_projector_config() -> Result<AuditProjectorConfig, Box<dyn std::error::
     }
 }
 
+fn durable_loopback_endpoint() -> DurableLoopbackEndpoint {
+    #[cfg(debug_assertions)]
+    if std::env::var("SMESH_TEST_RATIFICATION_AMEND_CANDIDATE").as_deref() == Ok("1") {
+        return DurableLoopbackEndpoint::with_interruption_events_for_test(
+            "amend in real Chromium",
+            smesh_a2a::DurableInterruptionKind::InputRequired,
+            "amended candidate awaits ratification",
+            vec![
+                smesh_a2a::MeshEvent::Evidence(smesh_a2a::CompletionEvidence::Review {
+                    id: "browser-amendment-review".to_owned(),
+                    issuer: "browser-amendment-fixture".to_owned(),
+                    subject_digest: smesh_a2a::content_digest(b"amended browser artifact"),
+                    evidence: b"amended browser evidence".to_vec(),
+                    evidence_digest: smesh_a2a::content_digest(b"amended browser evidence"),
+                    approved: true,
+                    assurance_bps: 9_500,
+                }),
+                smesh_a2a::MeshEvent::Artifact {
+                    name: "amended-release.json".to_owned(),
+                    media_type: "application/json".to_owned(),
+                    content: "{\"amended\":true}".to_owned(),
+                },
+            ],
+        );
+    }
+    DurableLoopbackEndpoint::new()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_durable_loopback_gateway(
     listener: std::net::TcpListener,
@@ -1051,13 +1099,14 @@ async fn run_durable_loopback_gateway(
         (None, None) => SqliteTaskStore::open(sqlite_path, config.max_tasks).await?,
     };
     let clock = InjectedClock::new(chrono::Utc::now().timestamp_millis());
+    let endpoint = durable_loopback_endpoint();
     let mut gateway = if let Some(auth) = auth {
         if let Some(policy) = authorization {
             if ratification_enabled {
                 build_authorized_durable_loopback_gateway_with_ratification_and_telemetry(
                     config,
                     store,
-                    DurableLoopbackEndpoint::new(),
+                    endpoint.clone(),
                     clock.clone(),
                     auth,
                     policy,
@@ -1067,7 +1116,7 @@ async fn run_durable_loopback_gateway(
                 build_authorized_durable_loopback_gateway_with_telemetry(
                     config,
                     store,
-                    DurableLoopbackEndpoint::new(),
+                    endpoint.clone(),
                     clock.clone(),
                     auth,
                     policy,
@@ -1081,7 +1130,7 @@ async fn run_durable_loopback_gateway(
         build_durable_loopback_gateway_with_telemetry(
             config,
             store,
-            DurableLoopbackEndpoint::new(),
+            endpoint,
             clock.clone(),
             telemetry.clone(),
         )?

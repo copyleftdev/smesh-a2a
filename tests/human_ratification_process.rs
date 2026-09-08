@@ -4,10 +4,12 @@ use std::io::{BufRead as _, BufReader, Read as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(debug_assertions)]
 use std::str::FromStr as _;
 use std::sync::mpsc;
 use std::time::Duration;
 
+#[cfg(debug_assertions)]
 use smesh_a2a::{
     AuthoritativeReviewCandidate, AuthorizationAuditInput, AuthorizationDecisionEffect,
     OutboxAuthority as _, OwnedTaskScope, PostgresStoreConfig, PostgresTaskStore,
@@ -59,11 +61,13 @@ fn copy_tls(root: &Path) {
         "client-ca.pem",
         "client.pem",
         "client.key",
+        "unmapped-client.pem",
+        "unmapped-client.key",
         "principals.json",
     ] {
         std::fs::copy(source.join(name), output.join(name)).unwrap();
     }
-    for name in ["server.key", "client.key"] {
+    for name in ["server.key", "client.key", "unmapped-client.key"] {
         std::fs::set_permissions(output.join(name), std::fs::Permissions::from_mode(0o600))
             .unwrap();
     }
@@ -72,7 +76,7 @@ fn copy_tls(root: &Path) {
 fn write_policy(path: &Path) {
     std::fs::write(
         path,
-        br#"{"schemaVersion":"smesh-authz-policy/v1","policyId":"ratification-process","revision":1,"tenants":[{"id":"tenant-a","enabled":true}],"accounts":[{"id":"agent-17","kind":"human","memberships":[{"tenantId":"tenant-a","roles":["humanRatifier"]}]}],"principalBindings":[{"principal":{"issuer":"mtls:test","subject":"agent-17"},"accountId":"agent-17"}]}"#,
+        br#"{"schemaVersion":"smesh-authz-policy/v1","policyId":"ratification-process","revision":1,"tenants":[{"id":"tenant-a","enabled":true},{"id":"tenant-b","enabled":true},{"id":"tenant-c","enabled":true}],"accounts":[{"id":"agent-17","kind":"human","memberships":[{"tenantId":"tenant-a","roles":["humanRatifier"]},{"tenantId":"tenant-b","roles":["humanRatifier"]},{"tenantId":"tenant-c","roles":["taskViewer"]}]}],"principalBindings":[{"principal":{"issuer":"mtls:test","subject":"agent-17"},"accountId":"agent-17"}]}"#,
     )
     .unwrap();
 }
@@ -164,7 +168,10 @@ fn launch(mut command: Command) -> Running {
     ready_rx.recv_timeout(WATCHDOG).unwrap_or_else(|error| {
         let _ = child.kill();
         let _ = child.wait();
-        panic!("gateway readiness watchdog failed: {error}")
+        let captured = complete_rx
+            .recv_timeout(WATCHDOG)
+            .unwrap_or_else(|_| "<stderr unavailable>".to_owned());
+        panic!("gateway readiness watchdog failed: {error}: {captured}")
     });
     Running {
         child,
@@ -278,12 +285,14 @@ async fn production_binary_installs_authenticated_routes_and_binds_restart_key()
     let key = fixture.key("key", KEY_CANARY, 0o600);
     let bind = free_address("127.0.0.1");
     let mut startup = command(&fixture, &database, &key, bind);
-    startup
-        .env("SMESH_A2A_OTLP_MODE", "http-protobuf")
-        .env("SMESH_A2A_OTLP_ENDPOINT", "http://127.0.0.1:9/")
-        .env("SMESH_TEST_OTLP_INSECURE_LOOPBACK", "1")
-        .env("SMESH_A2A_OTLP_EXPORT_TIMEOUT_MILLIS", "100")
-        .env("SMESH_A2A_OTLP_SHUTDOWN_TIMEOUT_MILLIS", "1000");
+    if cfg!(debug_assertions) {
+        startup
+            .env("SMESH_A2A_OTLP_MODE", "http-protobuf")
+            .env("SMESH_A2A_OTLP_ENDPOINT", "http://127.0.0.1:9/")
+            .env("SMESH_TEST_OTLP_INSECURE_LOOPBACK", "1")
+            .env("SMESH_A2A_OTLP_EXPORT_TIMEOUT_MILLIS", "100")
+            .env("SMESH_A2A_OTLP_SHUTDOWN_TIMEOUT_MILLIS", "1000");
+    }
     let process = launch(startup);
 
     let tls = fixture.0.join("tls");
@@ -357,6 +366,7 @@ async fn production_binary_installs_authenticated_routes_and_binds_restart_key()
                 "https://localhost:{}/ratification/v1/tasks/missing/decision",
                 bind.port()
             ))
+            .header("x-smesh-tenant", "tenant-a")
             .header("origin", format!("https://localhost:{}", bind.port()))
             .header(
                 "if-match",
@@ -425,6 +435,7 @@ async fn production_binary_installs_authenticated_routes_and_binds_restart_key()
 }
 
 #[allow(clippy::too_many_lines)] // One production PostgreSQL lifecycle intentionally stays linear.
+#[cfg(debug_assertions)]
 async fn seed_postgres_packet(config: PostgresStoreConfig, policy_digest: String) -> String {
     let store =
         PostgresTaskStore::open(config.with_ratification_key(zeroize::Zeroizing::new(*KEY_CANARY)))
@@ -643,6 +654,100 @@ async fn production_postgres_binary_qualifies_ratification_routes() {
     assert_eq!(view["phase"], "awaitingReview");
     assert_eq!(view["revision"], 0);
     let packet = &view["packet"];
+    let mut unmapped_identity = std::fs::read(tls.join("unmapped-client.pem")).unwrap();
+    unmapped_identity.extend_from_slice(&std::fs::read(tls.join("unmapped-client.key")).unwrap());
+    let unauthenticated = reqwest::Client::builder()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(&std::fs::read(tls.join("server-ca.pem")).unwrap())
+                .unwrap(),
+        )
+        .identity(reqwest::Identity::from_pem(&unmapped_identity).unwrap())
+        .build()
+        .unwrap();
+    for (name, request, expected) in [
+        (
+            "postgres-generation-success",
+            client
+                .get(format!(
+                    "{base}/ratification/v1/tasks/{task_id}/generations/1"
+                ))
+                .header("x-smesh-tenant", "tenant-a"),
+            reqwest::StatusCode::OK,
+        ),
+        (
+            "postgres-generation-missing",
+            client
+                .get(format!(
+                    "{base}/ratification/v1/tasks/{task_id}/generations/2"
+                ))
+                .header("x-smesh-tenant", "tenant-a"),
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+        (
+            "postgres-generation-cross-tenant",
+            client
+                .get(format!(
+                    "{base}/ratification/v1/tasks/{task_id}/generations/1"
+                ))
+                .header("x-smesh-tenant", "tenant-b"),
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+        (
+            "postgres-generation-role-denied",
+            client
+                .get(format!(
+                    "{base}/ratification/v1/tasks/{task_id}/generations/1"
+                ))
+                .header("x-smesh-tenant", "tenant-c"),
+            reqwest::StatusCode::FORBIDDEN,
+        ),
+        (
+            "postgres-generation-zero",
+            client
+                .get(format!(
+                    "{base}/ratification/v1/tasks/{task_id}/generations/0"
+                ))
+                .header("x-smesh-tenant", "tenant-a"),
+            reqwest::StatusCode::BAD_REQUEST,
+        ),
+        (
+            "postgres-generation-overflow",
+            client
+                .get(format!(
+                    "{base}/ratification/v1/tasks/{task_id}/generations/18446744073709551616"
+                ))
+                .header("x-smesh-tenant", "tenant-a"),
+            reqwest::StatusCode::BAD_REQUEST,
+        ),
+        (
+            "postgres-generation-unauthenticated",
+            unauthenticated.get(format!(
+                "{base}/ratification/v1/tasks/{task_id}/generations/1"
+            )),
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let response = tokio::time::timeout(WATCHDOG, request.send())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), expected, "{name}");
+        assert_eq!(
+            response.headers()["cache-control"],
+            "private, no-store",
+            "{name}"
+        );
+        assert_eq!(
+            response.headers()["x-content-type-options"],
+            "nosniff",
+            "{name}"
+        );
+        assert_eq!(
+            response.headers()["referrer-policy"],
+            "no-referrer",
+            "{name}"
+        );
+    }
     let fresh = tokio::time::timeout(WATCHDOG, get_view(&client, &base, &task_id).send())
         .await
         .unwrap()
@@ -699,9 +804,9 @@ async fn production_postgres_binary_qualifies_ratification_routes() {
             .header("x-smesh-tenant", "tenant-a")
             .header("origin", &base)
             .header("if-match", &reviewed_etag)
-            .header("idempotency-key", "production-approve-nonce")
+            .header("idempotency-key", "production-amend-nonce")
             .json(&serde_json::json!({
-                "decision": "approve",
+                "decision": "amend",
                 "rationale": "production path qualified"
             }))
             .send(),
@@ -710,10 +815,76 @@ async fn production_postgres_binary_qualifies_ratification_routes() {
     .unwrap()
     .unwrap();
     assert_eq!(decision.status(), reqwest::StatusCode::CREATED);
-    let decision_receipt: serde_json::Value = decision.json().await.unwrap();
+    let decision_etag = decision.headers()["etag"].to_str().unwrap().to_owned();
+    let decision_bytes = decision.bytes().await.unwrap();
+    let decision_receipt: serde_json::Value = serde_json::from_slice(&decision_bytes).unwrap();
     assert_eq!(decision_receipt["revision"], 2);
     assert_eq!(decision_receipt["action"]["kind"], "decision");
-    assert_eq!(decision_receipt["action"]["decision"], "approve");
+    assert_eq!(decision_receipt["action"]["decision"], "amend");
+
+    let audits_before_replay = {
+        let (audit_client, audit_connection) =
+            tokio_postgres::connect(&admin, tokio_postgres::NoTls)
+                .await
+                .unwrap();
+        let audit_driver = tokio::spawn(audit_connection);
+        audit_client
+            .batch_execute("SET smesh.internal_global='diag-v1'")
+            .await
+            .unwrap();
+        let count = audit_client
+            .query_one(
+                &format!("SELECT count(*) FROM {schema}.authorization_decisions"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        drop(audit_client);
+        audit_driver.abort();
+        count
+    };
+    let replay = tokio::time::timeout(
+        WATCHDOG,
+        client
+            .post(format!("{base}/ratification/v1/tasks/{task_id}/decision"))
+            .header("x-smesh-tenant", "tenant-a")
+            .header("origin", &base)
+            .header("if-match", &reviewed_etag)
+            .header("idempotency-key", "production-amend-nonce")
+            .json(&serde_json::json!({
+                "decision": "amend",
+                "rationale": "production path qualified"
+            }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(replay.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(replay.headers()["etag"], decision_etag);
+    assert_eq!(replay.bytes().await.unwrap(), decision_bytes);
+    let (audit_client, audit_connection) = tokio_postgres::connect(&admin, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let audit_driver = tokio::spawn(audit_connection);
+    audit_client
+        .batch_execute("SET smesh.internal_global='diag-v1'")
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_client
+            .query_one(
+                &format!("SELECT count(*) FROM {schema}.authorization_decisions"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        audits_before_replay + 1
+    );
+    drop(audit_client);
+    audit_driver.abort();
     let decided_response =
         tokio::time::timeout(WATCHDOG, get_view(&client, &base, &task_id).send())
             .await
@@ -721,7 +892,7 @@ async fn production_postgres_binary_qualifies_ratification_routes() {
             .unwrap();
     assert_eq!(decided_response.status(), reqwest::StatusCode::OK);
     let decided: serde_json::Value = decided_response.json().await.unwrap();
-    assert_eq!(decided["phase"], "approved");
+    assert_eq!(decided["phase"], "amended");
     assert_eq!(decided["revision"], 2);
     assert_eq!(decided["history"].as_array().unwrap().len(), 2);
 
@@ -764,7 +935,7 @@ async fn production_postgres_binary_qualifies_ratification_routes() {
             .unwrap();
     assert_eq!(persisted.status(), reqwest::StatusCode::OK);
     let persisted: serde_json::Value = persisted.json().await.unwrap();
-    assert_eq!(persisted["phase"], "approved");
+    assert_eq!(persisted["phase"], "amended");
     assert_eq!(persisted["history"].as_array().unwrap().len(), 2);
 
     let (admin_client, admin_connection) = tokio_postgres::connect(&admin, tokio_postgres::NoTls)
@@ -776,10 +947,10 @@ async fn production_postgres_binary_qualifies_ratification_routes() {
         .await
         .unwrap();
     let effects = admin_client.query_one(
-        &format!("SELECT (SELECT state='\"TASK_STATE_COMPLETED\"' FROM {schema}.tasks WHERE task_id=$1),(SELECT count(*) FROM {schema}.ratification_events WHERE task_id=$1),(SELECT final_result_json IS NOT NULL FROM {schema}.idempotency_records WHERE task_id=$1)"),
+        &format!("SELECT (SELECT state='\"TASK_STATE_COMPLETED\"' FROM {schema}.tasks WHERE task_id=$1),(SELECT count(*) FROM {schema}.ratification_events WHERE task_id=$1),(SELECT EXISTS(SELECT 1 FROM {schema}.idempotency_records WHERE task_id=$1 AND final_result_json IS NOT NULL))"),
         &[&task_id],
     ).await.unwrap();
-    assert_eq!(effects.get::<_, Option<bool>>(0), Some(true));
+    assert_eq!(effects.get::<_, Option<bool>>(0), Some(false));
     assert_eq!(effects.get::<_, i64>(1), 2);
     assert!(effects.get::<_, bool>(2));
     drop(admin_client);

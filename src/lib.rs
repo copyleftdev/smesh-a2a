@@ -41,6 +41,8 @@ mod loopback;
 mod outbox_driver;
 mod policy;
 mod postgres_store;
+#[doc(hidden)]
+pub use postgres_store::render_migration_sql_for_test;
 /// Secure operator-enrolled callback policy, SSRF validation, and signing.
 pub mod push;
 mod quota;
@@ -126,10 +128,11 @@ pub use durable_authority::{
     CancellationOutcome, ChangeObservation, ChangeObserver, DurableAuthority, ExecutionReservation,
     IntoDurableAuthority, LeaseRenewalOutcome, OutboxAuthority, OutboxLease, OwnedTaskScope,
     PollInterval, QuotaLease, QuotaLeaseAuthority, QuotaReservationInput, RatificationAuthority,
-    ReceiverAdmission, ReceiverAuthority, ReceiverLease, SendMessageAdmission,
-    StreamTranscriptBatch, SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE, TaskAdmission,
-    TaskEventBatch, TaskLifecycle, TelemetryCorrelation, TranscriptAuthority, TransitionOutcome,
-    authorized_message_identity, canonical_send_message_digest, canonical_send_message_digest_v2,
+    RatificationReplayAction, ReceiverAdmission, ReceiverAuthority, ReceiverLease,
+    SendMessageAdmission, StreamTranscriptBatch, SubscriptionCursor, TRUSTED_SINGLE_TENANT_SCOPE,
+    TaskAdmission, TaskEventBatch, TaskLifecycle, TelemetryCorrelation, TranscriptAuthority,
+    TransitionOutcome, authorized_message_identity, canonical_send_message_digest,
+    canonical_send_message_digest_v2,
 };
 pub use durable_dispatch::{
     DurableDispatchEnvelope, DurableInterruptionKind, DurableLoopbackEndpoint,
