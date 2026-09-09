@@ -1406,6 +1406,32 @@ impl A2aCaptureAdapter {
         content: &[u8],
         parent: CaptureParent,
     ) -> Result<CaptureReceipt, CaptureError> {
+        self.send_with_subject(
+            interaction_id,
+            peer_id,
+            task_id,
+            context_id,
+            None,
+            content,
+            parent,
+        )
+    }
+
+    /// Records one outbound A2A observation with an exact protocol subject or replacement identity.
+    ///
+    /// # Errors
+    /// Returns validation, interaction-binding, capacity, lock, or persistence errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_with_subject(
+        &self,
+        interaction_id: &str,
+        peer_id: &str,
+        task_id: Option<&str>,
+        context_id: Option<&str>,
+        subject_id: Option<&str>,
+        content: &[u8],
+        parent: CaptureParent,
+    ) -> Result<CaptureReceipt, CaptureError> {
         self.capture.record(
             &self.identity,
             CaptureKind::A2aSend,
@@ -1413,7 +1439,7 @@ impl A2aCaptureAdapter {
             peer_id,
             task_id,
             context_id,
-            None,
+            subject_id,
             content,
             parent,
         )
@@ -1730,6 +1756,51 @@ impl HumanConsoleCaptureAdapter {
         )?;
         Ok(decision)
     }
+
+    /// Records a deterministic test-fixture authority decision without claiming console or live-human I/O.
+    ///
+    /// The terminal observation bytes must be the exact frozen receipt returned by the fixture's
+    /// authority transaction. Production callers must use an authenticated authority boundary instead.
+    ///
+    /// # Errors
+    /// Returns validation, interaction-binding, capacity, lock, or persistence errors.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_scripted_fixture(
+        &self,
+        interaction_id: &str,
+        prompt_id: &str,
+        task_id: Option<&str>,
+        context_id: Option<&str>,
+        prompt: &[u8],
+        decision_receipt: &[u8],
+        parent: CaptureParent,
+    ) -> Result<[CaptureReceipt; 2], CaptureError> {
+        let mut reservation = self.capture.reserve_required(2, ReservationKind::Wrapper)?;
+        let prompt_receipt = reservation.record(
+            &self.identity,
+            CaptureKind::HumanPrompt,
+            interaction_id,
+            &self.identity.id,
+            task_id,
+            context_id,
+            Some(prompt_id),
+            prompt,
+            parent,
+        )?;
+        let decision_receipt_capture = reservation.record(
+            &self.identity,
+            CaptureKind::HumanDecision,
+            interaction_id,
+            &self.identity.id,
+            task_id,
+            context_id,
+            Some(prompt_id),
+            decision_receipt,
+            CaptureParent::Event(prompt_receipt.event_id.clone()),
+        )?;
+        Ok([prompt_receipt, decision_receipt_capture])
+    }
 }
 
 impl ArtifactCaptureAdapter {
@@ -1851,6 +1922,50 @@ impl ToolMcpCaptureAdapter {
         Ok(Self { capture, identity })
     }
 
+    /// Captures an already-observed call and its authoritative observed completion.
+    ///
+    /// This adapter performs no tool effect and does not synthesize a completion. The caller
+    /// supplies independently normalized source markers for the observed call and result.
+    ///
+    /// # Errors
+    /// Returns a capture error if the pair cannot be reserved or recorded atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_observed_call_result(
+        &self,
+        interaction_id: &str,
+        tool_id: &str,
+        task_id: Option<&str>,
+        context_id: Option<&str>,
+        observed_call: &[u8],
+        observed_result: &[u8],
+        parent: CaptureParent,
+    ) -> Result<(CaptureReceipt, CaptureReceipt), CaptureError> {
+        let mut reservation = self.capture.reserve_required(2, ReservationKind::Wrapper)?;
+        let call = reservation.record(
+            &self.identity,
+            CaptureKind::ToolCall,
+            interaction_id,
+            tool_id,
+            task_id,
+            context_id,
+            Some(tool_id),
+            observed_call,
+            parent,
+        )?;
+        let result = reservation.record(
+            &self.identity,
+            CaptureKind::ToolResult,
+            interaction_id,
+            tool_id,
+            task_id,
+            context_id,
+            Some(tool_id),
+            observed_result,
+            CaptureParent::Event(call.event_id.clone()),
+        )?;
+        Ok((call, result))
+    }
+
     /// Records a call before executing a real closure and records its result or failure.
     ///
     /// # Errors
@@ -1968,6 +2083,33 @@ impl SmeshJournalCaptureAdapter {
             context_id,
             Some(subject_id),
             &encoded,
+            parent,
+        )
+    }
+
+    /// Records a signal whose source identifier is explicitly unavailable.
+    ///
+    /// The absence is preserved as `None`; callers must carry the corresponding
+    /// public-safe field restriction in their digest-bound projection input.
+    ///
+    /// # Errors
+    /// Returns validation, capacity, lock, or persistence errors from the capture.
+    pub fn record_signal_with_unavailable_identifier(
+        &self,
+        interaction_id: &str,
+        task_id: Option<&str>,
+        context_id: Option<&str>,
+        parent: CaptureParent,
+    ) -> Result<CaptureReceipt, CaptureError> {
+        self.capture.record(
+            &self.identity,
+            CaptureKind::SmeshSignalEmitted,
+            interaction_id,
+            &self.identity.id,
+            task_id,
+            context_id,
+            None,
+            &[],
             parent,
         )
     }

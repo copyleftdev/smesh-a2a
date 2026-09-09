@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Verified Operational Observatory</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./operational.css">
+</head>
+<body data-mode="operational-verified">
+  <header>
+    <div><strong>OPERATIONAL OBSERVATORY</strong><span id="mode-status">VALIDATING PINNED OPERATIONAL PACKAGE…</span></div>
+    <p id="authority" role="status">VALIDATING COMPLETE LOCAL PACKAGE…</p>
+  </header>
+  <main>
+    <section class="visual-panel" aria-labelledby="visual-heading">
+      <h1 id="visual-heading">Recorded event state</h1>
+      <canvas id="observatory" width="1200" height="560" role="img" tabindex="0" aria-label="Verified operational event observatory; select a textual event row for exact source details">
+        Verified operational events are also available in the event log below.
+      </canvas>
+      <div id="gap-list" aria-label="Capture gaps"></div>
+    </section>
+    <aside>
+      <h2>Source events</h2>
+      <div id="event-log" role="log" aria-live="polite" aria-relevant="additions text"></div>
+      <h2>Exact source inspection</h2>
+      <pre id="inspector" tabindex="0">Select an event.</pre>
+    </aside>
+  </main>
+  <section id="narration" aria-live="polite" aria-atomic="true"><span>NARRATION</span><p id="narration-text">No cue at this time.</p><small id="narration-source"></small></section>
+  <div id="load-error" role="alert" hidden></div>
+  <div id="controls" aria-label="Operational timeline controls">
+    <button id="play" type="button" disabled aria-pressed="false">PLAY</button>
+    <button id="restart" type="button" disabled>RESTART</button>
+    <label for="scrub">Recorded timeline</label>
+    <input id="scrub" type="range" min="0" max="1000000" value="0" step="1" disabled aria-valuetext="0 ns">
+    <button id="debug-toggle" type="button" disabled aria-pressed="false">DEBUG</button>
+    <output id="time-readout" for="scrub">0 ns</output>
+  </div>
+  <script type="module" src="./operational-app.mjs"></script>
+</body>
+</html>

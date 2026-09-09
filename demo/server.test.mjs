@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { request } from 'node:http';
 import test from 'node:test';
 
@@ -54,6 +56,36 @@ test('demo server exposes only the explicit runtime asset allowlist', async () =
     assert.equal((await rawRequest(port, '/%2e%2e/Cargo.toml')).status, 404);
     assert.equal((await rawRequest(port, '/%E0%A4%A')).status, 400);
     assert.equal((await rawRequest(port, '/', 'POST')).status, 405);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test('vendored Three.js bytes match the reviewed SHA-256 contract', async () => {
+  const bytes = await readFile(new URL('./vendor/three.module.min.js', import.meta.url));
+  assert.equal(createHash('sha256').update(bytes).digest('hex'), 'f7cee3c7533449a1505cc12cb5128b89e3d4fd3d7ea62b05f9f5464a217472ee');
+});
+
+test('security headers cover success and every explicit error status', async () => {
+  const server = await createDemoServer({ port: 0 });
+  const { port } = server.address();
+  try {
+    const responses = [
+      await rawRequest(port, '/operational.html'),
+      await rawRequest(port, '/missing'),
+      await rawRequest(port, '/%E0%A4%A'),
+      await rawRequest(port, '/', 'POST'),
+      await rawRequest(port, '/lifeline-voiceover.mp3', 'GET', { range: 'bytes=9999999-' }),
+    ];
+    assert.deepEqual(responses.map(({ status }) => status), [200, 404, 400, 405, 416]);
+    for (const response of responses) {
+      assert.equal(response.headers['cache-control'], 'no-store');
+      assert.equal(response.headers['x-content-type-options'], 'nosniff');
+      assert.equal(response.headers['x-frame-options'], 'DENY');
+      assert.equal(response.headers['referrer-policy'], 'no-referrer');
+      assert.match(response.headers['content-security-policy'], /default-src '(?:self|none)'/);
+    }
+    assert.equal(responses[0].headers['content-security-policy'].includes("'unsafe-inline'"), false);
   } finally {
     await closeServer(server);
   }

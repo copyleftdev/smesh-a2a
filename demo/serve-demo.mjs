@@ -8,12 +8,45 @@ const demoRoot = realpathSync(dirname(fileURLToPath(import.meta.url)));
 const assets = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/index.html', ['index.html', 'text/html; charset=utf-8']],
+  ['/operational.html', ['operational.html', 'text/html; charset=utf-8']],
+  ['/operational.css', ['operational.css', 'text/css; charset=utf-8']],
+  ['/operational-app.mjs', ['operational-app.mjs', 'text/javascript; charset=utf-8']],
+  ['/operational-observatory.mjs', ['operational-observatory.mjs', 'text/javascript; charset=utf-8']],
+  ['/fixtures/operational-observatory-v1/package.jsonl', ['fixtures/operational-observatory-v1/package.jsonl', 'application/x-ndjson']],
+  ['/fixtures/operational-observatory-v1/receipt.json', ['fixtures/operational-observatory-v1/receipt.json', 'application/json']],
+  ['/fixtures/operational-observatory-v1/actors.json', ['fixtures/operational-observatory-v1/actors.json', 'application/json']],
+  ['/fixtures/operational-observatory-v1/editorial.json', ['fixtures/operational-observatory-v1/editorial.json', 'application/json']],
+  ['/fixtures/operational-observatory-v1/browser-bootstrap.json', ['fixtures/operational-observatory-v1/browser-bootstrap.json', 'application/json']],
+  ['/fixtures/operational-lifeline-v1/package.jsonl', ['fixtures/operational-lifeline-v1/package.jsonl', 'application/x-ndjson']],
+  ['/fixtures/operational-lifeline-v1/receipt.json', ['fixtures/operational-lifeline-v1/receipt.json', 'application/json']],
+  ['/fixtures/operational-lifeline-v1/actors.json', ['fixtures/operational-lifeline-v1/actors.json', 'application/json']],
+  ['/fixtures/operational-lifeline-v1/editorial.json', ['fixtures/operational-lifeline-v1/editorial.json', 'application/json']],
+  ['/fixtures/operational-lifeline-v1/browser-bootstrap.json', ['fixtures/operational-lifeline-v1/browser-bootstrap.json', 'application/json']],
   ['/lifeline.trace.jsonl', ['lifeline.trace.jsonl', 'application/x-ndjson']],
   ['/lifeline-voiceover.mp3', ['lifeline-voiceover.mp3', 'audio/mpeg']],
   ['/trace.schema.json', ['trace.schema.json', 'application/schema+json']],
   ['/poster.jpg', ['poster.jpg', 'image/jpeg']],
   ['/vendor/three.module.min.js', ['vendor/three.module.min.js', 'text/javascript; charset=utf-8']],
 ]);
+
+const LEGACY_CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+const STRICT_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+function securityHeaders(route = '') {
+  return {
+    'cache-control': 'no-store',
+    'content-security-policy': route === '/operational.html' ? STRICT_CSP : LEGACY_CSP,
+    'cross-origin-opener-policy': 'same-origin',
+    'cross-origin-resource-policy': 'same-origin',
+    'permissions-policy': 'camera=(), geolocation=(), microphone=()',
+    'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+  };
+}
+function respond(response, status, route, headers = {}, body) {
+  response.writeHead(status, { ...securityHeaders(route), ...headers });
+  response.end(body);
+}
 
 function loadAsset(relativeFile) {
   const canonical = realpathSync(join(demoRoot, relativeFile));
@@ -53,19 +86,19 @@ export function createDemoServer({ port = 43130, host = '127.0.0.1' } = {}) {
 
   const server = createServer((request, response) => {
     if (request.method !== 'GET' && request.method !== 'HEAD') {
-      response.writeHead(405, { allow: 'GET, HEAD' }).end('method not allowed');
+      respond(response, 405, '', { allow: 'GET, HEAD' }, 'method not allowed');
       return;
     }
     let route;
     try {
       route = decodeURIComponent((request.url || '/').split('?')[0]);
     } catch {
-      response.writeHead(400).end('bad request');
+      respond(response, 400, '', {}, 'bad request');
       return;
     }
     const asset = assets.get(route);
     if (!asset) {
-      response.writeHead(404).end('not found');
+      respond(response, 404, route, {}, 'not found');
       return;
     }
     try {
@@ -74,22 +107,18 @@ export function createDemoServer({ port = 43130, host = '127.0.0.1' } = {}) {
       const requestedRange = request.headers.range;
       const range = requestedRange ? parseRange(requestedRange, fullBody.length) : null;
       if (requestedRange && !range) {
-        response.writeHead(416, { 'content-range': `bytes */${fullBody.length}` }).end();
+        respond(response, 416, route, { 'content-range': `bytes */${fullBody.length}` });
         return;
       }
       const body = range ? fullBody.subarray(range.start, range.end + 1) : fullBody;
-      response.writeHead(range ? 206 : 200, {
+      respond(response, range ? 206 : 200, route, {
         'content-type': contentType,
         'content-length': body.length,
         'accept-ranges': 'bytes',
         ...(range ? { 'content-range': `bytes ${range.start}-${range.end}/${fullBody.length}` } : {}),
-        'cache-control': 'no-store',
-        'x-content-type-options': 'nosniff',
-        'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'",
-      });
-      response.end(request.method === 'HEAD' ? undefined : body);
+      }, request.method === 'HEAD' ? undefined : body);
     } catch {
-      response.writeHead(500).end('asset unavailable');
+      respond(response, 500, route, {}, 'asset unavailable');
     }
   });
 

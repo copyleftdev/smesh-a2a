@@ -803,6 +803,50 @@ fn smesh_journal_adapter_normalizes_pinned_journal_without_raw_payload() {
 }
 
 #[test]
+fn tool_mcp_adapter_records_already_observed_call_and_result_without_execution() {
+    let capture = Arc::new(CanonicalCapture::new("run-observed-tool", 2).unwrap());
+    let tool = ToolMcpCaptureAdapter::new(
+        Arc::clone(&capture),
+        ProducerIdentity::new(ProducerKind::Tool, "mcp-client", "tool-process").unwrap(),
+    )
+    .unwrap();
+    let call = br#"{"observedKind":"tool_called","sourceSequence":"7"}"#;
+    let result = br#"{"observedKind":"tool_completed","sourceSequence":"8"}"#;
+
+    tool.record_observed_call_result(
+        "observed-tool-call-1",
+        "inventory.lookup",
+        Some("task-3"),
+        Some("context-3"),
+        call,
+        result,
+        CaptureParent::Root,
+    )
+    .unwrap();
+
+    let stream = capture.snapshot().unwrap();
+    assert_eq!(stream.events.len(), 2);
+    assert_eq!(stream.events[0].kind, CaptureKind::ToolCall);
+    assert_eq!(stream.events[1].kind, CaptureKind::ToolResult);
+    assert_eq!(
+        stream.events[0].content.digest,
+        smesh_a2a::content_digest(call)
+    );
+    assert_eq!(
+        stream.events[1].content.digest,
+        smesh_a2a::content_digest(result)
+    );
+    assert_ne!(
+        stream.events[0].content.digest,
+        stream.events[1].content.digest
+    );
+    assert_eq!(
+        stream.events[1].parent,
+        CaptureParent::Event(stream.events[0].event_id.clone())
+    );
+}
+
+#[test]
 fn tool_mcp_wrapper_captures_call_and_result_around_real_execution() {
     let capture = Arc::new(CanonicalCapture::new("run-23", 16).unwrap());
     let tool = ToolMcpCaptureAdapter::new(

@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import {
   chromeArgs,
+  exportEvidenceDocument,
   guardWritable,
   numberArg,
   parseArgs,
@@ -29,6 +30,24 @@ test('argument parser and output extension reject malformed values', () => {
   assert.throws(() => parseArgs(['fps=30']), RangeError);
   assert.equal(requireExtension('film.mp4', '.mp4', 'out'), 'film.mp4');
   assert.throws(() => requireExtension('film.webm', '.mp4', 'out'), RangeError);
+});
+
+test('operational export evidence retains each frame state digest and contributing event IDs', () => {
+  const frames = [
+    { contributingEventIds: ['sha256:a'], stateDigest: 'sha256:d1', timeNs: '0' },
+    { contributingEventIds: ['sha256:a', 'sha256:b'], stateDigest: 'sha256:d2', timeNs: '1' },
+  ];
+  assert.deepEqual(exportEvidenceDocument({ fps: 30, frames, mode: 'operational', source: '/operational.html' }), {
+    fps: 30,
+    frames: [
+      { contributingEventIds: ['sha256:a'], frame: 0, stateDigest: 'sha256:d1', timeNs: '0' },
+      { contributingEventIds: ['sha256:a', 'sha256:b'], frame: 1, stateDigest: 'sha256:d2', timeNs: '1' },
+    ],
+    mode: 'operational',
+    schemaVersion: 'observatory-export-evidence/1',
+    source: '/operational.html',
+  });
+  assert.throws(() => exportEvidenceDocument({ fps: 30, frames: [{ timeNs: '0' }], mode: 'operational', source: '/operational.html' }), /evidence/i);
 });
 
 test('child stdin EPIPE is observed instead of becoming uncaught', async () => {

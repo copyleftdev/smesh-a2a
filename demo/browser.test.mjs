@@ -32,11 +32,15 @@ test('browser rejects malformed trace events and camera is time-derived', { time
       const first = window.LIFELINE_CAMERA_ROTATION_AT(70_000);
       window.LIFELINE_CAMERA_ROTATION_AT(1_000);
       const second = window.LIFELINE_CAMERA_ROTATION_AT(70_000);
-      return { rejected, first, second, ready: window.__lifelineReady };
+      const evidence = await window.LIFELINE_RENDER_FRAME(30, 30);
+      return { rejected, first, second, evidence, ready: window.__lifelineReady };
     });
     assert.equal(result.ready, true);
     assert.deepEqual(result.rejected, [true, true]);
     assert.deepEqual(result.first, result.second);
+    assert.equal(result.evidence.timeNs, '1000000000');
+    assert.match(result.evidence.stateDigest, /^sha256:[0-9a-f]{64}$/);
+    assert.ok(result.evidence.contributingEventIds.every((eventId) => eventId.startsWith('evt-')));
   } finally {
     if (browser) await browser.close();
     await closeServer(server);

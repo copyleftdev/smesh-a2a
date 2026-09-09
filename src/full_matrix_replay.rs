@@ -1642,7 +1642,7 @@ fn strict_lines(
     Ok(out)
 }
 
-fn canonical(v: &Value) -> Result<Vec<u8>, ReplayError> {
+pub(crate) fn canonical(v: &Value) -> Result<Vec<u8>, ReplayError> {
     canonical_bounded(v, MAX_BYTES)
 }
 
@@ -1825,13 +1825,13 @@ fn decimal_value(v: Option<&Value>) -> Result<u64, ReplayError> {
     }
     s.parse().map_err(|_| ReplayError::Malformed)
 }
-fn valid_identifier(s: &str) -> bool {
+pub(crate) fn valid_identifier(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 256
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/'))
 }
-fn validate_digest(s: &str) -> Result<(), ReplayError> {
+pub(crate) fn validate_digest(s: &str) -> Result<(), ReplayError> {
     decode_digest(s).map(|_| ())
 }
 fn decode_digest(s: &str) -> Result<[u8; 32], ReplayError> {
@@ -1861,7 +1861,7 @@ fn format_digest(d: &[u8; 32]) -> String {
     }
     s
 }
-fn hash(label: &str, parts: &[&[u8]]) -> String {
+pub(crate) fn hash(label: &str, parts: &[&[u8]]) -> String {
     format_digest(&hash_raw(label, parts))
 }
 fn hash_raw(label: &str, parts: &[&[u8]]) -> [u8; 32] {
