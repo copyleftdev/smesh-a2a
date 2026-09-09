@@ -52,6 +52,15 @@ export async function writeChunk(stream, chunk, state) {
   if (state?.error) throw state.error;
 }
 
+export function exportEvidenceDocument({ fps, frames, mode, source }) {
+  if (!Number.isSafeInteger(fps) || fps < 1 || !Array.isArray(frames) || !['legacy-synthetic', 'operational'].includes(mode) || typeof source !== 'string') throw new RangeError('export evidence arguments are invalid');
+  const normalized = frames.map((entry, frame) => {
+    if (!entry || !Array.isArray(entry.contributingEventIds) || typeof entry.stateDigest !== 'string' || typeof entry.timeNs !== 'string') throw new TypeError(`frame ${frame} evidence is incomplete`);
+    return Object.freeze({ contributingEventIds: [...entry.contributingEventIds], frame, stateDigest: entry.stateDigest, timeNs: entry.timeNs });
+  });
+  return Object.freeze({ fps, frames: normalized, mode, schemaVersion: 'observatory-export-evidence/1', source });
+}
+
 export function requireExtension(path, extension, name) {
   if (typeof path !== 'string' || !path.toLowerCase().endsWith(extension)) {
     throw new RangeError(`${name} must end with ${extension}`);

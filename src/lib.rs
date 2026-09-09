@@ -38,6 +38,8 @@ mod lifeline_failure;
 mod lifeline_teams;
 mod lifeline_topology;
 mod loopback;
+/// Verified, closed operational replay projection for local observatory consumers.
+pub mod operational_observatory;
 mod outbox_driver;
 mod policy;
 mod postgres_store;
@@ -181,6 +183,18 @@ pub use lifeline_topology::{
     LifelineSkill, LifelineTopologyError, LifelineTopologyManifest, RunningLifelineTopology,
 };
 pub use loopback::LoopbackDispatcher;
+pub use operational_observatory::{
+    EditorialCue, EditorialEntry, OPERATIONAL_ACTOR_MANIFEST_SCHEMA_VERSION,
+    OPERATIONAL_EDITORIAL_OVERLAY_SCHEMA_VERSION, OPERATIONAL_OBSERVATORY_PROJECTOR_ID,
+    OPERATIONAL_OBSERVATORY_PROJECTOR_VERSION, OPERATIONAL_OBSERVATORY_SCHEMA_VERSION,
+    OperationalActor, OperationalActorManifest, OperationalEditorialOverlay,
+    OperationalFailureKind, OperationalFailureOutcome, OperationalFieldRestriction,
+    OperationalProducer, OperationalProjection, OperationalProjectionError,
+    OperationalProjectionLimits, OperationalRestrictedField, OperationalRestrictionReason,
+    OperationalSite, OperationalSourceFact, OperationalSourceFactsManifest, OperationalVisibility,
+    project_operational_observatory, project_operational_observatory_with_source_facts,
+    verify_operational_projection,
+};
 pub use policy::{
     ArtifactManifest, COMPLETION_POLICY_V1, ClosedAttestation, CompletionEvidence,
     CompletionPolicySpec, CompletionReceipt, CompletionSnapshot, PolicyBlock, PolicyBlockReason,

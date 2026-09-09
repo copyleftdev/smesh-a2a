@@ -317,6 +317,13 @@
     function localOffset(normal,u,v){ const up=Math.abs(normal.y)>.9?new THREE.Vector3(1,0,0):new THREE.Vector3(0,1,0); const tangent=new THREE.Vector3().crossVectors(up,normal).normalize(); const bitangent=new THREE.Vector3().crossVectors(normal,tangent).normalize(); return tangent.multiplyScalar(u).add(bitangent.multiplyScalar(v)); }
     function hashRand(i){ return Math.abs(Math.sin(i*127.1+311.7)*43758.5453)%1; }
     function formatTime(ms){ const m=Math.floor(ms/60000),s=Math.floor(ms%60000/1000),x=Math.floor(ms%1000); return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(x).padStart(3,'0')}`; }
+    async function legacyEvidenceAt(time){
+      const contributingEventIds=events.filter(event=>event.simTimeMs<=time).map(event=>event.eventId);
+      const state=JSON.stringify({contributingEventIds,mode:'legacy-synthetic',timeNs:String(Math.round(time*1000000))});
+      const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(state));
+      const stateDigest=`sha256:${[...new Uint8Array(digest)].map(byte=>byte.toString(16).padStart(2,'0')).join('')}`;
+      return {contributingEventIds,stateDigest,timeNs:String(Math.round(time*1000000))};
+    }
 
 
     function animate(now){
@@ -357,10 +364,10 @@
     window.LIFELINE_VALIDATE_EVENT=(event)=>validateEvent(structuredClone(event),1);
     window.LIFELINE_CAMERA_ROTATION_AT=(time)=>cameraRotationAt(time);
     window.LIFELINE_START_CAPTURE=(rate=4)=>{document.body.classList.add('capture');voiceover.pause();tailMode=false;recordingMode=true;manualFrameMode=false;simTime=0;speed=rate;playing=true;lastReal=performance.now();return {rate,duration:DURATION};};
-    window.LIFELINE_RENDER_FRAME=(frame,fps=FPS)=>{
+    window.LIFELINE_RENDER_FRAME=async(frame,fps=FPS)=>{
       voiceover.pause();tailMode=false;recordingMode=true;manualFrameMode=true; playing=false; simTime=frame/fps*1000; renderAt(simTime);
       applyCameraRotation(simTime);
-      renderer.render(scene,camera); return simTime;
+      renderer.render(scene,camera); return legacyEvidenceAt(simTime);
     };
 
     loadTrace().catch(error=>{document.querySelector('#loading').textContent=`TRACE LOAD FAILED: ${error.message}`;console.error(error)});

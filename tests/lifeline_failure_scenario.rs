@@ -240,7 +240,7 @@ fn one_command_verifier_replays_persisted_evidence() {
 }
 
 #[test]
-fn run_receipt_readback_rejects_downgrade_and_trace_mismatch() {
+fn run_receipt_readback_accepts_deterministic_rerun_and_rejects_downgrade() {
     let parent = TempDir::new("run-verification");
     let first_output = parent.path().join("first");
     let second_output = parent.path().join("second");
@@ -259,7 +259,8 @@ fn run_receipt_readback_rejects_downgrade_and_trace_mismatch() {
     let run_bytes = std::fs::read(first_output.join("run.json")).unwrap();
     let run: smesh_a2a::LifelineFailureScenarioRun = serde_json::from_slice(&run_bytes).unwrap();
     assert!(run.verify(&first_events).is_ok());
-    assert!(run.verify(&second_events).is_err());
+    assert!(run.verify(&second_events).is_ok());
+    assert_eq!(first_events, second_events);
 
     let mut changed_operation: serde_json::Value = serde_json::from_slice(&run_bytes).unwrap();
     let primary_receipt = changed_operation["directorRun"]["initialOperations"]

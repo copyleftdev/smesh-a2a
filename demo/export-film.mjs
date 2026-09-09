@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
+import { writeFile } from 'node:fs/promises';
 import process from 'node:process';
 import puppeteer from 'puppeteer-core';
 
@@ -7,6 +8,7 @@ import { createDemoServer } from './serve-demo.mjs';
 import {
   chromeArgs,
   closeServer,
+  exportEvidenceDocument,
   guardWritable,
   numberArg,
   parseArgs,
@@ -16,8 +18,10 @@ import {
 } from './export-utils.mjs';
 
 const args = parseArgs(process.argv.slice(2));
+const mode = args.mode || 'legacy-synthetic';
+if (!['legacy-synthetic', 'operational'].includes(mode)) throw new RangeError('mode must be legacy-synthetic or operational');
 const fps = numberArg(args, 'fps', 30, { min: 1, max: 60, integer: true });
-const duration = numberArg(args, 'duration', 180, { min: 0.1, max: 600 });
+const duration = numberArg(args, 'duration', mode === 'operational' ? 1 : 180, { min: 0.1, max: 600 });
 const start = numberArg(args, 'start', 0, { min: 0, max: 600 });
 const defaultFrames = Math.round(duration * fps);
 const frames = numberArg(args, 'frames', defaultFrames, { min: 1, max: 36_000, integer: true });
@@ -25,7 +29,8 @@ const width = numberArg(args, 'width', 1920, { min: 320, max: 3840, integer: tru
 const height = numberArg(args, 'height', 1080, { min: 180, max: 2160, integer: true });
 const port = numberArg(args, 'port', 43131, { min: 1024, max: 65535, integer: true });
 const crf = numberArg(args, 'crf', 17, { min: 0, max: 51, integer: true });
-const output = requireExtension(args.out || 'lifeline-film.mp4', '.mp4', 'out');
+const output = requireExtension(args.out || (mode === 'operational' ? 'operational-observatory.mp4' : 'lifeline-film.mp4'), '.mp4', 'out');
+const evidenceOutput = requireExtension(args.evidence || output.replace(/\.mp4$/i, '.evidence.json'), '.json', 'evidence');
 const audio = args.audio || '';
 const presets = new Set(['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow']);
 const preset = args.preset || 'slow';
@@ -36,6 +41,8 @@ let browser;
 let ffmpeg;
 let ffmpegExit;
 let ffmpegInput;
+const frameEvidence = [];
+const sourcePath = mode === 'operational' ? '/operational.html' : '/';
 try {
   server = await createDemoServer({ port });
   browser = await puppeteer.launch({
@@ -45,8 +52,8 @@ try {
     defaultViewport: { width, height, deviceScaleFactor: 1 },
   });
   const page = await browser.newPage();
-  await page.goto(`http://127.0.0.1:${port}/?frame=0`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  await page.waitForFunction(() => window.__lifelineReady === true, { timeout: 30_000 });
+  await page.goto(`http://127.0.0.1:${port}${sourcePath}?frame=0`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await page.waitForFunction(mode === 'operational' ? () => window.__operationalReady === true : () => window.__lifelineReady === true, { timeout: 30_000 });
 
   const ffmpegArgs = ['-y', '-f', 'image2pipe', '-framerate', String(fps), '-i', 'pipe:0'];
   if (audio) ffmpegArgs.push('-i', audio, '-map', '0:v:0', '-map', '1:a:0', '-shortest');
@@ -60,7 +67,8 @@ try {
 
   for (let index = 0; index < frames; index += 1) {
     const absoluteFrame = Math.round(start * fps) + index;
-    await page.evaluate(([frame, rate]) => window.LIFELINE_RENDER_FRAME(frame, rate), [absoluteFrame, fps]);
+    const evidence = await page.evaluate(([frame, rate, selectedMode]) => selectedMode === 'operational' ? window.OPERATIONAL_RENDER_FRAME(frame, rate) : window.LIFELINE_RENDER_FRAME(frame, rate), [absoluteFrame, fps, mode]);
+    frameEvidence.push(evidence);
     const image = await page.screenshot({ type: 'jpeg', quality: 94, optimizeForSpeed: true });
     await writeChunk(ffmpeg.stdin, image, ffmpegInput);
     if (index % fps === 0) process.stdout.write(`\rframe ${index}/${frames}`);
@@ -68,7 +76,9 @@ try {
   ffmpeg.stdin.end();
   await ffmpegExit;
   if (ffmpegInput.error) throw ffmpegInput.error;
-  console.log(`\nwrote ${output}`);
+  const evidence = exportEvidenceDocument({ fps, frames: frameEvidence, mode, source: sourcePath });
+  await writeFile(evidenceOutput, `${JSON.stringify(evidence, null, 2)}\n`);
+  console.log(`\nwrote ${output} and ${evidenceOutput}`);
 } catch (error) {
   if (ffmpeg && !ffmpeg.killed) {
     ffmpeg.stdin.destroy();

@@ -515,13 +515,6 @@ impl LifelineResponseDirector {
                         })?;
                     let receipt =
                         execute_initial_operation(operation, gateway, root, Vec::new()).await?;
-                    record_receipt_transition(
-                        &trace,
-                        LifelineFailureEventKind::SiblingCompleted,
-                        &receipt,
-                        "completed",
-                        None,
-                    )?;
                     Ok::<LifelineDirectorOperationReceipt, LifelineDirectorError>(receipt)
                 }
             });
@@ -533,6 +526,19 @@ impl LifelineResponseDirector {
             return Err(LifelineDirectorError::Operation {
                 operation_id: primary.operation_id.clone(),
             });
+        }
+        // `join_all` starts every sibling before awaiting any result. Record their
+        // observed successful outcomes in manifest order only after the barrier;
+        // scheduler completion order is not a causal fact and must not perturb a
+        // deterministic sealed replay.
+        for receipt in &siblings {
+            record_receipt_transition(
+                &trace,
+                LifelineFailureEventKind::SiblingCompleted,
+                receipt,
+                "completed",
+                None,
+            )?;
         }
 
         trace
@@ -736,6 +742,8 @@ async fn execute_failure_primary(
         .await
         .map_err(|_| error())?;
     let mut message = Message::new(Role::User, vec![Part::text(operation.prompt.clone())]);
+    message.message_id = format!("lifeline-message-{}", operation.id);
+    message.task_id = Some(format!("lifeline-task-{}", operation.id));
     message.context_id = Some(root_context_id.clone());
     let message_id = message.message_id.clone();
     let request = SendMessageRequest {
@@ -925,6 +933,8 @@ async fn execute_failure_fallback(
             "Map the bounded fictional shipment routes using the reviewed fallback route.",
         )],
     );
+    message.message_id = format!("lifeline-message-{operation_id}");
+    message.task_id = Some(format!("lifeline-task-{operation_id}"));
     message.context_id = Some(root_context_id.clone());
     message.reference_task_ids = Some(vec![primary_task_id.clone()]);
     let message_id = message.message_id.clone();
@@ -1317,6 +1327,8 @@ async fn execute_initial_operation(
         .await
         .map_err(|_| error())?;
     let mut message = Message::new(Role::User, vec![Part::text(operation.prompt.clone())]);
+    message.message_id = format!("lifeline-message-{}", operation.id);
+    message.task_id = Some(format!("lifeline-task-{}", operation.id));
     message.context_id = Some(root_context_id.clone());
     if !reference_task_ids.is_empty() {
         message.reference_task_ids = Some(reference_task_ids.clone());

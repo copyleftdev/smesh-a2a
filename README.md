@@ -48,6 +48,10 @@ SMESH remains the internal coordination substrate: signals diffuse, decay, reinf
   behavior and state-bound interrupted-temporary reconciliation that never deletes a possible sole
   published copy, and independent Rust/Node source-merge
   golden vectors plus Unicode/u64 canonicalization corpus
+- Deterministic operational observatory projection plus a fail-closed same-origin Three.js/WebGL mode
+  with receipt/input commitments, source-event inspection, immutable seek/frame state digests, reduced
+  motion, cue intervals, accessibility semantics, and export evidence sidecars; the production route
+  pins the checked 46-event LIFELINE capture spanning six gateways owned by five providers
 - Bounded pre-persistence trace privacy for strict JSONL (or one explicitly supplied JSON object):
   six closed data classes, secret removal, typed placeholders, run-scoped HMAC handles, exact
   RFC 6901 action logs with record indices, semantic leak scanning, and separate public/restricted
@@ -97,6 +101,7 @@ See:
 - [`docs/RUNTIME_TERMINAL_RACES.md`](docs/RUNTIME_TERMINAL_RACES.md)
 - [`docs/ULTIMATE_DEMO.md`](docs/ULTIMATE_DEMO.md)
 - [`docs/TRACE_CAPTURE.md`](docs/TRACE_CAPTURE.md)
+- [`docs/OPERATIONAL_OBSERVATORY.md`](docs/OPERATIONAL_OBSERVATORY.md)
 - [`docs/LIFELINE_TOPOLOGY.md`](docs/LIFELINE_TOPOLOGY.md)
 - [`docs/LIFELINE_DIRECTOR.md`](docs/LIFELINE_DIRECTOR.md)
 - [`docs/LIFELINE_FAILURE_SCENARIO.md`](docs/LIFELINE_FAILURE_SCENARIO.md)
