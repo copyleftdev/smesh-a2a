@@ -93,12 +93,20 @@ test('operational CI runs an exact canary-free browser readiness diagnostic befo
   assert.match(browserReadiness, /pipe: true/);
   assert.match(browserReadiness, /userDataDir: profile/);
   assert.match(browserReadiness, /chromeArgs\(\{ qualificationOffline: 'true', unsafeNoSandbox: 'true' \}\)/);
-  assert.match(browserReadiness, /page\.goto\('about:blank'/);
+  assert.match(browserReadiness, /createServer/);
+  assert.match(browserReadiness, /listen\(0, '127\.0\.0\.1'/);
+  assert.match(browserReadiness, /server\.address\(\)/);
+  assert.match(browserReadiness, /page\.goto\(`http:\/\/127\.0\.0\.1:\$\{port\}`/);
+  assert.match(browserReadiness, /document\.body\.textContent/);
+  assert.match(browserReadiness, /assert\.equal/);
   assert.match(browserReadiness, /slice\(0, MAX_DIAGNOSTIC_BYTES\)/);
   assert.match(browserReadiness, /Promise\.race\(\[/);
-  assert.match(browserReadiness, /browser\?\.close\(\)/);
+  assert.match(browserReadiness, /bounded\('browser close', \(\) => browser\.close\(\)\)/);
+  assert.match(browserReadiness, /bounded\('browser reap', \(\) => once\(child, 'exit'\)\)/);
+  assert.match(browserReadiness, /server\.closeAllConnections\?\.\(\)/);
+  assert.match(browserReadiness, /server\.close/);
   assert.match(browserReadiness, /rm\(profile, \{ recursive: true, force: true \}\)/);
-  assert.doesNotMatch(browserReadiness, /fixtures|operational\.html|https?:\/\//);
+  assert.doesNotMatch(browserReadiness, /lifeline|acceptance-scorecard|operational\.html/);
 });
 
 test('Pages deploy has a bounded live public and restricted-route gate', () => {
