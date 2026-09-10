@@ -44,7 +44,8 @@ jobs:
       - name: Provision qualification process tooling
         run: |
           sudo timeout --signal=TERM --kill-after=10s 2m apt-get update
-          sudo timeout --signal=TERM --kill-after=10s 2m apt-get install --yes bubblewrap strace
+          sudo timeout --signal=TERM --kill-after=10s 2m apt-get install --yes apparmor apparmor-profiles apparmor-utils bubblewrap strace
+          timeout --signal=TERM --kill-after=10s 2m scripts/ensure-bwrap-ready.sh
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -94,7 +95,8 @@ jobs:
       - name: Install bounded browser tooling
         run: |
           sudo timeout --signal=TERM --kill-after=10s 2m apt-get update
-          sudo timeout --signal=TERM --kill-after=10s 2m apt-get install --yes bubblewrap strace
+          sudo timeout --signal=TERM --kill-after=10s 2m apt-get install --yes apparmor apparmor-profiles apparmor-utils bubblewrap strace
+          timeout --signal=TERM --kill-after=10s 2m scripts/ensure-bwrap-ready.sh
           timeout --signal=TERM --kill-after=10s 2m npm ci --prefix demo
       - name: Run operational acceptance harness
         run: timeout --signal=TERM --kill-after=15s 12m scripts/run-operational-acceptance.sh "${RUNNER_TEMP}/operational-acceptance"
