@@ -69,7 +69,7 @@ let browser;
 try {
   const userDataDir = process.env.SMESH_QUALIFICATION_BROWSER_PROFILE;
   if (!userDataDir) throw new Error('Rust-owned browser profile is required');
-  browser = await puppeteer.launch({ executablePath: process.env.CHROME || '/usr/bin/google-chrome', headless: true, userDataDir, args: chromeArgs({ qualificationOffline: 'true', unsafeNoSandbox: 'true' }) });
+  browser = await puppeteer.launch({ executablePath: process.env.CHROME || '/usr/bin/google-chrome', headless: true, pipe: true, userDataDir, args: chromeArgs({ qualificationOffline: 'true', unsafeNoSandbox: 'true' }) });
   if (process.env.SMESH_QUALIFICATION_LIFECYCLE_MARKER) {
     const browserProcess = browser.process();
     await writeFile(process.env.SMESH_QUALIFICATION_LIFECYCLE_MARKER, JSON.stringify({

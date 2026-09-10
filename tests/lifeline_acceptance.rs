@@ -1109,7 +1109,7 @@ fn qualification_preserves_predictable_collision_and_removes_only_owned_roots() 
 
 #[cfg(target_os = "linux")]
 #[test]
-fn qualification_browser_socket_trace_has_no_dns_or_non_loopback_attempt() {
+fn qualification_browser_uses_anonymous_control_pipe_without_dns_or_non_loopback_attempt() {
     assert!(
         Path::new("/usr/bin/strace").is_file(),
         "strace is required for Linux qualification"
@@ -1125,7 +1125,15 @@ fn qualification_browser_socket_trace_has_no_dns_or_non_loopback_attempt() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let status = process::bounded_status(
         Command::new("/usr/bin/strace")
-            .args(["-f", "-qq", "-z", "-e", "trace=connect,sendto", "-o"])
+            .args([
+                "-f",
+                "-qq",
+                "-v",
+                "-z",
+                "-e",
+                "trace=connect,sendto,process",
+                "-o",
+            ])
             .arg(&trace)
             .args([
                 "bwrap",
@@ -1147,8 +1155,16 @@ fn qualification_browser_socket_trace_has_no_dns_or_non_loopback_attempt() {
     )
     .unwrap();
     assert!(status.success());
-    let sockets = std::fs::read_to_string(trace).unwrap();
-    for line in sockets.lines().filter(|line| line.contains("AF_INET")) {
+    let trace_text = std::fs::read_to_string(trace).unwrap();
+    assert!(
+        trace_text.contains("--remote-debugging-pipe"),
+        "qualification browser must use anonymous CDP pipes"
+    );
+    assert!(
+        !trace_text.contains("--remote-debugging-port"),
+        "qualification browser exposed a TCP CDP listener"
+    );
+    for line in trace_text.lines().filter(|line| line.contains("AF_INET")) {
         assert!(
             line.contains("127.0.0.1")
                 || line.contains("sin6_addr=inet_pton(AF_INET6, \"::1\"")
