@@ -686,12 +686,17 @@ pub fn evaluate_operational_lifeline(
                 }
                 Some(probe) => {
                     evidence = probe.evidence;
+                    let invariant = qualification_invariant_failure(&criterion.id, &probe.facts);
                     diagnostics.push(diagnostic(
                         DiagnosticCode::ContradictoryEvidence,
                         &criterion.id,
-                        "qualificationProbe",
-                        "pass",
-                        vec!["fail".into()],
+                        invariant
+                            .as_ref()
+                            .map_or("qualificationProbe", |failure| failure.fact_id),
+                        invariant
+                            .as_ref()
+                            .map_or("pass", |failure| failure.expected),
+                        invariant.map_or_else(|| vec!["fail".into()], |failure| failure.observed),
                         evidence.clone(),
                     ));
                     AcceptanceStatus::Fail
@@ -979,6 +984,7 @@ fn valid_qualification_facts(criterion_id: &str, facts: &Value) -> bool {
             ]);
             exact(&[
                 "attemptKinds",
+                "nodeListenerBrowserRequests",
                 "offlineRendered",
                 "requestPaths",
                 "sameOriginOnly",
@@ -986,12 +992,15 @@ fn valid_qualification_facts(criterion_id: &str, facts: &Value) -> bool {
                 "syntheticCompleteInputSet",
                 "syntheticRejected",
                 "syntheticSemanticRejected",
+                "unknownSameOriginAborted",
             ]) && facts["attemptKinds"] == json!(["browserExternalFetch"])
+                && facts["nodeListenerBrowserRequests"] == "0"
                 && facts["offlineRendered"] == true
                 && facts["sameOriginOnly"] == true
                 && facts["syntheticCompleteInputSet"] == true
                 && facts["syntheticRejected"] == true
                 && facts["syntheticSemanticRejected"] == true
+                && facts["unknownSameOriginAborted"] == true
                 && facts["requestPaths"] == expected_paths
                 && valid_digest_value(&facts["stateDigest"])
         }
@@ -1022,6 +1031,49 @@ fn valid_qualification_facts(criterion_id: &str, facts: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+fn qualification_invariant_failure(criterion_id: &str, facts: &Value) -> Option<RetainedFailure> {
+    if criterion_id != "m3-28-ac4" {
+        return None;
+    }
+    if facts["nodeListenerBrowserRequests"] != "0" {
+        return Some(RetainedFailure {
+            code: DiagnosticCode::ContradictoryEvidence,
+            fact_id: "nodeListenerBrowserRequests",
+            expected: "0",
+            observed: vec!["nonzero".into()],
+        });
+    }
+    if facts["unknownSameOriginAborted"] != true {
+        return Some(RetainedFailure {
+            code: DiagnosticCode::ContradictoryEvidence,
+            fact_id: "unknownSameOriginAborted",
+            expected: "true",
+            observed: vec!["false".into()],
+        });
+    }
+    let expected_paths = json!([
+        "/fixtures/operational-lifeline-v1/actors.json",
+        "/fixtures/operational-lifeline-v1/browser-bootstrap.json",
+        "/fixtures/operational-lifeline-v1/editorial.json",
+        "/fixtures/operational-lifeline-v1/package.jsonl",
+        "/fixtures/operational-lifeline-v1/receipt.json",
+        "/operational-app.mjs",
+        "/operational-observatory.mjs",
+        "/operational.css",
+        "/operational.html",
+        "/vendor/three.module.min.js"
+    ]);
+    if facts["requestPaths"] != expected_paths {
+        return Some(RetainedFailure {
+            code: DiagnosticCode::ContradictoryEvidence,
+            fact_id: "requestPaths",
+            expected: "exact repository browser asset allowlist",
+            observed: vec!["altered".into()],
+        });
+    }
+    None
 }
 
 struct RetainedFailure {

@@ -31,7 +31,7 @@ const assets = new Map([
 
 const LEGACY_CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 const STRICT_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
-function securityHeaders(route = '') {
+export function securityHeaders(route = '') {
   return {
     'cache-control': 'no-store',
     'content-security-policy': route === '/operational.html' ? STRICT_CSP : LEGACY_CSP,

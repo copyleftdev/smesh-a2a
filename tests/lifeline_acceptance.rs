@@ -18,6 +18,347 @@ const QUALIFICATION_BIN: Option<&str> =
 const CLI_WATCHDOG: Duration = Duration::from_secs(30);
 const QUALIFICATION_WATCHDOG: Duration = Duration::from_secs(60);
 
+#[cfg(target_os = "linux")]
+const OUTBOUND_SYSCALLS: [&str; 4] = ["connect", "sendto", "sendmsg", "sendmmsg"];
+
+#[cfg(target_os = "linux")]
+fn trace_pid_and_body(line: &str) -> Option<(String, &str)> {
+    let line = line.trim_start();
+    if let Some(rest) = line.strip_prefix("[pid ") {
+        let (pid, body) = rest.split_once(']')?;
+        return pid
+            .chars()
+            .all(|character| character.is_ascii_digit())
+            .then(|| (pid.to_string(), body.trim_start()));
+    }
+    let split = line.find(char::is_whitespace);
+    if let Some(index) = split {
+        let candidate = &line[..index];
+        if !candidate.is_empty()
+            && candidate
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        {
+            return Some((candidate.to_string(), line[index..].trim_start()));
+        }
+    }
+    Some((String::new(), line))
+}
+
+#[cfg(target_os = "linux")]
+fn split_top_level(value: &str) -> Option<Vec<&str>> {
+    let mut fields = Vec::new();
+    let mut stack = Vec::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut start = 0;
+    for (index, character) in value.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => quoted = true,
+            '(' | '{' | '[' => stack.push(character),
+            ')' => {
+                if stack.pop() != Some('(') {
+                    return None;
+                }
+            }
+            '}' => {
+                if stack.pop() != Some('{') {
+                    return None;
+                }
+            }
+            ']' => {
+                if stack.pop() != Some('[') {
+                    return None;
+                }
+            }
+            ',' if stack.is_empty() => {
+                fields.push(value[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quoted || escaped || !stack.is_empty() {
+        return None;
+    }
+    fields.push(value[start..].trim());
+    Some(fields)
+}
+
+#[cfg(target_os = "linux")]
+fn wrapped_fields(value: &str, open: char, close: char) -> Option<Vec<&str>> {
+    let value = value.trim();
+    let inner = value.strip_prefix(open)?.strip_suffix(close)?;
+    split_top_level(inner)
+}
+
+#[cfg(target_os = "linux")]
+fn quoted_after<'a>(value: &'a str, marker: &str) -> Option<&'a str> {
+    let start = value.find(marker)? + marker.len();
+    let suffix = &value[start..];
+    let mut escaped = false;
+    for (index, character) in suffix.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Some(&suffix[..index]);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn decoded_strace_string(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            if bytes.get(index + 1) != Some(&b'x') {
+                return None;
+            }
+            let digits = std::str::from_utf8(bytes.get(index + 2..index + 4)?).ok()?;
+            decoded.push(u8::from_str_radix(digits, 16).ok()?);
+            index += 4;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+#[cfg(target_os = "linux")]
+struct InetDestination {
+    is_loopback: bool,
+    is_dns: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn network_port(fields: &[&str], field_name: &str) -> Option<u16> {
+    let mut ports = fields
+        .iter()
+        .filter_map(|field| field.strip_prefix(field_name));
+    let port = ports.next()?;
+    if ports.next().is_some() {
+        return None;
+    }
+    port.strip_prefix("htons(")?.strip_suffix(')')?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn inet_destination(sockaddr: &str) -> Option<Vec<InetDestination>> {
+    let sockaddr = sockaddr.trim();
+    if sockaddr == "NULL" {
+        return Some(Vec::new());
+    }
+    let fields = wrapped_fields(sockaddr, '{', '}')?;
+    let family = fields
+        .iter()
+        .find_map(|field| field.strip_prefix("sa_family="))?;
+    if family == "AF_INET6" {
+        let port = network_port(&fields, "sin6_port=")?;
+        let address = decoded_strace_string(quoted_after(sockaddr, "inet_pton(AF_INET6, \"")?)?;
+        return address.parse::<std::net::Ipv6Addr>().ok().map(|address| {
+            vec![InetDestination {
+                is_loopback: address.is_loopback(),
+                is_dns: port == 53,
+            }]
+        });
+    }
+    if family == "AF_INET" {
+        let port = network_port(&fields, "sin_port=")?;
+        let address = decoded_strace_string(quoted_after(sockaddr, "sin_addr=inet_addr(\"")?)?;
+        return address.parse::<std::net::Ipv4Addr>().ok().map(|address| {
+            vec![InetDestination {
+                is_loopback: address.is_loopback(),
+                is_dns: port == 53,
+            }]
+        });
+    }
+    Some(Vec::new())
+}
+
+#[cfg(target_os = "linux")]
+fn message_destinations(header: &str) -> Option<Vec<InetDestination>> {
+    let fields = wrapped_fields(header, '{', '}')?;
+    let name = fields
+        .iter()
+        .find_map(|field| field.strip_prefix("msg_name="))?;
+    inet_destination(name)
+}
+
+#[cfg(target_os = "linux")]
+fn syscall_destinations(syscall: &str, arguments: &str) -> Option<Vec<InetDestination>> {
+    let arguments = split_top_level(arguments)?;
+    match syscall {
+        "connect" => inet_destination(arguments.get(1)?),
+        "sendto" => inet_destination(arguments.get(4)?),
+        "sendmsg" => message_destinations(arguments.get(1)?),
+        "sendmmsg" => {
+            let messages = wrapped_fields(arguments.get(1)?, '[', ']')?;
+            let mut destinations = Vec::new();
+            for message in messages {
+                let fields = wrapped_fields(message, '{', '}')?;
+                let header = fields
+                    .iter()
+                    .find_map(|field| field.strip_prefix("msg_hdr="))?;
+                destinations.extend(message_destinations(header)?);
+            }
+            Some(destinations)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn completed_call<'a>(body: &'a str, syscall: &str) -> Option<(&'a str, &'a str)> {
+    let open = syscall.len();
+    if body.as_bytes().get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0_u32;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (offset, character) in body[open..].char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => quoted = true,
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let close = open + offset;
+                    return Some((&body[open + 1..close], body[close + 1..].trim()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn explicitly_fail_closed(result: &str) -> bool {
+    let Some(result) = result.strip_prefix("= -1 ") else {
+        return false;
+    };
+    ["ENETUNREACH", "EACCES"].iter().any(|code| {
+        result == *code
+            || result
+                .strip_prefix(&format!("{code} "))
+                .is_some_and(|detail| detail.starts_with('(') && detail.ends_with(')'))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn completed_inet_effect(body: &str, syscall: &str) -> Option<bool> {
+    let (arguments, result) = completed_call(body, syscall)?;
+    let destinations = syscall_destinations(syscall, arguments)?;
+    Some(
+        destinations
+            .iter()
+            .all(|destination| destination.is_loopback && !destination.is_dns)
+            || explicitly_fail_closed(result),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn forbidden_inet_effect(trace: &str) -> Option<String> {
+    use std::collections::{HashMap, VecDeque};
+
+    let mut unfinished: HashMap<(String, &'static str), VecDeque<(String, String)>> =
+        HashMap::new();
+    for line in trace.lines() {
+        let Some((pid, body)) = trace_pid_and_body(line) else {
+            if OUTBOUND_SYSCALLS
+                .iter()
+                .any(|syscall| line.contains(syscall))
+            {
+                return Some(line.to_string());
+            }
+            continue;
+        };
+        if let Some(resumed) = body.strip_prefix("<... ") {
+            let Some((syscall, suffix)) = resumed.split_once(" resumed>") else {
+                if OUTBOUND_SYSCALLS
+                    .iter()
+                    .any(|syscall| resumed.starts_with(syscall))
+                {
+                    return Some(line.to_string());
+                }
+                continue;
+            };
+            let Some(syscall) = OUTBOUND_SYSCALLS
+                .iter()
+                .copied()
+                .find(|candidate| *candidate == syscall)
+            else {
+                continue;
+            };
+            let key = (pid, syscall);
+            let Some((prefix, _original)) = unfinished.get_mut(&key).and_then(VecDeque::pop_front)
+            else {
+                return Some(line.to_string());
+            };
+            if completed_inet_effect(&format!("{prefix}{suffix}"), syscall) != Some(true) {
+                return Some(line.to_string());
+            }
+            continue;
+        }
+        let Some(syscall) = OUTBOUND_SYSCALLS
+            .iter()
+            .copied()
+            .find(|syscall| body.starts_with(&format!("{syscall}(")))
+        else {
+            if OUTBOUND_SYSCALLS.iter().any(|syscall| {
+                body.strip_prefix(syscall).is_some_and(|suffix| {
+                    !suffix.starts_with(|character: char| {
+                        character.is_alphanumeric() || character == '_'
+                    })
+                })
+            }) {
+                return Some(line.to_string());
+            }
+            continue;
+        };
+        if let Some(prefix) = body.strip_suffix("<unfinished ...>") {
+            unfinished
+                .entry((pid, syscall))
+                .or_default()
+                .push_back((prefix.to_string(), line.to_string()));
+        } else if completed_inet_effect(body, syscall) != Some(true) {
+            return Some(line.to_string());
+        }
+    }
+    unfinished
+        .into_values()
+        .flat_map(VecDeque::into_iter)
+        .next()
+        .map(|(_, original)| original)
+}
+
 #[test]
 fn registry_is_the_closed_milestone_20_through_29_contract() {
     let criteria = canonical_criteria().expect("canonical registry");
@@ -403,6 +744,107 @@ fn every_qualification_criterion_rejects_coherently_rehashed_fabrication() {
 }
 
 #[test]
+fn browser_boundary_invariants_survive_coherent_rehash_and_offline_report_rebinding() {
+    let package =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("demo/fixtures/operational-lifeline-v1");
+    let baseline_qualification: serde_json::Value =
+        serde_json::from_slice(&passing_qualification()).unwrap();
+    let baseline_artifacts =
+        evaluate_operational_lifeline(&package, &passing_qualification()).unwrap();
+    for (label, fact_id, replacement) in [
+        (
+            "listener reached",
+            "nodeListenerBrowserRequests",
+            serde_json::json!("1"),
+        ),
+        (
+            "unknown route continued",
+            "unknownSameOriginAborted",
+            serde_json::json!(false),
+        ),
+        (
+            "request path altered",
+            "requestPaths",
+            serde_json::json!([
+                "/fixtures/operational-lifeline-v1/actors.json",
+                "/operational.html"
+            ]),
+        ),
+        (
+            "request path added",
+            "requestPaths",
+            serde_json::json!([
+                "/fixtures/operational-lifeline-v1/actors.json",
+                "/fixtures/operational-lifeline-v1/browser-bootstrap.json",
+                "/fixtures/operational-lifeline-v1/editorial.json",
+                "/fixtures/operational-lifeline-v1/package.jsonl",
+                "/fixtures/operational-lifeline-v1/receipt.json",
+                "/operational-app.mjs",
+                "/operational-observatory.mjs",
+                "/operational.css",
+                "/operational.html",
+                "/qualification-extra.mjs",
+                "/vendor/three.module.min.js"
+            ]),
+        ),
+    ] {
+        let mut qualification = baseline_qualification.clone();
+        let probe = qualification["probes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|probe| probe["criterionId"] == "m3-28-ac4")
+            .unwrap();
+        probe["facts"][fact_id] = replacement.clone();
+        let fact_bytes = serde_json::to_vec(&probe["facts"]).unwrap();
+        probe["evidence"][0]["artifactDigest"] =
+            criteria_evidence_digest("operational-lifeline-qualification-evidence", &fact_bytes)
+                .into();
+        let evaluated =
+            evaluate_operational_lifeline(&package, &serde_json::to_vec(&qualification).unwrap())
+                .unwrap();
+        let result = evaluated
+            .scorecard
+            .results
+            .iter()
+            .find(|result| result.criterion_id == "m3-28-ac4")
+            .unwrap();
+        assert_eq!(result.status.as_str(), "fail", "{label}");
+        assert_eq!(result.diagnostics[0].fact_id, fact_id, "{label}");
+        assert_eq!(
+            result.diagnostics[0].code.as_str(),
+            "contradictoryEvidence",
+            "{label}"
+        );
+
+        let mut scorecard: serde_json::Value =
+            serde_json::from_slice(&baseline_artifacts.scorecard_json).unwrap();
+        scorecard["qualificationFacts"]["m3-28-ac4"][fact_id] = replacement;
+        let fact_bytes = serde_json::to_vec(&scorecard["qualificationFacts"]["m3-28-ac4"]).unwrap();
+        let result = scorecard["results"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|result| result["criterionId"] == "m3-28-ac4")
+            .unwrap();
+        result["evidence"][0]["artifactDigest"] =
+            criteria_evidence_digest("operational-lifeline-qualification-evidence", &fact_bytes)
+                .into();
+        let scorecard = serde_json::to_vec(&scorecard).unwrap();
+        let receipt = coherently_rebind_receipt(&baseline_artifacts.receipt_json, &scorecard);
+        let root = TempRoot::new("browser-invariant-report");
+        let report = root.path().join("report");
+        std::fs::create_dir(&report).unwrap();
+        std::fs::write(report.join("acceptance-scorecard.json"), scorecard).unwrap();
+        std::fs::write(report.join("acceptance-receipt.json"), receipt).unwrap();
+        assert!(
+            verify_acceptance_report(&report).is_err(),
+            "offline verifier accepted {label}"
+        );
+    }
+}
+
+#[test]
 fn qualification_facts_bind_all_blocker_semantics() {
     let value: serde_json::Value = serde_json::from_slice(&passing_qualification()).unwrap();
     let facts = |id: &str| {
@@ -442,6 +884,8 @@ fn qualification_facts_bind_all_blocker_semantics() {
         facts("m3-28-ac4")["attemptKinds"],
         serde_json::json!(["browserExternalFetch"])
     );
+    assert_eq!(facts("m3-28-ac4")["nodeListenerBrowserRequests"], "0");
+    assert_eq!(facts("m3-28-ac4")["unknownSameOriginAborted"], true);
 }
 
 #[test]
@@ -1109,7 +1553,117 @@ fn qualification_preserves_predictable_collision_and_removes_only_owned_roots() 
 
 #[cfg(target_os = "linux")]
 #[test]
-fn qualification_browser_uses_anonymous_control_pipe_without_dns_or_non_loopback_attempt() {
+fn socket_trace_parser_allows_loopback_effects_and_rejects_external_effects() {
+    let allowed = concat!(
+        "101 connect(7, {sa_family=AF_UNIX, sun_path=\"/tmp/browser.sock\"}, 110) = 0\n",
+        "102 connect(8, {sa_family=AF_INET6, sin6_port=htons(443), inet_pton(AF_INET6, \"2001:4860:4860::8888\", &sin6_addr)}, 28) = -1 ENETUNREACH (Network is unreachable)\n",
+        "103 sendto(9, \"dns\", 3, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"127.0.0.53\")}, 16) = -1 EACCES (Permission denied)\n",
+        "107 connect(13, {sa_family=AF_INET6, sin6_port=htons(443), inet_pton(AF_INET6, \"2001:4860:4860::8888\", &sin6_addr)}, 28 <unfinished ...>\n",
+        "107 <... connect resumed>) = -1 ENETUNREACH (Network is unreachable)\n",
+        "108 connect(14, {sa_family=AF_INET, sin_port=htons(41721), sin_addr=inet_addr(\"127.42.0.1\")}, 16) = 0\n",
+        "109 connect(15, {sa_family=AF_INET, sin_port=htons(41722), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = -1 EINPROGRESS (Operation now in progress)\n",
+        "110 connect(16, {sa_family=AF_INET6, sin6_port=htons(41723), inet_pton(AF_INET6, \"::1\", &sin6_addr)}, 28) = 0\n",
+        "111 connect(17, {sa_family=AF_INET6, sin6_port=htons(41724), inet_pton(AF_INET6, \"::1\", &sin6_addr)}, 28) = -1 EINPROGRESS (Operation now in progress)\n",
+        "112 sendto(18, \"local\", 5, MSG_NOSIGNAL, {sa_family=AF_INET6, sin6_port=htons(41725), inet_pton(AF_INET6, \"::1\", &sin6_addr)}, 28) = 5\n",
+        "117 connect(23, {sa_family=AF_INET6, sin6_port=htons(443), inet_pton(AF_INET6, \"2001:db8::3\", &sin6_addr)}, 28 <unfinished ...>\n",
+        "117 <... connect resumed>) = -1 ENETUNREACH (Network is unreachable)\n",
+        "117 connect(24, {sa_family=AF_INET6, sin6_port=htons(443), inet_pton(AF_INET6, \"2001:db8::4\", &sin6_addr)}, 28 <unfinished ...>\n",
+        "117 <... connect resumed>) = -1 EACCES (Permission denied)\n",
+    );
+    assert_eq!(forbidden_inet_effect(allowed), None);
+    for effect in [
+        "104 connect(10, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"203.0.113.7\")}, 16) = 0",
+        "105 connect(11, {sa_family=AF_INET6, sin6_port=htons(443), inet_pton(AF_INET6, \"2001:db8::1\", &sin6_addr)}, 28) = -1 EINPROGRESS (Operation now in progress)",
+        "113 connect(19, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"198.51.100.8\")}, 16 <unfinished ...>",
+        "114 connect(20, {sa_family=AF_INET6, sin6_port=htons(443), inet_pton(AF_INET6, \"not-an-address\", &sin6_addr)}, 28) = 0",
+        "115 connect(21, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"203.0.113.8\")}, 16) = -1 EINPROGRESS (Operation now in progress)",
+        "116 connect(22, {sa_family=AF_INET6, sin6_port=htons(443), inet_pton(AF_INET6, \"2001:db8::2\", &sin6_addr)}, 28) = 0",
+    ] {
+        assert_eq!(
+            forbidden_inet_effect(&format!("{allowed}{effect}\n")),
+            Some(effect.to_string())
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn socket_trace_parser_rejects_dns_unless_explicitly_fail_closed() {
+    let explicitly_blocked = concat!(
+        "401 connect(4, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"127.0.0.53\")}, 16) = -1 EACCES (Permission denied)\n",
+        "402 sendto(5, \"dns\", 3, MSG_NOSIGNAL, {sa_family=AF_INET6, sin6_port=htons(53), inet_pton(AF_INET6, \"::1\", &sin6_addr)}, 28) = -1 ENETUNREACH (Network is unreachable)\n",
+        "403 sendmsg(6, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"127.0.0.53\")}, msg_namelen=16, msg_iov=[], msg_iovlen=0}, 0) = -1 EACCES (Permission denied)\n",
+        "404 sendmmsg(7, [{msg_hdr={msg_name={sa_family=AF_INET6, sin6_port=htons(53), inet_pton(AF_INET6, \"::1\", &sin6_addr)}, msg_namelen=28, msg_iov=[], msg_iovlen=0}, msg_len=0}], 1, 0) = -1 ENETUNREACH (Network is unreachable)\n",
+    );
+    assert_eq!(forbidden_inet_effect(explicitly_blocked), None);
+
+    for effect in [
+        "405 connect(8, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"127.0.0.53\")}, 16) = 0",
+        "406 connect(9, {sa_family=AF_INET6, sin6_port=htons(53), inet_pton(AF_INET6, \"::1\", &sin6_addr)}, 28) = -1 EINPROGRESS (Operation now in progress)",
+        "407 sendto(10, \"dns\", 3, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"127.0.0.53\")}, 16) = 3",
+        "408 sendmsg(11, {msg_name={sa_family=AF_INET6, sin6_port=htons(53), inet_pton(AF_INET6, \"::1\", &sin6_addr)}, msg_namelen=28, msg_iov=[], msg_iovlen=0}, 0) = 1",
+        "409 sendmmsg(12, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"127.0.0.53\")}, msg_namelen=16, msg_iov=[], msg_iovlen=0}, msg_len=0}], 1, 0) = 1",
+        "410 sendto(13, \"dns\", 3, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(unknown), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = 3",
+        "411 sendmsg(14, {msg_name={sa_family=AF_INET6, inet_pton(AF_INET6, \"::1\", &sin6_addr)}, msg_namelen=28, msg_iov=[], msg_iovlen=0}, 0) = 1",
+        "412 connect(15, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr(\"127.0.0.53\")}, 16 <unfinished ...>",
+        "413 sendto(16, \"dns\", 3, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(8080), sin_port=htons(53), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = 3",
+    ] {
+        assert_eq!(
+            forbidden_inet_effect(&format!("{explicitly_blocked}{effect}\n")),
+            Some(effect.to_string()),
+            "{effect}",
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn socket_trace_parser_rejects_payload_address_and_result_spoofing() {
+    let spoofed = "201 sendto(9, \"payload inet_addr(\\\"127.0.0.1\\\") and = -1 ENETUNREACH (\", 61, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"203.0.113.7\")}, 16) = 61\n";
+    assert_eq!(
+        forbidden_inet_effect(spoofed),
+        Some(spoofed.trim().to_string())
+    );
+    let spoofed_dns_port = "202 sendto(10, \"payload sin_port=htons(53)\", 26, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = 26\n";
+    assert_eq!(forbidden_inet_effect(spoofed_dns_port), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn socket_trace_parser_structurally_covers_sendmsg_and_sendmmsg() {
+    let allowed = concat!(
+        "[pid 301] sendmsg(4, {msg_name={sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"127.0.0.1\")}, msg_namelen=16, msg_iov=[{iov_base=\"local\", iov_len=5}], msg_iovlen=1}, 0) = 5\n",
+        "302 sendmmsg(5, [{msg_hdr={msg_name={sa_family=AF_INET6, sin6_port=htons(80), inet_pton(AF_INET6, \"::1\", &sin6_addr)}, msg_namelen=28, msg_iov=[{iov_base=\"local\", iov_len=5}], msg_iovlen=1}, msg_len=5}], 1, MSG_NOSIGNAL) = 1\n",
+        "303 sendmsg(6, {msg_name={sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"203.0.113.30\")}, msg_namelen=16, msg_iov=[{iov_base=\"blocked\", iov_len=7}], msg_iovlen=1}, 0) = -1 EACCES (Permission denied)\n",
+        "304 sendmmsg(7, [{msg_hdr={msg_name={sa_family=AF_INET6, sin6_port=htons(80), inet_pton(AF_INET6, \"2001:db8::30\", &sin6_addr)}, msg_namelen=28, msg_iov=[{iov_base=\"blocked\", iov_len=7}], msg_iovlen=1}, msg_len=0}], 1, 0) = -1 ENETUNREACH (Network is unreachable)\n",
+        "305 sendmsg(8, {msg_name={sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"203.0.113.31\")} <unfinished ...>\n",
+        "306 sendmsg(9, {msg_name={sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"203.0.113.32\")} <unfinished ...>\n",
+        "306 <... sendmsg resumed>, msg_namelen=16, msg_iov=[], msg_iovlen=0}, 0) = -1 EACCES (Permission denied)\n",
+        "305 <... sendmsg resumed>, msg_namelen=16, msg_iov=[], msg_iovlen=0}, 0) = -1 ENETUNREACH (Network is unreachable)\n",
+    );
+    assert_eq!(forbidden_inet_effect(allowed), None);
+
+    for effect in [
+        "307 sendmsg(10, {msg_name={sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"203.0.113.33\")}, msg_namelen=16, msg_iov=[{iov_base=\"ok\", iov_len=2}], msg_iovlen=1}, 0) = 2",
+        "308 sendmsg(11, {msg_name={sa_family=AF_INET6, sin6_port=htons(80), inet_pton(AF_INET6, \"2001:db8::33\", &sin6_addr)}, msg_namelen=28, msg_iov=[], msg_iovlen=0}, 0) = -1 EINPROGRESS (Operation now in progress)",
+        "309 sendmmsg(12, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"203.0.113.34\")}, msg_namelen=16, msg_iov=[], msg_iovlen=0}, msg_len=0}], 1, 0) = 1",
+        "310 sendmmsg(13, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"203.0.113.35\")}, msg_namelen=16, msg_iov=[], msg_iovlen=0}, msg_len=0}], 1, 0) = ?",
+        "311 sendmsg(14, {msg_name={sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"203.0.113.36\")}, msg_namelen=16, msg_iov=[{iov_base=\"inet_addr(\\\"127.0.0.1\\\") = -1 EACCES (\", iov_len=43}], msg_iovlen=1}, 0) = 43",
+        "312 sendmsg malformed",
+        "313 sendmsg(15, {msg_name={sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"203.0.113.37\")}, msg_namelen=16, msg_iov=[], msg_iovlen=0}, 0) = -1 EACCES (Permission denied) trailing",
+    ] {
+        assert_eq!(
+            forbidden_inet_effect(&format!("{allowed}{effect}\n")),
+            Some(effect.to_string()),
+            "{effect}",
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn qualification_browser_uses_anonymous_control_pipe_without_successful_dns_or_non_loopback_effects()
+ {
     assert!(
         Path::new("/usr/bin/strace").is_file(),
         "strace is required for Linux qualification"
@@ -1129,9 +1683,9 @@ fn qualification_browser_uses_anonymous_control_pipe_without_dns_or_non_loopback
                 "-f",
                 "-qq",
                 "-v",
-                "-z",
+                "-xx",
                 "-e",
-                "trace=connect,sendto,process",
+                "trace=network,process",
                 "-o",
             ])
             .arg(&trace)
@@ -1156,23 +1710,32 @@ fn qualification_browser_uses_anonymous_control_pipe_without_dns_or_non_loopback
     .unwrap();
     assert!(status.success());
     let trace_text = std::fs::read_to_string(trace).unwrap();
+    let hex_argument = |argument: &str| {
+        use std::fmt::Write;
+
+        argument.bytes().fold(String::new(), |mut encoded, byte| {
+            write!(encoded, "\\x{byte:02x}").unwrap();
+            encoded
+        })
+    };
     assert!(
-        trace_text.contains("--remote-debugging-pipe"),
+        trace_text.contains(&hex_argument("--remote-debugging-pipe")),
         "qualification browser must use anonymous CDP pipes"
     );
     assert!(
-        !trace_text.contains("--remote-debugging-port"),
+        !trace_text.contains(&hex_argument("--remote-debugging-port")),
         "qualification browser exposed a TCP CDP listener"
     );
-    for line in trace_text.lines().filter(|line| line.contains("AF_INET")) {
-        assert!(
-            line.contains("127.0.0.1")
-                || line.contains("sin6_addr=inet_pton(AF_INET6, \"::1\"")
-                || line.contains("EAFNOSUPPORT"),
-            "external socket attempt: {line}"
-        );
-        assert!(!line.contains("sin_port=htons(53)"), "DNS attempt: {line}");
-    }
+    assert!(
+        trace_text.contains("ENETUNREACH"),
+        "fail-closed IPv6 reachability attempt must remain visible"
+    );
+    let page_network_syscall = forbidden_inet_effect(&trace_text);
+    assert!(
+        page_network_syscall.is_none(),
+        "browser page asset network syscall: {}",
+        page_network_syscall.unwrap_or_default()
+    );
 }
 
 #[cfg(target_os = "linux")]

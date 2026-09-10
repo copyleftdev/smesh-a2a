@@ -2,8 +2,9 @@
 import { readFile, readdir, readlink, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import puppeteer from 'puppeteer-core';
-import { chromeArgs, closeServer } from './export-utils.mjs';
-import { createDemoServer } from './serve-demo.mjs';
+import { chromeArgs } from './export-utils.mjs';
+import { createDemoServer, securityHeaders } from './serve-demo.mjs';
+import { cleanupQualification, createRequestSettlement } from './operational-request-boundary.mjs';
 import {
   EXPECTED_OPERATIONAL_ARTIFACTS,
   buildCoherentSyntheticSubstitution,
@@ -42,28 +43,65 @@ if (plantedStderr) {
   throw new Error('planted browser diagnostic failure');
 }
 
+const BROWSER_ASSET_DESCRIPTORS = new Map([
+  ['/operational.html', ['operational.html', 'text/html; charset=utf-8']],
+  ['/operational.css', ['operational.css', 'text/css; charset=utf-8']],
+  ['/operational-app.mjs', ['operational-app.mjs', 'text/javascript; charset=utf-8']],
+  ['/operational-observatory.mjs', ['operational-observatory.mjs', 'text/javascript; charset=utf-8']],
+  ['/vendor/three.module.min.js', ['vendor/three.module.min.js', 'text/javascript; charset=utf-8']],
+  ['/fixtures/operational-lifeline-v1/package.jsonl', ['fixtures/operational-lifeline-v1/package.jsonl', 'application/x-ndjson']],
+  ['/fixtures/operational-lifeline-v1/receipt.json', ['fixtures/operational-lifeline-v1/receipt.json', 'application/json']],
+  ['/fixtures/operational-lifeline-v1/actors.json', ['fixtures/operational-lifeline-v1/actors.json', 'application/json']],
+  ['/fixtures/operational-lifeline-v1/editorial.json', ['fixtures/operational-lifeline-v1/editorial.json', 'application/json']],
+  ['/fixtures/operational-lifeline-v1/browser-bootstrap.json', ['fixtures/operational-lifeline-v1/browser-bootstrap.json', 'application/json']],
+]);
+
+async function repositoryBrowserAssets(syntheticFiles = null) {
+  const assets = new Map(await Promise.all([...BROWSER_ASSET_DESCRIPTORS].map(async ([path, [relativeFile, contentType]]) => [
+    path,
+    { body: await readFile(new URL(relativeFile, import.meta.url)), contentType },
+  ])));
+  if (syntheticFiles) {
+    for (const [artifactPath, body] of syntheticFiles) {
+      const path = `/fixtures/operational-lifeline-v1/${artifactPath}`;
+      const asset = assets.get(path);
+      if (asset) assets.set(path, { ...asset, body });
+    }
+  }
+  return assets;
+}
+
 const server = await createDemoServer({ port: 0 });
 const { port } = server.address();
 const origin = `http://127.0.0.1:${port}`;
 const deniedRequests = [];
+const deniedSameOriginRequests = [];
+const requestSettlements = [];
+let nodeListenerBrowserRequests = 0;
+server.on('request', () => { nodeListenerBrowserRequests += 1; });
 async function ownRequests(page, syntheticFiles = null) {
+  const assets = await repositoryBrowserAssets(syntheticFiles);
   await page.setRequestInterception(true);
-  page.on('request', async (request) => {
+  requestSettlements.push(createRequestSettlement(page, async (request) => {
     const url = new URL(request.url());
     if (url.origin !== origin) {
       deniedRequests.push(request.url());
       await request.abort('blockedbyclient');
       return;
     }
-    const match = /\/fixtures\/operational-lifeline-v1\/([^/?]+)$/.exec(url.pathname);
-    if (syntheticFiles && match) {
-      const body = syntheticFiles.get(match[1]);
-      if (!body) throw new Error('synthetic browser input missing');
-      await request.respond({ status: 200, body });
+    const asset = assets.get(url.pathname);
+    if (!asset) {
+      deniedSameOriginRequests.push(url.pathname);
+      await request.abort('blockedbyclient');
       return;
     }
-    await request.continue();
-  });
+    await request.respond({
+      status: 200,
+      contentType: asset.contentType,
+      headers: securityHeaders(url.pathname),
+      body: asset.body,
+    });
+  }));
 }
 let browser;
 try {
@@ -92,8 +130,11 @@ try {
   await ownRequests(page);
   const requests = [];
   page.on('request', (request) => requests.push(request.url()));
-  await page.goto(`${origin}/operational.html?frame=0`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  const documentResponse = await page.goto(`${origin}/operational.html?frame=0`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   await page.waitForFunction(() => window.__operationalReady === true, { timeout: 30_000 });
+  const expectedDocumentHeaders = securityHeaders('/operational.html');
+  const documentHeaders = documentResponse.headers();
+  if (Object.entries(expectedDocumentHeaders).some(([name, value]) => documentHeaders[name] !== value)) throw new Error('intercepted document security headers mismatch');
   await page.setOfflineMode(true);
   const state = await page.evaluate(() => window.OPERATIONAL_RENDER_FRAME(0, 30));
   await page.setOfflineMode(false);
@@ -104,6 +145,16 @@ try {
   });
   await egress.close();
   if (externalSucceeded || !deniedRequests.some((url) => url.startsWith('https://qualification-egress.invalid/planted'))) throw new Error('owned egress boundary did not bite');
+  const unknown = await browser.newPage();
+  await ownRequests(unknown);
+  let unknownSameOriginAborted = false;
+  try {
+    await unknown.goto(`${origin}/qualification-route-not-owned`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  } catch {
+    unknownSameOriginAborted = true;
+  }
+  await unknown.close();
+  if (!unknownSameOriginAborted || !deniedSameOriginRequests.includes('/qualification-route-not-owned')) throw new Error('unknown same-origin route did not fail closed');
   const sameOriginRequests = requests.filter((url) => new URL(url).origin === origin);
   const paths = [...new Set(sameOriginRequests.map((url) => new URL(url).pathname))].sort();
   const expectedPaths = [
@@ -130,10 +181,12 @@ try {
   const syntheticCompleteInputSet = verifiedInputSet.artifacts.length === 18
     && verifiedInputSet.inputSetDigest === substitution.inputSetDigest
     && substitution.eventCount === 46;
-  const evidence = { attemptKinds: ['browserExternalFetch'], offlineRendered: true, requestPaths: paths, sameOriginOnly: true, stateDigest: state.stateDigest, syntheticCompleteInputSet, syntheticRejected: true, syntheticSemanticRejected: true };
+  await Promise.all([page.close(), synthetic.close()]);
+  await Promise.all(requestSettlements.map((settlement) => settlement.settle()));
+  if (nodeListenerBrowserRequests !== 0) throw new Error('browser reached the Node listener');
+  const evidence = { attemptKinds: ['browserExternalFetch'], nodeListenerBrowserRequests: String(nodeListenerBrowserRequests), offlineRendered: true, requestPaths: paths, sameOriginOnly: true, stateDigest: state.stateDigest, syntheticCompleteInputSet, syntheticRejected: true, syntheticSemanticRejected: true, unknownSameOriginAborted };
   const bytes = Buffer.from(JSON.stringify(evidence));
   process.stdout.write(JSON.stringify({ evidence, evidenceDigest: `sha256:${createHash('sha256').update(bytes).digest('hex')}`, schemaVersion: 'operational-browser-qualification/1' }));
 } finally {
-  if (browser) await browser.close();
-  await closeServer(server);
+  await cleanupQualification({ browser, requestSettlements, server });
 }
