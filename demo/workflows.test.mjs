@@ -8,6 +8,10 @@ const bwrapReadiness = await readFile(
   new URL('../scripts/ensure-bwrap-ready.sh', import.meta.url),
   'utf8',
 ).catch(() => '');
+const browserReadiness = await readFile(
+  new URL('./operational-browser-readiness.mjs', import.meta.url),
+  'utf8',
+).catch(() => '');
 
 function jobBlock(source, name) {
   const start = source.indexOf(`  ${name}:`);
@@ -69,6 +73,32 @@ test('general test job installs browser dependencies before Rust suites', () => 
   assert.notEqual(install, -1, 'general test job must install demo dependencies');
   assert.notEqual(firstCargoTest, -1, 'general test job must run Rust tests');
   assert.ok(install < firstCargoTest, 'npm ci must precede every cargo test in the general test job');
+});
+
+test('operational CI runs an exact canary-free browser readiness diagnostic before fixtures', () => {
+  const block = jobBlock(ci, 'operational-acceptance');
+  const install = block.indexOf('npm ci --prefix demo');
+  const diagnostic = block.indexOf('demo/operational-browser-readiness.mjs');
+  const harness = block.indexOf('scripts/run-operational-acceptance.sh');
+  assert.ok(install !== -1 && install < diagnostic, 'diagnostic dependencies must be installed first');
+  assert.ok(diagnostic !== -1 && diagnostic < harness, 'diagnostic must precede every operational fixture');
+  assert.match(
+    block,
+    /timeout --signal=TERM --kill-after=10s 45s bwrap --unshare-net --die-with-parent --dev-bind \/ \/ --proc \/proc -- node demo\/operational-browser-readiness\.mjs/,
+  );
+
+  assert.match(browserReadiness, /CANARY-FREE browser readiness diagnostic/);
+  assert.match(browserReadiness, /mkdtemp\(join\(tmpdir\(\), 'smesh-browser-readiness-'\)\)/);
+  assert.match(browserReadiness, /chmod\(profile, 0o700\)/);
+  assert.match(browserReadiness, /pipe: true/);
+  assert.match(browserReadiness, /userDataDir: profile/);
+  assert.match(browserReadiness, /chromeArgs\(\{ qualificationOffline: 'true', unsafeNoSandbox: 'true' \}\)/);
+  assert.match(browserReadiness, /page\.goto\('about:blank'/);
+  assert.match(browserReadiness, /slice\(0, MAX_DIAGNOSTIC_BYTES\)/);
+  assert.match(browserReadiness, /Promise\.race\(\[/);
+  assert.match(browserReadiness, /browser\?\.close\(\)/);
+  assert.match(browserReadiness, /rm\(profile, \{ recursive: true, force: true \}\)/);
+  assert.doesNotMatch(browserReadiness, /fixtures|operational\.html|https?:\/\//);
 });
 
 test('Pages deploy has a bounded live public and restricted-route gate', () => {
