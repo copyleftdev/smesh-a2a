@@ -102,6 +102,7 @@ See:
 - [`docs/ULTIMATE_DEMO.md`](docs/ULTIMATE_DEMO.md)
 - [`docs/TRACE_CAPTURE.md`](docs/TRACE_CAPTURE.md)
 - [`docs/OPERATIONAL_OBSERVATORY.md`](docs/OPERATIONAL_OBSERVATORY.md)
+- [`docs/OPERATIONAL_ACCEPTANCE.md`](docs/OPERATIONAL_ACCEPTANCE.md)
 - [`docs/LIFELINE_TOPOLOGY.md`](docs/LIFELINE_TOPOLOGY.md)
 - [`docs/LIFELINE_DIRECTOR.md`](docs/LIFELINE_DIRECTOR.md)
 - [`docs/LIFELINE_FAILURE_SCENARIO.md`](docs/LIFELINE_FAILURE_SCENARIO.md)
@@ -142,6 +143,21 @@ public writer scans the complete JSONL before creating, truncating, or altering 
 Restricted originals are not
 persisted or encrypted by this module; use the existing encrypted artifact authority under the
 restricted manifest policy.
+
+## Operational acceptance
+
+Run the complete issue #29 gate with one bounded command; the destination must not exist:
+
+```bash
+scripts/run-operational-acceptance.sh /tmp/operational-acceptance
+```
+
+It leaves only the canonical scorecard and integrity receipt. Verify those files offline with
+`target/debug/operational-lifeline-acceptance verify-report /tmp/operational-acceptance`. The hashes
+are integrity/reproducibility commitments, not signatures, a trust root, human authority, or live
+effect authority. CI uploads only those two files for 14 days. See
+[`docs/OPERATIONAL_ACCEPTANCE.md`](docs/OPERATIONAL_ACCEPTANCE.md) for download verification, the
+Pages allowlist, receipt limitations, and the exact issue #30 exclusion.
 
 ## LIFELINE cinematic demo
 

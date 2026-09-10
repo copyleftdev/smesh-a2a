@@ -83,4 +83,10 @@ The deployment has six independently addressed gateway cards but five provider n
 
 Checked production visual evidence is `demo/evidence/operational-lifeline-chrome152-linux.{json,png}`. It captures deterministic end-state frame 1380 at 30 fps (46 seconds), where all 46 source events contribute. Its PNG SHA-256 is environment-bound to Chrome 152.0.7977.64 headless Linux and the project's pinned SwiftShader arguments; the checked renderer-independent state digest is the portable authority.
 
-Issue #29 scorecard/CI acceptance receipts and issue #30 film/publication/postmortem remain out of scope.
+## Issue #29 qualification and publication boundary
+
+`scripts/run-operational-acceptance.sh NEW_REPORT_DIRECTORY` executes the 14 qualification-plane probes, compares two fresh seed-47 18-artifact generations with this fixture, evaluates all 40 criteria, and emits only `acceptance-scorecard.json` and `acceptance-receipt.json`. `verify-report` verifies the pair offline. Receipt hashes are integrity commitments, not signatures or authority.
+
+GitHub Pages is built only through `scripts/stage-pages.sh`; it publishes the five public operational fixture assets used by this page and excludes `restricted/`, tests, dependencies, scripts, maps, package metadata, and acceptance raw evidence. The checked `restricted/` bytes are public-repository test evidence—not confidential—but are not site/server-addressable.
+
+Issue #30 remains excluded: no film rendering/publication, release asset, release-download verification, or postmortem is produced by issue #29.

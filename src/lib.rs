@@ -33,6 +33,8 @@ mod fuzzing;
 mod guard;
 mod input;
 mod lifeline;
+/// Closed operational LIFELINE acceptance contract and evaluator.
+pub mod lifeline_acceptance;
 mod lifeline_director;
 mod lifeline_failure;
 mod lifeline_teams;
@@ -41,6 +43,8 @@ mod loopback;
 /// Verified, closed operational replay projection for local observatory consumers.
 pub mod operational_observatory;
 mod outbox_driver;
+#[doc(hidden)]
+pub mod owned_temp;
 mod policy;
 mod postgres_store;
 #[doc(hidden)]

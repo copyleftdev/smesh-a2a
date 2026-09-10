@@ -25,10 +25,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Stage closed public Pages allowlist
+        run: scripts/stage-pages.sh "${RUNNER_TEMP}/smesh-pages-public"
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: demo
+          path: ${{ runner.temp }}/smesh-pages-public
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4
+      - name: Verify live public and restricted route boundary
+        timeout-minutes: 5
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          set -eu
+          base_url=${PAGE_URL%/}
+          verified=false
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            public_status=$(curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 10 "${base_url}/operational.html") || public_status=000
+            restricted_ok=true
+            for name in canonical-capture.jsonl sealed-replay.jsonl evidence-manifest.json criteria-evidence.json; do
+              status=$(curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 10 "${base_url}/fixtures/operational-lifeline-v1/restricted/${name}") || status=000
+              if ! [ "$status" = 404 ]; then restricted_ok=false; fi
+            done
+            if [ "$public_status" = 200 ] && [ "$restricted_ok" = true ]; then
+              verified=true
+              break
+            fi
+            if [ "$attempt" -lt 12 ]; then sleep 5; fi
+          done
+          [ "$verified" = true ]

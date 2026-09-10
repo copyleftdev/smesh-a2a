@@ -19,6 +19,20 @@ export function numberArg(args, name, fallback, { min, max, integer = false } = 
 
 export function chromeArgs(args) {
   const values = ['--enable-unsafe-swiftshader', '--disable-dev-shm-usage'];
+  if (args.qualificationOffline === 'true') values.push(
+    '--disable-background-networking',
+    '--disable-component-update',
+    '--disable-default-apps',
+    '--disable-domain-reliability',
+    '--disable-sync',
+    '--disable-features=AsyncDns,DnsOverHttps,NetworkTimeServiceQuerying,UseDnsHttpsSvcb',
+    '--metrics-recording-only',
+    '--no-first-run',
+    '--safebrowsing-disable-auto-update',
+    '--proxy-server=direct://',
+    '--proxy-bypass-list=*',
+    '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost',
+  );
   if (args.unsafeNoSandbox === 'true') values.push('--no-sandbox');
   return values;
 }

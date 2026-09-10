@@ -3,11 +3,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use wait_timeout::ChildExt as _;
+#[allow(dead_code)]
+#[path = "support/process.rs"]
+mod process;
 
 const OPERATIONAL_BIN: Option<&str> = option_env!("CARGO_BIN_EXE_operational-lifeline-capture");
 const CONTEXT_FOR_TEST: &str = "lifeline-incident-0047";
-const GENERATED_ARTIFACTS: [&str; 17] = [
+const GENERATED_ARTIFACTS: [&str; 18] = [
     "actors.json",
     "browser-bootstrap.json",
     "editorial.json",
@@ -16,6 +18,7 @@ const GENERATED_ARTIFACTS: [&str; 17] = [
     "receipt.json",
     "restricted/canonical-capture.jsonl",
     "restricted/causal-source.jsonl",
+    "restricted/criteria-evidence.json",
     "restricted/decision-receipt.json",
     "restricted/evidence-manifest.json",
     "restricted/privacy-manifest.json",
@@ -26,6 +29,33 @@ const GENERATED_ARTIFACTS: [&str; 17] = [
     "restricted/review-receipt.json",
     "restricted/sealed-replay.jsonl",
 ];
+
+#[cfg(target_os = "linux")]
+#[test]
+fn capture_command_lifecycle_reaps_planted_descendant_after_leader_exit() {
+    let fixture = TempDir::new("capture-command-descendant");
+    let marker = fixture.path().join("descendant-pid");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "sleep 30 & printf '%s' \"$!\" > \"$1\"; exit 0",
+            "capture-command-descendant",
+        ])
+        .arg(&marker);
+
+    bounded(&mut command);
+
+    let pid = std::fs::read_to_string(marker).unwrap();
+    let proc_entry = Path::new("/proc").join(pid.trim());
+    let survived = proc_entry.exists();
+    if survived {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", pid.trim()])
+            .status();
+    }
+    assert!(!survived, "capture command descendant survived leader exit");
+}
 
 #[test]
 #[allow(clippy::too_many_lines)] // End-to-end evidence assertions intentionally remain in one scenario.
@@ -292,6 +322,70 @@ fn six_gateway_operational_capture_is_real_private_and_deterministic() {
             );
         }
     }
+
+    let criteria_evidence = read_json(&first.join("restricted/criteria-evidence.json"));
+    assert_eq!(
+        criteria_evidence["schemaVersion"],
+        "operational-lifeline-criteria-evidence/1"
+    );
+    assert_eq!(criteria_evidence["seed"], "47");
+    assert_eq!(criteria_evidence["scenario"]["rootContextRestarts"], "0");
+    assert_eq!(
+        criteria_evidence["scenario"]["primaryFinalState"],
+        "canceled"
+    );
+    assert_eq!(
+        criteria_evidence["scenario"]["identityReconciliation"]["matched"],
+        true
+    );
+    assert!(criteria_evidence["scenario"]["identityReconciliation"]["unavailableIds"].is_null());
+    assert_eq!(
+        criteria_evidence["scenario"]["identityReconciliation"]["sourceIdentitySetDigest"],
+        criteria_evidence["scenario"]["identityReconciliation"]["captureIdentitySetDigest"]
+    );
+    let source_bindings =
+        criteria_evidence["scenario"]["identityReconciliation"]["sourceEventBindings"]
+            .as_array()
+            .unwrap();
+    assert_eq!(source_bindings.len(), 19);
+    assert!(source_bindings.iter().all(|binding| {
+        binding
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            == BTreeSet::from(["captureEventId", "sourceRecordDigest"])
+            && binding["captureEventId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("sha256:") && id.len() == 71)
+            && binding["sourceRecordDigest"]
+                .as_str()
+                .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+    }));
+    let teams = criteria_evidence["teams"].as_array().unwrap();
+    assert_eq!(teams.len(), 5);
+    assert!(teams.iter().all(|team| {
+        team["claim"]["observed"] == true
+            && team["reinforcement"]["observed"] == true
+            && team["reinforcement"]["distinctAttesters"] == true
+            && team["backoff"]["winnerScoreGreater"] == true
+            && team["backoff"]["losingRoleReinforced"] == true
+            && team["contradictionDecay"]["hashReconciled"] == true
+            && team["contradictionDecay"]["runtimeHashesEmitted"] == true
+            && team["contradictionDecay"]["expiryTickObserved"] == true
+            && team["contradictionDecay"]["removedFromActive"] == true
+            && team["contradictionDecay"]["retainedInHistory"] == true
+            && team["isolation"]["organizationBound"] == true
+            && team["isolation"]["toolBound"] == true
+            && team["isolation"]["candidateBound"] == true
+            && team["sourceJournalDigest"]
+                .as_str()
+                .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+            && team["runtimeJournalDigest"]
+                .as_str()
+                .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+    }));
 
     let evidence: serde_json::Value = read_json(&first.join("restricted/evidence-manifest.json"));
     assert_eq!(evidence["schemaVersion"], "operational-lifeline-evidence/1");
@@ -574,20 +668,15 @@ fn generate_scenario(root: &Path) -> PathBuf {
 }
 
 fn operational_capture_succeeds(scenario: &Path, output: &Path) -> bool {
-    let mut child = Command::new(OPERATIONAL_BIN.expect("operational capture binary is missing"))
-        .arg(scenario)
-        .arg(output)
-        .spawn()
-        .unwrap();
-    child
-        .wait_timeout(Duration::from_secs(30))
-        .unwrap()
-        .unwrap_or_else(|| {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("operational watchdog expired")
-        })
-        .success()
+    process::bounded_status(
+        Command::new(OPERATIONAL_BIN.expect("operational capture binary is missing"))
+            .arg(scenario)
+            .arg(output),
+        Duration::from_secs(30),
+        "operational capture",
+    )
+    .unwrap_or_else(|error| panic!("operational capture lifecycle failed: {error}"))
+    .success()
 }
 
 fn run_once(root: &Path, label: &str) -> PathBuf {
@@ -607,15 +696,8 @@ fn run_once(root: &Path, label: &str) -> PathBuf {
 }
 
 fn bounded(command: &mut Command) {
-    let mut child = command.spawn().unwrap();
-    let status = child
-        .wait_timeout(Duration::from_secs(30))
-        .unwrap()
-        .unwrap_or_else(|| {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("operational watchdog expired")
-        });
+    let status = process::bounded_status(command, Duration::from_secs(30), "operational command")
+        .unwrap_or_else(|error| panic!("operational command lifecycle failed: {error}"));
     assert!(status.success());
 }
 
@@ -623,7 +705,7 @@ fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
-fn generated_artifacts(root: &Path) -> [&str; 17] {
+fn generated_artifacts(root: &Path) -> [&str; 18] {
     for name in GENERATED_ARTIFACTS {
         assert!(
             root.join(name).is_file(),
