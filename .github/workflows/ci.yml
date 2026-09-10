@@ -99,7 +99,7 @@ jobs:
           timeout --signal=TERM --kill-after=10s 2m scripts/ensure-bwrap-ready.sh
           timeout --signal=TERM --kill-after=10s 2m npm ci --prefix demo
       - name: Run canary-free exact browser readiness diagnostic
-        run: timeout --signal=TERM --kill-after=10s 45s bwrap --unshare-net --die-with-parent --dev-bind / / --proc /proc -- node demo/operational-browser-readiness.mjs
+        run: timeout --signal=TERM --kill-after=10s 45s scripts/run-browser-readiness-diagnostic.sh
       - name: Run operational acceptance harness
         run: timeout --signal=TERM --kill-after=15s 12m scripts/run-operational-acceptance.sh "${RUNNER_TEMP}/operational-acceptance"
       - name: Independently verify acceptance report

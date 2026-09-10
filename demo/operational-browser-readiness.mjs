@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { chmod, mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,9 +11,11 @@ import puppeteer from 'puppeteer-core';
 import { chromeArgs } from './export-utils.mjs';
 
 const MAX_DIAGNOSTIC_BYTES = 16 * 1024;
+const MAX_APPARMOR_LABEL_BYTES = 1024;
 const CLEANUP_TIMEOUT_MS = 5_000;
 const LABEL = 'CANARY-FREE browser readiness diagnostic';
 const RESPONSE = 'chrome-node-loopback-ready';
+const APPARMOR_LABEL_ALLOWLIST = /^[A-Za-z0-9_./:+,@=()& -]+$/;
 
 function bounded(label, operation) {
   let timer;
@@ -49,6 +51,21 @@ try {
     userDataDir: profile,
     args: chromeArgs({ qualificationOffline: 'true', unsafeNoSandbox: 'true' }),
   });
+  const browserPid = browser.process()?.pid;
+  assert(Number.isSafeInteger(browserPid) && browserPid > 0, 'browser PID unavailable');
+  const rawAppArmorLabel = await readFile(`/proc/${browserPid}/attr/current`, 'utf8');
+  assert(
+    Buffer.byteLength(rawAppArmorLabel) <= MAX_APPARMOR_LABEL_BYTES + 1,
+    'browser AppArmor label exceeds diagnostic cap',
+  );
+  const browserAppArmorLabel = rawAppArmorLabel.endsWith('\n')
+    ? rawAppArmorLabel.slice(0, -1)
+    : rawAppArmorLabel;
+  assert(browserAppArmorLabel.length > 0, 'browser AppArmor label is empty');
+  assert(APPARMOR_LABEL_ALLOWLIST.test(browserAppArmorLabel), 'browser AppArmor label contains a disallowed byte');
+  process.stdout.write(
+    `[${LABEL}] AUTHORITY browser_pid=${browserPid} browser_apparmor_label=${JSON.stringify(browserAppArmorLabel)}\n`,
+  );
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${port}`, { waitUntil: 'domcontentloaded', timeout: 10_000 });
   assert.equal(await page.evaluate(() => document.body.textContent), RESPONSE);

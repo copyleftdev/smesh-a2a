@@ -12,6 +12,14 @@ const browserReadiness = await readFile(
   new URL('./operational-browser-readiness.mjs', import.meta.url),
   'utf8',
 ).catch(() => '');
+const browserDiagnostic = await readFile(
+  new URL('../scripts/run-browser-readiness-diagnostic.sh', import.meta.url),
+  'utf8',
+).catch(() => '');
+const appArmorFilter = await readFile(
+  new URL('./filter-apparmor-denials.mjs', import.meta.url),
+  'utf8',
+).catch(() => '');
 
 function jobBlock(source, name) {
   const start = source.indexOf(`  ${name}:`);
@@ -78,13 +86,13 @@ test('general test job installs browser dependencies before Rust suites', () => 
 test('operational CI runs an exact canary-free browser readiness diagnostic before fixtures', () => {
   const block = jobBlock(ci, 'operational-acceptance');
   const install = block.indexOf('npm ci --prefix demo');
-  const diagnostic = block.indexOf('demo/operational-browser-readiness.mjs');
+  const diagnostic = block.indexOf('scripts/run-browser-readiness-diagnostic.sh');
   const harness = block.indexOf('scripts/run-operational-acceptance.sh');
   assert.ok(install !== -1 && install < diagnostic, 'diagnostic dependencies must be installed first');
   assert.ok(diagnostic !== -1 && diagnostic < harness, 'diagnostic must precede every operational fixture');
   assert.match(
     block,
-    /timeout --signal=TERM --kill-after=10s 45s bwrap --unshare-net --die-with-parent --dev-bind \/ \/ --proc \/proc -- node demo\/operational-browser-readiness\.mjs/,
+    /timeout --signal=TERM --kill-after=10s 45s scripts\/run-browser-readiness-diagnostic\.sh/,
   );
 
   assert.match(browserReadiness, /CANARY-FREE browser readiness diagnostic/);
@@ -92,6 +100,12 @@ test('operational CI runs an exact canary-free browser readiness diagnostic befo
   assert.match(browserReadiness, /chmod\(profile, 0o700\)/);
   assert.match(browserReadiness, /pipe: true/);
   assert.match(browserReadiness, /userDataDir: profile/);
+  assert.match(browserReadiness, /browser\.process\(\)\?\.pid/);
+  assert.match(browserReadiness, /\/proc\/\$\{browserPid\}\/attr\/current/);
+  assert.match(browserReadiness, /MAX_APPARMOR_LABEL_BYTES/);
+  assert.match(browserReadiness, /APPARMOR_LABEL_ALLOWLIST/);
+  assert.match(browserReadiness, /browser_pid=\$\{browserPid\}/);
+  assert.match(browserReadiness, /browser_apparmor_label=\$\{JSON\.stringify\(browserAppArmorLabel\)\}/);
   assert.match(browserReadiness, /chromeArgs\(\{ qualificationOffline: 'true', unsafeNoSandbox: 'true' \}\)/);
   assert.match(browserReadiness, /createServer/);
   assert.match(browserReadiness, /listen\(0, '127\.0\.0\.1'/);
@@ -107,6 +121,16 @@ test('operational CI runs an exact canary-free browser readiness diagnostic befo
   assert.match(browserReadiness, /server\.close/);
   assert.match(browserReadiness, /rm\(profile, \{ recursive: true, force: true \}\)/);
   assert.doesNotMatch(browserReadiness, /lifeline|acceptance-scorecard|operational\.html/);
+
+  assert.match(browserDiagnostic, /status=\$\{PIPESTATUS\[0\]\}/);
+  assert.match(browserDiagnostic, /runner_kernel=\$\(uname -r\)/);
+  assert.match(browserDiagnostic, /journalctl --dmesg --since "@\$\{start_epoch\}"/);
+  assert.match(browserDiagnostic, /filter-apparmor-denials\.mjs "\$browser_pid" "\$browser_apparmor_label"/);
+  assert.match(browserDiagnostic, /exit "\$status"/);
+  assert.match(appArmorFilter, /apparmor="DENIED"/);
+  assert.match(appArmorFilter, /class="net"/);
+  assert.match(appArmorFilter, /MAX_DENIAL_BYTES/);
+  assert.doesNotMatch(`${browserDiagnostic}\n${appArmorFilter}`, /printenv|\/proc\/self\/environ|env\s*$/m);
 });
 
 test('Pages deploy has a bounded live public and restricted-route gate', () => {
