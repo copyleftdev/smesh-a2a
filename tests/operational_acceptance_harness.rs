@@ -8,6 +8,38 @@ use std::time::{Duration, Instant};
 mod process;
 
 static CANDIDATE_TREE_ARCHIVE_LOCK: Mutex<()> = Mutex::new(());
+static OPERATIONAL_HARNESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct OperationalHarnessTestGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+fn acquire_operational_harness_test_lock() -> OperationalHarnessTestGuard {
+    OperationalHarnessTestGuard {
+        _guard: OPERATIONAL_HARNESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    }
+}
+
+#[test]
+fn operational_harness_test_lock_excludes_parallel_heavy_tests() {
+    use std::sync::TryLockError;
+
+    let owner = acquire_operational_harness_test_lock();
+    assert!(matches!(
+        OPERATIONAL_HARNESS_TEST_LOCK.try_lock(),
+        Err(TryLockError::WouldBlock)
+    ));
+    drop(owner);
+
+    let _successor = OPERATIONAL_HARNESS_TEST_LOCK
+        .try_lock()
+        .unwrap_or_else(|error| match error {
+            TryLockError::Poisoned(error) => error.into_inner(),
+            TryLockError::WouldBlock => panic!("released operational harness lock remained held"),
+        });
+}
 
 #[test]
 fn documented_outer_acceptance_timeout_exceeds_every_inner_watchdog_and_cleanup_budget() {
@@ -341,7 +373,8 @@ fn bounded_output_cleans_pipe_holding_descendant_after_normal_group_leader_exit(
 fn harness_failure_never_deletes_report_collision_created_after_initial_check() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let checkout = IsolatedCheckout::new();
+    let operational_harness_test_guard = acquire_operational_harness_test_lock();
+    let checkout = IsolatedCheckout::new(&operational_harness_test_guard);
     let report = checkout.root().join("attacker-report");
     let fake_bin = checkout.root().join("fake-bin");
     std::fs::create_dir(&fake_bin).unwrap();
@@ -378,7 +411,8 @@ fn harness_failure_never_deletes_report_collision_created_after_initial_check() 
 #[cfg(target_os = "linux")]
 #[test]
 fn documented_harness_allows_default_browser_watchdog_to_finish_owned_cleanup() {
-    let checkout = IsolatedCheckout::new();
+    let operational_harness_test_guard = acquire_operational_harness_test_lock();
+    let checkout = IsolatedCheckout::new(&operational_harness_test_guard);
     let report = checkout.root().join("forced-hang-report");
     let marker = checkout.root().join("forced-hang-lifecycle.json");
 
@@ -460,7 +494,8 @@ fn assert_no_process_cmdline_contains(needle: &[u8]) {
 
 #[test]
 fn four_concurrent_documented_harness_runs_share_dependencies_safely() {
-    let checkout = IsolatedCheckout::new();
+    let operational_harness_test_guard = acquire_operational_harness_test_lock();
+    let checkout = IsolatedCheckout::new(&operational_harness_test_guard);
     let reports = (0..4)
         .map(|index| checkout.root().join(format!("parallel-report-{index}")))
         .collect::<Vec<_>>();
@@ -481,8 +516,9 @@ fn four_concurrent_documented_harness_runs_share_dependencies_safely() {
 
 #[test]
 fn two_cold_git_archives_emit_byte_identical_40_of_40_reports() {
-    let first_checkout = IsolatedCheckout::new();
-    let second_checkout = IsolatedCheckout::new();
+    let operational_harness_test_guard = acquire_operational_harness_test_lock();
+    let first_checkout = IsolatedCheckout::new(&operational_harness_test_guard);
+    let second_checkout = IsolatedCheckout::new(&operational_harness_test_guard);
     let first = first_checkout.root().join("report");
     let second = second_checkout.root().join("report");
     for (checkout, report) in [
@@ -515,7 +551,8 @@ fn two_cold_git_archives_emit_byte_identical_40_of_40_reports() {
 
 #[test]
 fn clean_git_archive_runs_documented_command_without_a_preexisting_target() {
-    let checkout = IsolatedCheckout::new();
+    let operational_harness_test_guard = acquire_operational_harness_test_lock();
+    let checkout = IsolatedCheckout::new(&operational_harness_test_guard);
     let report = checkout.root().join("report");
     assert!(!checkout.path().join("target").exists());
     run_documented_harness(checkout.path(), &report);
@@ -574,13 +611,14 @@ fn run_documented_harness_result(
     )
 }
 
-struct IsolatedCheckout {
+struct IsolatedCheckout<'guard> {
     root: TempRoot,
     checkout: PathBuf,
+    _operational_harness_test_guard: &'guard OperationalHarnessTestGuard,
 }
 
-impl IsolatedCheckout {
-    fn new() -> Self {
+impl<'guard> IsolatedCheckout<'guard> {
+    fn new(operational_harness_test_guard: &'guard OperationalHarnessTestGuard) -> Self {
         let root = TempRoot::new();
         let archive = root.path().join("candidate.tar");
         let checkout = root.path().join("checkout");
@@ -629,7 +667,11 @@ impl IsolatedCheckout {
             .success()
         );
         assert!(!checkout.join("target").exists());
-        Self { root, checkout }
+        Self {
+            root,
+            checkout,
+            _operational_harness_test_guard: operational_harness_test_guard,
+        }
     }
 
     fn root(&self) -> &Path {
