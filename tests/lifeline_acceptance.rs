@@ -18,6 +18,8 @@ const QUALIFICATION_BIN: Option<&str> =
     option_env!("CARGO_BIN_EXE_operational-lifeline-qualification");
 const CLI_WATCHDOG: Duration = Duration::from_secs(30);
 const QUALIFICATION_WATCHDOG: Duration = Duration::from_secs(60);
+const LIFECYCLE_MARKER_BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
+const LIFECYCLE_MARKER_OUTER_WATCHDOG: Duration = Duration::from_secs(40);
 
 fn browser_process_lock() -> &'static Mutex<()> {
     static LOCK: Mutex<()> = Mutex::new(());
@@ -31,15 +33,44 @@ fn with_browser_process_lock<T>(invoke: impl FnOnce() -> T) -> T {
     invoke()
 }
 
+fn with_browser_process_lock_setup<S, T>(
+    setup: impl FnOnce() -> S,
+    invoke: impl FnOnce(&mut S) -> Result<T, String>,
+) -> Result<(T, Duration, S), String> {
+    let _guard = browser_process_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut setup_resource = setup();
+    let started = Instant::now();
+    invoke(&mut setup_resource).map(|output| (output, started.elapsed(), setup_resource))
+}
+
+fn bounded_browser_output_unlocked(
+    command: &mut Command,
+    watchdog: Duration,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    process::bounded_output(command, watchdog, label)
+}
+
+fn bounded_browser_output_with_setup<S>(
+    command: &mut Command,
+    watchdog: Duration,
+    label: &str,
+    setup: impl FnOnce() -> S,
+) -> Result<(std::process::Output, Duration, S), String> {
+    with_browser_process_lock_setup(setup, |_| {
+        bounded_browser_output_unlocked(command, watchdog, label)
+    })
+}
+
 fn bounded_browser_output(
     command: &mut Command,
     watchdog: Duration,
     label: &str,
 ) -> Result<(std::process::Output, Duration), String> {
-    with_browser_process_lock(|| {
-        let started = Instant::now();
-        process::bounded_output(command, watchdog, label).map(|output| (output, started.elapsed()))
-    })
+    let (output, elapsed, ()) = bounded_browser_output_with_setup(command, watchdog, label, || ())?;
+    Ok((output, elapsed))
 }
 
 fn bounded_browser_status(
@@ -47,10 +78,46 @@ fn bounded_browser_status(
     watchdog: Duration,
     label: &str,
 ) -> Result<(std::process::ExitStatus, Duration), String> {
-    with_browser_process_lock(|| {
-        let started = Instant::now();
-        process::bounded_status(command, watchdog, label).map(|status| (status, started.elapsed()))
-    })
+    let (status, elapsed, ()) = with_browser_process_lock_setup(
+        || (),
+        |()| process::bounded_status(command, watchdog, label),
+    )?;
+    Ok((status, elapsed))
+}
+
+#[cfg(target_os = "linux")]
+fn read_lifecycle_marker(marker: &Path) -> serde_json::Value {
+    let bytes = std::fs::read(marker).expect("lifecycle marker missing after forced browser hang");
+    serde_json::from_slice(&bytes).expect("lifecycle marker contained invalid JSON")
+}
+
+#[cfg(target_os = "linux")]
+struct ProcessIsolationSentinel {
+    child: std::process::Child,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessIsolationSentinel {
+    fn spawn() -> Self {
+        Self {
+            child: Command::new("/bin/sleep").arg("infinity").spawn().unwrap(),
+        }
+    }
+
+    fn assert_alive(&mut self, context: &str) {
+        assert!(
+            self.child.try_wait().unwrap().is_none(),
+            "unrelated process was terminated {context}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ProcessIsolationSentinel {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[test]
@@ -108,6 +175,48 @@ fn bounded_browser_process_calls_are_centralized() {
     let bounded_status = ["process::bounded_", "status("].concat();
     assert_eq!(source.matches(&bounded_output).count(), 1);
     assert_eq!(source.matches(&bounded_status).count(), 1);
+}
+
+#[test]
+fn bounded_browser_setup_runs_only_after_exact_lock_acquisition() {
+    const WATCHDOG: Duration = Duration::from_secs(120);
+
+    let guard = browser_process_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(browser_process_lock().try_lock().is_err());
+    let (setup_tx, setup_rx) = mpsc::channel();
+    let contender = thread::spawn(move || {
+        let mut command = Command::new("/bin/true");
+        bounded_browser_output_with_setup(
+            &mut command,
+            WATCHDOG,
+            "post-lock setup regression",
+            || setup_tx.send(()).unwrap(),
+        )
+        .unwrap();
+    });
+    assert!(matches!(
+        setup_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    drop(guard);
+    setup_rx.recv_timeout(WATCHDOG).unwrap();
+    contender.join().unwrap();
+}
+
+#[test]
+fn lifecycle_marker_timing_budgets_allow_cold_launch_and_bounded_cleanup() {
+    assert!(
+        LIFECYCLE_MARKER_BROWSER_TIMEOUT >= Duration::from_secs(30),
+        "marker-dependent browser timeout must allow a cold browser launch"
+    );
+    assert!(
+        LIFECYCLE_MARKER_OUTER_WATCHDOG
+            >= LIFECYCLE_MARKER_BROWSER_TIMEOUT + Duration::from_secs(5),
+        "outer watchdog must leave bounded time for lifecycle cleanup"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1113,9 +1222,10 @@ fn acceptance_wrapper_reaps_double_forked_escaped_pipe_holder_and_preserves_unre
     let qualification_bin = root.path().join("operational-lifeline-qualification");
     let supplied = root.path().join("supplied.json");
     std::fs::write(&supplied, b"{}").unwrap();
-    let mut unrelated = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-
-    for iteration in 0..50 {
+    let ((), _, mut unrelated) = with_browser_process_lock_setup(
+        ProcessIsolationSentinel::spawn,
+        |unrelated| {
+            for iteration in 0..50 {
         let marker = root.path().join(format!("escaped-identity-{iteration}"));
         std::fs::write(
             &escaped,
@@ -1146,7 +1256,8 @@ fn acceptance_wrapper_reaps_double_forked_escaped_pipe_holder_and_preserves_unre
         std::fs::set_permissions(&qualification_bin, std::fs::Permissions::from_mode(0o755))
             .unwrap();
 
-        let (result, elapsed) = bounded_browser_output(
+        let started = Instant::now();
+        let result = bounded_browser_output_unlocked(
             Command::new(&acceptance)
                 .arg(
                     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1156,8 +1267,8 @@ fn acceptance_wrapper_reaps_double_forked_escaped_pipe_holder_and_preserves_unre
                 .arg(root.path().join(format!("report-{iteration}"))),
             Duration::from_secs(3),
             "acceptance escaped pipe regression",
-        )
-        .unwrap();
+        )?;
+        let elapsed = started.elapsed();
         assert!(elapsed < Duration::from_secs(2));
         assert!(!result.status.success());
         let identity = std::fs::read_to_string(&marker).unwrap();
@@ -1174,14 +1285,13 @@ fn acceptance_wrapper_reaps_double_forked_escaped_pipe_holder_and_preserves_unre
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(
-            unrelated.try_wait().unwrap().is_none(),
-            "unrelated process was terminated at iteration {iteration}"
-        );
-    }
-
-    unrelated.kill().unwrap();
-    unrelated.wait().unwrap();
+                unrelated.assert_alive(&format!("at iteration {iteration}"));
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    unrelated.assert_alive("after all escaped-pipe iterations");
 }
 
 #[cfg(target_os = "linux")]
@@ -1243,9 +1353,7 @@ fn acceptance_wrapper_recovers_from_kernel_emfile_at_pidfd_open() {
     let supplied = root.path().join("supplied.json");
     std::fs::write(&supplied, b"{}").unwrap();
     let emergency_evidence = root.path().join("emergency-retry.json");
-    let mut unrelated = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-
-    let (output, elapsed) = bounded_browser_output(
+    let (output, elapsed, mut unrelated) = bounded_browser_output_with_setup(
         Command::new("/bin/sh")
             .args(["-c", "ulimit -n 24; exec \"$@\"", "low-nofile"])
             .arg(&acceptance)
@@ -1261,6 +1369,7 @@ fn acceptance_wrapper_recovers_from_kernel_emfile_at_pidfd_open() {
             ),
         Duration::from_secs(6),
         "acceptance low-RLIMIT_NOFILE descendant regression",
+        ProcessIsolationSentinel::spawn,
     )
     .unwrap();
     assert!(elapsed < Duration::from_secs(5));
@@ -1286,9 +1395,7 @@ fn acceptance_wrapper_recovers_from_kernel_emfile_at_pidfd_open() {
             "escaped pid {pid} survived"
         );
     }
-    assert!(unrelated.try_wait().unwrap().is_none());
-    unrelated.kill().unwrap();
-    unrelated.wait().unwrap();
+    unrelated.assert_alive("after low-RLIMIT_NOFILE invocation");
 }
 
 #[cfg(target_os = "linux")]
@@ -1838,17 +1945,19 @@ fn forced_browser_timeout_reaps_owned_node_chrome_and_listener() {
             .arg(&package)
             .arg(&output)
             .env("SMESH_QUALIFICATION_FORCE_BROWSER_HANG", "1")
-            .env("SMESH_QUALIFICATION_BROWSER_TIMEOUT_MS", "500")
+            .env(
+                "SMESH_QUALIFICATION_BROWSER_TIMEOUT_MS",
+                LIFECYCLE_MARKER_BROWSER_TIMEOUT.as_millis().to_string(),
+            )
             .env("SMESH_QUALIFICATION_LIFECYCLE_MARKER", &marker),
-        Duration::from_secs(5),
+        LIFECYCLE_MARKER_OUTER_WATCHDOG,
         "forced browser-timeout qualification runner",
     )
     .unwrap();
     assert!(!status.success());
-    assert!(elapsed < Duration::from_secs(10));
+    assert!(elapsed < LIFECYCLE_MARKER_OUTER_WATCHDOG);
     assert!(!output.exists());
-    let lifecycle: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(marker).unwrap()).unwrap();
+    let lifecycle = read_lifecycle_marker(&marker);
     let node_pid = lifecycle["nodePid"].as_u64().unwrap();
     let browser_pid = lifecycle["browserPid"].as_u64().unwrap();
     let listener_socket = lifecycle["listenerSocket"]
@@ -1963,23 +2072,26 @@ fn tampered_lifecycle_marker_cannot_authorize_profile_cleanup() {
     let marker = root.path().join("lifecycle.json");
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let package = repo.join("demo/fixtures/operational-lifeline-v1");
-    let (status, _) = bounded_browser_status(
+    let (status, elapsed) = bounded_browser_status(
         Command::new(QUALIFICATION_BIN.expect("qualification binary missing"))
             .arg(repo)
             .arg(&package)
             .arg(&package)
             .arg(&output)
             .env("SMESH_QUALIFICATION_FORCE_BROWSER_HANG", "1")
-            .env("SMESH_QUALIFICATION_BROWSER_TIMEOUT_MS", "500")
+            .env(
+                "SMESH_QUALIFICATION_BROWSER_TIMEOUT_MS",
+                LIFECYCLE_MARKER_BROWSER_TIMEOUT.as_millis().to_string(),
+            )
             .env("SMESH_QUALIFICATION_LIFECYCLE_MARKER", &marker)
             .env("SMESH_QUALIFICATION_LIFECYCLE_REPORTED_PROFILE", &unrelated),
-        Duration::from_secs(5),
+        LIFECYCLE_MARKER_OUTER_WATCHDOG,
         "tampered lifecycle-marker qualification runner",
     )
     .unwrap();
     assert!(!status.success());
-    let lifecycle: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(marker).unwrap()).unwrap();
+    assert!(elapsed < LIFECYCLE_MARKER_OUTER_WATCHDOG);
+    let lifecycle = read_lifecycle_marker(&marker);
     assert_eq!(
         lifecycle["profileArgument"],
         format!("--user-data-dir={}", unrelated.display())
