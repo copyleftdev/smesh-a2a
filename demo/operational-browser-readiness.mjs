@@ -9,6 +9,7 @@ import process from 'node:process';
 import puppeteer from 'puppeteer-core';
 
 import { chromeArgs } from './export-utils.mjs';
+import { waitForMainFrame } from './frame-readiness.mjs';
 
 const MAX_DIAGNOSTIC_BYTES = 16 * 1024;
 const MAX_APPARMOR_LABEL_BYTES = 1024;
@@ -78,6 +79,7 @@ try {
   );
 
   const page = await browser.newPage();
+  await waitForMainFrame(page);
   try {
     await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
     assert.equal(await page.evaluate(() => document.body.textContent), DIRECT_RESPONSE);

@@ -60,6 +60,7 @@ fn documented_outer_acceptance_timeout_exceeds_every_inner_watchdog_and_cleanup_
         browser < inner,
         "browser watchdog must expire inside qualification"
     );
+    assert_eq!(browser, 90, "production browser timeout changed");
     assert!(
         outer > inner + cleanup,
         "outer={outer}, inner={inner}, cleanup={cleanup}"
@@ -413,11 +414,17 @@ fn harness_failure_never_deletes_report_collision_created_after_initial_check() 
 fn documented_harness_allows_default_browser_watchdog_to_finish_owned_cleanup() {
     let operational_harness_test_guard = acquire_operational_harness_test_lock();
     let checkout = IsolatedCheckout::new(&operational_harness_test_guard);
+    let qualification_report = checkout.root().join("qualification-report");
     let report = checkout.root().join("forced-hang-report");
     let marker = checkout.root().join("forced-hang-lifecycle.json");
 
-    let started = Instant::now();
-    let status = process::bounded_status(
+    assert!(!checkout.path().join("target").exists());
+    assert!(!checkout.path().join("node_modules").exists());
+    run_documented_harness(checkout.path(), &qualification_report);
+    assert_exact_40_of_40_report(&qualification_report);
+
+    let process_started = Instant::now();
+    let outcome = process::bounded_status_after_marker(
         Command::new(
             checkout
                 .path()
@@ -427,20 +434,31 @@ fn documented_harness_allows_default_browser_watchdog_to_finish_owned_cleanup() 
         .current_dir(checkout.path())
         .env("SMESH_QUALIFICATION_FORCE_FRESH_BROWSER_HANG", "1")
         .env("SMESH_QUALIFICATION_FRESH_LIFECYCLE_MARKER", &marker),
+        &marker,
         Duration::from_secs(3 * 60),
+        Duration::from_secs(90 + 8),
         "default 90s browser-hang operational harness",
     )
     .unwrap();
-    let elapsed = started.elapsed();
+    let process_elapsed = process_started.elapsed();
 
-    assert!(!status.success());
+    assert!(!outcome.status.success());
     assert!(
-        elapsed >= Duration::from_secs(90),
-        "outer timeout preempted inner watchdog: {elapsed:?}"
+        outcome.marker_observed(),
+        "authentic lifecycle marker was not observed"
     );
     assert!(
-        elapsed < Duration::from_secs(3 * 60),
-        "inner cleanup did not return promptly: {elapsed:?}"
+        process_elapsed >= Duration::from_secs(90),
+        "inner watchdog exited too early after process invocation: {process_elapsed:?}"
+    );
+    assert!(
+        process_elapsed < Duration::from_secs(3 * 60),
+        "operational harness exceeded its pre-marker watchdog: {process_elapsed:?}"
+    );
+    assert!(
+        outcome.post_marker_process_elapsed.unwrap() < Duration::from_secs(98),
+        "inner cleanup did not return promptly after marker: {:?}",
+        outcome.post_marker_process_elapsed
     );
     assert!(!report.exists());
     let lifecycle: serde_json::Value =
@@ -474,6 +492,202 @@ fn documented_harness_allows_default_browser_watchdog_to_finish_owned_cleanup() 
     }
     assert_no_process_cmdline_contains(checkout.path().as_os_str().as_encoded_bytes());
     assert_no_process_cmdline_contains(profile_argument.as_bytes());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn marker_relative_watchdog_rejects_stale_marker_without_launching() {
+    let root = TempRoot::new();
+    let marker = root.path().join("marker");
+    let launched = root.path().join("launched");
+    std::fs::write(&marker, b"stale").unwrap();
+    let error = process::bounded_status_after_marker(
+        Command::new("/bin/sh")
+            .args(["-c", ": > \"$1\"", "stale-marker"])
+            .arg(&launched),
+        &marker,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        "stale marker",
+    )
+    .unwrap_err();
+    assert!(error.contains("existed before process launch"), "{error}");
+    assert!(!launched.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn marker_relative_status_records_absent_marker() {
+    let root = TempRoot::new();
+    let marker = root.path().join("marker");
+    let outcome = process::bounded_status_after_marker(
+        Command::new("/bin/sh").args(["-c", "exit 6"]),
+        &marker,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        "absent marker",
+    )
+    .unwrap();
+    assert_eq!(outcome.status.code(), Some(6));
+    assert!(!outcome.marker_observed());
+    assert!(outcome.post_marker_process_elapsed.is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn marker_relative_status_exposes_slow_setup_then_early_exit() {
+    let root = TempRoot::new();
+    let marker = root.path().join("marker");
+    let outcome = process::bounded_status_after_marker(
+        Command::new("/bin/sh")
+            .args(["-c", "sleep 0.15; : > \"$1\"; exit 7", "phase"])
+            .arg(&marker),
+        &marker,
+        Duration::from_secs(1),
+        Duration::from_millis(100),
+        "slow setup early exit",
+    )
+    .unwrap();
+    assert_eq!(outcome.status.code(), Some(7));
+    assert!(outcome.pre_marker_elapsed >= Duration::from_millis(100));
+    assert!(outcome.marker_observed());
+    assert!(outcome.post_marker_process_elapsed.unwrap() < Duration::from_millis(100));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn marker_observation_wins_same_poll_as_exit() {
+    let root = TempRoot::new();
+    let marker = root.path().join("marker");
+    let outcome = process::bounded_status_after_marker(
+        Command::new("/bin/sh")
+            .args(["-c", ": > \"$1\"; exit 9", "phase"])
+            .arg(&marker),
+        &marker,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        "same poll marker and exit",
+    )
+    .unwrap();
+    assert_eq!(outcome.status.code(), Some(9));
+    assert!(outcome.marker_observed());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn marker_first_observed_after_pre_marker_deadline_fails_closed() {
+    let root = TempRoot::new();
+    let marker = root.path().join("marker");
+    let error = process::bounded_status_after_marker_with_injected_observers(
+        Command::new("/bin/sh").args(["-c", "exec sleep 30"]),
+        &marker,
+        Duration::from_millis(50),
+        Duration::from_secs(1),
+        "marker observation crossing deadline",
+        move |deadline| {
+            assert!(
+                Instant::now() < deadline,
+                "marker observer must enter before the helper's exact deadline"
+            );
+            while Instant::now() <= deadline {
+                std::hint::spin_loop();
+            }
+            assert!(Instant::now() > deadline);
+            Ok(true)
+        },
+        |child, _| process::observe_child_exit_for_test(child),
+    )
+    .unwrap_err();
+    assert!(error.contains("pre-marker phase timed out"), "{error}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exit_first_observed_after_pre_marker_deadline_fails_closed() {
+    let root = TempRoot::new();
+    let marker = root.path().join("marker");
+    let error = process::bounded_status_after_marker_with_injected_observers(
+        Command::new("/bin/sh").args(["-c", "exit 0"]),
+        &marker,
+        Duration::from_millis(50),
+        Duration::from_secs(1),
+        "exit observation crossing pre-marker deadline",
+        |_| Ok(false),
+        move |child, deadline| {
+            assert!(
+                Instant::now() < deadline,
+                "exit observer must enter before the exact pre-marker deadline"
+            );
+            while Instant::now() <= deadline {
+                std::hint::spin_loop();
+            }
+            assert!(Instant::now() > deadline);
+            loop {
+                if process::observe_child_exit_for_test(child)? {
+                    return Ok(true);
+                }
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(error.contains("pre-marker phase timed out"), "{error}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exit_first_observed_after_post_marker_deadline_fails_closed() {
+    let root = TempRoot::new();
+    let marker = root.path().join("marker");
+    let error = process::bounded_status_after_marker_with_injected_observers(
+        Command::new("/bin/sh").args(["-c", "exit 0"]),
+        &marker,
+        Duration::from_secs(1),
+        Duration::from_millis(50),
+        "exit observation crossing deadline",
+        |_| Ok(true),
+        move |child, deadline| {
+            assert!(
+                Instant::now() < deadline,
+                "exit observer must enter before the exact post-marker deadline"
+            );
+            while Instant::now() <= deadline {
+                std::hint::spin_loop();
+            }
+            assert!(Instant::now() > deadline);
+            loop {
+                if process::observe_child_exit_for_test(child)? {
+                    return Ok(true);
+                }
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(error.contains("post-marker phase timed out"), "{error}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn marker_relative_watchdog_times_out_post_marker_phase() {
+    let root = TempRoot::new();
+    let marker = root.path().join("marker");
+    let pid_marker = root.path().join("pid");
+    let error = process::bounded_status_after_marker(
+        Command::new("/bin/sh")
+            .args([
+                "-c",
+                ": > \"$1\"; printf %s $$ > \"$2\"; exec sleep 30",
+                "phase",
+            ])
+            .arg(&marker)
+            .arg(&pid_marker),
+        &marker,
+        Duration::from_secs(1),
+        Duration::from_millis(100),
+        "post-marker timeout",
+    )
+    .unwrap_err();
+    assert!(error.contains("post-marker phase timed out"), "{error}");
+    assert_owned_pids_absent(&pid_marker);
 }
 
 #[cfg(target_os = "linux")]
@@ -609,6 +823,24 @@ fn run_documented_harness_result(
         Duration::from_secs(8 * 60),
         "documented operational acceptance harness",
     )
+}
+
+fn assert_exact_40_of_40_report(report: &Path) {
+    smesh_a2a::lifeline_acceptance::verify_acceptance_report(report).unwrap();
+    let mut files = std::fs::read_dir(report)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    files.sort();
+    assert_eq!(
+        files,
+        ["acceptance-receipt.json", "acceptance-scorecard.json"]
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report.join("acceptance-scorecard.json")).unwrap())
+            .unwrap();
+    assert_eq!(scorecard["summary"]["passed"], "40");
+    assert_eq!(scorecard["summary"]["failed"], "0");
 }
 
 struct IsolatedCheckout<'guard> {

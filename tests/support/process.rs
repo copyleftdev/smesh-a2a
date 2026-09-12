@@ -25,6 +25,178 @@ pub fn bounded_status(
     wait_and_reap(&mut child, watchdog, label, InjectedErrors::default())
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct MarkerRelativeStatus {
+    pub status: ExitStatus,
+    pub pre_marker_elapsed: Duration,
+    pub post_marker_process_elapsed: Option<Duration>,
+}
+
+#[cfg(target_os = "linux")]
+impl MarkerRelativeStatus {
+    pub fn marker_observed(&self) -> bool {
+        self.post_marker_process_elapsed.is_some()
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn bounded_status_after_marker(
+    command: &mut Command,
+    marker: &std::path::Path,
+    watchdog: Duration,
+    post_marker_watchdog: Duration,
+    label: &str,
+) -> Result<MarkerRelativeStatus, String> {
+    bounded_status_after_marker_with_observers(
+        command,
+        marker,
+        watchdog,
+        post_marker_watchdog,
+        label,
+        Instant::now(),
+        |_| observe_marker(marker),
+        |child, _| observe_child_exit(child, Duration::ZERO),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn bounded_status_after_marker_with_observers<M, E>(
+    command: &mut Command,
+    marker: &std::path::Path,
+    watchdog: Duration,
+    post_marker_watchdog: Duration,
+    label: &str,
+    started: Instant,
+    mut observe_marker: M,
+    mut observe_exit: E,
+) -> Result<MarkerRelativeStatus, String>
+where
+    M: FnMut(Instant) -> Result<bool, String>,
+    E: FnMut(&mut std::process::Child, Instant) -> std::io::Result<bool>,
+{
+    if marker.exists() {
+        return Err(format!(
+            "{label} marker existed before process launch: {}",
+            marker.display()
+        ));
+    }
+    let mut child = spawn_owned(command, label)?;
+    let deadline = started + watchdog;
+    let mut marker_observed_at = None;
+
+    loop {
+        let marker_transition = if marker_observed_at.is_none() {
+            match observe_marker(deadline) {
+                Ok(transition) => transition,
+                Err(error) => {
+                    let cleanup = cleanup_owned_group(&mut child, label, InjectedErrors::default());
+                    return Err(with_cleanup_errors(format!("{label} {error}"), &cleanup));
+                }
+            }
+        } else {
+            false
+        };
+        let marker_checked_at = Instant::now();
+
+        if marker_observed_at.is_none() && marker_checked_at >= deadline {
+            let primary = format!("{label} pre-marker phase timed out after {watchdog:?}");
+            let cleanup = cleanup_owned_group(&mut child, label, InjectedErrors::default());
+            return Err(with_cleanup_errors(primary, &cleanup));
+        }
+
+        if marker_transition {
+            marker_observed_at = Some(marker_checked_at);
+        }
+
+        let active_deadline =
+            marker_observed_at.map_or(deadline, |observed_at| observed_at + post_marker_watchdog);
+        let exited = match observe_exit(&mut child, active_deadline) {
+            Ok(exited) => exited,
+            Err(error) => {
+                let primary = format!("{label} wait failed: {error}");
+                let cleanup = cleanup_owned_group(&mut child, label, InjectedErrors::default());
+                return Err(with_cleanup_errors(primary, &cleanup));
+            }
+        };
+        let exit_checked_at = Instant::now();
+
+        if marker_observed_at.is_none() && exit_checked_at >= deadline {
+            let primary = format!("{label} pre-marker phase timed out after {watchdog:?}");
+            let cleanup = cleanup_owned_group(&mut child, label, InjectedErrors::default());
+            return Err(with_cleanup_errors(primary, &cleanup));
+        }
+
+        if let Some(observed_at) = marker_observed_at
+            && exit_checked_at >= observed_at + post_marker_watchdog
+        {
+            let primary =
+                format!("{label} post-marker phase timed out after {post_marker_watchdog:?}");
+            let cleanup = cleanup_owned_group(&mut child, label, InjectedErrors::default());
+            return Err(with_cleanup_errors(primary, &cleanup));
+        }
+
+        if exited {
+            let pre_marker_elapsed = marker_observed_at.unwrap_or(exit_checked_at) - started;
+            let post_marker_process_elapsed = marker_observed_at
+                .map(|observed_at| exit_checked_at.saturating_duration_since(observed_at));
+            let status = finish_normally_exited_group(&mut child, label)?;
+            return Ok(MarkerRelativeStatus {
+                status,
+                pre_marker_elapsed,
+                post_marker_process_elapsed,
+            });
+        }
+
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub fn bounded_status_after_marker_with_injected_observers<M, E>(
+    command: &mut Command,
+    marker: &std::path::Path,
+    watchdog: Duration,
+    post_marker_watchdog: Duration,
+    label: &str,
+    observe_marker: M,
+    observe_exit: E,
+) -> Result<MarkerRelativeStatus, String>
+where
+    M: FnMut(Instant) -> Result<bool, String>,
+    E: FnMut(&mut std::process::Child, Instant) -> std::io::Result<bool>,
+{
+    bounded_status_after_marker_with_observers(
+        command,
+        marker,
+        watchdog,
+        post_marker_watchdog,
+        label,
+        Instant::now(),
+        observe_marker,
+        observe_exit,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn observe_marker(marker: &std::path::Path) -> Result<bool, String> {
+    match std::fs::metadata(marker) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("marker metadata read failed: {error}")),
+    }
+}
+
+fn with_cleanup_errors(primary: String, cleanup: &[String]) -> String {
+    if cleanup.is_empty() {
+        primary
+    } else {
+        format!("{primary}; cleanup errors: {}", cleanup.join("; "))
+    }
+}
+
 pub fn bounded_output(
     command: &mut Command,
     watchdog: Duration,
@@ -272,6 +444,11 @@ fn observe_child_exit(
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub fn observe_child_exit_for_test(child: &mut std::process::Child) -> std::io::Result<bool> {
+    observe_child_exit(child, Duration::ZERO)
 }
 
 #[cfg(not(target_os = "linux"))]
