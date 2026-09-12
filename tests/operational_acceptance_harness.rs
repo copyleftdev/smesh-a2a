@@ -707,25 +707,88 @@ fn assert_no_process_cmdline_contains(needle: &[u8]) {
 }
 
 #[test]
-fn four_concurrent_documented_harness_runs_share_dependencies_safely() {
+fn documented_harness_holds_dependency_lock_during_mutation_and_releases_it_on_exit() {
+    use rustix::fs::{FlockOperation, flock};
+    use std::os::unix::fs::PermissionsExt as _;
+
     let operational_harness_test_guard = acquire_operational_harness_test_lock();
     let checkout = IsolatedCheckout::new(&operational_harness_test_guard);
-    let reports = (0..4)
-        .map(|index| checkout.root().join(format!("parallel-report-{index}")))
-        .collect::<Vec<_>>();
-    std::thread::scope(|scope| {
-        let handles = reports
-            .iter()
-            .map(|report| scope.spawn(|| run_documented_harness_result(checkout.path(), report)))
-            .collect::<Vec<_>>();
-        for handle in handles {
-            let status = handle.join().unwrap().unwrap();
-            assert!(status.success());
-        }
-    });
-    for report in reports {
-        smesh_a2a::lifeline_acceptance::verify_acceptance_report(&report).unwrap();
+    let report = checkout.root().join("report");
+    let mutation_started = checkout.root().join("mutation-started");
+    let mutation_release = checkout.root().join("mutation-release");
+    let cargo_mutation_started = checkout.root().join("cargo-mutation-started");
+    let fake_bin = checkout.root().join("fake-bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    for (name, script) in [
+        (
+            "npm",
+            "#!/bin/sh\n: > \"$MUTATION_STARTED\"\nwhile [ ! -e \"$MUTATION_RELEASE\" ]; do sleep 0.01; done\nexit 76\n",
+        ),
+        (
+            "cargo",
+            "#!/bin/sh\n: > \"$CARGO_MUTATION_STARTED\"\nexit 77\n",
+        ),
+    ] {
+        let command = fake_bin.join(name);
+        std::fs::write(&command, script).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    let mut path = fake_bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap());
+
+    std::thread::scope(|scope| {
+        let harness = scope.spawn(|| {
+            process::bounded_status(
+                Command::new(
+                    checkout
+                        .path()
+                        .join("scripts/run-operational-acceptance.sh"),
+                )
+                .arg(&report)
+                .current_dir(checkout.path())
+                .env("PATH", path)
+                .env("MUTATION_STARTED", &mutation_started)
+                .env("MUTATION_RELEASE", &mutation_release)
+                .env("CARGO_MUTATION_STARTED", &cargo_mutation_started),
+                Duration::from_secs(10),
+                "dependency lifecycle lock regression",
+            )
+        });
+
+        let marker_deadline = Instant::now() + Duration::from_secs(5);
+        while !mutation_started.exists() && Instant::now() < marker_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            mutation_started.exists(),
+            "fake npm did not reach dependency mutation before its watchdog"
+        );
+
+        let lock_path = checkout
+            .path()
+            .join("target/.operational-acceptance-dependencies.lock");
+        let lock_probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(
+            flock(&lock_probe, FlockOperation::NonBlockingLockExclusive),
+            Err(rustix::io::Errno::WOULDBLOCK),
+            "dependency mutation ran without the shell holding the lifecycle lock"
+        );
+
+        std::fs::write(&mutation_release, b"release").unwrap();
+        let status = harness.join().unwrap().unwrap();
+        assert!(!status.success());
+        assert!(!report.exists());
+        assert!(!cargo_mutation_started.exists());
+        #[cfg(target_os = "linux")]
+        assert_no_process_cmdline_contains(checkout.path().as_os_str().as_encoded_bytes());
+        flock(&lock_probe, FlockOperation::NonBlockingLockExclusive)
+            .expect("dependency lifecycle lock remained held after harness termination");
+    });
 }
 
 #[test]
