@@ -25,6 +25,19 @@ test('unsafe Chrome sandbox downgrade is explicit', () => {
   assert.equal(chromeArgs({ unsafeNoSandbox: 'true' }).includes('--no-sandbox'), true);
 });
 
+test('qualification Chrome profile disables background networking and external DNS', () => {
+  const args = chromeArgs({ qualificationOffline: 'true' });
+  for (const flag of [
+    '--disable-background-networking',
+    '--disable-component-update',
+    '--disable-domain-reliability',
+    '--disable-sync',
+    '--no-first-run',
+    '--safebrowsing-disable-auto-update',
+    '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost',
+  ]) assert.equal(args.includes(flag), true, flag);
+});
+
 test('argument parser and output extension reject malformed values', () => {
   assert.deepEqual(parseArgs(['--fps=30', '--keepCapture=true']), { fps: '30', keepCapture: 'true' });
   assert.throws(() => parseArgs(['fps=30']), RangeError);
@@ -51,7 +64,10 @@ test('operational export evidence retains each frame state digest and contributi
 });
 
 test('child stdin EPIPE is observed instead of becoming uncaught', async () => {
-  const child = spawn(process.execPath, ['-e', 'process.exit(7)'], { stdio: ['pipe', 'ignore', 'ignore'] });
+  const child = spawn(process.execPath, ['-e', 'process.exit(7)'], {
+    stdio: ['pipe', 'ignore', 'ignore'],
+    timeout: 5_000,
+  });
   const guard = guardWritable(child.stdin);
   const exit = waitForExit(child, 'child');
   exit.catch(() => {});

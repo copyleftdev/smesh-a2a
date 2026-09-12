@@ -6,7 +6,7 @@ if [ "$#" -ne 1 ]; then
   exit 64
 fi
 
-repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 output=$1
 case "$output" in
   /*) ;;
@@ -25,7 +25,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 cd "$repo"
-timeout 180 cargo build --quiet --bin lifeline-failure-scenario --bin operational-lifeline-capture
+timeout 180 cargo build --locked --quiet --bin lifeline-failure-scenario --bin operational-lifeline-capture
 timeout 45 target/debug/lifeline-failure-scenario deploy/lifeline-teams.json "$work/scenario" >/dev/null
 timeout 45 target/debug/operational-lifeline-capture "$work/scenario" "$output" >/dev/null
 printf '%s\n' "$output/package.jsonl"

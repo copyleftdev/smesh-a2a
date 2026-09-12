@@ -41,6 +41,18 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Provision qualification process tooling
+        run: |
+          sudo timeout --signal=TERM --kill-after=10s 2m apt-get update
+          sudo timeout --signal=TERM --kill-after=10s 2m apt-get install --yes apparmor apparmor-profiles apparmor-utils bubblewrap strace
+          timeout --signal=TERM --kill-after=10s 2m scripts/ensure-bwrap-ready.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: demo/package-lock.json
+      - name: Install demo tooling
+        run: timeout --signal=TERM --kill-after=10s 2m npm ci --prefix demo
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -53,13 +65,6 @@ jobs:
         run: RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
       - name: Diff hygiene
         run: git diff --check
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: demo/package-lock.json
-      - name: Install demo tooling
-        run: npm ci --prefix demo
       - name: Audit demo tooling
         run: npm audit --audit-level=high --prefix demo
       - name: Test demo tooling
@@ -72,6 +77,45 @@ jobs:
         run: |
           cargo run --quiet --bin lifeline-trace -- /tmp/lifeline.trace.jsonl
           cmp /tmp/lifeline.trace.jsonl demo/lifeline.trace.jsonl
+
+  operational-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: demo/package-lock.json
+      - name: Install bounded browser tooling
+        run: |
+          sudo timeout --signal=TERM --kill-after=10s 2m apt-get update
+          sudo timeout --signal=TERM --kill-after=10s 2m apt-get install --yes apparmor apparmor-profiles apparmor-utils bubblewrap strace
+          timeout --signal=TERM --kill-after=10s 2m scripts/ensure-bwrap-ready.sh
+          timeout --signal=TERM --kill-after=10s 2m npm ci --prefix demo
+      - name: Run canary-free exact browser readiness diagnostic
+        run: timeout --signal=TERM --kill-after=10s 45s scripts/run-browser-readiness-diagnostic.sh
+      - name: Run operational acceptance harness
+        run: timeout --signal=TERM --kill-after=15s 12m scripts/run-operational-acceptance.sh "${RUNNER_TEMP}/operational-acceptance"
+      - name: Independently verify acceptance report
+        run: target/debug/operational-lifeline-acceptance verify-report "${RUNNER_TEMP}/operational-acceptance"
+      - name: Upload canonical operational acceptance receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: operational-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/operational-acceptance/acceptance-scorecard.json
+            ${{ runner.temp }}/operational-acceptance/acceptance-receipt.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
+          include-hidden-files: false
 
   push-security:
     runs-on: ubuntu-latest

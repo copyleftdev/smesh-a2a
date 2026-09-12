@@ -1,19 +1,20 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use smesh_a2a::lifeline_acceptance::criteria_evidence_digest;
 use smesh_a2a::{
-    A2aCaptureAdapter, ArtifactCaptureAdapter, CanonicalCapture, CaptureParent, CausalMerger,
-    CausalSourceEvent, DataClass, EditorialCue, EditorialEntry, HumanConsoleCaptureAdapter,
-    HumanDecision, HybridLogicalClock, LifelineFailureScenarioRun, MergeLimits,
-    MissingParentPolicy, OperationalActor, OperationalActorManifest, OperationalEditorialOverlay,
-    OperationalProducer, OperationalProjectionLimits, OperationalSite, OperationalVisibility,
-    PrivacyPolicy, ProducerIdentity, ProducerKind, ProjectionReceipt, RatificationCommand,
-    RatificationLedger, RedactionAction, RedactionRule, ReplaySealInput, ReviewAcknowledgement,
-    ReviewArtifact, ReviewPacketInput, RunHmacKey, SmeshJournalCaptureAdapter,
-    ToolMcpCaptureAdapter, capture_causal_source_jsonl, content_digest,
+    A2aCaptureAdapter, ArtifactCaptureAdapter, CanonicalCapture, CaptureParent, CaptureStream,
+    CausalMerger, CausalSourceEvent, DataClass, EditorialCue, EditorialEntry,
+    HumanConsoleCaptureAdapter, HumanDecision, HybridLogicalClock, LifelineFailureScenarioRun,
+    MergeLimits, MissingParentPolicy, OperationalActor, OperationalActorManifest,
+    OperationalEditorialOverlay, OperationalProducer, OperationalProjectionLimits, OperationalSite,
+    OperationalVisibility, PrivacyPolicy, ProducerIdentity, ProducerKind, ProjectionReceipt,
+    RatificationCommand, RatificationLedger, RedactionAction, RedactionRule, ReplaySealInput,
+    ReviewAcknowledgement, ReviewArtifact, ReviewPacketInput, RunHmacKey,
+    SmeshJournalCaptureAdapter, ToolMcpCaptureAdapter, capture_causal_source_jsonl, content_digest,
     project_operational_observatory_with_source_facts, sanitize_public_trace_with_receipts,
     verify_lifeline_failure_trace, verify_operational_projection, verify_sanitized_trace,
 };
@@ -111,6 +112,7 @@ fn compose(source: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     let mut labels = HashMap::<String, (String, String)>::new();
     let mut pending_facts = HashMap::<String, PendingSourceFact>::new();
     let mut source_bindings = Vec::<Value>::new();
+    let mut team_criteria = Vec::<Value>::new();
     capture_failure(&capture, &failure_bytes, &mut labels, &mut pending_facts)?;
     source_bindings.push(source_binding(
         "lifeline-failure-scenario/1",
@@ -130,6 +132,7 @@ fn compose(source: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
             &source.join(format!("journals/{team}.runtime.jsonl")),
             256 * 1024,
         )?;
+        team_criteria.push(extract_team_criteria(team, &journal, &runtime)?);
         capture_runtime(
             &capture,
             team,
@@ -177,6 +180,12 @@ fn compose(source: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     if !stream.capture_valid || stream.events.is_empty() {
         return Err("canonical capture is invalid".into());
     }
+    let criteria_evidence =
+        build_criteria_evidence(&run_value, &failure_bytes, &stream, team_criteria)?;
+    write_private(
+        &restricted.join("criteria-evidence.json"),
+        &canonical_value(&criteria_evidence)?,
+    )?;
     let mut fact_entries = stream
         .events
         .iter()
@@ -446,6 +455,446 @@ fn capture_failure(
         );
     }
     Ok(())
+}
+
+fn is_loopback_http_url(value: &str) -> bool {
+    let Some(authority_and_path) = value.strip_prefix("http://127.0.0.1:") else {
+        return false;
+    };
+    let authority = authority_and_path.split('/').next().unwrap_or_default();
+    !authority.is_empty() && authority.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_criteria_evidence(
+    run: &Value,
+    failure_bytes: &[u8],
+    stream: &CaptureStream,
+    mut teams: Vec<Value>,
+) -> Result<Value, Box<dyn Error>> {
+    let failure_records = std::str::from_utf8(failure_bytes)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let captured = stream
+        .events
+        .iter()
+        .map(|event| (event.interaction_id.as_str(), event))
+        .collect::<HashMap<_, _>>();
+    let mut source_identity_projection = Vec::with_capacity(failure_records.len());
+    let mut capture_identity_projection = Vec::with_capacity(failure_records.len());
+    let mut source_event_bindings = failure_records
+        .iter()
+        .map(|record| {
+            let source_event_id = record["eventId"]
+                .as_str()
+                .ok_or("failure event identity absent")?;
+            let captured_event = captured
+                .get(source_event_id)
+                .ok_or("failure event did not enter canonical capture")?;
+            let source_identity = json!({
+                "contextId": record["contextId"],
+                "interactionId": source_event_id,
+                "subjectId": record["replacesTaskId"].as_str().or_else(|| record["messageId"].as_str()),
+                "taskId": record["taskId"],
+            });
+            let capture_identity = json!({
+                "contextId": captured_event.context_id,
+                "interactionId": captured_event.interaction_id,
+                "subjectId": captured_event.subject_id,
+                "taskId": captured_event.task_id,
+            });
+            source_identity_projection.push(source_identity);
+            capture_identity_projection.push(capture_identity);
+            Ok(json!({
+                "captureEventId": captured_event.event_id,
+                "sourceRecordDigest": source_record_digest(record)?,
+            }))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    source_event_bindings.sort_by(|left, right| {
+        left["captureEventId"]
+            .as_str()
+            .cmp(&right["captureEventId"].as_str())
+    });
+
+    let kinds = failure_records
+        .iter()
+        .filter_map(|record| record["kind"].as_str())
+        .collect::<BTreeSet<_>>();
+    let required_recovery = [
+        "primary-outage-observed",
+        "primary-stream-failed",
+        "cancel-requested",
+        "cancel-confirmed",
+        "late-output-fenced",
+        "fallback-selected",
+        "fallback-submitted",
+        "fallback-completed",
+    ];
+    let initial = run
+        .pointer("/directorRun/initialOperations")
+        .and_then(Value::as_array)
+        .ok_or("initial operations absent")?;
+    let discovered_gateways = run
+        .pointer("/directorRun/discoveredGateways")
+        .and_then(Value::as_array)
+        .ok_or("discovered gateways absent")?;
+    let loopback_routing_only = discovered_gateways.len() == 6
+        && discovered_gateways.iter().all(|gateway| {
+            gateway["discoveryUrl"]
+                .as_str()
+                .is_some_and(is_loopback_http_url)
+                && gateway["interfaces"].as_array().is_some_and(|interfaces| {
+                    interfaces.len() == 2
+                        && interfaces.iter().all(|interface| {
+                            interface["url"].as_str().is_some_and(is_loopback_http_url)
+                        })
+                })
+        });
+    let one_context = initial
+        .iter()
+        .all(|operation| operation["contextId"].as_str() == run["rootContextId"].as_str());
+    let unique_tasks = initial
+        .iter()
+        .filter_map(|operation| operation["taskId"].as_str())
+        .collect::<BTreeSet<_>>();
+    let submitted_before_completion = failure_records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record["kind"].as_str(),
+                Some("task-submitted" | "primary-submitted")
+            )
+        })
+        .filter_map(|record| record["sequence"].as_u64())
+        .max()
+        .zip(
+            failure_records
+                .iter()
+                .filter(|record| record["kind"] == "sibling-completed")
+                .filter_map(|record| record["sequence"].as_u64())
+                .min(),
+        )
+        .is_some_and(|(submitted, completed)| submitted < completed);
+
+    let initial_evidence = initial
+        .iter()
+        .map(|operation| {
+            json!({
+                "binding": operation["binding"],
+                "contextId": operation["contextId"],
+                "gatewayId": operation["gatewayId"],
+                "operationId": operation["operationId"],
+                "taskId": operation["taskId"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let initial_digest = criteria_evidence_digest(
+        "operational-lifeline-initial-task-set",
+        &canonical_value(&Value::Array(initial_evidence))?,
+    );
+    let source_identity_digest = criteria_evidence_digest(
+        "operational-lifeline-source-identity-set",
+        &canonical_value(&Value::Array(source_identity_projection))?,
+    );
+    let capture_identity_digest = criteria_evidence_digest(
+        "operational-lifeline-source-identity-set",
+        &canonical_value(&Value::Array(capture_identity_projection))?,
+    );
+    let identities_match = source_identity_digest == capture_identity_digest;
+    teams.sort_by(|left, right| left["teamId"].as_str().cmp(&right["teamId"].as_str()));
+
+    Ok(json!({
+        "runId": RUN_ID,
+        "scenario": {
+            "concurrentInitialTasks": {
+                "observed": initial.len() == 4 && unique_tasks.len() == 4 && one_context && submitted_before_completion,
+                "sourceRecordDigest": initial_digest,
+            },
+            "failureRecovery": required_recovery.iter().all(|kind| kinds.contains(kind)),
+            "fallbackIdentity": {
+                "distinctTaskId": run["fallbackTaskId"] != run["primaryTaskId"],
+                "replacementBound": run["fallbackReplacesTaskId"] == run["primaryTaskId"],
+                "sameRootContext": run["fallbackContextId"] == run["rootContextId"],
+            },
+            "identityReconciliation": {
+                "captureIdentitySetDigest": capture_identity_digest,
+                "matched": identities_match && source_event_bindings.len() == failure_records.len(),
+                "sourceEventBindings": source_event_bindings,
+                "sourceIdentitySetDigest": source_identity_digest,
+                "unavailableIds": Value::Null,
+            },
+            "loopbackRoutingOnly": loopback_routing_only,
+            "primaryFinalState": run["primaryFinalState"],
+            "rootContextRestarts": run["rootContextRestarts"].as_u64().ok_or("root restart count absent")?.to_string(),
+        },
+        "schemaVersion": "operational-lifeline-criteria-evidence/1",
+        "seed": "47",
+        "sourceRecords": {
+            "failureRecordCount": failure_records.len().to_string(),
+            "failureSourceDigest": criteria_evidence_digest("operational-lifeline-failure-source", failure_bytes),
+            "teamCount": teams.len().to_string(),
+        },
+        "teams": teams,
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
+fn extract_team_criteria(
+    team: &str,
+    journal: &[u8],
+    runtime: &[u8],
+) -> Result<Value, Box<dyn Error>> {
+    let records = parse_canonical_records(journal, "team journal")?;
+    let runtime_records = parse_canonical_records(runtime, "runtime journal")?;
+    let by_kind = |kind: &str| {
+        records
+            .iter()
+            .filter(|record| record["kind"].as_str() == Some(kind))
+            .collect::<Vec<_>>()
+    };
+    let claims = by_kind("task_claimed");
+    let reinforcements = by_kind("signal_reinforced");
+    let backoffs = by_kind("task_backed_off");
+    let contradictions = by_kind("signal_contradicted");
+    let decays = by_kind("signal_decayed");
+    let tools = by_kind("tool_called");
+    let candidates = by_kind("candidate_built");
+    if claims.len() < 2
+        || reinforcements.len() != 1
+        || backoffs.len() != 1
+        || contradictions.len() != 1
+        || decays.len() != 1
+        || tools.len() != 1
+        || candidates.len() != 1
+    {
+        return Err("team criterion evidence cardinality is invalid".into());
+    }
+    for claim in &claims {
+        source_object(
+            &claim["data"],
+            &[
+                "context_id",
+                "organization",
+                "role",
+                "score",
+                "seed",
+                "task_id",
+            ],
+            "claim data",
+        )?;
+    }
+    let reinforcement = source_object(
+        &reinforcements[0]["data"],
+        &[
+            "attesters",
+            "context_id",
+            "organization",
+            "reinforcement_count",
+            "role",
+            "signal_hash",
+            "task_id",
+        ],
+        "reinforcement data",
+    )?;
+    let backoff = source_object(
+        &backoffs[0]["data"],
+        &[
+            "context_id",
+            "loser_score",
+            "organization",
+            "role",
+            "seed",
+            "task_id",
+            "winner_role",
+            "winner_score",
+        ],
+        "backoff data",
+    )?;
+    let contradiction = source_object(
+        &contradictions[0]["data"],
+        &[
+            "context_id",
+            "contradiction_hash",
+            "hypothesis_hash",
+            "organization",
+            "role",
+            "task_id",
+        ],
+        "contradiction data",
+    )?;
+    let decay = source_object(
+        &decays[0]["data"],
+        &[
+            "context_id",
+            "organization",
+            "removed_from_active",
+            "retained_in_history",
+            "role",
+            "signal_hash",
+            "task_id",
+        ],
+        "decay data",
+    )?;
+    let tool = source_object(
+        &tools[0]["data"],
+        &[
+            "context_id",
+            "organization",
+            "role",
+            "seed",
+            "task_id",
+            "tool_id",
+        ],
+        "tool call data",
+    )?;
+    let candidate = source_object(
+        &candidates[0]["data"],
+        &[
+            "bytes",
+            "context_id",
+            "digest",
+            "media_type",
+            "name",
+            "organization",
+            "role",
+            "task_id",
+        ],
+        "candidate data",
+    )?;
+    let attesters = reinforcement["attesters"]
+        .as_array()
+        .ok_or("reinforcement attesters absent")?;
+    let distinct_attesters = attesters.len() >= 2
+        && attesters
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>()
+            .len()
+            == attesters.len();
+    let winner_score = backoff["winner_score"]
+        .as_u64()
+        .ok_or("winner score absent")?;
+    let loser_score = backoff["loser_score"]
+        .as_u64()
+        .ok_or("loser score absent")?;
+    let emitted = runtime_records
+        .iter()
+        .filter(|record| record["kind"] == "signal_emitted")
+        .filter_map(|record| record["data"]["hash"].as_str())
+        .collect::<BTreeSet<_>>();
+    let hypothesis = contradiction["hypothesis_hash"]
+        .as_str()
+        .ok_or("hypothesis hash absent")?;
+    let contradiction_hash = contradiction["contradiction_hash"]
+        .as_str()
+        .ok_or("contradiction hash absent")?;
+    let expiry_tick_observed = runtime_records.iter().any(|record| {
+        record["kind"] == "tick_completed"
+            && record["data"]["expired"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+    });
+    let organizations = records
+        .iter()
+        .filter_map(|record| record["data"]["organization"].as_str())
+        .collect::<BTreeSet<_>>();
+    let team_prefix = format!("{team}-");
+    let local_tool_prefix = format!("local.{team}-");
+    let source_record_digests = [
+        ("backoff", backoffs[0]),
+        ("contradiction", contradictions[0]),
+        ("decay", decays[0]),
+        ("reinforcement", reinforcements[0]),
+    ]
+    .into_iter()
+    .map(|(kind, record)| {
+        Ok((
+            kind.to_owned(),
+            Value::String(source_record_digest(record)?),
+        ))
+    })
+    .collect::<Result<serde_json::Map<_, _>, Box<dyn Error>>>()?;
+    let source_journal_digest = criteria_evidence_digest(
+        "operational-lifeline-team-semantic-records",
+        &canonical_value(&Value::Object(source_record_digests.clone()))?,
+    );
+    let reinforcement_hash = reinforcement["signal_hash"]
+        .as_str()
+        .ok_or("reinforcement hash absent")?;
+    let mut runtime_record_digests = runtime_records
+        .iter()
+        .filter(|record| {
+            record["kind"] == "signal_emitted"
+                && record["data"]["hash"].as_str().is_some_and(|value| {
+                    matches!(value, v if v == hypothesis || v == contradiction_hash || v == reinforcement_hash)
+                })
+        })
+        .map(source_record_digest)
+        .collect::<Result<Vec<_>, _>>()?;
+    runtime_record_digests.sort();
+    let runtime_journal_digest = criteria_evidence_digest(
+        "operational-lifeline-runtime-semantic-records",
+        &canonical_value(&json!({
+            "expiryTickObserved": expiry_tick_observed,
+            "sourceRecordDigests": runtime_record_digests,
+        }))?,
+    );
+
+    Ok(json!({
+        "backoff": {
+            "losingRoleReinforced": backoff["role"] == reinforcement["role"],
+            "observed": true,
+            "winnerScoreGreater": winner_score > loser_score,
+        },
+        "claim": {"observed": true, "recordCount": claims.len().to_string()},
+        "contradictionDecay": {
+            "expiryTickObserved": expiry_tick_observed,
+            "hashReconciled": decay["signal_hash"].as_str() == Some(hypothesis),
+            "removedFromActive": decay["removed_from_active"].as_bool() == Some(true),
+            "retainedInHistory": decay["retained_in_history"].as_bool() == Some(true),
+            "runtimeHashesEmitted": emitted.contains(hypothesis) && emitted.contains(contradiction_hash),
+        },
+        "isolation": {
+            "candidateBound": candidate["organization"] == tool["organization"]
+                && candidate["context_id"] == tool["context_id"]
+                && candidate["task_id"] == tool["task_id"],
+            "organizationBound": organizations.len() == 1,
+            "toolBound": tool["tool_id"].as_str().is_some_and(|id| id.starts_with(&local_tool_prefix))
+                && attesters.iter().all(|value| value.as_str().is_some_and(|id| id.starts_with(&team_prefix))),
+        },
+        "reinforcement": {
+            "distinctAttesters": distinct_attesters,
+            "observed": reinforcement["reinforcement_count"].as_u64().is_some_and(|count| count > 0),
+        },
+        "runtimeJournalDigest": runtime_journal_digest,
+        "sourceJournalDigest": source_journal_digest,
+        "sourceRecordDigests": Value::Object(source_record_digests),
+        "teamId": team,
+    }))
+}
+
+fn parse_canonical_records(bytes: &[u8], label: &str) -> Result<Vec<Value>, Box<dyn Error>> {
+    let mut records = Vec::new();
+    for line in std::str::from_utf8(bytes)?.lines() {
+        let value: Value = serde_json::from_str(line)?;
+        if canonical_value(&value)? != line.as_bytes() {
+            return Err(format!("{label} record is not canonical").into());
+        }
+        records.push(value);
+    }
+    if records.is_empty() {
+        return Err(format!("{label} is empty").into());
+    }
+    Ok(records)
+}
+
+fn source_record_digest(record: &Value) -> Result<String, Box<dyn Error>> {
+    Ok(criteria_evidence_digest(
+        "operational-lifeline-source-record",
+        &canonical_value(record)?,
+    ))
 }
 
 fn capture_runtime(
