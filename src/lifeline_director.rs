@@ -37,6 +37,38 @@ pub enum LifelineDirectorError {
     Discovery { gateway_id: String },
     #[error("director operation {operation_id} failed")]
     Operation { operation_id: String },
+    #[error("director operation {operation_id} failed at {stage}")]
+    OperationStage {
+        operation_id: String,
+        stage: LifelineDirectorOperationStage,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifelineDirectorOperationStage {
+    SyncTransport,
+    SyncResponseShape,
+    SyncResponseValidation,
+}
+
+impl std::fmt::Display for LifelineDirectorOperationStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::SyncTransport => "sync transport",
+            Self::SyncResponseShape => "sync response shape",
+            Self::SyncResponseValidation => "sync response validation",
+        })
+    }
+}
+
+fn sync_operation_error(
+    operation_id: &str,
+    stage: LifelineDirectorOperationStage,
+) -> LifelineDirectorError {
+    LifelineDirectorError::OperationStage {
+        operation_id: operation_id.to_owned(),
+        stage,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -924,6 +956,7 @@ async fn execute_failure_fallback(
     let error = || LifelineDirectorError::Operation {
         operation_id: operation_id.to_owned(),
     };
+    let stage_error = |stage| sync_operation_error(operation_id, stage);
     let client = official_client_for(&gateway, TRANSPORT_PROTOCOL_HTTP_JSON)
         .await
         .map_err(|_| error())?;
@@ -961,15 +994,21 @@ async fn execute_failure_fallback(
         }),
     )
     .await
-    .map_err(|_| error())?
-    .map_err(|_| error())?;
+    .map_err(|_| stage_error(LifelineDirectorOperationStage::SyncTransport))?
+    .map_err(|_| stage_error(LifelineDirectorOperationStage::SyncTransport))?;
     let SendMessageResponse::Task(task) = response else {
-        return Err(error());
+        return Err(stage_error(
+            LifelineDirectorOperationStage::SyncResponseShape,
+        ));
     };
-    validate_task_evidence(&task)?;
-    validate_task_identity(&task.id, &task.context_id, &task.id, &root_context_id)?;
+    validate_task_evidence(&task)
+        .map_err(|_| stage_error(LifelineDirectorOperationStage::SyncResponseValidation))?;
+    validate_task_identity(&task.id, &task.context_id, &task.id, &root_context_id)
+        .map_err(|_| stage_error(LifelineDirectorOperationStage::SyncResponseValidation))?;
     if task.status.state != TaskState::Completed || task.id == primary_task_id {
-        return Err(error());
+        return Err(stage_error(
+            LifelineDirectorOperationStage::SyncResponseValidation,
+        ));
     }
     let mut observed_message_ids = vec![message_id.clone()];
     let mut observed_task_ids = vec![primary_task_id.clone()];
@@ -979,7 +1018,8 @@ async fn execute_failure_fallback(
         &mut observed_message_ids,
         &mut observed_task_ids,
         &mut artifact_ids,
-    )?;
+    )
+    .map_err(|_| stage_error(LifelineDirectorOperationStage::SyncResponseValidation))?;
     trace
         .record(LifelineFailureTransition {
             kind: LifelineFailureEventKind::FallbackCompleted,
@@ -1308,6 +1348,7 @@ async fn execute_initial_operation(
     let error = || LifelineDirectorError::Operation {
         operation_id: operation.id.clone(),
     };
+    let stage_error = |stage| sync_operation_error(&operation.id, stage);
     let gateway = gateway.ok_or_else(&error)?;
     let binding = operation.path.binding();
     let http = director_http_client()?;
@@ -1522,14 +1563,18 @@ async fn execute_initial_operation(
             client.send_message(&request),
         )
         .await
-        .map_err(|_| error())?
-        .map_err(|_| error())?;
+        .map_err(|_| stage_error(LifelineDirectorOperationStage::SyncTransport))?
+        .map_err(|_| stage_error(LifelineDirectorOperationStage::SyncTransport))?;
         let SendMessageResponse::Task(task) = response else {
-            return Err(error());
+            return Err(stage_error(
+                LifelineDirectorOperationStage::SyncResponseShape,
+            ));
         };
         if validate_task_evidence(&task).is_err() {
             cancel_task_best_effort(&client, &task.id).await;
-            return Err(error());
+            return Err(stage_error(
+                LifelineDirectorOperationStage::SyncResponseValidation,
+            ));
         }
         (task, Vec::new())
     };
@@ -1538,14 +1583,25 @@ async fn execute_initial_operation(
         || !task.status.state.is_terminal()
     {
         cancel_task_best_effort(&client, &task.id).await;
-        return Err(error());
+        return Err(if operation.path == LifelineDirectorPath::StreamReconnect {
+            error()
+        } else {
+            stage_error(LifelineDirectorOperationStage::SyncResponseValidation)
+        });
     }
     capture_task_ids(
         &task,
         &mut observed_message_ids,
         &mut observed_task_ids,
         &mut observed_artifact_ids,
-    )?;
+    )
+    .map_err(|_| {
+        if operation.path == LifelineDirectorPath::StreamReconnect {
+            error()
+        } else {
+            stage_error(LifelineDirectorOperationStage::SyncResponseValidation)
+        }
+    })?;
     Ok(LifelineDirectorOperationReceipt {
         operation_id: operation.id,
         gateway_id: gateway.gateway_id,
@@ -2278,7 +2334,7 @@ fn director_http_client() -> Result<reqwest::Client, LifelineDirectorError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
-        .timeout(std::time::Duration::from_secs(2))
+        .connect_timeout(std::time::Duration::from_secs(2))
         .build()
         .map_err(|_| invariant("director HTTP client construction failed"))
 }

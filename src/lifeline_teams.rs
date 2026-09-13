@@ -2300,7 +2300,7 @@ mod tests {
         assert!(stream.next().await.unwrap().is_ok());
         drop(stream);
         drop(trace_guard);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        dispatcher.runtime_trace.verify().await.unwrap();
 
         let registry = Arc::clone(&dispatcher.registry);
         fleet.shutdown().await.unwrap();

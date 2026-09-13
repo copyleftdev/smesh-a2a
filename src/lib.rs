@@ -168,8 +168,9 @@ pub use lifeline::{
 };
 pub use lifeline_director::{
     LIFELINE_DIRECTOR_SCHEMA_VERSION, LifelineDirectorError, LifelineDirectorManifest,
-    LifelineDirectorOperation, LifelineDirectorOperationReceipt, LifelineDirectorRun,
-    LifelineFailureScenarioRun, LifelineResponseDirector, ResolvedLifelineGateway,
+    LifelineDirectorOperation, LifelineDirectorOperationReceipt, LifelineDirectorOperationStage,
+    LifelineDirectorRun, LifelineFailureScenarioRun, LifelineResponseDirector,
+    ResolvedLifelineGateway,
 };
 pub use lifeline_failure::{
     LIFELINE_FAILURE_TRACE_SCHEMA_VERSION, LifelineFailureError, LifelineFailureEvent,
