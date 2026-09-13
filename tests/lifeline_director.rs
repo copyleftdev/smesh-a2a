@@ -12,8 +12,9 @@ use axum::routing::{get, post};
 use futures::StreamExt as _;
 use futures::stream::{self, BoxStream};
 use smesh_a2a::{
-    DispatchError, LifelineDirectorManifest, LifelineResponseDirector, LifelineTopologyManifest,
-    MeshDispatcher, MeshEvent, MeshRequest, RunningLifelineTopology,
+    DispatchError, LifelineDirectorError, LifelineDirectorManifest, LifelineDirectorOperationStage,
+    LifelineDirectorRun, LifelineResponseDirector, LifelineTopologyManifest, MeshDispatcher,
+    MeshEvent, MeshRequest, RunningLifelineTopology,
 };
 use wait_timeout::ChildExt as _;
 
@@ -54,6 +55,93 @@ async fn hostile_sync_rpc(
             }
         }
     }))
+}
+
+#[derive(Clone, Copy)]
+enum ControlledSyncBehavior {
+    Delayed,
+    Pending,
+    Message,
+}
+
+#[derive(Clone)]
+struct ControlledSyncState {
+    card: serde_json::Value,
+    behavior: ControlledSyncBehavior,
+}
+
+async fn controlled_sync_card(State(state): State<ControlledSyncState>) -> Json<serde_json::Value> {
+    Json(state.card)
+}
+
+async fn controlled_sync_rpc(
+    State(state): State<ControlledSyncState>,
+    Json(request): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    assert_eq!(request["method"], "SendMessage");
+    match state.behavior {
+        ControlledSyncBehavior::Delayed => {
+            tokio::time::sleep(Duration::from_millis(2_100)).await;
+        }
+        ControlledSyncBehavior::Pending => std::future::pending::<()>().await,
+        ControlledSyncBehavior::Message => {
+            let mut message = a2a::Message::new(a2a::Role::Agent, vec![a2a::Part::text("bounded")]);
+            message.context_id = Some("lifeline-incident-0047".to_owned());
+            return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": a2a::SendMessageResponse::Message(message)
+            }));
+        }
+    }
+    Json(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request["id"].clone(),
+        "result": {
+            "task": {
+                "id": "controlled-sync-task",
+                "contextId": "lifeline-incident-0047",
+                "status": {"state": "TASK_STATE_COMPLETED"}
+            }
+        }
+    }))
+}
+
+async fn run_controlled_sync(
+    behavior: ControlledSyncBehavior,
+) -> Result<LifelineDirectorRun, LifelineDirectorError> {
+    let topology =
+        LifelineTopologyManifest::from_json(include_str!("../deploy/lifeline-topology.json"))
+            .unwrap()
+            .with_ephemeral_loopback_ports()
+            .launch()
+            .await
+            .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let card = card_for_mock_gateway(&topology, "meridian", &origin).await;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/.well-known/agent-card.json", get(controlled_sync_card))
+                .route("/jsonrpc", post(controlled_sync_rpc))
+                .with_state(ControlledSyncState { card, behavior }),
+        )
+        .await
+        .unwrap();
+    });
+    let director = LifelineResponseDirector::new(manifest_for_topology(
+        &topology,
+        Some(("meridian", &origin)),
+    ));
+
+    let result = tokio::time::timeout(Duration::from_secs(8), director.run()).await;
+
+    server.abort();
+    let _ = server.await;
+    topology.shutdown().await.unwrap();
+    result.expect("director exceeded the outer test watchdog")
 }
 
 #[derive(Clone)]
@@ -586,6 +674,66 @@ async fn nonterminal_sync_response_is_canceled_before_director_failure() {
     assert!(result.is_err());
     assert_eq!(*methods.lock().unwrap(), vec!["SendMessage", "CancelTask"]);
     assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn synchronous_response_after_old_client_budget_succeeds() {
+    let run = run_controlled_sync(ControlledSyncBehavior::Delayed)
+        .await
+        .expect("the old client-wide request budget preempted the send watchdog");
+
+    assert!(
+        run.initial_operations()
+            .iter()
+            .any(|receipt| receipt.operation_id() == "lot-genealogy" && receipt.is_completed())
+    );
+}
+
+#[tokio::test]
+async fn permanently_pending_synchronous_endpoint_fails_at_transport_stage() {
+    let error = run_controlled_sync(ControlledSyncBehavior::Pending)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        LifelineDirectorError::OperationStage {
+            operation_id,
+            stage: LifelineDirectorOperationStage::SyncTransport,
+        } if operation_id == "lot-genealogy"
+    ));
+}
+
+#[tokio::test]
+async fn synchronous_message_response_fails_at_response_shape_stage() {
+    let error = run_controlled_sync(ControlledSyncBehavior::Message)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        LifelineDirectorError::OperationStage {
+            operation_id,
+            stage: LifelineDirectorOperationStage::SyncResponseShape,
+        } if operation_id == "lot-genealogy"
+    ));
+}
+
+#[test]
+fn failure_fallback_stage_diagnostics_are_payload_free() {
+    let error = LifelineDirectorError::OperationStage {
+        operation_id: "shipment-routing-fallback".to_owned(),
+        stage: LifelineDirectorOperationStage::SyncTransport,
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "director operation shipment-routing-fallback failed at sync transport"
+    );
+    assert_eq!(
+        format!("{error:?}"),
+        "OperationStage { operation_id: \"shipment-routing-fallback\", stage: SyncTransport }"
+    );
 }
 
 #[tokio::test]
