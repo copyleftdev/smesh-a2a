@@ -560,6 +560,73 @@ fn forbidden_inet_effect(trace: &str) -> Option<String> {
         .map(|(_, original)| original)
 }
 
+#[cfg(target_os = "linux")]
+fn qualification_socket_trace_args() -> [&'static str; 7] {
+    [
+        "-ff",
+        "-qq",
+        "-v",
+        "-xx",
+        "-e",
+        "trace=network,process",
+        "-o",
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn read_split_strace(prefix: &Path) -> std::io::Result<String> {
+    use std::fmt::Write as _;
+
+    let parent = prefix
+        .parent()
+        .ok_or_else(|| std::io::Error::other("strace prefix has no parent"))?;
+    let file_prefix = prefix
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| std::io::Error::other("strace prefix is not UTF-8"))?;
+    let shard_prefix = format!("{file_prefix}.");
+    let mut shards = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(pid) = name.strip_prefix(&shard_prefix) else {
+            continue;
+        };
+        let pid = pid.parse::<u64>().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid strace shard name: {name}"),
+            )
+        })?;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("strace shard is not a regular file: {name}"),
+            ));
+        }
+        shards.push((pid, entry.path()));
+    }
+    if shards.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "split strace produced no process shards",
+        ));
+    }
+    shards.sort_unstable_by_key(|(pid, _)| *pid);
+
+    let mut trace = String::new();
+    for (pid, path) in shards {
+        for line in std::fs::read_to_string(path)?.lines() {
+            writeln!(trace, "{pid} {line}").expect("writing to a String cannot fail");
+        }
+    }
+    Ok(trace)
+}
+
 #[test]
 fn registry_is_the_closed_milestone_20_through_29_contract() {
     let criteria = canonical_criteria().expect("canonical registry");
@@ -1749,6 +1816,57 @@ fn qualification_preserves_predictable_collision_and_removes_only_owned_roots() 
 
 #[cfg(target_os = "linux")]
 #[test]
+fn socket_trace_uses_per_process_output_to_avoid_split_records() {
+    assert_eq!(
+        qualification_socket_trace_args(),
+        [
+            "-ff",
+            "-qq",
+            "-v",
+            "-xx",
+            "-e",
+            "trace=network,process",
+            "-o",
+        ]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn split_socket_trace_reader_labels_each_process_for_parser() {
+    let root = TempRoot::new("split-strace-reader");
+    let prefix = root.path().join("sockets.trace");
+    let loopback = "sendmsg(4, {msg_name={sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"127.0.0.1\")}, msg_namelen=16, msg_iov=[], msg_iovlen=0}, 0) = 1";
+    let blocked = "connect(5, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"203.0.113.7\")}, 16) = -1 EACCES (Permission denied)";
+    std::fs::write(
+        root.path().join("sockets.trace.43231"),
+        format!("{loopback}\n???( <unfinished ...>\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("sockets.trace.43232"),
+        format!("{blocked}\n"),
+    )
+    .unwrap();
+
+    let trace = read_split_strace(&prefix).unwrap();
+
+    assert_eq!(
+        trace,
+        format!("43231 {loopback}\n43231 ???( <unfinished ...>\n43232 {blocked}\n")
+    );
+    assert_eq!(forbidden_inet_effect(&trace), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn socket_trace_parser_still_rejects_opaque_unfinished_sendmsg() {
+    let line = "43231 sendmsg(12, 0x7f43341ed9c0, MSG_NOSIGNAL <unfinished ...>";
+    assert_eq!(forbidden_inet_effect(line), Some(line.to_owned()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn socket_trace_parser_allows_loopback_effects_and_rejects_external_effects() {
     let allowed = concat!(
         "101 connect(7, {sa_family=AF_UNIX, sun_path=\"/tmp/browser.sock\"}, 110) = 0\n",
@@ -1875,15 +1993,7 @@ fn qualification_browser_uses_anonymous_control_pipe_without_successful_dns_or_n
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let (status, _) = bounded_browser_status(
         Command::new("/usr/bin/strace")
-            .args([
-                "-f",
-                "-qq",
-                "-v",
-                "-xx",
-                "-e",
-                "trace=network,process",
-                "-o",
-            ])
+            .args(qualification_socket_trace_args())
             .arg(&trace)
             .args([
                 "bwrap",
@@ -1905,7 +2015,7 @@ fn qualification_browser_uses_anonymous_control_pipe_without_successful_dns_or_n
     )
     .unwrap();
     assert!(status.success());
-    let trace_text = std::fs::read_to_string(trace).unwrap();
+    let trace_text = read_split_strace(&trace).unwrap();
     let hex_argument = |argument: &str| {
         use std::fmt::Write;
 
