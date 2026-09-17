@@ -1,4 +1,4 @@
-//! Executable PostgreSQL schema-v6 durable authority adapter.
+//! Executable `PostgreSQL` schema-v6 durable authority adapter.
 #![allow(
     clippy::if_not_else,
     clippy::missing_errors_doc,
@@ -663,7 +663,7 @@ impl PostgresStoreConfig {
     }
 
     /// Bind strict artifact policy. Key material and the POSIX root are
-    /// preflighted before any PostgreSQL connection is acquired.
+    /// preflighted before any `PostgreSQL` connection is acquired.
     #[must_use]
     pub fn with_artifact_store(mut self, config: ArtifactStoreConfig) -> Self {
         self.artifact_store = Some(Arc::new(config));
@@ -709,7 +709,7 @@ impl PostgresStoreConfig {
         self
     }
 
-    /// Bind the exact callback policy before any PostgreSQL resource is acquired.
+    /// Bind the exact callback policy before any `PostgreSQL` resource is acquired.
     #[must_use]
     pub fn with_push_policy(mut self, policy: crate::push::PushPolicy) -> Self {
         self.push_policy = Some(Arc::new(policy));
@@ -1663,7 +1663,7 @@ impl PostgresTaskStore {
         self
     }
 
-    /// Verify and restore an encrypted artifact root against offline restored PostgreSQL metadata.
+    /// Verify and restore an encrypted artifact root against offline restored `PostgreSQL` metadata.
     pub async fn restore_artifacts(
         config: PostgresStoreConfig,
         plan: &crate::ArtifactRestorePlanFile,

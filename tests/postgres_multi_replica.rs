@@ -1,7 +1,7 @@
 #![cfg(all(unix, debug_assertions))]
 #![allow(clippy::match_wild_err_arm, clippy::too_many_lines)]
 
-//! Real-process PostgreSQL gateway evidence. Transport authentication is deliberately
+//! Real-process `PostgreSQL` gateway evidence. Transport authentication is deliberately
 //! replaced here by a test-only outer middleware which constructs the immutable
 //! principal server-side and strips the selector before protocol parsing. Production
 //! mTLS composition remains covered by `authorized_gateway_process` and `tls_integration`.

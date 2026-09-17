@@ -2109,7 +2109,7 @@ impl IntoDurableAuthority for Arc<dyn DurableAuthority> {
 }
 
 /// Sealed local-loopback surface. Authenticated production code never receives
-/// this dependency, and PostgreSQL adapters cannot implement it outside the crate.
+/// this dependency, and `PostgreSQL` adapters cannot implement it outside the crate.
 #[async_trait]
 pub(crate) trait LocalDevelopmentCompatibility: Send + Sync {
     async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError>;

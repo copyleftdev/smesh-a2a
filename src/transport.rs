@@ -170,7 +170,7 @@ pub enum TransportConfigError {
 }
 
 /// Fully parsed production transport policy. Validation is intentionally usable
-/// before listener, SQLite, runtime, or mesh resources are acquired.
+/// before listener, `SQLite`, runtime, or mesh resources are acquired.
 #[derive(Clone, Debug)]
 pub struct ProductionTransportConfig {
     /// HTTP transport boundary mode.
