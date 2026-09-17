@@ -89,6 +89,11 @@ async fn child_main() {
             Arc::clone(&completion_committed),
             Arc::clone(&publish_release),
         )
+    } else if std::env::var("SMESH_TEST_BARRIER_MODE").as_deref() == Ok("pre-receive") {
+        DurableLoopbackEndpoint::with_pre_receive_barrier(
+            Arc::clone(&barrier_started),
+            Arc::clone(&barrier_release),
+        )
     } else {
         DurableLoopbackEndpoint::new()
     };
@@ -120,12 +125,21 @@ async fn child_main() {
             smesh_a2a::authorize_request,
         ))
         .layer(axum::middleware::from_fn(inject_server_principal));
-    if std::env::var("SMESH_TEST_BARRIER_MODE").as_deref() == Ok("race") {
+    if matches!(
+        std::env::var("SMESH_TEST_BARRIER_MODE").as_deref(),
+        Ok("race" | "pre-receive")
+    ) {
+        let pre_receive = std::env::var("SMESH_TEST_BARRIER_MODE").as_deref() == Ok("pre-receive");
         let label = replica.clone();
         let started = Arc::clone(&barrier_started);
         tokio::spawn(async move {
             started.notified().await;
-            println!("CHECKPOINT {label} before-effect");
+            let phase = if pre_receive {
+                "before-receive"
+            } else {
+                "after-receive-before-effect"
+            };
+            println!("CHECKPOINT {label} {phase}");
             std::io::stdout().flush().unwrap();
         });
         let label = replica.clone();
@@ -179,8 +193,19 @@ async fn child_main() {
         .unwrap()
         .unwrap();
     ticker.shutdown().await.unwrap();
-    gateway.shutdown().await.unwrap();
-    println!("STOPPED {replica}");
+    if replica == "post-shutdown" {
+        let error = gateway
+            .shutdown()
+            .await
+            .expect_err("admitted shutdown remains unresolved");
+        assert_eq!(error.code, -32603);
+        assert_eq!(error.message, "durable post-receive outcome is unresolved");
+        assert_eq!(error.details, None);
+        println!("UNRESOLVED {replica}");
+    } else {
+        gateway.shutdown().await.unwrap();
+        println!("STOPPED {replica}");
+    }
 }
 
 struct Replica {
@@ -271,6 +296,19 @@ impl Replica {
     fn command(&mut self, value: &str, checkpoint: &str) {
         self.send(value);
         self.wait_checkpoint(checkpoint);
+    }
+
+    fn join_stopped(&mut self) {
+        assert!(
+            self.child
+                .wait_timeout(WATCHDOG)
+                .unwrap()
+                .expect("shutdown child must exit")
+                .success()
+        );
+        if let Some(reader) = self.reader.take() {
+            reader.join().unwrap();
+        }
     }
 
     fn kill_and_reap(&mut self) {
@@ -481,7 +519,7 @@ async fn two_independent_postgres_gateway_processes_share_authority_and_survive_
         assert!(response.status().is_success());
         response.text().await.unwrap()
     });
-    winner.wait_checkpoint("CHECKPOINT winner-b before-effect");
+    winner.wait_checkpoint("CHECKPOINT winner-b after-receive-before-effect");
     let mut competitor = Replica::spawn("competitor-c", &schema, &admin, &runtime, None, false);
     competitor.command("GO", "GO_ACK competitor-c");
 
@@ -588,7 +626,7 @@ async fn two_independent_postgres_gateway_processes_share_authority_and_survive_
         &schema,
         &admin,
         &runtime,
-        Some("race"),
+        Some("pre-receive"),
         false,
     );
     shutdown_subscriber.command("GO", "GO_ACK shutdown-subscriber");
@@ -611,7 +649,15 @@ async fn two_independent_postgres_gateway_processes_share_authority_and_survive_
         .or_else(|| shutdown_admitted["result"]["id"].as_str())
         .unwrap()
         .to_owned();
-    shutdown_winner.wait_checkpoint("CHECKPOINT shutdown-winner before-effect");
+    shutdown_winner.wait_checkpoint("CHECKPOINT shutdown-winner before-receive");
+    let receivers: i64 = super_client.query_one(
+        &format!("SELECT count(*) FROM {schema}.receiver_inbox WHERE tenant_scope='tenant-process' AND task_id=$1"),
+        &[&shutdown_task],
+    ).await.unwrap().get(0);
+    assert_eq!(
+        receivers, 0,
+        "safe shutdown requeue requires a genuinely pre-receive barrier"
+    );
     let shutdown_row = super_client.query_one(
         &format!("SELECT dispatch_id,lease_until FROM {schema}.outbox WHERE tenant_scope='tenant-process' AND task_id=$1"),
         &[&shutdown_task],
@@ -630,7 +676,7 @@ async fn two_independent_postgres_gateway_processes_share_authority_and_survive_
         }
     }).await.expect("shutdown sender renewal must cross original expiry");
     shutdown_winner.command("STOP", "STOPPED shutdown-winner");
-    shutdown_winner.kill_and_reap();
+    shutdown_winner.join_stopped();
     let requeued = super_client.query_one(
         &format!("SELECT state,lease_owner,lease_token,lease_until,available_at<={schema}.db_millis() FROM {schema}.outbox WHERE tenant_scope='tenant-process' AND dispatch_id=$1"),
         &[&shutdown_dispatch],
@@ -672,6 +718,17 @@ async fn two_independent_postgres_gateway_processes_share_authority_and_survive_
     })
     .await
     .expect("shutdown recovery must finish before the outage scenario");
+    let recovered = super_client.query_one(
+        &format!("SELECT o.state,r.state,(SELECT count(*) FROM {schema}.loopback_effects WHERE tenant_scope=o.tenant_scope AND dispatch_id=o.dispatch_id) FROM {schema}.outbox o JOIN {schema}.receiver_inbox r USING(tenant_scope,dispatch_id) WHERE o.tenant_scope='tenant-process' AND o.dispatch_id=$1"),
+        &[&shutdown_dispatch],
+    ).await.unwrap();
+    assert_eq!(recovered.get::<_, String>(0), "delivered");
+    assert_eq!(recovered.get::<_, String>(1), "completed");
+    assert_eq!(
+        recovered.get::<_, i64>(2),
+        1,
+        "safe pre-receive requeue produces exactly one effect"
+    );
     shutdown_subscriber.command("STOP", "STOPPED shutdown-subscriber");
     shutdown_subscriber.kill_and_reap();
     shutdown_recovery.command("STOP", "STOPPED shutdown-recovery");
@@ -704,7 +761,7 @@ async fn two_independent_postgres_gateway_processes_share_authority_and_survive_
         .or_else(|| outage_admitted["result"]["id"].as_str())
         .unwrap_or_else(|| panic!("unexpected outage admission: {outage_admitted}"))
         .to_owned();
-    outage_winner.wait_checkpoint("CHECKPOINT outage-winner before-effect");
+    outage_winner.wait_checkpoint("CHECKPOINT outage-winner after-receive-before-effect");
     let outage_row = super_client.query_one(
         &format!("SELECT r.dispatch_id,r.lease_until FROM {schema}.receiver_inbox r JOIN {schema}.outbox o USING(tenant_scope,dispatch_id) WHERE r.tenant_scope='tenant-process' AND r.task_id=$1 AND r.state='processing'"),
         &[&outage_task],
@@ -824,6 +881,62 @@ async fn two_independent_postgres_gateway_processes_share_authority_and_survive_
     assert_eq!(outage_effects, 1);
     outage_recovery.command("STOP", "STOPPED outage-recovery");
     outage_recovery.kill_and_reap();
+
+    // Shutdown is not task cancellation. Once a receiver exists, the sender
+    // must remain unresolved even though the loopback processor confirms stop.
+    let mut unresolved = Replica::spawn(
+        "post-shutdown",
+        &schema,
+        &admin,
+        &runtime,
+        Some("race"),
+        false,
+    );
+    unresolved.command("GO", "GO_ACK post-shutdown");
+    let unresolved_send = serde_json::json!({
+        "jsonrpc":"2.0","id":"post-shutdown","method":a2a::jsonrpc::methods::SEND_MESSAGE,
+        "params":{"message":{"messageId":"post-shutdown-message","role":"ROLE_USER","parts":[{"text":"post receive shutdown"}]},"configuration":{"returnImmediately":true}}
+    });
+    let admitted = json(
+        client
+            .post(format!("http://127.0.0.1:{}/jsonrpc", unresolved.port))
+            .json(&unresolved_send),
+    )
+    .await;
+    let task_id = admitted["result"]["task"]["id"]
+        .as_str()
+        .or_else(|| admitted["result"]["id"].as_str())
+        .unwrap();
+    unresolved.wait_checkpoint("CHECKPOINT post-shutdown after-receive-before-effect");
+    let before = super_client.query_one(
+        &format!("SELECT o.dispatch_id,o.attempt_count,r.state FROM {schema}.outbox o JOIN {schema}.receiver_inbox r USING(tenant_scope,dispatch_id) WHERE o.tenant_scope='tenant-process' AND o.task_id=$1"), &[&task_id],
+    ).await.unwrap();
+    let dispatch: String = before.get(0);
+    let attempts: i64 = before.get(1);
+    assert_eq!(before.get::<_, String>(2), "processing");
+    unresolved.command("STOP", "UNRESOLVED post-shutdown");
+    unresolved.join_stopped();
+    let after = super_client.query_one(
+        &format!("SELECT o.state,o.attempt_count,r.state,t.state,(SELECT count(*) FROM {schema}.loopback_effects WHERE tenant_scope=o.tenant_scope AND dispatch_id=o.dispatch_id),(SELECT count(*) FROM {schema}.cancellation_intents WHERE tenant_scope=o.tenant_scope AND task_id=o.task_id) FROM {schema}.outbox o JOIN {schema}.receiver_inbox r USING(tenant_scope,dispatch_id) JOIN {schema}.tasks t ON t.tenant_scope=o.tenant_scope AND t.task_id=o.task_id WHERE o.tenant_scope='tenant-process' AND o.dispatch_id=$1"), &[&dispatch],
+    ).await.unwrap();
+    assert_eq!(after.get::<_, String>(0), "leased");
+    assert_eq!(
+        after.get::<_, i64>(1),
+        attempts,
+        "shutdown must not retry admitted work"
+    );
+    assert_eq!(after.get::<_, String>(2), "processing");
+    assert_eq!(after.get::<_, String>(3), "\"TASK_STATE_SUBMITTED\"");
+    assert_eq!(
+        after.get::<_, i64>(4),
+        0,
+        "no duplicate or fabricated effect"
+    );
+    assert_eq!(
+        after.get::<_, i64>(5),
+        0,
+        "shutdown creates no cancellation authority"
+    );
     drop(super_client);
     connection.abort();
     PostgresTaskStore::drop_test_schema(&cleanup).await.unwrap();

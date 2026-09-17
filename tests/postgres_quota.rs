@@ -203,23 +203,741 @@ async fn seed_fair_outbox(client: &tokio_postgres::Client, schema: &str, tenant:
     client.execute(&format!("INSERT INTO {schema}.outbox(dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,attempt_count,max_attempts,available_at,created_at,updated_at,dispatch_identity_version) VALUES($1,$2,$3,$4,1,$5,$6,'pending',0,3,1,1,1,1)"), &[&dispatch,&tenant,&admission.task.id,&admission.request.message.message_id,&payload,&smesh_a2a::content_digest(payload.as_bytes())]).await.unwrap();
 }
 
-fn audit(suffix: &str) -> AuthorizationAuditInput {
+fn audit_for_policy(
+    command: &SendMessageAdmission,
+    suffix: &str,
+    operation: &str,
+    policy_id: &str,
+    policy_revision: u64,
+    policy_digest: &str,
+) -> AuthorizationAuditInput {
+    let request_digest = smesh_a2a::canonical_send_message_digest_v2(
+        "tenant-race",
+        "account-race",
+        &command.request,
+        command.streaming,
+    )
+    .unwrap();
     AuthorizationAuditInput::new(
         format!("audit-{suffix}"),
         "tenant-race",
         "account-race",
-        "authz-policy",
-        1,
-        "authz-digest",
-        "TaskCreate",
+        policy_id,
+        policy_revision,
+        policy_digest,
+        operation,
         AuthorizationDecisionEffect::Allow,
         "policy_grant",
-        "message",
-        format!("resource-{suffix}"),
+        "send-message-request",
+        request_digest,
         None,
         1_700_000_000_000,
     )
     .unwrap()
+}
+
+fn audit_for(
+    command: &SendMessageAdmission,
+    suffix: &str,
+    operation: &str,
+) -> AuthorizationAuditInput {
+    audit_for_policy(
+        command,
+        suffix,
+        operation,
+        "authz-policy",
+        1,
+        "authz-digest",
+    )
+}
+
+fn audit(suffix: &str) -> AuthorizationAuditInput {
+    audit_for(&command(suffix), suffix, "TaskCreate")
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn runtime_authority_context_reloads_postgres_rows() {
+    Box::pin(tokio::time::timeout(Duration::from_secs(30), async {
+        let Some(admin) = admin_url() else {
+            return;
+        };
+        let runtime = env::var("SMESH_TEST_POSTGRES_RUNTIME_URL").unwrap();
+        let schema = format!("smesh_runtime_authority_{:016x}", rand::random::<u64>());
+        let quota_policy = policy();
+        let config = PostgresStoreConfig::new(&admin, &runtime, &schema)
+            .unwrap()
+            .with_test_only_insecure_loopback(true)
+            .with_quota_policy(Arc::clone(&quota_policy));
+        let store = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
+        let scope = OwnedTaskScope::new_with_principal_and_authentication(
+            "tenant-race",
+            "account-race",
+            "principal-race",
+            VisibilityScope::Tenant,
+            "bearer-jwt",
+        )
+        .unwrap();
+        let subject = QuotaSubject::new("tenant-race", "account-race", "principal-race").unwrap();
+        let mut admission = command("runtime-authority");
+        admission.streaming = true;
+        let bytes = serde_json::to_vec(&admission.request).unwrap().len() as u64;
+        let intent = quota_policy
+            .admission_intent(&subject, "runtime-authority", bytes, admission.streaming)
+            .unwrap();
+        store
+            .authorize_and_admit_mutation(
+                &scope,
+                AuthorizedMutation::with_quota_intent(admission.clone(), intent.clone()),
+                audit_for(&admission, "runtime-authority", "TaskCreate"),
+            )
+            .await
+            .unwrap();
+        let mut accounting_config = tokio_postgres::Config::from_str(&admin).unwrap();
+        accounting_config.options(format!(
+            "-c search_path={schema},pg_catalog -c smesh.tenant_scope=tenant-race -c smesh.internal_global=diag-v1"
+        ));
+        let (accounting_client, accounting_connection) =
+            accounting_config.connect(tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(async move {
+            let _ = accounting_connection.await;
+        });
+        let principal_bytes: i64 = accounting_client
+            .query_one(
+                "SELECT retained_bytes FROM retained_authority_usage WHERE tenant_scope='tenant-race' AND scope_kind='principal' AND scope_id='principal-race'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(principal_bytes > 0);
+        let attribution = accounting_client
+            .query_one(
+                "SELECT count(*),count(*) FILTER (WHERE retained_principal(to_jsonb(i))='principal-race') FROM idempotency_records i WHERE authorization_principal_scope='principal-race'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(attribution.get::<_, i64>(0), 1);
+        assert_eq!(attribution.get::<_, i64>(1), 1);
+        let sender = store
+            .claim_outbox("runtime-authority-sender", admission.now + 1, 60_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload_digest =
+            smesh_a2a::content_digest(&serde_json::to_vec(&sender.request).unwrap());
+        let receiver = match store
+            .begin_receive(
+                smesh_a2a::DurableDispatchEnvelope {
+                    tenant_scope: sender.tenant_scope.clone(),
+                    dispatch_id: sender.dispatch_id.clone(),
+                    payload_digest,
+                    request: sender.request.clone(),
+                    execution_reservation: sender.execution_reservation.clone(),
+                },
+                "runtime-authority-receiver",
+                admission.now + 2,
+                60_000,
+            )
+            .await
+            .unwrap()
+        {
+            ReceiverAdmission::Execute(lease) => lease,
+            other => panic!("expected receiver execution, got {other:?}"),
+        };
+        let authority_now = admission.now + 2;
+
+        let context = store
+            .load_runtime_authority_context(&sender, &receiver, authority_now)
+            .await
+            .unwrap();
+        assert_eq!(context.request(), &sender.request);
+        assert_eq!(context.transport_payload_digest(), receiver.payload_digest);
+        assert_eq!(
+            context.authorized_request_digest(),
+            smesh_a2a::canonical_send_message_digest_v2(
+                "tenant-race",
+                "account-race",
+                &admission.request,
+                true,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            context.transport_payload_digest(),
+            context.authorized_request_digest()
+        );
+        assert_eq!(context.scope().tenant_scope(), "tenant-race");
+        assert_eq!(context.scope().account_id(), "account-race");
+        assert_eq!(context.scope().principal_scope(), "principal-race");
+        assert_eq!(context.scope().authentication_method(), "bearer-jwt");
+        assert_eq!(context.scope().visibility(), VisibilityScope::Tenant);
+        assert_eq!(context.scope().authorization_policy_id(), "authz-policy");
+        assert_eq!(context.scope().authorization_policy_revision(), 1);
+        assert_eq!(
+            context.scope().authorization_policy_digest(),
+            "authz-digest"
+        );
+        assert_eq!(
+            context.production_reservation(),
+            sender.execution_reservation.as_ref()
+        );
+        assert_eq!(
+            context.budget(),
+            sender.execution_reservation.as_ref().unwrap().budget
+        );
+        assert!(
+            receiver.lease_until > sender.lease_until,
+            "receiver lease must remain live at sender expiry"
+        );
+        let error = store
+            .load_runtime_authority_context(&sender, &receiver, sender.lease_until)
+            .await
+            .expect_err("expired sender must fail while receiver remains live");
+        assert_eq!(error.code, -32603);
+        assert_eq!(error.message, "durable runtime authority unavailable");
+        assert!(error.details.is_none());
+        let mut renewed_sender = sender.clone();
+        renewed_sender.lease_until = receiver.lease_until + 60_000;
+        let (renew_client, renew_connection) =
+            tokio_postgres::connect(&admin, tokio_postgres::NoTls)
+                .await
+                .unwrap();
+        let renew_driver = tokio::spawn(renew_connection);
+        renew_client
+            .query_one(
+                "SELECT set_config('smesh.internal_global','diag-v1',false),
+                        set_config('smesh.tenant_scope','tenant-race',false)",
+                &[],
+            )
+            .await
+            .unwrap();
+        let initial_evidence = renew_client
+            .query_one(
+                &format!(
+                    "SELECT d.decision_id,d.operation,d.resource_kind,d.resource_digest,
+                            d.actor_account_id,d.policy_id,d.policy_revision,d.policy_digest,
+                            i.authorization_principal_scope,i.authorization_authentication_method,
+                            i.authorization_visibility
+                     FROM {schema}.idempotency_records i
+                     JOIN {schema}.authorization_decisions d
+                       ON d.tenant_scope=i.tenant_scope
+                      AND d.decision_id=i.authorization_decision_id
+                     WHERE i.tenant_scope='tenant-race' AND i.task_id=$1"
+                ),
+                &[&admission.task.id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial_evidence.get::<_, &str>(0), "audit-runtime-authority");
+        assert_eq!(initial_evidence.get::<_, &str>(1), "TaskCreate");
+        assert_eq!(initial_evidence.get::<_, &str>(2), "send-message-request");
+        assert_eq!(initial_evidence.get::<_, &str>(3), context.authorized_request_digest());
+        assert_eq!(initial_evidence.get::<_, &str>(4), "account-race");
+        assert_eq!(initial_evidence.get::<_, &str>(5), "authz-policy");
+        assert_eq!(initial_evidence.get::<_, i64>(6), 1);
+        assert_eq!(initial_evidence.get::<_, &str>(7), "authz-digest");
+        assert_eq!(initial_evidence.get::<_, &str>(8), "principal-race");
+        assert_eq!(initial_evidence.get::<_, &str>(9), "bearer-jwt");
+        assert_eq!(initial_evidence.get::<_, &str>(10), "tenant");
+        renew_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.outbox DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage DISABLE ROW LEVEL SECURITY;"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            renew_client
+                .execute(
+                    &format!("UPDATE {schema}.outbox SET lease_until=$1 WHERE tenant_scope='tenant-race' AND outbox_id=$2 AND lease_until=$3"),
+                    &[&renewed_sender.lease_until, &sender.outbox_id, &sender.lease_until],
+                )
+                .await
+                .unwrap(),
+            1,
+            "sender lease renewal must durably apply"
+        );
+        renew_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.retained_authority_usage ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage FORCE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.outbox ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.outbox FORCE ROW LEVEL SECURITY;"
+            ))
+            .await
+            .unwrap();
+        drop(renew_client);
+        renew_driver.abort();
+        assert!(
+            renewed_sender.lease_until > receiver.lease_until,
+            "sender lease must remain live at receiver expiry"
+        );
+        let error = store
+            .load_runtime_authority_context(&renewed_sender, &receiver, receiver.lease_until)
+            .await
+            .expect_err("expired receiver must fail while sender remains live");
+        assert_eq!(error.code, -32603);
+        assert_eq!(error.message, "durable runtime authority unavailable");
+        assert!(error.details.is_none());
+        let sender = renewed_sender;
+
+        let mut runtime_config = tokio_postgres::Config::from_str(&runtime).unwrap();
+        runtime_config.options(format!(
+            "-c role={schema}_runtime -c smesh.tenant_scope=tenant-race -c smesh.account_id=account-race"
+        ));
+        let (runtime_client, runtime_connection) = runtime_config.connect(tokio_postgres::NoTls).await.unwrap();
+        let runtime_driver = tokio::spawn(runtime_connection);
+        for mutation in [
+            "principal_scope='forged-principal'",
+            "authentication_method='forged-authentication'",
+            "authorization_policy_id='forged-policy'",
+            "authorization_policy_revision=2",
+            "authorization_policy_digest='forged-digest'",
+            "visibility='own'",
+            "authorization_decision_id='forged-decision'",
+        ] {
+            let error = runtime_client
+                .execute(
+                    &format!("UPDATE {schema}.tasks SET {mutation} WHERE tenant_scope='tenant-race' AND task_id=$1"),
+                    &[&admission.task.id],
+                )
+                .await
+                .expect_err(mutation);
+            assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+                "runtime must have no effective UPDATE privilege for {mutation}"
+            );
+        }
+        drop(runtime_client);
+        runtime_driver.abort();
+
+        let context_json = serde_json::to_string(&context).unwrap();
+        for token in [
+            &sender.lease_token,
+            &receiver.lease_token,
+            &receiver.sender_lease_token,
+        ] {
+            assert!(!context_json.contains(token));
+        }
+        assert!(context_json.contains(context.transport_payload_digest()));
+        assert!(context_json.contains(context.authorized_request_digest()));
+
+        let mut sender_mutations = Vec::new();
+        let mut changed = sender.clone();
+        changed.lease_token.push_str("-stale");
+        sender_mutations.push(("sender token", changed));
+        let mut changed = sender.clone();
+        changed.attempt_no += 1;
+        sender_mutations.push(("sender attempt", changed));
+        let mut changed = sender.clone();
+        changed.lease_until -= 1;
+        sender_mutations.push(("sender expiry", changed));
+        let mut changed = sender.clone();
+        changed.task_id.push_str("-other");
+        sender_mutations.push(("sender identity", changed));
+        let mut changed = sender.clone();
+        changed.tenant_scope.push_str("-other");
+        sender_mutations.push(("sender tenant", changed));
+        let mut changed = sender.clone();
+        changed.request.text.push_str("-other");
+        sender_mutations.push(("sender request", changed));
+        let mut changed = sender.clone();
+        changed.ratification_required = !changed.ratification_required;
+        sender_mutations.push(("sender policy fence", changed));
+        let mut changed = sender.clone();
+        changed
+            .execution_reservation
+            .as_mut()
+            .unwrap()
+            .binding_digest
+            .push_str("-other");
+        sender_mutations.push(("sender reservation binding", changed));
+        let mut changed = sender.clone();
+        changed
+            .execution_reservation
+            .as_mut()
+            .unwrap()
+            .policy_digest
+            .push_str("-other");
+        sender_mutations.push(("sender reservation policy", changed));
+        for (label, changed) in sender_mutations {
+            assert_ne!(changed, sender, "{label} mutation must differ");
+            let error = store
+                .load_runtime_authority_context(&changed, &receiver, authority_now)
+                .await
+                .expect_err(label);
+            assert_eq!(error.code, -32603, "{label}");
+            assert_eq!(
+                error.message, "durable runtime authority unavailable",
+                "{label}"
+            );
+            assert!(error.details.is_none(), "{label}");
+        }
+
+        let mut receiver_mutations = Vec::new();
+        let mut changed = receiver.clone();
+        changed.lease_token.push_str("-stale");
+        receiver_mutations.push(("receiver token", changed));
+        let mut changed = receiver.clone();
+        changed.lease_epoch += 1;
+        receiver_mutations.push(("receiver epoch", changed));
+        let mut changed = receiver.clone();
+        changed.sender_lease_token.push_str("-stale");
+        receiver_mutations.push(("receiver sender binding", changed));
+        let mut changed = receiver.clone();
+        changed.sender_attempt_no += 1;
+        receiver_mutations.push(("receiver sender attempt", changed));
+        let mut changed = receiver.clone();
+        changed.payload_digest.push_str("-other");
+        receiver_mutations.push(("receiver digest", changed));
+        let mut changed = receiver.clone();
+        changed.tenant_scope.push_str("-other");
+        receiver_mutations.push(("receiver scope", changed));
+        let mut changed = receiver.clone();
+        changed.task_id.push_str("-other");
+        receiver_mutations.push(("receiver task identity", changed));
+        let mut changed = receiver.clone();
+        changed.dispatch_id.push_str("-other");
+        receiver_mutations.push(("receiver dispatch identity", changed));
+        let mut changed = receiver.clone();
+        changed.lease_until -= 1;
+        receiver_mutations.push(("receiver expiry", changed));
+        let mut changed = receiver.clone();
+        let reservation = changed.execution_reservation.as_mut().unwrap();
+        reservation.budget = smesh_a2a::ExecutionBudget::new(
+            reservation.budget.max_output_bytes() + 1,
+            reservation.budget.max_event_count(),
+        )
+        .unwrap();
+        receiver_mutations.push(("receiver reservation budget", changed));
+        for (label, changed) in receiver_mutations {
+            assert_ne!(changed, receiver, "{label} mutation must differ");
+            let error = store
+                .load_runtime_authority_context(&sender, &changed, authority_now)
+                .await
+                .expect_err(label);
+            assert_eq!(error.code, -32603, "{label}");
+            assert_eq!(
+                error.message, "durable runtime authority unavailable",
+                "{label}"
+            );
+            assert!(error.details.is_none(), "{label}");
+        }
+
+        let (admin_client, admin_connection) =
+            tokio_postgres::connect(&admin, tokio_postgres::NoTls).await.unwrap();
+        let admin_driver = tokio::spawn(admin_connection);
+        let set_task_policy = |policy: &str| {
+            format!(
+                "ALTER TABLE {schema}.tasks DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.tasks DISABLE TRIGGER tasks_runtime_authority_immutable;
+                 UPDATE {schema}.tasks SET authorization_policy_id='{policy}'
+                  WHERE tenant_scope='tenant-race' AND task_id='{}';
+                 ALTER TABLE {schema}.tasks ENABLE TRIGGER tasks_runtime_authority_immutable;
+                 ALTER TABLE {schema}.retained_authority_usage ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage FORCE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.tasks ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.tasks FORCE ROW LEVEL SECURITY;",
+                admission.task.id
+            )
+        };
+        admin_client
+            .batch_execute(&set_task_policy("privileged-contradiction"))
+            .await
+            .unwrap();
+        let still_causative = store
+            .load_runtime_authority_context(&sender, &receiver, authority_now)
+            .await
+            .expect("runtime authority must not be sourced from copied task admission provenance");
+        assert_eq!(still_causative.scope().authorization_policy_id(), "authz-policy");
+        admin_client
+            .batch_execute(&set_task_policy("authz-policy"))
+            .await
+            .unwrap();
+
+        admin_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.idempotency_records DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.idempotency_records DISABLE TRIGGER idempotency_runtime_authority_immutable;"
+            ))
+            .await
+            .unwrap();
+        let authorization_decision_id: String = admin_client
+            .query_one(
+                &format!("SELECT authorization_decision_id FROM {schema}.idempotency_records WHERE tenant_scope='tenant-race' AND task_id=$1"),
+                &[&admission.task.id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            admin_client
+                .execute(
+                    &format!("UPDATE {schema}.idempotency_records SET authorization_decision_id=NULL WHERE tenant_scope='tenant-race' AND task_id=$1"),
+                    &[&admission.task.id],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        admin_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.idempotency_records ENABLE TRIGGER idempotency_runtime_authority_immutable;
+                 ALTER TABLE {schema}.retained_authority_usage ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage FORCE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.idempotency_records ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.idempotency_records FORCE ROW LEVEL SECURITY;"
+            ))
+            .await
+            .unwrap();
+        let null_store = Arc::clone(&store);
+        let null_sender = sender.clone();
+        let null_receiver = receiver.clone();
+        let null_result = tokio::spawn(async move {
+            null_store
+                .load_runtime_authority_context(&null_sender, &null_receiver, authority_now)
+                .await
+        })
+        .await
+        .expect("legacy NULL authority load must not panic")
+        .expect_err("legacy NULL causative authority must remain non-executable");
+        assert_eq!(null_result.code, -32603);
+        assert_eq!(null_result.message, "durable runtime authority unavailable");
+        assert!(null_result.details.is_none());
+        admin_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.idempotency_records DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.idempotency_records DISABLE TRIGGER idempotency_runtime_authority_immutable;"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            admin_client
+                .execute(
+                    &format!("UPDATE {schema}.idempotency_records SET authorization_decision_id=$1 WHERE tenant_scope='tenant-race' AND task_id=$2"),
+                    &[&authorization_decision_id, &admission.task.id],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        admin_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.idempotency_records ENABLE TRIGGER idempotency_runtime_authority_immutable;
+                 ALTER TABLE {schema}.retained_authority_usage ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage FORCE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.idempotency_records ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.idempotency_records FORCE ROW LEVEL SECURITY;"
+            ))
+            .await
+            .unwrap();
+        drop(admin_client);
+        admin_driver.abort();
+
+        let mut substituted_request = sender.request.clone();
+        substituted_request.text = "coherently substituted executable text".to_owned();
+        let substituted_json = serde_json::to_string(&substituted_request).unwrap();
+        let substituted_digest = smesh_a2a::content_digest(substituted_json.as_bytes());
+        let mut substituted_sender = sender.clone();
+        let mut substituted_receiver = receiver.clone();
+        let (tamper_client, tamper_connection) =
+            tokio_postgres::connect(&admin, tokio_postgres::NoTls).await.unwrap();
+        let tamper_driver = tokio::spawn(tamper_connection);
+        tamper_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.outbox DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.receiver_inbox DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage DISABLE ROW LEVEL SECURITY;"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            tamper_client
+                .execute(
+                    &format!("UPDATE {schema}.outbox SET payload_json=$1,payload_digest=$2 WHERE tenant_scope='tenant-race' AND task_id=$3 AND state='leased'"),
+                    &[&substituted_json, &substituted_digest, &admission.task.id],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tamper_client
+                .execute(
+                    &format!("UPDATE {schema}.receiver_inbox SET payload_json=$1,payload_digest=$2 WHERE tenant_scope='tenant-race' AND task_id=$3 AND state='processing'"),
+                    &[&substituted_json, &substituted_digest, &admission.task.id],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        tamper_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.retained_authority_usage ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage FORCE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.receiver_inbox ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.receiver_inbox FORCE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.outbox ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.outbox FORCE ROW LEVEL SECURITY;"
+            ))
+            .await
+            .unwrap();
+        drop(tamper_client);
+        tamper_driver.abort();
+        substituted_sender.request = substituted_request;
+        substituted_receiver.payload_digest = substituted_digest;
+        let error = store
+            .load_runtime_authority_context(
+                &substituted_sender,
+                &substituted_receiver,
+                authority_now,
+            )
+            .await
+            .expect_err("causative request must bind executable semantics");
+        assert_eq!(error.code, -32603);
+        assert_eq!(error.message, "durable runtime authority unavailable");
+        assert!(error.details.is_none());
+
+        let original_json = serde_json::to_string(&sender.request).unwrap();
+        let original_digest = smesh_a2a::content_digest(original_json.as_bytes());
+        let (mut lock_client, lock_connection) =
+            tokio_postgres::connect(&superuser_url(), tokio_postgres::NoTls)
+                .await
+                .unwrap();
+        let lock_driver = tokio::spawn(lock_connection);
+        lock_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.outbox DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.receiver_inbox DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage DISABLE ROW LEVEL SECURITY;"
+            ))
+            .await
+            .unwrap();
+        lock_client
+            .execute(
+                &format!("UPDATE {schema}.outbox SET payload_json=$1,payload_digest=$2 WHERE tenant_scope='tenant-race' AND task_id=$3 AND state='leased'"),
+                &[&original_json, &original_digest, &admission.task.id],
+            )
+            .await
+            .unwrap();
+        lock_client
+            .execute(
+                &format!("UPDATE {schema}.receiver_inbox SET payload_json=$1,payload_digest=$2 WHERE tenant_scope='tenant-race' AND task_id=$3 AND state='processing'"),
+                &[&original_json, &original_digest, &admission.task.id],
+            )
+            .await
+            .unwrap();
+        lock_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.retained_authority_usage ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage FORCE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.receiver_inbox ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.receiver_inbox FORCE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.outbox ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.outbox FORCE ROW LEVEL SECURITY;"
+            ))
+            .await
+            .unwrap();
+        let lock_tx = lock_client.transaction().await.unwrap();
+        lock_tx
+            .query_one(
+                &format!(
+                    "SELECT 1 FROM {schema}.receiver_inbox WHERE tenant_scope=$1 AND dispatch_id=$2 FOR UPDATE"
+                ),
+                &[&receiver.tenant_scope, &receiver.dispatch_id],
+            )
+            .await
+            .unwrap();
+
+        let (mut cancel_client, cancel_connection) =
+            tokio_postgres::connect(&superuser_url(), tokio_postgres::NoTls)
+                .await
+                .unwrap();
+        let cancel_driver = tokio::spawn(cancel_connection);
+        let cancel_schema = schema.clone();
+        let cancel_receiver = receiver.clone();
+        let cancellation = tokio::spawn(async move {
+            let tx = cancel_client.transaction().await.unwrap();
+            tx.query_one(
+                &format!(
+                    "SELECT 1 /* cancellation-first-regression */ FROM {cancel_schema}.receiver_inbox WHERE tenant_scope=$1 AND dispatch_id=$2 FOR UPDATE"
+                ),
+                &[&cancel_receiver.tenant_scope, &cancel_receiver.dispatch_id],
+            )
+            .await
+            .unwrap();
+            tx.execute(
+                &format!(
+                    "INSERT INTO {cancel_schema}.cancellation_intents(tenant_scope,dispatch_id,task_id,state,requested_at) VALUES($1,$2,$3,'requested',{cancel_schema}.db_millis())"
+                ),
+                &[
+                    &cancel_receiver.tenant_scope,
+                    &cancel_receiver.dispatch_id,
+                    &cancel_receiver.task_id,
+                ],
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        });
+        let (monitor, monitor_connection) =
+            tokio_postgres::connect(&superuser_url(), tokio_postgres::NoTls)
+                .await
+                .unwrap();
+        let monitor_driver = tokio::spawn(monitor_connection);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = monitor
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE query LIKE '%cancellation-first-regression%' AND wait_event_type='Lock')",
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancellation did not queue on the receiver lock");
+        let completion_store = Arc::clone(&store);
+        let completion_receiver = receiver.clone();
+        let completion = tokio::spawn(async move {
+            completion_store
+                .complete_loopback_receive(
+                    &completion_receiver,
+                    &[smesh_a2a::MeshEvent::Completed {
+                        summary: "cancellation-first race".into(),
+                    }],
+                    authority_now + 1,
+                )
+                .await
+        });
+        lock_tx.commit().await.unwrap();
+        cancellation.await.unwrap();
+        let completion_error = completion
+            .await
+            .unwrap()
+            .expect_err("cancellation queued first must defeat terminal completion");
+        assert_eq!(completion_error.message, "receiver lease is stale");
+        cancel_driver.abort();
+        monitor_driver.abort();
+        lock_driver.abort();
+
+        drop(store);
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    }))
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1075,16 +1793,24 @@ async fn continuation_charges_its_typed_operation_once_without_second_active_all
         let subject =
             QuotaSubject::new("tenant-race", "account-race", "principal-race").unwrap();
 
-        let first = command("continuation");
+        let mut first = command("continuation");
+        first.streaming = true;
         let first_bytes = serde_json::to_vec(&first.request).unwrap().len() as u64;
         let first_intent = quota_policy
-            .admission_intent(&subject, "continuation", first_bytes, false)
+            .admission_intent(&subject, "continuation", first_bytes, first.streaming)
             .unwrap();
         store
             .authorize_and_admit_mutation(
                 &scope,
                 AuthorizedMutation::with_quota_intent(first.clone(), first_intent),
-                audit("continuation-create"),
+                audit_for_policy(
+                    &first,
+                    "continuation-create",
+                    "TaskCreate",
+                    "policy-p1",
+                    1,
+                    "digest-p1",
+                ),
             )
             .await
             .unwrap();
@@ -1116,10 +1842,18 @@ async fn continuation_charges_its_typed_operation_once_without_second_active_all
             )
             .await
             .unwrap();
+        client
+            .execute(
+                &format!("UPDATE {schema}.outbox SET state='superseded',updated_at=$1 WHERE tenant_scope='tenant-race' AND task_id='task-continuation' AND state='pending'"),
+                &[&first.now],
+            )
+            .await
+            .unwrap();
         drop(client);
         driver.abort();
 
         let mut followup = command("followup");
+        followup.streaming = true;
         followup.task = paused.clone();
         followup.original_result = a2a::SendMessageResponse::Task(paused.clone());
         followup.request.message.task_id = Some(paused.id.clone());
@@ -1133,14 +1867,272 @@ async fn continuation_charges_its_typed_operation_once_without_second_active_all
                 bytes,
             )
             .unwrap();
+        let continuation_audit = audit_for_policy(
+            &followup,
+            "continuation-followup",
+            "TaskContinue",
+            "policy-p2",
+            2,
+            "digest-p2",
+        );
         store
             .authorize_and_continue_mutation(
                 &scope,
-                AuthorizedMutation::with_quota_intent(followup, intent),
-                audit("continuation-followup"),
+                AuthorizedMutation::with_quota_intent(followup.clone(), intent),
+                continuation_audit.clone(),
             )
             .await
             .unwrap();
+
+        let continuation_sender = store
+            .claim_outbox("continuation-sender", followup.now + 2, 60_000)
+            .await
+            .unwrap()
+            .expect("continuation dispatch must be claimable");
+        let continuation_receiver = match store
+            .begin_receive(
+                smesh_a2a::DurableDispatchEnvelope {
+                    tenant_scope: continuation_sender.tenant_scope.clone(),
+                    dispatch_id: continuation_sender.dispatch_id.clone(),
+                    payload_digest: smesh_a2a::content_digest(
+                        &serde_json::to_vec(&continuation_sender.request).unwrap(),
+                    ),
+                    request: continuation_sender.request.clone(),
+                    execution_reservation: continuation_sender.execution_reservation.clone(),
+                },
+                "continuation-receiver",
+                followup.now + 3,
+                60_000,
+            )
+            .await
+            .unwrap()
+        {
+            ReceiverAdmission::Execute(lease) => lease,
+            other => panic!("expected continuation receiver execution, got {other:?}"),
+        };
+        let continuation_context = store
+            .load_runtime_authority_context(
+                &continuation_sender,
+                &continuation_receiver,
+                followup.now + 3,
+            )
+            .await
+            .expect("continuation must load its own causative P2 authority");
+        assert_eq!(
+            continuation_context.scope().authorization_policy_id(),
+            "policy-p2"
+        );
+        assert_eq!(
+            continuation_context.scope().authorization_policy_revision(),
+            2
+        );
+        assert_eq!(
+            continuation_context.scope().authorization_policy_digest(),
+            "digest-p2"
+        );
+        assert_eq!(continuation_context.scope().principal_scope(), "account-race");
+        assert_eq!(
+            continuation_context.scope().authentication_method(),
+            "trusted-local"
+        );
+        assert_eq!(continuation_context.scope().visibility(), VisibilityScope::Own);
+        assert_eq!(
+            continuation_context.authorized_request_digest(),
+            smesh_a2a::canonical_send_message_digest_v2(
+                "tenant-race",
+                "account-race",
+                &followup.request,
+                followup.streaming,
+            )
+            .unwrap()
+        );
+        let unrelated = AuthorizationAuditInput::new(
+            "audit-continuation-unrelated",
+            "tenant-race",
+            "account-race",
+            "policy-p2",
+            2,
+            "digest-p2",
+            "TaskGet",
+            AuthorizationDecisionEffect::Allow,
+            "unrelated allow",
+            "send-message-request",
+            continuation_context.authorized_request_digest(),
+            Some(followup.task.id.clone()),
+            followup.now,
+        )
+        .unwrap();
+        store
+            .append_authorization_decision(unrelated)
+            .await
+            .unwrap();
+        let unary_digest = smesh_a2a::canonical_send_message_digest_v2(
+            "tenant-race",
+            "account-race",
+            &followup.request,
+            false,
+        )
+        .unwrap();
+        assert_ne!(unary_digest, continuation_context.authorized_request_digest());
+        let unary_substitute = AuthorizationAuditInput::new(
+            "audit-continuation-unary-substitute",
+            "tenant-race",
+            "account-race",
+            "policy-p2",
+            2,
+            "digest-p2",
+            "TaskContinue",
+            AuthorizationDecisionEffect::Allow,
+            "unary substitution",
+            "send-message-request",
+            unary_digest,
+            None,
+            followup.now,
+        )
+        .unwrap();
+        store
+            .append_authorization_decision(unary_substitute)
+            .await
+            .unwrap();
+        let (tamper_client, tamper_connection) =
+            tokio_postgres::connect(&admin, tokio_postgres::NoTls)
+                .await
+                .unwrap();
+        let tamper_driver = tokio::spawn(tamper_connection);
+        tamper_client
+            .query_one(
+                "SELECT set_config('smesh.internal_global','diag-v1',false),
+                        set_config('smesh.tenant_scope','tenant-race',false)",
+                &[],
+            )
+            .await
+            .unwrap();
+        let continuation_evidence = tamper_client
+            .query_one(
+                &format!(
+                    "SELECT d.decision_id,d.operation,d.resource_kind,d.resource_digest,
+                            d.actor_account_id,d.policy_id,d.policy_revision,d.policy_digest,
+                            i.authorization_principal_scope,i.authorization_authentication_method,
+                            i.authorization_visibility
+                     FROM {schema}.idempotency_records i
+                     JOIN {schema}.authorization_decisions d
+                       ON d.tenant_scope=i.tenant_scope
+                      AND d.decision_id=i.authorization_decision_id
+                     WHERE d.decision_id=$1"
+                ),
+                &[&continuation_audit.decision_id()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(continuation_evidence.get::<_, &str>(0), continuation_audit.decision_id());
+        assert_eq!(continuation_evidence.get::<_, &str>(1), "TaskContinue");
+        assert_eq!(continuation_evidence.get::<_, &str>(2), "send-message-request");
+        assert_eq!(
+            continuation_evidence.get::<_, &str>(3),
+            continuation_context.authorized_request_digest()
+        );
+        assert_eq!(continuation_evidence.get::<_, &str>(4), "account-race");
+        assert_eq!(continuation_evidence.get::<_, &str>(5), "policy-p2");
+        assert_eq!(continuation_evidence.get::<_, i64>(6), 2);
+        assert_eq!(continuation_evidence.get::<_, &str>(7), "digest-p2");
+        assert_eq!(continuation_evidence.get::<_, &str>(8), "account-race");
+        assert_eq!(continuation_evidence.get::<_, &str>(9), "trusted-local");
+        assert_eq!(continuation_evidence.get::<_, &str>(10), "own");
+        tamper_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.idempotency_records DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage DISABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.idempotency_records DISABLE TRIGGER idempotency_runtime_authority_immutable;"
+            ))
+            .await
+            .unwrap();
+        let set_continuation_authority = |decision: &str, policy: &str, revision: i64, digest: &str| {
+            format!(
+                "UPDATE {schema}.idempotency_records SET authorization_decision_id='{decision}',authorization_policy_id='{policy}',authorization_policy_revision={revision},authorization_policy_digest='{digest}' WHERE tenant_scope='tenant-race' AND task_id='task-continuation' AND message_id<>'{}'",
+                smesh_a2a::authorized_message_identity("tenant-race", "account-race", &first.request.message.message_id)
+            )
+        };
+        tamper_client
+            .batch_execute(&set_continuation_authority(
+                "audit-continuation-create",
+                "policy-p1",
+                1,
+                "digest-p1",
+            ))
+            .await
+            .unwrap();
+        let error = store
+            .load_runtime_authority_context(
+                &continuation_sender,
+                &continuation_receiver,
+                followup.now + 3,
+            )
+            .await
+            .expect_err("coherent substitution of initial P1 must not authorize continuation");
+        assert_eq!(
+            (error.code, error.message.as_str(), error.details),
+            (-32603, "durable runtime authority unavailable", None)
+        );
+        tamper_client
+            .batch_execute(&set_continuation_authority(
+                "audit-continuation-unary-substitute",
+                "policy-p2",
+                2,
+                "digest-p2",
+            ))
+            .await
+            .unwrap();
+        let error = store
+            .load_runtime_authority_context(
+                &continuation_sender,
+                &continuation_receiver,
+                followup.now + 3,
+            )
+            .await
+            .expect_err("unary decision digest must not authorize streaming continuation");
+        assert_eq!(
+            (error.code, error.message.as_str(), error.details),
+            (-32603, "durable runtime authority unavailable", None)
+        );
+        tamper_client
+            .batch_execute(&set_continuation_authority(
+                "audit-continuation-unrelated",
+                "policy-p2",
+                2,
+                "digest-p2",
+            ))
+            .await
+            .unwrap();
+        let error = store
+            .load_runtime_authority_context(
+                &continuation_sender,
+                &continuation_receiver,
+                followup.now + 3,
+            )
+            .await
+            .expect_err("allow for another operation must not authorize continuation");
+        assert_eq!((error.code, error.message.as_str(), error.details), (-32603, "durable runtime authority unavailable", None));
+        tamper_client
+            .batch_execute(&set_continuation_authority(
+                continuation_audit.decision_id(),
+                "policy-p2",
+                2,
+                "digest-p2",
+            ))
+            .await
+            .unwrap();
+        tamper_client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.idempotency_records ENABLE TRIGGER idempotency_runtime_authority_immutable;
+                 ALTER TABLE {schema}.retained_authority_usage ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.retained_authority_usage FORCE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.idempotency_records ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {schema}.idempotency_records FORCE ROW LEVEL SECURITY;"
+            ))
+            .await
+            .unwrap();
+        drop(tamper_client);
+        tamper_driver.abort();
 
         assert_eq!(
             store
@@ -1207,7 +2199,11 @@ async fn continuation_charges_its_typed_operation_once_without_second_active_all
         client.batch_execute(&format!("SET ROLE {schema}_runtime")).await.unwrap();
         client.query_one("SELECT set_config('smesh.tenant_scope','tenant-race',false),set_config('smesh.account_id','account-race',false)", &[]).await.unwrap();
         let states = client.query_one(&format!("SELECT count(*) FILTER (WHERE state='reserved'),count(*) FILTER (WHERE state='settled') FROM {schema}.quota_execution_reservations"), &[]).await.unwrap();
-        assert_eq!((states.get::<_, i64>(0), states.get::<_, i64>(1)), (0, 2));
+        assert_eq!(
+            (states.get::<_, i64>(0), states.get::<_, i64>(1)),
+            (1, 1),
+            "receiver-admitted continuation stays reserved for reconciliation while cancellation settles only the non-admitted allocation"
+        );
         drop(client);
         driver.abort();
 

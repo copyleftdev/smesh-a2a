@@ -8,7 +8,7 @@ use smesh_a2a::{
     ArtifactAuthority, ArtifactPublicationTestFault, ArtifactStoreConfig, AuthorityDiagnostics,
     AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput, AuthorizationAuditSink,
     AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead, DurableAuthority,
-    OutboxAuthority, OwnedTaskScope, PostgresStoreConfig, PostgresTaskStore,
+    LegacyTenantBinding, OutboxAuthority, OwnedTaskScope, PostgresStoreConfig, PostgresTaskStore,
     PostgresTransactionTestFault, QuotaReservationInput, ReceiverAuthority, SqliteTaskStore,
     TaskAdmission, TaskLifecycle, TranscriptAuthority, VisibilityScope,
 };
@@ -23,8 +23,8 @@ use support::authority_row_parity::{
     dump_sqlite,
 };
 use support::durable_authority_conformance::{
-    run_continuation_cancellation_conformance, run_durable_authority_command_conformance,
-    run_durable_authority_command_conformance_open,
+    run_continuation_cancellation_conformance, run_durable_authority_command_conformance_open,
+    run_durable_authority_command_conformance_with_quota,
     run_quota_continuation_cancellation_conformance,
 };
 use support::row_parity_scenario::populate_pagination_and_active_cancellation;
@@ -503,6 +503,21 @@ postgres_test!(
 );
 
 #[test]
+fn cancellation_and_receiver_completion_share_the_receiver_row_lock() {
+    let source = include_str!("../src/postgres_store.rs");
+    assert!(source.contains(
+        "SELECT state,lease_until,sender_attempt_no,lease_epoch FROM __S__.receiver_inbox WHERE tenant_scope=$1 AND dispatch_id=$2 FOR UPDATE"
+    ));
+    let completion_lock = source
+        .find("SELECT 1 FROM __S__.receiver_inbox WHERE tenant_scope=$1 AND task_id=$2 AND dispatch_id=$3")
+        .unwrap();
+    let post_lock_cancellation = source
+        .find("SELECT EXISTS(SELECT 1 FROM __S__.cancellation_intents WHERE tenant_scope=$1 AND dispatch_id=$2 AND state='requested')")
+        .unwrap();
+    assert!(post_lock_cancellation > completion_lock);
+}
+
+#[test]
 fn postgres_config_redacts_both_migrator_and_runtime_urls() {
     let config = PostgresStoreConfig::new(
         "postgresql://migrator:migrator-canary@localhost/db",
@@ -676,11 +691,40 @@ fn retryable_growth_uses_materialized_quota_enforcement_without_global_hot_path_
 }
 
 #[test]
+fn runtime_authority_migration_rejects_structural_quota_overage() {
+    let migration = include_str!("../migrations/postgres/0012_runtime_authority_scope.sql");
+    assert!(
+        migration
+            .contains("ALTER TABLE __SCHEMA__.quota_policy_versions DISABLE ROW LEVEL SECURITY")
+    );
+    assert!(migration.contains(
+        "FROM __SCHEMA__.quota_policy_versions\n  WHERE tenant_scope=r.tenant_scope AND lifecycle='active'"
+    ));
+    assert!(migration.contains("retained_limit:=COALESCE(retained_limit,67108864)"));
+    assert!(migration.contains("IF r.retained_bytes>retained_limit THEN"));
+    assert!(migration.contains("USING ERRCODE='53000'"));
+    assert!(
+        migration
+            .contains("ALTER TABLE __SCHEMA__.quota_policy_versions ENABLE ROW LEVEL SECURITY")
+    );
+    assert!(
+        migration.contains("ALTER TABLE __SCHEMA__.quota_policy_versions FORCE ROW LEVEL SECURITY")
+    );
+    assert!(
+        migration.contains("CREATE OR REPLACE FUNCTION __SCHEMA__.cleanup_authorization_decisions")
+    );
+    assert!(migration.contains("i.authorization_decision_id=d.decision_id"));
+    assert!(migration.contains("runtime_outbox.state IN ('pending','leased')"));
+    assert!(migration.contains("CREATE INDEX idempotency_runtime_authorization_decision"));
+    assert!(migration.contains("idempotency_records(tenant_scope,authorization_decision_id)"));
+}
+
+#[test]
 fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist() {
     let source = include_str!("../src/postgres_store.rs");
     assert_eq!(
         source.matches(".transaction()").count() + source.matches(".build_transaction()").count(),
-        18,
+        19,
         "new direct transaction site must be routed through the bounded runner or explicitly reviewed"
     );
     assert_eq!(
@@ -700,6 +744,9 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
         "read-only callback semantic validation needs a transaction-local forced-RLS marker",
         "read-only indexed quota diagnostics for deterministic evidence",
         "read-only indexed scoped telemetry correlation lookup",
+        // Forced-RLS tenant marker plus tenant/message/task join and current lease-token fence;
+        // SELECT only, no durable writes or retry/commit ambiguity to route through the runner.
+        "read-only tenant-scoped lookup of a leased causative request",
         "policy reconciliation is startup-only, advisory-fenced, and atomically audited",
         "artifact orphan claim persists before unlink",
         "artifact orphan finalize fences exact ownership",
@@ -859,10 +906,22 @@ postgres_test!(
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let sqlite_path = root.join("authority.sqlite3");
+        let sqlite_binding = LegacyTenantBinding::new(
+            "tenant-conformance",
+            "owner-conformance",
+            "policy-conformance",
+            9,
+            "sha256:policy-conformance",
+        )
+        .unwrap();
         let sqlite = Arc::new(
-            SqliteTaskStore::open_with_audit_projection(&sqlite_path, 64)
-                .await
-                .unwrap(),
+            SqliteTaskStore::open_with_legacy_binding_and_audit_projection(
+                &sqlite_path,
+                64,
+                sqlite_binding.clone(),
+            )
+            .await
+            .unwrap(),
         );
         let sqlite_key = sqlite.completion_receipt_key();
 
@@ -931,9 +990,13 @@ postgres_test!(
             assert_eq!(sqlite_dump.counts[table], postgres_dump.counts[table]);
         }
 
-        let sqlite_reopened = SqliteTaskStore::open_with_audit_projection(&sqlite_path, 64)
-            .await
-            .unwrap();
+        let sqlite_reopened = SqliteTaskStore::open_with_legacy_binding_and_audit_projection(
+            &sqlite_path,
+            64,
+            sqlite_binding,
+        )
+        .await
+        .unwrap();
         assert_eq!(sqlite_reopened.completion_receipt_key(), sqlite_key);
         sqlite_reopened.shutdown().await.unwrap();
         let postgres_reopened = PostgresTaskStore::open(pg_config.clone()).await.unwrap();
@@ -968,10 +1031,32 @@ postgres_test!(
     postgres_runs_shared_durable_authority_command_conformance,
     {
         let Some(url) = admin_url() else { return };
-        let config = config(url, "conformance");
+        let quota_policy = Arc::new(
+            smesh_a2a::QuotaPolicy::from_json(
+                br#"{
+          "schemaVersion":"smesh-quota-policy/v1","policyId":"authority-conformance","revision":1,
+          "requestWindowMillis":60000,"reconnectWindowMillis":60000,
+          "limits":{
+            "requestCount":{"tenant":100,"account":100,"principal":100},
+            "concurrentActiveWork":{"tenant":100,"account":100,"principal":100},
+            "inputBytes":{"tenant":1048576,"account":1048576,"principal":1048576},
+            "outputBytes":{"tenant":1048576,"account":1048576,"principal":1048576},
+            "eventCount":{"tenant":1024,"account":1024,"principal":1024},
+            "concurrentStreams":{"tenant":100,"account":100,"principal":100},
+            "concurrentSubscriptions":{"tenant":100,"account":100,"principal":100},
+            "reconnectCount":{"tenant":100,"account":100,"principal":100},
+            "retainedAuthorityBytes":{"tenant":16777216,"account":16777216,"principal":16777216}
+          },"overrides":[]
+        }"#,
+            )
+            .unwrap(),
+        );
+        let config = config(url, "conformance")
+            .with_quota_policy(Arc::clone(&quota_policy))
+            .with_quota_enforcement(false);
         let store = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
         let authority: Arc<dyn DurableAuthority> = store;
-        run_durable_authority_command_conformance(authority).await;
+        run_durable_authority_command_conformance_with_quota(authority, quota_policy).await;
         PostgresTaskStore::drop_test_schema(&config).await.unwrap();
     }
 );
@@ -1713,7 +1798,10 @@ postgres_test!(startup_rejects_corrupt_task_event_history, {
     let config = config(url.clone(), "event_corruption");
     let store = Arc::new(PostgresTaskStore::open(config.clone()).await.unwrap());
     let authority: Arc<dyn DurableAuthority> = store;
-    run_durable_authority_command_conformance(authority).await;
+    // Event corruption needs durable history, not a production runtime reservation.
+    // The separate quota conformance fixture exercises strict runtime reload.
+    run_durable_authority_command_conformance_open(authority.clone()).await;
+    authority.shutdown().await.unwrap();
     let (client, driver) = admin_client(&superuser_url()).await;
     client
         .execute(

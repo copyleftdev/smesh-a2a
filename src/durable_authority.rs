@@ -1278,8 +1278,13 @@ pub enum ReceiverAdmission {
 #[allow(clippy::large_enum_variant)]
 pub enum CancellationOutcome {
     Canceled(Task),
+    /// A completed migrated receiver has authoritative replay but no persisted
+    /// runtime attempt identity. Await publication without signaling a runtime.
+    LegacyReplayOnly {
+        message_id: String,
+    },
     AwaitReceiver {
-        dispatch_id: String,
+        correlation: crate::DurableDispatchCorrelation,
         message_id: String,
     },
 }
@@ -1847,6 +1852,11 @@ pub trait TaskLifecycle: Send + Sync {
 
 #[async_trait]
 pub trait OutboxAuthority: Send + Sync {
+    async fn causative_request_digest(&self, _lease: &OutboxLease) -> Result<String, A2AError> {
+        Err(A2AError::unsupported_operation(
+            "causative request digest is unavailable",
+        ))
+    }
     async fn claim_outbox(
         &self,
         lease_owner: &str,
@@ -1859,6 +1869,12 @@ pub trait OutboxAuthority: Send + Sync {
         lease_duration: i64,
     ) -> Result<LeaseRenewalOutcome, A2AError>;
     async fn task_for_outbox(&self, lease: &OutboxLease) -> Result<Option<Task>, A2AError>;
+    async fn load_runtime_authority_context(
+        &self,
+        outbox_lease: &OutboxLease,
+        receiver_lease: &ReceiverLease,
+        now: i64,
+    ) -> Result<crate::DurableRuntimeAuthorityContext, A2AError>;
     /// Optional source-compatible observability capability. Implementations should
     /// return correlation from the same scoped authoritative rows as the claim.
     async fn telemetry_correlation_for_outbox(

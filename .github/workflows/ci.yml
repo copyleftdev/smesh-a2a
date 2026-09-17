@@ -33,6 +33,27 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: smesh-ci-postgres
+          POSTGRES_DB: smesh_test
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SMESH_TEST_POSTGRES_SUPERUSER_URL: postgresql://postgres:smesh-ci-postgres@127.0.0.1:55432/smesh_test
+      SMESH_TEST_POSTGRES_ADMIN_URL: postgresql://smesh_migrator:smesh-ci-migrator@127.0.0.1:55432/smesh_test
+      SMESH_TEST_POSTGRES_RUNTIME_URL: postgresql://smesh_test_runtime:smesh-ci-runtime@127.0.0.1:55432/smesh_test
+      SMESH_TEST_POSTGRES_QUOTED_MIGRATOR_URL: postgresql://smesh%27mig%5Cqa:smesh-ci-quoted@127.0.0.1:55432/smesh_test
+      SMESH_POSTGRES_TEST_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v5
         with:
@@ -41,6 +62,19 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Provision required runtime-authority PostgreSQL fixture
+        env:
+          PGPASSWORD: smesh-ci-postgres
+        run: |
+          pg_isready -h 127.0.0.1 -p 55432 -U postgres -d smesh_test
+          psql -h 127.0.0.1 -p 55432 -U postgres -d smesh_test -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE smesh_migrator LOGIN PASSWORD 'smesh-ci-migrator' NOSUPERUSER NOBYPASSRLS NOCREATEDB CREATEROLE NOREPLICATION NOINHERIT;
+          CREATE ROLE smesh_test_runtime LOGIN PASSWORD 'smesh-ci-runtime' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT;
+          GRANT CREATE ON DATABASE smesh_test TO smesh_migrator;
+          CREATE ROLE "smesh'mig\qa" LOGIN PASSWORD 'smesh-ci-quoted' NOSUPERUSER NOBYPASSRLS NOCREATEDB CREATEROLE NOREPLICATION NOINHERIT;
+          ALTER ROLE "smesh'mig\qa" SET standard_conforming_strings=off;
+          GRANT CREATE ON DATABASE smesh_test TO "smesh'mig\qa";
+          SQL
       - name: Provision qualification process tooling
         run: |
           sudo timeout --signal=TERM --kill-after=10s 2m apt-get update
@@ -58,9 +92,30 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --all-targets --all-features
+        run: |
+          # Migration startup shares bounded database advisory locks. Exercise
+          # every PG-enabled binary completely and serially before the ordinary
+          # aggregate, which must retain default-parallel non-PG race coverage.
+          for target in \
+            artifact_migration authorized_gateway_process callback_authority \
+            human_ratification_process postgres_artifact_process \
+            postgres_authorization_retention postgres_multi_replica \
+            postgres_observability_process postgres_push_process postgres_quota \
+            postgres_quota_process postgres_ratification postgres_runtime_builder \
+            postgres_store runtime_authority_matrix telemetry_audit_projection; do
+            cargo test --locked --all-features --test "$target" -- --test-threads=1
+          done
+          unset SMESH_TEST_POSTGRES_SUPERUSER_URL SMESH_TEST_POSTGRES_ADMIN_URL \
+            SMESH_TEST_POSTGRES_RUNTIME_URL SMESH_TEST_POSTGRES_QUOTED_MIGRATOR_URL \
+            SMESH_TEST_POSTGRES_REQUIRED SMESH_POSTGRES_TEST_REQUIRED
+          cargo test --all-targets --all-features
       - name: Release all-target/all-feature suite
-        run: cargo test --release --locked --all-targets --all-features -- --test-threads=1
+        run: |
+          # Each step inherits job env anew; remove PG again for this aggregate.
+          unset SMESH_TEST_POSTGRES_SUPERUSER_URL SMESH_TEST_POSTGRES_ADMIN_URL \
+            SMESH_TEST_POSTGRES_RUNTIME_URL SMESH_TEST_POSTGRES_QUOTED_MIGRATOR_URL \
+            SMESH_TEST_POSTGRES_REQUIRED SMESH_POSTGRES_TEST_REQUIRED
+          cargo test --release --locked --all-targets --all-features -- --test-threads=1
       - name: Documentation
         run: RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
       - name: Diff hygiene

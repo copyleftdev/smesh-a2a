@@ -602,7 +602,7 @@ async fn durable_rest_preflight_errors_use_http_status_envelopes_before_sse() {
     .unwrap();
     drop(conflict_setup_stream);
     bounded("raw REST conflict receiver barrier", started.notified()).await;
-    let mut conflict = admitted;
+    let mut conflict = admitted.clone();
     conflict.message.parts = vec![Part::text("different")];
     let (status, headers, body) = raw_rest(
         &gateway,
@@ -628,6 +628,19 @@ async fn durable_rest_preflight_errors_use_http_status_envelopes_before_sse() {
     );
 
     release.notify_one();
+    let terminal = collect_rest_stream(&base_url, &admitted).await;
+    assert!(matches!(
+        terminal.last(),
+        Some(StreamResponse::StatusUpdate(update))
+            if update.status.state == TaskState::Completed
+    ));
+    assert_eq!(collect_rest_stream(&base_url, &admitted).await, terminal);
+    bounded(
+        "raw REST conflict coordinator idle",
+        gateway.wait_for_coordinator_idle(),
+    )
+    .await
+    .unwrap();
     shutdown_tx.send(()).unwrap();
     bounded_join("raw REST preflight server join", server).await;
     bounded("raw REST preflight gateway shutdown", gateway.shutdown())
@@ -1495,6 +1508,7 @@ async fn durable_unary_input_required_continuation_replays_each_message_exactly(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One working-to-terminal authoritative replay trace.
 async fn return_immediately_continuation_replays_authoritative_working_snapshot() {
     let path = database_path();
     let clock = InjectedClock::new(1_700_000_030_000);
@@ -1559,27 +1573,48 @@ async fn return_immediately_continuation_replays_authoritative_working_snapshot(
     .unwrap();
     assert_eq!(replay, admitted);
     assert!(matches!(
-        admitted,
+        &admitted,
         SendMessageResponse::Task(Task { status: TaskStatus { state: TaskState::Working, .. }, history: Some(history), .. })
             if history.len() == 1 && history[0].message_id == "return-continuation"
     ));
     release.notify_one();
-    bounded("return continuation terminal commit", async {
+    let terminal_client = client(&base_url).await;
+    let terminal = bounded("return-immediately terminal replay", async {
         loop {
-            if bounded(
-                "gateway durable effect count",
-                gateway.durable_effect_count(),
-            )
-            .await
-            .unwrap()
-                == 2
-            {
-                break;
+            let replay = terminal_client.send_message(&continuation).await.unwrap();
+            if matches!(
+                &replay,
+                SendMessageResponse::Task(Task {
+                    status: TaskStatus {
+                        state: TaskState::Completed,
+                        ..
+                    },
+                    ..
+                })
+            ) {
+                break replay;
             }
-            gateway.wait_for_waiter_count(0).await.unwrap();
+            assert_eq!(replay, admitted);
         }
     })
     .await;
+    assert!(matches!(
+        terminal,
+        SendMessageResponse::Task(Task {
+            status: TaskStatus {
+                state: TaskState::Completed,
+                ..
+            },
+            history: Some(history),
+            ..
+        }) if history.len() == 1 && history[0].message_id == "return-continuation"
+    ));
+    bounded(
+        "return-immediately coordinator idle",
+        gateway.wait_for_coordinator_idle(),
+    )
+    .await
+    .unwrap();
     shutdown_tx.send(()).unwrap();
     bounded_join("return-immediately server join", server).await;
     bounded("return-immediately gateway shutdown", gateway.shutdown())
@@ -2719,7 +2754,7 @@ async fn max_attempts_one_crash_after_receiver_complete_is_committed_by_driver()
 }
 
 #[tokio::test]
-async fn active_blocked_dispatch_shutdown_requeues_fenced_attempt_and_stops_claiming() {
+async fn active_blocked_post_receive_shutdown_fails_stop_without_sender_settlement() {
     let path = database_path();
     let clock = InjectedClock::new(1_700_000_100_000);
     let started = Arc::new(Notify::new());
@@ -2753,9 +2788,14 @@ async fn active_blocked_dispatch_shutdown_requeues_fenced_attempt_and_stops_clai
     );
     bounded("blocked receiver dispatch barrier", started.notified()).await;
 
-    bounded("active blocked gateway shutdown", gateway.shutdown())
+    let shutdown = bounded("active blocked gateway shutdown", gateway.shutdown())
         .await
-        .unwrap();
+        .expect_err("post-receive shutdown must report unresolved authority");
+    assert!(
+        shutdown
+            .to_string()
+            .contains("durable post-receive outcome is unresolved")
+    );
     clock.advance_to(1_700_000_200_000);
     assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
     shutdown_tx.send(()).unwrap();
@@ -2791,28 +2831,18 @@ async fn active_blocked_dispatch_shutdown_requeues_fenced_attempt_and_stops_clai
             },
         )
         .unwrap();
-    assert_eq!(durable.1, 1);
-    match (durable.0.as_str(), durable.2.as_deref(), durable.4.as_str()) {
-        ("pending", Some("retry"), "processing") => {
-            assert!(
-                durable
-                    .3
-                    .as_deref()
-                    .is_some_and(|error| error.contains("shutdown interrupted"))
-            );
-        }
-        // If receiver cancellation wins the shutdown race, the accepted receiver row
-        // remains the authoritative restart boundary. The attempt may be unfinished,
-        // but it must remain leased/reconcilable rather than dead-lettered or retried
-        // under a new effect identity.
-        ("leased", None, "processing" | "completed") => assert!(durable.3.is_none()),
-        ("delivered", Some("delivered"), "completed") => {}
-        state => panic!("unexpected durable shutdown arbitration state: {state:?}"),
-    }
-    assert_eq!(durable.5, 0);
-    if durable.0 != "delivered" {
-        assert_eq!(durable.6, 0);
-    }
+    assert_eq!(
+        durable,
+        (
+            "leased".to_owned(),
+            1,
+            None,
+            None,
+            "processing".to_owned(),
+            0,
+            0,
+        )
+    );
     cleanup(&path);
 }
 

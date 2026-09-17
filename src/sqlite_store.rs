@@ -30,7 +30,8 @@ use crate::{
     canonical_send_message_digest_v2, content_digest, durable_authority::valid_bounded_identity,
 };
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
+const V11_SCHEMA_VERSION: i64 = 11;
 const V10_SCHEMA_VERSION: i64 = 10;
 const V9_SCHEMA_VERSION: i64 = 9;
 const V8_SCHEMA_VERSION: i64 = 8;
@@ -330,6 +331,40 @@ const RATIFICATION_OUTBOX_FENCE_SQL: &str = "ALTER TABLE outbox ADD COLUMN ratif
 CREATE TRIGGER outbox_ratification_fence_immutable BEFORE UPDATE OF ratification_required ON outbox
  WHEN NEW.ratification_required IS NOT OLD.ratification_required
  BEGIN SELECT RAISE(ABORT,'outbox ratification fence is immutable'); END;";
+const RUNTIME_AUTHORITY_SCHEMA_SQL: &str = "ALTER TABLE tasks ADD COLUMN visibility TEXT CHECK(visibility IN ('own','tenant'));
+ALTER TABLE tasks ADD COLUMN admission_policy_id TEXT;
+ALTER TABLE tasks ADD COLUMN admission_policy_revision INTEGER CHECK(admission_policy_revision IS NULL OR admission_policy_revision > 0);
+ALTER TABLE tasks ADD COLUMN admission_policy_digest TEXT;
+ALTER TABLE tasks ADD COLUMN admission_decision_id TEXT;
+ALTER TABLE idempotency_records ADD COLUMN authorization_principal_scope TEXT;
+ALTER TABLE idempotency_records ADD COLUMN authorization_authentication_method TEXT;
+ALTER TABLE idempotency_records ADD COLUMN authorization_visibility TEXT CHECK(authorization_visibility IN ('own','tenant'));
+ALTER TABLE idempotency_records ADD COLUMN authorization_policy_id TEXT;
+ALTER TABLE idempotency_records ADD COLUMN authorization_policy_revision INTEGER CHECK(authorization_policy_revision IS NULL OR authorization_policy_revision > 0);
+ALTER TABLE idempotency_records ADD COLUMN authorization_policy_digest TEXT;
+ALTER TABLE idempotency_records ADD COLUMN authorization_decision_id TEXT;
+ALTER TABLE idempotency_records ADD COLUMN authorization_decided_at INTEGER;
+ALTER TABLE receiver_inbox ADD COLUMN sender_attempt_no INTEGER CHECK(sender_attempt_no IS NULL OR sender_attempt_no > 0);
+ALTER TABLE receiver_inbox ADD COLUMN sender_lease_token TEXT;
+CREATE TRIGGER tasks_runtime_authority_immutable BEFORE UPDATE OF principal_scope,authentication_method,visibility,admission_policy_id,admission_policy_revision,admission_policy_digest,admission_decision_id ON tasks
+ WHEN NEW.visibility IS NOT OLD.visibility
+   OR NEW.principal_scope IS NOT OLD.principal_scope
+   OR NEW.authentication_method IS NOT OLD.authentication_method
+   OR NEW.admission_policy_id IS NOT OLD.admission_policy_id
+   OR NEW.admission_policy_revision IS NOT OLD.admission_policy_revision
+   OR NEW.admission_policy_digest IS NOT OLD.admission_policy_digest
+   OR NEW.admission_decision_id IS NOT OLD.admission_decision_id
+ BEGIN SELECT RAISE(ABORT,'task runtime authority is immutable'); END;
+CREATE TRIGGER idempotency_runtime_authority_immutable BEFORE UPDATE OF authorization_principal_scope,authorization_authentication_method,authorization_visibility,authorization_policy_id,authorization_policy_revision,authorization_policy_digest,authorization_decision_id,authorization_decided_at ON idempotency_records
+ WHEN NEW.authorization_principal_scope IS NOT OLD.authorization_principal_scope
+   OR NEW.authorization_authentication_method IS NOT OLD.authorization_authentication_method
+   OR NEW.authorization_visibility IS NOT OLD.authorization_visibility
+   OR NEW.authorization_policy_id IS NOT OLD.authorization_policy_id
+   OR NEW.authorization_policy_revision IS NOT OLD.authorization_policy_revision
+   OR NEW.authorization_policy_digest IS NOT OLD.authorization_policy_digest
+   OR NEW.authorization_decision_id IS NOT OLD.authorization_decision_id
+   OR NEW.authorization_decided_at IS NOT OLD.authorization_decided_at
+ BEGIN SELECT RAISE(ABORT,'idempotency runtime authority is immutable'); END;";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyTenantBinding {
@@ -1573,7 +1608,7 @@ impl SqliteTaskStore {
         authorization: Option<(OwnedTaskScope, AuthorizationAuditInput)>,
         callback_intent: Option<crate::callback_authority::CallbackIntent>,
     ) -> Result<AdmissionOutcome, A2AError> {
-        let (tenant_scope, owner_account_id, principal_scope, authentication_method) =
+        let (tenant_scope, owner_account_id, principal_scope, authentication_method, visibility) =
             authorization.as_ref().map_or_else(
                 || {
                     (
@@ -1581,6 +1616,7 @@ impl SqliteTaskStore {
                         self.default_account.to_string(),
                         self.default_account.to_string(),
                         "trusted-local".to_owned(),
+                        None,
                     )
                 },
                 |(scope, _)| {
@@ -1589,10 +1625,28 @@ impl SqliteTaskStore {
                         scope.owner_account_id.clone(),
                         scope.principal_scope.clone(),
                         scope.authentication_method.clone(),
+                        Some(match scope.visibility {
+                            VisibilityScope::Own => "own".to_owned(),
+                            VisibilityScope::Tenant => "tenant".to_owned(),
+                        }),
                     )
                 },
             );
         let authorization_audit = authorization.map(|(_, audit)| audit);
+        let admission_policy_id = authorization_audit
+            .as_ref()
+            .map(|audit| audit.policy_id().to_owned());
+        let admission_policy_revision = authorization_audit
+            .as_ref()
+            .map(|audit| i64::try_from(audit.policy_revision()))
+            .transpose()
+            .map_err(|_| A2AError::invalid_request("authorization policy revision is too large"))?;
+        let admission_policy_digest = authorization_audit
+            .as_ref()
+            .map(|audit| audit.policy_digest().to_owned());
+        let admission_decision_id = authorization_audit
+            .as_ref()
+            .map(|audit| audit.decision_id().to_owned());
         let identity_version = if authorization_audit.is_some() { 2 } else { 1 };
         let actor_account_id = authorization_audit
             .as_ref()
@@ -1725,10 +1779,14 @@ impl SqliteTaskStore {
             transaction
                 .execute(
                     "INSERT INTO tasks(task_id, context_id, state, status_timestamp, revision, task_json,
-                         tenant_scope, owner_account_id, principal_scope, authentication_method)
-                     VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9)",
+                         tenant_scope, owner_account_id, principal_scope, authentication_method,
+                         visibility, admission_policy_id, admission_policy_revision, admission_policy_digest,
+                         admission_decision_id)
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![task.id, task.context_id, state, timestamp, encoded_task,
-                        tenant_scope, owner_account_id, principal_scope, authentication_method],
+                        tenant_scope, owner_account_id, principal_scope, authentication_method,
+                        visibility, admission_policy_id, admission_policy_revision, admission_policy_digest,
+                        admission_decision_id],
                 )
                 .map_err(|_| A2AError::invalid_request("task already exists"))?;
             transaction
@@ -1756,8 +1814,12 @@ impl SqliteTaskStore {
                     "INSERT INTO idempotency_records(
                          tenant_scope, message_id, request_digest, task_id, state,
                          admission_result_json, final_result_json, created_at, updated_at,
-                         digest_version, actor_account_id, causative_request_json, invocation_kind
-                     ) VALUES (?1, ?2, ?3, ?4, 'in_progress', ?5, NULL, ?6, ?6, ?7, ?8, ?9, ?10)",
+                         digest_version, actor_account_id, causative_request_json, invocation_kind,
+                         authorization_principal_scope,authorization_authentication_method,
+                         authorization_visibility,authorization_policy_id,authorization_policy_revision,
+                         authorization_policy_digest,authorization_decision_id,authorization_decided_at
+                     ) VALUES (?1, ?2, ?3, ?4, 'in_progress', ?5, NULL, ?6, ?6, ?7, ?8, ?9, ?10,
+                               ?11,?12,?13,?14,?15,?16,?17,?18)",
                     params![
                         tenant_scope,
                         message_id,
@@ -1769,6 +1831,14 @@ impl SqliteTaskStore {
                         actor_account_id,
                         causative_request_json,
                         invocation_kind,
+                        principal_scope,
+                        authentication_method,
+                        visibility,
+                        admission_policy_id,
+                        admission_policy_revision,
+                        admission_policy_digest,
+                        admission_decision_id,
+                        authorization_audit.as_ref().map(AuthorizationAuditInput::decided_at),
                     ],
                 )
                 .map_err(|_| A2AError::internal("idempotency reservation failed"))?;
@@ -1829,7 +1899,7 @@ impl SqliteTaskStore {
                 let decision = audit.clone().decided(
                     AuthorizationDecisionEffect::Allow,
                     "admission_committed",
-                    None,
+                    Some(task.id.clone()),
                 );
                 insert_authorization_audit(&transaction, &decision)?;
             }
@@ -1905,25 +1975,42 @@ impl SqliteTaskStore {
         {
             return Err(A2AError::invalid_params("invalid durable continuation"));
         }
-        let (tenant_scope, owner_account_id, own_only, authorization_audit) = authorization
-            .map_or_else(
-                || {
-                    (
-                        self.default_scope.to_string(),
-                        self.default_account.to_string(),
-                        false,
-                        None,
-                    )
-                },
-                |(scope, audit)| {
-                    (
-                        scope.tenant_scope,
-                        scope.owner_account_id,
-                        scope.visibility == crate::authorization::VisibilityScope::Own,
-                        Some(audit),
-                    )
-                },
-            );
+        let (
+            tenant_scope,
+            owner_account_id,
+            principal_scope,
+            authentication_method,
+            visibility,
+            own_only,
+            authorization_audit,
+        ) = authorization.map_or_else(
+            || {
+                (
+                    self.default_scope.to_string(),
+                    self.default_account.to_string(),
+                    self.default_account.to_string(),
+                    "trusted-local".to_owned(),
+                    None,
+                    false,
+                    None,
+                )
+            },
+            |(scope, audit)| {
+                let visibility = match scope.visibility {
+                    VisibilityScope::Own => "own",
+                    VisibilityScope::Tenant => "tenant",
+                };
+                (
+                    scope.tenant_scope,
+                    scope.owner_account_id,
+                    scope.principal_scope,
+                    scope.authentication_method,
+                    Some(visibility.to_owned()),
+                    matches!(scope.visibility, VisibilityScope::Own),
+                    Some(audit),
+                )
+            },
+        );
         let identity_version = if authorization_audit.is_some() { 2 } else { 1 };
         let raw_message_id = message_id;
         let message_id = authorization_audit.as_ref().map_or_else(
@@ -2069,10 +2156,20 @@ impl SqliteTaskStore {
             tx.execute(
                 "INSERT INTO idempotency_records(tenant_scope, message_id, request_digest, task_id,
                      state, admission_result_json, created_at, updated_at, digest_version,
-                     actor_account_id, causative_request_json, invocation_kind)
-                 VALUES (?1, ?2, ?3, ?4, 'in_progress', ?5, ?6, ?6, ?7, ?8, ?9, ?10)",
+                     actor_account_id, causative_request_json, invocation_kind,
+                     authorization_principal_scope,authorization_authentication_method,
+                     authorization_visibility,authorization_policy_id,authorization_policy_revision,
+                     authorization_policy_digest,authorization_decision_id,authorization_decided_at)
+                 VALUES (?1, ?2, ?3, ?4, 'in_progress', ?5, ?6, ?6, ?7, ?8, ?9, ?10,
+                         ?11,?12,?13,?14,?15,?16,?17,?18)",
                 params![tenant_scope, message_id, digest, task.id, result_json, now,
-                    identity_version, actor_account_id, causative_request_json, invocation_kind],
+                    identity_version, actor_account_id, causative_request_json, invocation_kind,
+                    principal_scope,authentication_method,visibility,
+                    authorization_audit.as_ref().map(AuthorizationAuditInput::policy_id),
+                    authorization_audit.as_ref().map(|audit| i64::try_from(audit.policy_revision()).unwrap_or(-1)),
+                    authorization_audit.as_ref().map(AuthorizationAuditInput::policy_digest),
+                    authorization_audit.as_ref().map(AuthorizationAuditInput::decision_id),
+                    authorization_audit.as_ref().map(AuthorizationAuditInput::decided_at)],
             ).map_err(|_| A2AError::internal("continuation idempotency reservation failed"))?;
             tx.execute(
                 "INSERT INTO outbox(dispatch_id, tenant_scope, task_id, message_id, causative_revision,
@@ -2110,7 +2207,7 @@ impl SqliteTaskStore {
                 let decision = audit.clone().decided(
                     AuthorizationDecisionEffect::Allow,
                     "continuation_committed",
-                    None,
+                    Some(task.id.clone()),
                 );
                 insert_authorization_audit(&tx, &decision)?;
             }
@@ -2935,14 +3032,35 @@ impl SqliteTaskStore {
             if task.status.state.is_terminal() {
                 return Err(A2AError::task_not_cancelable(&task_id));
             }
-            let receiver_state: Option<String> = tx.query_row(
-                "SELECT state FROM receiver_inbox WHERE tenant_scope = ?1 AND dispatch_id = ?2",
-                params![tenant_scope, dispatch_id], |row| row.get(0),
+            let receiver_state: Option<(String, Option<i64>, Option<i64>, i64)> = tx.query_row(
+                "SELECT state, lease_until, sender_attempt_no, lease_epoch FROM receiver_inbox
+                 WHERE tenant_scope = ?1 AND dispatch_id = ?2",
+                params![tenant_scope, dispatch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             ).optional().map_err(|_| A2AError::internal("cancellation receiver lookup failed"))?;
             let active_state = matches!(task.status.state,
                 a2a::TaskState::Submitted | a2a::TaskState::Working);
-            if active_state && receiver_state.is_some() {
-                if receiver_state.as_deref() == Some("processing") {
+            if active_state
+                && let Some((receiver_kind, receiver_until, attempt, fence)) = receiver_state
+                && (receiver_kind == "completed" || receiver_until.is_some_and(|value| value > now))
+            {
+                // Only completed legacy rows are replay-only. A live receiver
+                // without persisted attempt identity cannot be safely signaled.
+                let outcome = match attempt {
+                    None if receiver_kind == "completed" => CancellationOutcome::LegacyReplayOnly { message_id },
+                    None => return Err(A2AError::internal("legacy receiver has no runtime correlation")),
+                    Some(attempt) => CancellationOutcome::AwaitReceiver {
+                        correlation: crate::DurableDispatchCorrelation::from_authority_parts(
+                            &tenant_scope, &dispatch_id,
+                            u32::try_from(attempt).map_err(|_| A2AError::internal("cancellation correlation is corrupt"))?,
+                            u64::try_from(fence).map_err(|_| A2AError::internal("cancellation correlation is corrupt"))?,
+                        )?,
+                        message_id,
+                    },
+                };
+                if receiver_kind == "processing"
+                    && receiver_until.is_some_and(|value| value > now)
+                {
                     tx.execute(
                         "INSERT INTO cancellation_intents(
                              tenant_scope, dispatch_id, task_id, state, requested_at)
@@ -2957,7 +3075,7 @@ impl SqliteTaskStore {
                     insert_authorization_audit(&tx, &decision)?;
                 }
                 tx.commit().map_err(|_| A2AError::internal("cancellation intent transaction failed"))?;
-                return Ok(CancellationOutcome::AwaitReceiver { dispatch_id, message_id });
+                return Ok(outcome);
             }
 
             let previous_state = state_key(&task)?;
@@ -3571,7 +3689,8 @@ impl SqliteTaskStore {
                 let changed = tx
                     .execute(
                         "UPDATE receiver_inbox SET lease_epoch = ?3, lease_owner = ?4,
-                         lease_token = ?5, lease_until = ?6, updated_at = ?7
+                         lease_token = ?5, lease_until = ?6, updated_at = ?7,
+                         sender_attempt_no=?9,sender_lease_token=?10
                      WHERE tenant_scope = ?1 AND dispatch_id = ?2 AND state = 'processing'
                        AND lease_epoch = ?8 AND lease_until <= ?7",
                         params![
@@ -3582,7 +3701,9 @@ impl SqliteTaskStore {
                             token,
                             lease_until,
                             now,
-                            epoch
+                            epoch,
+                            sender_attempt,
+                            sender_token
                         ],
                     )
                     .map_err(|_| A2AError::internal("receiver reclaim failed"))?;
@@ -3624,8 +3745,8 @@ impl SqliteTaskStore {
             tx.execute(
                 "INSERT INTO receiver_inbox(tenant_scope, dispatch_id, payload_digest,
                      payload_json, task_id, context_id, state, lease_epoch, lease_owner,
-                     lease_token, lease_until, accepted_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'processing', 1, ?7, ?8, ?9, ?10, ?10)",
+                     lease_token, lease_until, accepted_at, updated_at,sender_attempt_no,sender_lease_token)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'processing', 1, ?7, ?8, ?9, ?10, ?10,?11,?12)",
                 params![
                     tenant_scope,
                     envelope.dispatch_id,
@@ -3636,7 +3757,9 @@ impl SqliteTaskStore {
                     lease_owner,
                     token,
                     lease_until,
-                    now
+                    now,
+                    sender_attempt,
+                    sender_token
                 ],
             )
             .map_err(|_| A2AError::internal("receiver acceptance failed"))?;
@@ -4342,6 +4465,8 @@ impl SqliteTaskStore {
             &command.authentication_method,
             &command.task_id,
         )?;
+        let scope = scope.clone();
+        let resource_digest = self.authorization_resource_digest(&command.packet_hash)?;
         let digest = decision_command_digest(&command)?;
         let tenant = scope.tenant_scope.clone();
         let task_id = command.task_id.clone();
@@ -4373,7 +4498,8 @@ impl SqliteTaskStore {
             if task_state!="\"TASK_STATE_INPUT_REQUIRED\"" || task_revision!=packet_revision || state!="reviewed" || revision!=1 || command.expected_revision!=1 || reviewer.as_deref()!=Some(&command.account_id) || head.is_none() || !crate::ratification::decision_command_matches_packet(&command,&packet) { return Err(ratification_conflict()); }
             let action=crate::HumanRatificationAction::Decision(command.decision.clone());
             let action_key=match command.decision {crate::HumanDecision::Approve=>"approve",crate::HumanDecision::Reject=>"reject",crate::HumanDecision::Amend=>"amend"};
-            let receipt=build_ratification_receipt(&packet,&command.account_id,&command.principal_scope,&command.authentication_method,2,action,&command.rationale,command.decided_at_millis,&command.idempotency_key,head,&key)?;
+            let mut receipt=build_ratification_receipt(&packet,&command.account_id,&command.principal_scope,&command.authentication_method,2,action,&command.rationale,command.decided_at_millis,&command.idempotency_key,head,&key)?;
+            bind_amendment_authorization(&mut receipt, &scope, &audit, task_owner, &resource_digest, &key)?;
             insert_ratification_event(&tx,&receipt,action_key,&digest)?;
             let mut task=decode_task(task_json)?; let previous_state=task_state;
             let mut approved_publication=None;
@@ -4430,11 +4556,11 @@ impl SqliteTaskStore {
                 let message_id=authorized_message_identity(&tenant,task_owner,&message.message_id);
                 let request_digest=canonical_send_message_digest_v2(&tenant,task_owner,&request,false)?;
                 let dispatch_id=content_digest(format!("{tenant}\0send-message\0{message_id}").as_bytes());
-                tx.execute("INSERT INTO idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id,causative_request_json,invocation_kind) VALUES(?1,?2,?3,?4,'in_progress',?5,?6,?6,2,?7,?8,'unary')",params![tenant,message_id,request_digest,task_id,result_json,command.decided_at_millis,task_owner,serde_json::to_string(&request).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?]).map_err(|_|A2AError::internal("ratification amendment reservation failed"))?;
+                tx.execute("INSERT INTO idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,created_at,updated_at,digest_version,actor_account_id,causative_request_json,invocation_kind,authorization_principal_scope,authorization_authentication_method,authorization_visibility,authorization_policy_id,authorization_policy_revision,authorization_policy_digest,authorization_decision_id,authorization_decided_at) VALUES(?1,?2,?3,?4,'in_progress',?5,?6,?6,2,?7,?8,'unary',?9,?10,?11,?12,?13,?14,?15,?16)",params![tenant,message_id,request_digest,task_id,result_json,command.decided_at_millis,task_owner,serde_json::to_string(&request).map_err(|_|A2AError::internal("ratification amendment encoding failed"))?,scope.principal_scope(),scope.authentication_method(),receipt.amendment_authorization.as_ref().ok_or_else(||A2AError::internal("amendment authority missing"))?.visibility,audit.policy_id,i64::try_from(audit.policy_revision).map_err(|_|A2AError::internal("policy revision invalid"))?,audit.policy_digest,audit.decision_id,audit.decided_at]).map_err(|_|A2AError::internal("ratification amendment reservation failed"))?;
                 tx.execute("INSERT INTO outbox(dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,max_attempts,available_at,created_at,updated_at,dispatch_identity_version,ratification_required) VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',8,?8,?8,?8,2,1)",params![dispatch_id,tenant,task_id,message_id,next_revision,payload_json,content_digest(payload_json.as_bytes()),command.decided_at_millis]).map_err(|_|A2AError::internal("ratification amendment dispatch failed"))?;
             }
             if matches!(command.decision,crate::HumanDecision::Approve|crate::HumanDecision::Reject){enqueue_terminal_callbacks(&tx,&tenant,&task,u64::try_from(next_revision).map_err(|_|A2AError::internal("ratification revision corrupt"))?,command.decided_at_millis)?;}
-            insert_authorization_audit(&tx,&audit.clone().decided(AuthorizationDecisionEffect::Allow,event_kind,None))?;
+            insert_authorization_audit(&tx,&audit.clone().decided(AuthorizationDecisionEffect::Allow,event_kind,Some(task_id.clone())))?;
             write_integrated_ratification_anchor(&tx, &key)?;
             ensure_atomic_capacity(&tx)?;
             ensure_stream_capacity(&tx)?;
@@ -5371,6 +5497,7 @@ fn open_database(
             | V8_SCHEMA_VERSION
             | V9_SCHEMA_VERSION
             | V10_SCHEMA_VERSION
+            | V11_SCHEMA_VERSION
             | SCHEMA_VERSION
     ) {
         return Err(SqliteStoreError::InvalidSchema);
@@ -5438,7 +5565,7 @@ fn open_database(
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
+            migrate_v9_to_v12(&mut connection, supplied_ratification_key.as_deref())
         }
         V2_SCHEMA_VERSION => {
             migrate_v2_to_v3(&mut connection, max_tasks)?;
@@ -5448,7 +5575,7 @@ fn open_database(
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
+            migrate_v9_to_v12(&mut connection, supplied_ratification_key.as_deref())
         }
         V3_SCHEMA_VERSION => {
             migrate_v3_to_v4(&mut connection, max_tasks)?;
@@ -5457,7 +5584,7 @@ fn open_database(
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
+            migrate_v9_to_v12(&mut connection, supplied_ratification_key.as_deref())
         }
         V4_SCHEMA_VERSION => {
             migrate_v4_to_v5(&mut connection, max_tasks, &selected_binding)?;
@@ -5465,36 +5592,38 @@ fn open_database(
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
+            migrate_v9_to_v12(&mut connection, supplied_ratification_key.as_deref())
         }
         V5_SCHEMA_VERSION => {
             migrate_v5_to_v6(&mut connection)?;
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
+            migrate_v9_to_v12(&mut connection, supplied_ratification_key.as_deref())
         }
         V6_SCHEMA_VERSION => {
             migrate_v6_to_v7(&mut connection)?;
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
+            migrate_v9_to_v12(&mut connection, supplied_ratification_key.as_deref())
         }
         V7_SCHEMA_VERSION => {
             migrate_v7_to_v8(&mut connection)?;
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
+            migrate_v9_to_v12(&mut connection, supplied_ratification_key.as_deref())
         }
         V8_SCHEMA_VERSION => {
             migrate_v8_to_v9(&mut connection)?;
-            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
+            migrate_v9_to_v12(&mut connection, supplied_ratification_key.as_deref())
         }
         V9_SCHEMA_VERSION => {
-            migrate_v9_to_v11(&mut connection, supplied_ratification_key.as_deref())
+            migrate_v9_to_v12(&mut connection, supplied_ratification_key.as_deref())
         }
         V10_SCHEMA_VERSION => {
-            migrate_v10_to_v11(&mut connection, supplied_ratification_key.as_deref())
+            migrate_v10_to_v11(&mut connection, supplied_ratification_key.as_deref())?;
+            migrate_v11_to_v12(&mut connection)
         }
+        V11_SCHEMA_VERSION => migrate_v11_to_v12(&mut connection),
         SCHEMA_VERSION => validate_schema(&connection),
         _ => Err(SqliteStoreError::InvalidSchema),
     }?;
@@ -6624,7 +6753,25 @@ fn validate_atomic_records(connection: &Connection) -> Result<(), SqliteStoreErr
             .and_then(|history| history.last())
             .ok_or(SqliteStoreError::InvalidSchema)?;
         let expected_message_id = if dispatch_identity_version == 2 {
-            authorized_message_identity(&scope, &owner_account_id, &causative_message.message_id)
+            // Structural identity also runs during legacy migrations. Continuations
+            // bind their own actor; the runtime loader enforces visibility and
+            // amendment provenance using the fully migrated authorization rows.
+            let actor: String = connection
+                .query_row(
+                    "SELECT actor_account_id FROM idempotency_records
+                 WHERE tenant_scope=?1 AND message_id=?2 AND task_id=?3
+                 AND (?4 != 1 OR actor_account_id=?5)",
+                    params![
+                        scope,
+                        message_id,
+                        task_id,
+                        causative_revision,
+                        owner_account_id
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|_| SqliteStoreError::InvalidSchema)?;
+            authorized_message_identity(&scope, &actor, &causative_message.message_id)
         } else {
             causative_message.message_id.clone()
         };
@@ -7063,6 +7210,14 @@ fn create_current_ratification_schema(connection: &Connection) -> Result<(), Sql
         .map_err(|_| SqliteStoreError::Initialization)
 }
 
+fn create_current_runtime_authority_schema(
+    connection: &Connection,
+) -> Result<(), SqliteStoreError> {
+    connection
+        .execute_batch(RUNTIME_AUTHORITY_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)
+}
+
 fn initialize_schema(
     connection: &mut Connection,
     binding: &LegacyTenantBinding,
@@ -7079,7 +7234,7 @@ fn initialize_schema(
     }
     let cursor_key: [u8; 32] = rand::random();
     let receipt_key: [u8; 32] = rand::random();
-    let migration_hash = schema_v11_hash();
+    let migration_hash = schema_v12_hash();
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| SqliteStoreError::Initialization)?;
@@ -7137,6 +7292,7 @@ fn initialize_schema(
         .execute_batch(V9_AUTHORIZATION_ACCOUNTING_TRIGGERS_SQL)
         .map_err(|_| SqliteStoreError::Initialization)?;
     create_current_ratification_schema(&transaction)?;
+    create_current_runtime_authority_schema(&transaction)?;
     transaction.execute(
         "INSERT INTO store_identity(singleton, tenant_scope, owner_account_id, policy_id, policy_revision, policy_digest)
          VALUES(1, ?1, ?2, ?3, ?4, ?5)",
@@ -7525,6 +7681,17 @@ fn schema_v11_hash() -> String {
     )
 }
 
+fn schema_v12_hash() -> String {
+    content_digest(
+        [
+            schema_v11_hash().as_bytes(),
+            RUNTIME_AUTHORITY_SCHEMA_SQL.as_bytes(),
+        ]
+        .concat()
+        .as_slice(),
+    )
+}
+
 const CALLBACK_OBJECTS: &[&str] = &[
     "callback_policy_snapshots",
     "callback_enrollments",
@@ -7596,6 +7763,10 @@ const RATIFICATION_ANCHOR_OBJECTS: &[&str] = &[
     "ratification_ledger_anchor_no_delete",
 ];
 const RATIFICATION_OUTBOX_FENCE_OBJECTS: &[&str] = &["outbox_ratification_fence_immutable"];
+const RUNTIME_AUTHORITY_OBJECTS: &[&str] = &[
+    "tasks_runtime_authority_immutable",
+    "idempotency_runtime_authority_immutable",
+];
 
 #[allow(clippy::too_many_lines)]
 fn validate_schema_version(
@@ -7635,7 +7806,12 @@ fn validate_schema_version(
         let actual = normalize_schema_sql(&actual);
         let matches_expected = if version >= V5_SCHEMA_VERSION && *object_name == "tasks" {
             let base = expected_schema_sql(V2_SCHEMA_SQL, "tasks").expect("v2 tasks schema");
-            let expected_tasks = if version >= V10_SCHEMA_VERSION {
+            let expected_tasks = if version >= SCHEMA_VERSION {
+                format!(
+                    "{},tenant_scopetextnotnulldefault'smesh-dev-only-tenant',owner_account_idtextnotnulldefault'smesh-dev-only-account',principal_scopetextnotnulldefault'legacy-principal',authentication_methodtextnotnulldefault'trusted-local',visibilitytextcheck(visibilityin('own','tenant')),admission_policy_idtext,admission_policy_revisionintegercheck(admission_policy_revisionisnulloradmission_policy_revision>0),admission_policy_digesttext,admission_decision_idtext)",
+                    base.strip_suffix(')').expect("tasks schema closes")
+                )
+            } else if version >= V10_SCHEMA_VERSION {
                 format!(
                     "{},tenant_scopetextnotnulldefault'smesh-dev-only-tenant',owner_account_idtextnotnulldefault'smesh-dev-only-account',principal_scopetextnotnulldefault'legacy-principal',authentication_methodtextnotnulldefault'trusted-local')",
                     base.strip_suffix(')').expect("tasks schema closes")
@@ -7647,19 +7823,33 @@ fn validate_schema_version(
                 )
             };
             actual == expected_tasks
+        } else if version >= SCHEMA_VERSION && *object_name == "receiver_inbox" {
+            let base = expected_schema_sql(RECEIVER_SCHEMA_SQL, "receiver_inbox")
+                .expect("receiver schema");
+            let expected_receiver = base.replace(
+                ",primarykey(tenant_scope,dispatch_id)",
+                ",sender_attempt_nointegercheck(sender_attempt_noisnullorsender_attempt_no>0),sender_lease_tokentext,primarykey(tenant_scope,dispatch_id)",
+            );
+            actual == expected_receiver
         } else if version >= V5_SCHEMA_VERSION && *object_name == "idempotency_records" {
             let base = expected_schema_sql(V2_SCHEMA_SQL, "idempotency_records")
                 .expect("v2 idempotency schema");
-            let expected_idempotency = base.replace(
+            let mut expected_idempotency = base.replace(
                 ",primarykey(tenant_scope,message_id)",
                 ",digest_versionintegernotnulldefault2check(digest_versionin(1,2)),actor_account_idtext,causative_request_jsontext,invocation_kindtextcheck(invocation_kindin('unary','streaming')),primarykey(tenant_scope,message_id)",
             );
+            if version >= SCHEMA_VERSION {
+                expected_idempotency = expected_idempotency.replace(
+                    ",primarykey(tenant_scope,message_id)",
+                    ",authorization_principal_scopetext,authorization_authentication_methodtext,authorization_visibilitytextcheck(authorization_visibilityin('own','tenant')),authorization_policy_idtext,authorization_policy_revisionintegercheck(authorization_policy_revisionisnullorauthorization_policy_revision>0),authorization_policy_digesttext,authorization_decision_idtext,authorization_decided_atinteger,primarykey(tenant_scope,message_id)",
+                );
+            }
             actual == expected_idempotency
         } else if version >= V5_SCHEMA_VERSION && *object_name == "outbox" {
             let base = normalize_schema_sql(V4_OUTBOX_TABLE_SQL)
                 .replace("outbox_v4", "outbox")
                 .replace('"', "");
-            let suffix = if version >= SCHEMA_VERSION {
+            let suffix = if version >= V11_SCHEMA_VERSION {
                 ",dispatch_identity_versionintegernotnulldefault2check(dispatch_identity_versionin(1,2)),ratification_requiredintegernotnulldefault0check(ratification_requiredin(0,1)))"
             } else {
                 ",dispatch_identity_versionintegernotnulldefault2check(dispatch_identity_versionin(1,2)))"
@@ -7707,7 +7897,8 @@ fn validate_schema_version(
         )
         .map_err(|_| SqliteStoreError::InvalidSchema)?;
     let expected_hash = match version {
-        SCHEMA_VERSION => schema_v11_hash(),
+        SCHEMA_VERSION => schema_v12_hash(),
+        V11_SCHEMA_VERSION => schema_v11_hash(),
         V10_SCHEMA_VERSION => schema_v10_hash(),
         V9_SCHEMA_VERSION => schema_v9_hash(),
         V8_SCHEMA_VERSION => schema_v8_hash(),
@@ -7723,7 +7914,9 @@ fn validate_schema_version(
         || metadata.2.len() != 32
         || metadata.3.len() != 32
         || actual_task_columns
-            != if version >= V10_SCHEMA_VERSION {
+            != if version >= SCHEMA_VERSION {
+                "created_order:INTEGER:0:1,task_id:TEXT:1:0,context_id:TEXT:1:0,state:TEXT:1:0,status_timestamp:TEXT:0:0,revision:INTEGER:1:0,task_json:TEXT:1:0,tenant_scope:TEXT:1:0,owner_account_id:TEXT:1:0,principal_scope:TEXT:1:0,authentication_method:TEXT:1:0,visibility:TEXT:0:0,admission_policy_id:TEXT:0:0,admission_policy_revision:INTEGER:0:0,admission_policy_digest:TEXT:0:0,admission_decision_id:TEXT:0:0"
+            } else if version >= V10_SCHEMA_VERSION {
                 "created_order:INTEGER:0:1,task_id:TEXT:1:0,context_id:TEXT:1:0,state:TEXT:1:0,status_timestamp:TEXT:0:0,revision:INTEGER:1:0,task_json:TEXT:1:0,tenant_scope:TEXT:1:0,owner_account_id:TEXT:1:0,principal_scope:TEXT:1:0,authentication_method:TEXT:1:0"
             } else if version >= V5_SCHEMA_VERSION {
                 "created_order:INTEGER:0:1,task_id:TEXT:1:0,context_id:TEXT:1:0,state:TEXT:1:0,status_timestamp:TEXT:0:0,revision:INTEGER:1:0,task_json:TEXT:1:0,tenant_scope:TEXT:1:0,owner_account_id:TEXT:1:0"
@@ -7742,9 +7935,14 @@ fn validate_schema_version(
                     + if version >= V10_SCHEMA_VERSION {
                         AUTHORIZATION_ACCOUNTING_OBJECTS.len()
                             + RATIFICATION_OBJECTS.len()
-                            + if version == SCHEMA_VERSION {
+                            + if version >= V11_SCHEMA_VERSION {
                                 RATIFICATION_ANCHOR_OBJECTS.len()
                                     + RATIFICATION_OUTBOX_FENCE_OBJECTS.len()
+                                    + if version >= SCHEMA_VERSION {
+                                        RUNTIME_AUTHORITY_OBJECTS.len()
+                                    } else {
+                                        0
+                                    }
                             } else {
                                 0
                             }
@@ -7858,6 +8056,34 @@ fn validate_schema_v10(connection: &Connection) -> Result<([u8; 32], [u8; 32]), 
     Ok(keys)
 }
 
+fn validate_schema_v11(connection: &Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_version(connection, V11_SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
+    validate_schema_objects(connection, CALLBACK_SCHEMA_SQL, CALLBACK_OBJECTS)?;
+    validate_schema_objects(
+        connection,
+        V9_AUTHORIZATION_ACCOUNTING_TABLE_SQL,
+        &AUTHORIZATION_ACCOUNTING_OBJECTS[..1],
+    )?;
+    validate_schema_objects(
+        connection,
+        V9_AUTHORIZATION_ACCOUNTING_TRIGGERS_SQL,
+        &AUTHORIZATION_ACCOUNTING_OBJECTS[1..],
+    )?;
+    validate_authorization_accounting(connection)?;
+    validate_schema_objects(connection, RATIFICATION_SCHEMA_SQL, RATIFICATION_OBJECTS)?;
+    validate_schema_objects(
+        connection,
+        RATIFICATION_ANCHOR_SCHEMA_SQL,
+        RATIFICATION_ANCHOR_OBJECTS,
+    )?;
+    validate_schema_objects(
+        connection,
+        RATIFICATION_OUTBOX_FENCE_SQL,
+        RATIFICATION_OUTBOX_FENCE_OBJECTS,
+    )?;
+    Ok(keys)
+}
+
 fn validate_schema(connection: &Connection) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
     let keys = validate_schema_version(connection, SCHEMA_VERSION, V2_SCHEMA_SQL, V7_OBJECTS)?;
     validate_schema_objects(connection, CALLBACK_SCHEMA_SQL, CALLBACK_OBJECTS)?;
@@ -7882,6 +8108,11 @@ fn validate_schema(connection: &Connection) -> Result<([u8; 32], [u8; 32]), Sqli
         connection,
         RATIFICATION_OUTBOX_FENCE_SQL,
         RATIFICATION_OUTBOX_FENCE_OBJECTS,
+    )?;
+    validate_schema_objects(
+        connection,
+        RUNTIME_AUTHORITY_SCHEMA_SQL,
+        RUNTIME_AUTHORITY_OBJECTS,
     )?;
     Ok(keys)
 }
@@ -8364,12 +8595,13 @@ fn migrate_v9_to_v10(
     Ok(validated)
 }
 
-fn migrate_v9_to_v11(
+fn migrate_v9_to_v12(
     connection: &mut Connection,
     supplied_key: Option<&[u8; 32]>,
 ) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
     migrate_v9_to_v10(connection)?;
-    migrate_v10_to_v11(connection, supplied_key)
+    migrate_v10_to_v11(connection, supplied_key)?;
+    migrate_v11_to_v12(connection)
 }
 
 fn migrate_v10_to_v11(
@@ -8432,7 +8664,36 @@ fn migrate_v10_to_v11_inner(
     transaction
         .execute(
             "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
-            params![SCHEMA_VERSION, schema_v11_hash()],
+            params![V11_SCHEMA_VERSION, schema_v11_hash()],
+        )
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .pragma_update(None, "user_version", V11_SCHEMA_VERSION)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    let validated = validate_schema_v11(&transaction)?;
+    if validated != keys {
+        return Err(SqliteStoreError::InvalidSchema);
+    }
+    transaction
+        .commit()
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    Ok(validated)
+}
+
+fn migrate_v11_to_v12(
+    connection: &mut Connection,
+) -> Result<([u8; 32], [u8; 32]), SqliteStoreError> {
+    let keys = validate_schema_v11(connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute_batch(RUNTIME_AUTHORITY_SCHEMA_SQL)
+        .map_err(|_| SqliteStoreError::Initialization)?;
+    transaction
+        .execute(
+            "UPDATE store_metadata SET schema_version=?1,migration_hash=?2 WHERE singleton=1",
+            params![SCHEMA_VERSION, schema_v12_hash()],
         )
         .map_err(|_| SqliteStoreError::Initialization)?;
     transaction
@@ -10155,6 +10416,135 @@ pub(crate) fn decision_command_digest(
     })).map(|bytes|content_digest(&bytes)).map_err(|_|A2AError::invalid_request("invalid ratification decision command"))
 }
 
+pub(crate) fn bind_amendment_authorization(
+    receipt: &mut crate::HumanRatificationReceipt,
+    scope: &OwnedTaskScope,
+    audit: &AuthorizationAuditInput,
+    task_owner: &str,
+    resource_digest: &str,
+    key: &[u8; 32],
+) -> Result<(), A2AError> {
+    if !matches!(
+        receipt.action,
+        crate::HumanRatificationAction::Decision(crate::HumanDecision::Amend)
+    ) {
+        return Ok(());
+    }
+    if audit.operation != "ratificationDecide"
+        || audit.resource_kind != "ratification"
+        || (audit.resource_digest != receipt.packet_hash
+            && audit.resource_digest != resource_digest)
+        || (scope.visibility() == VisibilityScope::Own && scope.owner_account_id() != task_owner)
+    {
+        return Err(A2AError::invalid_request(
+            "ratification authorization binding mismatch",
+        ));
+    }
+    receipt.amendment_authorization = Some(crate::ratification::AmendmentAuthorization {
+        resource_digest: audit.resource_digest.clone(),
+        decision_id: audit.decision_id.clone(),
+        decided_at_millis: audit.decided_at,
+        visibility: match scope.visibility() {
+            VisibilityScope::Own => "own",
+            VisibilityScope::Tenant => "tenant",
+        }
+        .to_owned(),
+        task_owner_account_id: task_owner.to_owned(),
+    });
+    receipt.receipt_hash = crate::ratification::receipt_statement_hash(receipt)
+        .map_err(|_| A2AError::internal("ratification receipt encoding failed"))?;
+    receipt.seal = crate::ratification::ratification_mac(
+        key,
+        crate::ratification::RECEIPT_DOMAIN,
+        receipt.receipt_hash.as_bytes(),
+    );
+    Ok(())
+}
+
+/// Authenticate the distinct human authorization actor and owner-scoped executable identity.
+/// Callers authenticate the retained packet/receipt anchor in the same transaction first.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_runtime_amendment(
+    receipt_json: &str,
+    packet_json: &str,
+    lease: &OutboxLease,
+    request: &SendMessageRequest,
+    causative_revision: i64,
+    task_owner: &str,
+    decision_id: &str,
+    decision_actor: &str,
+    policy_id: &str,
+    policy_revision: u64,
+    policy_digest: &str,
+    principal: &str,
+    authentication: &str,
+    visibility: &str,
+    decided_at: i64,
+    key: &[u8; 32],
+) -> Result<String, A2AError> {
+    let unavailable = || A2AError::internal("durable runtime authority unavailable");
+    let receipt: crate::HumanRatificationReceipt =
+        serde_json::from_str(receipt_json).map_err(|_| unavailable())?;
+    let packet: crate::ReviewPacket =
+        serde_json::from_str(packet_json).map_err(|_| unavailable())?;
+    let binding = receipt
+        .amendment_authorization
+        .as_ref()
+        .ok_or_else(unavailable)?;
+    let hash = crate::ratification::receipt_statement_hash(&receipt).map_err(|_| unavailable())?;
+    if receipt.receipt_hash != hash
+        || receipt.seal
+            != crate::ratification::ratification_mac(
+                key,
+                crate::ratification::RECEIPT_DOMAIN,
+                hash.as_bytes(),
+            )
+        || !receipt_matches_packet(&receipt, &packet)
+        || !matches!(
+            receipt.action,
+            crate::HumanRatificationAction::Decision(crate::HumanDecision::Amend)
+        )
+        || receipt.revision != 2
+        || !lease.ratification_required
+        || receipt.tenant_id != lease.tenant_scope
+        || receipt.task_id != lease.task_id
+        || receipt.context_id != lease.request.context_id
+        || receipt.task_revision.checked_add(1) != u64::try_from(causative_revision).ok()
+        || binding.task_owner_account_id != task_owner
+        || binding.decision_id != decision_id
+        || binding.decided_at_millis != decided_at
+        || binding.visibility != visibility
+        || (visibility == "own" && decision_actor != task_owner)
+        || receipt.account_id != decision_actor
+        || receipt.authorization_policy_id != policy_id
+        || receipt.authorization_policy_revision != policy_revision
+        || receipt.authorization_policy_digest != policy_digest
+        || receipt.principal_scope != principal
+        || receipt.authentication_method != authentication
+    {
+        return Err(unavailable());
+    }
+    let mut message = Message::new(Role::User, vec![Part::text(receipt.rationale)]);
+    message.message_id = format!(
+        "ratification-amend-{}",
+        hash.get(7..31).ok_or_else(unavailable)?
+    );
+    message.task_id = Some(receipt.task_id);
+    message.context_id = Some(receipt.context_id);
+    let expected = SendMessageRequest {
+        message,
+        configuration: None,
+        metadata: None,
+        tenant: None,
+    };
+    if serde_json::to_value(request).map_err(|_| unavailable())?
+        != serde_json::to_value(expected).map_err(|_| unavailable())?
+    {
+        return Err(unavailable());
+    }
+    Ok(binding.resource_digest.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_ratification_receipt(
     packet: &crate::ReviewPacket,
@@ -10170,6 +10560,7 @@ pub(crate) fn build_ratification_receipt(
     key: &[u8; 32],
 ) -> Result<crate::HumanRatificationReceipt, A2AError> {
     let mut receipt = crate::HumanRatificationReceipt {
+        amendment_authorization: None,
         tenant_id: packet.tenant_id.clone(),
         task_id: packet.task_id.clone(),
         account_id: account.to_owned(),
@@ -10453,7 +10844,7 @@ impl crate::AuthorityIdentity for SqliteTaskStore {
     }
 
     fn completion_receipt_key(&self) -> Option<[u8; 32]> {
-        Some(SqliteTaskStore::completion_receipt_key(self))
+        Some(*self.receipt_key)
     }
 
     fn authorization_resource_digest(&self, resource: &str) -> Result<String, A2AError> {
@@ -11151,8 +11542,26 @@ impl crate::CancellationAuthority for SqliteTaskStore {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl crate::OutboxAuthority for SqliteTaskStore {
+    async fn causative_request_digest(&self, lease: &OutboxLease) -> Result<String, A2AError> {
+        let tenant = lease.tenant_scope.clone();
+        let outbox_id = lease.outbox_id;
+        let token = lease.lease_token.clone();
+        self.run(move |connection| {
+            connection
+                .query_row(
+                    "SELECT i.request_digest FROM outbox o JOIN idempotency_records i
+                       ON i.tenant_scope=o.tenant_scope AND i.message_id=o.message_id AND i.task_id=o.task_id
+                     WHERE o.tenant_scope=?1 AND o.outbox_id=?2 AND o.lease_token=?3 AND o.state='leased'",
+                    params![tenant, outbox_id, token],
+                    |row| row.get(0),
+                )
+                .map_err(|_| A2AError::internal("causative request digest lookup failed"))
+        })
+        .await
+    }
     async fn telemetry_correlation_for_outbox(
         &self,
         lease: &crate::OutboxLease,
@@ -11198,6 +11607,319 @@ impl crate::OutboxAuthority for SqliteTaskStore {
             VisibilityScope::Tenant,
         )?;
         SqliteTaskStore::get_scoped(self, &scope, &lease.task_id).await
+    }
+
+    async fn load_runtime_authority_context(
+        &self,
+        outbox_lease: &OutboxLease,
+        receiver_lease: &ReceiverLease,
+        now: i64,
+    ) -> Result<crate::DurableRuntimeAuthorityContext, A2AError> {
+        let outbox_lease = outbox_lease.clone();
+        let receiver_lease = receiver_lease.clone();
+        let key = self.ratification_key.clone();
+        self.run(move |connection| {
+            let unavailable = || A2AError::internal("durable runtime authority unavailable");
+            if outbox_lease.execution_reservation.is_some()
+                || receiver_lease.execution_reservation.is_some()
+            {
+                return Err(unavailable());
+            }
+            let transaction = connection.transaction().map_err(|_| unavailable())?;
+            #[allow(clippy::type_complexity)]
+            let row: Option<(
+                String,
+                String,
+                String,
+                bool,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                String,
+                i64,
+                String,
+                String,
+                String,
+                i64,
+                String,
+                String,
+                Option<String>,
+                String,
+                String,
+                String,
+                i64,
+                i64,
+                i64,
+            )> = transaction
+                .query_row(
+                    "SELECT o.payload_json,o.payload_digest,o.message_id,o.ratification_required,
+                            r.payload_json,r.context_id,t.context_id,t.owner_account_id,
+                            i.authorization_principal_scope,i.authorization_authentication_method,i.request_digest,
+                            i.causative_request_json,i.invocation_kind,i.actor_account_id,
+                            i.authorization_visibility,i.authorization_policy_id,i.authorization_policy_revision,
+                            i.authorization_policy_digest,
+                            r.sender_attempt_no,r.sender_lease_token,
+                            d.actor_account_id,d.policy_id,d.policy_revision,d.policy_digest,
+                            d.effect,d.task_id,d.operation,d.resource_kind,d.resource_digest,
+                            d.decided_at,i.authorization_decided_at,o.causative_revision
+                     FROM outbox o
+                     JOIN receiver_inbox r ON r.tenant_scope=o.tenant_scope
+                                           AND r.dispatch_id=o.dispatch_id
+                                           AND r.task_id=o.task_id
+                                           AND r.payload_digest=o.payload_digest
+                                           AND r.payload_json=o.payload_json
+                     JOIN tasks t ON t.tenant_scope=o.tenant_scope AND t.task_id=o.task_id
+                     JOIN idempotency_records i ON i.tenant_scope=o.tenant_scope
+                                                AND i.message_id=o.message_id
+                                                AND i.task_id=o.task_id
+                     JOIN authorization_decisions d ON d.tenant_scope=i.tenant_scope
+                                                   AND d.decision_id=i.authorization_decision_id
+                     WHERE o.tenant_scope=?1 AND o.outbox_id=?2 AND o.dispatch_id=?3
+                       AND o.task_id=?4 AND o.attempt_count=?5 AND o.max_attempts=?6
+                       AND o.state='leased' AND o.lease_owner=?7 AND o.lease_token=?8
+                       AND o.lease_until=?9
+                       AND o.ratification_required=?10
+                       AND r.tenant_scope=?11 AND r.task_id=?12 AND r.dispatch_id=?13
+                       AND r.payload_digest=?14 AND r.state='processing'
+                       AND r.lease_owner=?15 AND r.lease_token=?16 AND r.lease_epoch=?17
+                       AND r.lease_until=?18
+                       AND r.sender_attempt_no=?19 AND r.sender_lease_token=?20
+                       AND o.lease_until>?21 AND r.lease_until>?21",
+                    params![
+                        outbox_lease.tenant_scope,
+                        outbox_lease.outbox_id,
+                        outbox_lease.dispatch_id,
+                        outbox_lease.task_id,
+                        i64::from(outbox_lease.attempt_no),
+                        i64::from(outbox_lease.max_attempts),
+                        outbox_lease.lease_owner,
+                        outbox_lease.lease_token,
+                        outbox_lease.lease_until,
+                        outbox_lease.ratification_required,
+                        receiver_lease.tenant_scope,
+                        receiver_lease.task_id,
+                        receiver_lease.dispatch_id,
+                        receiver_lease.payload_digest,
+                        receiver_lease.lease_owner,
+                        receiver_lease.lease_token,
+                        i64::try_from(receiver_lease.lease_epoch).map_err(|_| unavailable())?,
+                        receiver_lease.lease_until,
+                        i64::from(receiver_lease.sender_attempt_no),
+                        receiver_lease.sender_lease_token,
+                        now,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
+                            row.get(11)?,
+                            row.get(12)?,
+                            row.get(13)?,
+                            row.get(14)?,
+                            row.get(15)?,
+                            row.get(16)?,
+                            row.get(17)?,
+                            row.get(18)?,
+                            row.get(19)?,
+                            row.get(20)?,
+                            row.get(21)?,
+                            row.get(22)?,
+                            row.get(23)?,
+                            row.get(24)?,
+                            row.get(25)?,
+                            row.get(26)?,
+                            row.get(27)?,
+                            row.get(28)?,
+                            row.get(29)?,
+                            row.get(30)?,
+                            row.get(31)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|_| unavailable())?;
+            let Some((
+                payload_json,
+                payload_digest,
+                message_id,
+                ratification_required,
+                receiver_payload_json,
+                receiver_context_id,
+                task_context_id,
+                account_id,
+                principal_scope,
+                authentication_method,
+                authorized_request_digest,
+                causative_request_json,
+                invocation_kind,
+                actor_account_id,
+                visibility,
+                policy_id,
+                policy_revision,
+                policy_digest,
+                receiver_sender_attempt,
+                receiver_sender_token,
+                decision_actor,
+                decision_policy_id,
+                decision_policy_revision,
+                decision_policy_digest,
+                decision_effect,
+                decision_task_id,
+                decision_operation,
+                decision_resource_kind,
+                decision_resource_digest,
+                decision_decided_at,
+                authorization_decided_at,
+                causative_revision,
+            )) = row
+            else {
+                return Err(unavailable());
+            };
+            let request: MeshRequest =
+                serde_json::from_str(&payload_json).map_err(|_| unavailable())?;
+            let causative_request: SendMessageRequest =
+                serde_json::from_str(&causative_request_json).map_err(|_| unavailable())?;
+            let streaming = match invocation_kind.as_str() {
+                "unary" => false,
+                "streaming" => true,
+                _ => return Err(unavailable()),
+            };
+            let policy_revision = u64::try_from(policy_revision).map_err(|_| unavailable())?;
+            let visibility = match visibility.as_str() {
+                "own" => VisibilityScope::Own,
+                "tenant" => VisibilityScope::Tenant,
+                _ => return Err(unavailable()),
+            };
+            let authorized_mesh_request = MeshRequest::from_a2a(
+                outbox_lease.task_id.clone(),
+                task_context_id.clone(),
+                &causative_request.message,
+                InputLimits {
+                    max_text_bytes: request.text.len(),
+                },
+            )
+            .map_err(|_| unavailable())?;
+            let amendment_packet_hash = if ratification_required {
+                ensure_integrated_ratification_integrity(&transaction, &key).map_err(|_| unavailable())?;
+                let (receipt_json, packet_json, decision_id): (String, String, String) = transaction.query_row(
+                    "SELECT e.receipt_json,p.packet_json,i.authorization_decision_id
+                     FROM ratification_packets p JOIN ratification_events e
+                     ON e.tenant_scope=p.tenant_scope AND e.task_id=p.task_id AND e.generation=p.generation
+                     JOIN idempotency_records i ON i.tenant_scope=p.tenant_scope AND i.task_id=p.task_id
+                     WHERE p.tenant_scope=?1 AND p.task_id=?2 AND p.task_revision=?3-1
+                     AND p.state='amended' AND e.revision=2 AND e.action='amend' AND i.message_id=?4",
+                    params![outbox_lease.tenant_scope,outbox_lease.task_id,causative_revision,message_id],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                ).map_err(|_| unavailable())?;
+                if streaming { return Err(unavailable()); }
+                Some(verify_runtime_amendment(&receipt_json,&packet_json,&outbox_lease,
+                    &causative_request,causative_revision,&account_id,&decision_id,&decision_actor,
+                    &policy_id,policy_revision,&policy_digest,&principal_scope,&authentication_method,
+                    match visibility {VisibilityScope::Own => "own",VisibilityScope::Tenant => "tenant"},
+                    decision_decided_at,&key)?)
+            } else { None };
+            transaction.commit().map_err(|_| unavailable())?;
+            if payload_json != receiver_payload_json
+                || payload_digest != content_digest(payload_json.as_bytes())
+                || request != outbox_lease.request
+                || request.task_id != outbox_lease.task_id
+                || request.context_id != task_context_id
+                || request != authorized_mesh_request
+                || receiver_context_id != task_context_id
+                || ((amendment_packet_hash.is_some() || causative_revision == 1 || visibility == VisibilityScope::Own)
+                    && actor_account_id != account_id)
+                || message_id
+                    != authorized_message_identity(
+                        &outbox_lease.tenant_scope,
+                        &actor_account_id,
+                        &causative_request.message.message_id,
+                    )
+                || authorized_request_digest
+                    != canonical_send_message_digest_v2(
+                        &outbox_lease.tenant_scope,
+                        &actor_account_id,
+                        &causative_request,
+                        streaming,
+                    )
+                    .map_err(|_| unavailable())?
+                || ratification_required != outbox_lease.ratification_required
+                || receiver_sender_attempt != i64::from(receiver_lease.sender_attempt_no)
+                || receiver_sender_token != receiver_lease.sender_lease_token
+                || (amendment_packet_hash.is_none() && decision_actor != actor_account_id)
+                || decision_policy_id != policy_id
+                || u64::try_from(decision_policy_revision).map_err(|_| unavailable())?
+                    != policy_revision
+                || decision_policy_digest != policy_digest
+                || decision_effect != "allow"
+                || decision_task_id.as_deref() != Some(outbox_lease.task_id.as_str())
+                || decision_operation
+                    != if amendment_packet_hash.is_some() { "ratificationDecide" } else if causative_revision == 1 {
+                        "TaskCreate"
+                    } else {
+                        "TaskContinue"
+                    }
+                || decision_resource_kind != if amendment_packet_hash.is_some() { "ratification" } else { "send-message-request" }
+                || decision_resource_digest != *amendment_packet_hash.as_ref().unwrap_or(&authorized_request_digest)
+                || decision_decided_at != authorization_decided_at
+            {
+                return Err(unavailable());
+            }
+            let scope = crate::DurableRuntimeScope::from_persisted_task_bindings(
+                OwnedTaskScope::new_with_principal_and_authentication(
+                    &outbox_lease.tenant_scope,
+                    decision_actor,
+                    principal_scope,
+                    visibility,
+                    authentication_method,
+                )
+                .map_err(|_| unavailable())?,
+                crate::DurableAuthorizationDecisionProvenance::new(
+                    policy_id,
+                    policy_revision,
+                    policy_digest,
+                )
+                .map_err(|_| unavailable())?,
+            )
+            .map_err(|_| unavailable())?;
+            let correlation = crate::DurableDispatchCorrelation::new(
+                scope.clone(),
+                &outbox_lease.dispatch_id,
+                outbox_lease.attempt_no,
+                receiver_lease.lease_epoch,
+            )
+            .map_err(|_| unavailable())?;
+            let budget = crate::ExecutionBudget::new(MAX_ATOMIC_JSON_BYTES as u64, 1_024)
+                .map_err(|_| unavailable())?;
+            crate::DurableRuntimeAuthorityContext::loopback_development(
+                scope,
+                correlation,
+                request,
+                payload_digest,
+                authorized_request_digest,
+                budget,
+            )
+            .map_err(|_| unavailable())
+        })
+        .await
     }
 
     async fn finish_outbox_attempt(
@@ -11772,6 +12494,1203 @@ crate::impl_unsupported_artifact_authority!(SqliteTaskStore);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[allow(clippy::too_many_lines)]
+    async fn migrated_cancellation_fixture(
+        completed: bool,
+    ) -> (
+        std::path::PathBuf,
+        SqliteTaskStore,
+        DurableDispatchEnvelope,
+        Vec<MeshEvent>,
+    ) {
+        let directory = std::env::temp_dir().join(format!(
+            "smesh-v11-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("legacy.sqlite3");
+        let store = SqliteTaskStore::open(&path, 8).await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut message = Message::new(Role::User, vec![Part::text("legacy work")]);
+        message.message_id = "legacy-message".to_owned();
+        let task = Task {
+            id: "legacy-task".to_owned(),
+            context_id: "legacy-context".to_owned(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: Some(vec![message.clone()]),
+            metadata: None,
+        };
+        store
+            .admit_send_message(SendMessageAdmission {
+                request: a2a::SendMessageRequest {
+                    message,
+                    configuration: None,
+                    metadata: None,
+                    tenant: None,
+                },
+                streaming: false,
+                task: task.clone(),
+                original_result: SendMessageResponse::Task(task),
+                input_limits: InputLimits::default(),
+                now,
+                max_attempts: 3,
+            })
+            .await
+            .unwrap();
+        let sender = store
+            .claim_outbox("legacy-sender", now, 60_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let envelope = DurableDispatchEnvelope {
+            tenant_scope: sender.tenant_scope.clone(),
+            dispatch_id: sender.dispatch_id.clone(),
+            payload_digest: content_digest(&serde_json::to_vec(&sender.request).unwrap()),
+            request: sender.request.clone(),
+            execution_reservation: None,
+        };
+        let ReceiverAdmission::Execute(receiver) = store
+            .begin_receive(envelope.clone(), "legacy-receiver", now, 60_000)
+            .await
+            .unwrap()
+        else {
+            panic!("receiver not admitted")
+        };
+        let events = vec![MeshEvent::Completed {
+            summary: "legacy committed bytes".to_owned(),
+        }];
+        if completed {
+            store
+                .complete_loopback_receive(&receiver, &events, now + 1)
+                .await
+                .unwrap();
+        }
+        store.shutdown_shared().await.unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER tasks_runtime_authority_immutable;
+             DROP TRIGGER idempotency_runtime_authority_immutable;
+             ALTER TABLE idempotency_records DROP COLUMN authorization_decided_at;
+             ALTER TABLE idempotency_records DROP COLUMN authorization_decision_id;
+             ALTER TABLE idempotency_records DROP COLUMN authorization_policy_digest;
+             ALTER TABLE idempotency_records DROP COLUMN authorization_policy_revision;
+             ALTER TABLE idempotency_records DROP COLUMN authorization_policy_id;
+             ALTER TABLE idempotency_records DROP COLUMN authorization_visibility;
+             ALTER TABLE idempotency_records DROP COLUMN authorization_authentication_method;
+             ALTER TABLE idempotency_records DROP COLUMN authorization_principal_scope;
+             ALTER TABLE receiver_inbox DROP COLUMN sender_lease_token;
+             ALTER TABLE receiver_inbox DROP COLUMN sender_attempt_no;
+             ALTER TABLE tasks DROP COLUMN admission_decision_id;
+             ALTER TABLE tasks DROP COLUMN admission_policy_digest;
+             ALTER TABLE tasks DROP COLUMN admission_policy_revision;
+             ALTER TABLE tasks DROP COLUMN admission_policy_id;
+             ALTER TABLE tasks DROP COLUMN visibility;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE store_metadata SET schema_version=11,migration_hash=?1 WHERE singleton=1",
+                [schema_v11_hash()],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 11).unwrap();
+        validate_schema_v11(&connection).unwrap();
+        drop(connection);
+        let reopened = SqliteTaskStore::open(&path, 8).await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let attempt: Option<i64> = connection
+            .query_row("SELECT sender_attempt_no FROM receiver_inbox", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            attempt, None,
+            "migration must not invent runtime correlation"
+        );
+        drop(connection);
+        (directory, reopened, envelope, events)
+    }
+
+    #[tokio::test]
+    async fn migrated_v11_expired_receiver_cancels_without_runtime_correlation() {
+        let (directory, store, _, _) = migrated_cancellation_fixture(false).await;
+        let outcome = store
+            .request_cancellation("legacy-task", chrono::Utc::now().timestamp_millis())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CancellationOutcome::Canceled(task) if task.status.state == a2a::TaskState::Canceled)
+        );
+        store.shutdown_shared().await.unwrap();
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrated_v11_completed_receiver_defers_to_exact_replay() {
+        let (directory, store, envelope, events) = migrated_cancellation_fixture(true).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let outcome = store
+            .request_cancellation("legacy-task", now)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CancellationOutcome::LegacyReplayOnly { message_id } if message_id == "legacy-message")
+        );
+        assert!(
+            !store
+                .cancellation_requested(&envelope.dispatch_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            matches!(store.begin_receive(envelope, "legacy-replay", now, 60_000).await.unwrap(), ReceiverAdmission::Replay(replay) if replay == events)
+        );
+        store.shutdown_shared().await.unwrap();
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrated_v11_live_receiver_missing_correlation_fails_without_intent() {
+        let (directory, store, envelope, _) = migrated_cancellation_fixture(false).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let connection = Connection::open(directory.join("legacy.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE receiver_inbox SET lease_until=?1 WHERE state='processing'",
+                [now + 60_000],
+            )
+            .unwrap();
+        drop(connection);
+        let error = store
+            .request_cancellation("legacy-task", now)
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "legacy receiver has no runtime correlation");
+        assert!(
+            !store
+                .cancellation_requested(&envelope.dispatch_id)
+                .await
+                .unwrap()
+        );
+        store.shutdown_shared().await.unwrap();
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrated_v11_handler_replays_completion_without_cancel_ack() {
+        use crate::outbox_driver::{
+            DriverTestGate, DriverTestHooks, spawn_durable_driver_with_test_hooks,
+        };
+        use a2a_server::RequestHandler as _;
+        let (directory, store, _, _) = migrated_cancellation_fixture(true).await;
+        let now = chrono::Utc::now().timestamp_millis() + 120_000;
+        let gate = DriverTestGate::new();
+        let driver = spawn_durable_driver_with_test_hooks(
+            store.clone(),
+            crate::DurableLoopbackEndpoint::new(),
+            crate::InjectedClock::new(now),
+            DriverTestHooks {
+                before_claim: Some(gate.clone()),
+                ..Default::default()
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+            .await
+            .unwrap();
+        let control = driver.control();
+        let (telemetry, records) =
+            crate::telemetry::TelemetryHandle::multisignal_capture_for_test(64, 0.0);
+        let handler = crate::durable_handler::DurableRequestHandler::new(
+            store.clone(),
+            control.clone(),
+            crate::InjectedClock::new(now),
+            InputLimits::default(),
+        )
+        .with_telemetry(Some(telemetry));
+        let cancel = tokio::spawn(async move {
+            handler
+                .cancel_task(
+                    &a2a_server::ServiceParams::default(),
+                    a2a::CancelTaskRequest {
+                        id: "legacy-task".to_owned(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+        });
+        let mut state = control.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.borrow().waiters == 0 {
+                state.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            control
+                .cancel_signals
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        gate.release.notify_one();
+        let task = tokio::time::timeout(std::time::Duration::from_secs(3), cancel)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status.state, a2a::TaskState::Completed);
+        assert_eq!(
+            store
+                .final_result_for_message("legacy-message")
+                .await
+                .unwrap(),
+            Some(SendMessageResponse::Task(task))
+        );
+        driver.shutdown().await.unwrap();
+        let captured: Vec<_> = records.try_iter().collect();
+        assert!(
+            captured
+                .iter()
+                .any(|r| r.name() == crate::telemetry::EventName::CancellationRequested.as_str())
+        );
+        assert!(!captured.iter().any(|r| {
+            [
+                crate::telemetry::EventName::CancellationAcknowledged.as_str(),
+                crate::telemetry::EventName::CancellationStopped.as_str(),
+            ]
+            .contains(&r.name())
+        }));
+        store.shutdown_shared().await.unwrap();
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn runtime_authority_context_reloads_sqlite_rows() {
+        let directory = std::env::temp_dir().join(format!(
+            "smesh-runtime-authority-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("authority.sqlite3");
+        let policy_digest = content_digest(b"admission-policy-b/v7");
+        let store = SqliteTaskStore::open(&path, 8).await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut message = a2a::Message::new(a2a::Role::User, vec![a2a::Part::text("run")]);
+        message.message_id = "runtime-message".to_owned();
+        let request = a2a::SendMessageRequest {
+            message: message.clone(),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let task = Task {
+            id: "runtime-task".to_owned(),
+            context_id: "runtime-context".to_owned(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: Some(vec![message]),
+            metadata: None,
+        };
+        let scope = OwnedTaskScope::new_with_principal_and_authentication(
+            TRUSTED_SINGLE_TENANT_SCOPE,
+            DEV_ONLY_ACCOUNT_ID,
+            "runtime-principal",
+            VisibilityScope::Tenant,
+            "bearer-jwt",
+        )
+        .unwrap();
+        store
+            .authorize_and_admit(
+                &scope,
+                SendMessageAdmission {
+                    request: request.clone(),
+                    streaming: true,
+                    task: task.clone(),
+                    original_result: SendMessageResponse::Task(task),
+                    input_limits: InputLimits::default(),
+                    now,
+                    max_attempts: 3,
+                },
+                AuthorizationAuditInput::new(
+                    "runtime-decision",
+                    TRUSTED_SINGLE_TENANT_SCOPE,
+                    DEV_ONLY_ACCOUNT_ID,
+                    "admission-policy-b",
+                    7,
+                    &policy_digest,
+                    "TaskCreate",
+                    AuthorizationDecisionEffect::Allow,
+                    "allowed",
+                    "send-message-request",
+                    canonical_send_message_digest_v2(
+                        TRUSTED_SINGLE_TENANT_SCOPE,
+                        DEV_ONLY_ACCOUNT_ID,
+                        &request,
+                        true,
+                    )
+                    .unwrap(),
+                    Some("runtime-task".to_owned()),
+                    now,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sender = store
+            .claim_outbox("runtime-sender", now + 1, 60_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload_digest = content_digest(&serde_json::to_vec(&sender.request).unwrap());
+        let receiver = match store
+            .begin_receive(
+                DurableDispatchEnvelope {
+                    tenant_scope: sender.tenant_scope.clone(),
+                    dispatch_id: sender.dispatch_id.clone(),
+                    payload_digest: payload_digest.clone(),
+                    request: sender.request.clone(),
+                    execution_reservation: None,
+                },
+                "runtime-receiver",
+                now + 2,
+                60_000,
+            )
+            .await
+            .unwrap()
+        {
+            ReceiverAdmission::Execute(lease) => lease,
+            other => panic!("expected receiver execution, got {other:?}"),
+        };
+        let authority_now = now + 2;
+
+        let context = <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+            &store,
+            &sender,
+            &receiver,
+            authority_now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(context.request(), &sender.request);
+        assert_eq!(context.transport_payload_digest(), payload_digest);
+        assert_eq!(
+            context.authorized_request_digest(),
+            canonical_send_message_digest_v2(
+                TRUSTED_SINGLE_TENANT_SCOPE,
+                DEV_ONLY_ACCOUNT_ID,
+                &request,
+                true,
+            )
+            .unwrap()
+        );
+        assert_eq!(context.scope().principal_scope(), "runtime-principal");
+        assert_eq!(context.scope().authentication_method(), "bearer-jwt");
+        assert_eq!(context.scope().visibility(), VisibilityScope::Tenant);
+        assert_eq!(
+            context.scope().authorization_policy_id(),
+            "admission-policy-b"
+        );
+        assert_eq!(context.scope().authorization_policy_revision(), 7);
+        assert_eq!(context.scope().authorization_policy_digest(), policy_digest);
+        assert!(context.is_loopback_development());
+        let initial_authority = Connection::open(&path).unwrap();
+        let initial_message_id = authorized_message_identity(
+            TRUSTED_SINGLE_TENANT_SCOPE,
+            DEV_ONLY_ACCOUNT_ID,
+            "runtime-message",
+        );
+        let initial_evidence = initial_authority
+            .query_row(
+                "SELECT d.decision_id,d.operation,d.resource_kind,d.resource_digest,
+                        d.actor_account_id,d.policy_id,d.policy_revision,d.policy_digest,
+                        i.authorization_principal_scope,i.authorization_authentication_method,
+                        i.authorization_visibility
+                 FROM idempotency_records i
+                 JOIN authorization_decisions d
+                   ON d.tenant_scope=i.tenant_scope
+                  AND d.decision_id=i.authorization_decision_id
+                 WHERE i.tenant_scope=?1 AND i.message_id=?2",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, initial_message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(initial_evidence.0, "runtime-decision");
+        assert_eq!(initial_evidence.1, "TaskCreate");
+        assert_eq!(initial_evidence.2, "send-message-request");
+        assert_eq!(initial_evidence.3, context.authorized_request_digest());
+        assert_eq!(initial_evidence.4, DEV_ONLY_ACCOUNT_ID);
+        assert_eq!(initial_evidence.5, "admission-policy-b");
+        assert_eq!(initial_evidence.6, 7);
+        assert_eq!(initial_evidence.7, policy_digest);
+        assert_eq!(initial_evidence.8, "runtime-principal");
+        assert_eq!(initial_evidence.9, "bearer-jwt");
+        assert_eq!(initial_evidence.10, "tenant");
+        drop(initial_authority);
+
+        let context_json = serde_json::to_string(&context).unwrap();
+        let envelope_json =
+            serde_json::to_string(&crate::DurableWorkEnvelope::new(context.clone())).unwrap();
+        for encoded in [&context_json, &envelope_json] {
+            assert!(!encoded.contains(&sender.lease_token));
+            assert!(!encoded.contains(&receiver.lease_token));
+            assert!(!encoded.contains(&receiver.sender_lease_token));
+            assert!(encoded.contains(context.transport_payload_digest()));
+            assert!(encoded.contains(context.authorized_request_digest()));
+        }
+        assert_ne!(
+            context.transport_payload_digest(),
+            context.authorized_request_digest()
+        );
+        assert!(receiver.lease_until > sender.lease_until);
+        let error = <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+            &store,
+            &sender,
+            &receiver,
+            sender.lease_until,
+        )
+        .await
+        .expect_err("expired sender must fail while receiver remains live");
+        assert_eq!(error.code, -32603);
+        assert_eq!(error.message, "durable runtime authority unavailable");
+        assert!(error.details.is_none());
+        let mut renewed_sender = sender.clone();
+        renewed_sender.lease_until = receiver.lease_until + 60_000;
+        let renewal = Connection::open(&path).unwrap();
+        register_disabled_projection_functions(&renewal);
+        assert_eq!(
+            renewal
+                .execute(
+                    "UPDATE outbox SET lease_until=?1 WHERE tenant_scope=?2 AND outbox_id=?3 AND lease_until=?4",
+                    params![
+                        renewed_sender.lease_until,
+                        sender.tenant_scope,
+                        sender.outbox_id,
+                        sender.lease_until
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+        drop(renewal);
+        assert!(renewed_sender.lease_until > receiver.lease_until);
+        let error = <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+            &store,
+            &renewed_sender,
+            &receiver,
+            receiver.lease_until,
+        )
+        .await
+        .expect_err("expired receiver must fail while sender remains live");
+        assert_eq!(error.code, -32603);
+        assert_eq!(error.message, "durable runtime authority unavailable");
+        assert!(error.details.is_none());
+        let sender = renewed_sender;
+
+        let mut sender_mutations = Vec::new();
+        let mut changed = sender.clone();
+        changed.lease_token.push_str("-stale");
+        sender_mutations.push(("sender token", changed));
+        let mut changed = sender.clone();
+        changed.attempt_no += 1;
+        sender_mutations.push(("sender attempt", changed));
+
+        let mut changed = sender.clone();
+        changed.task_id.push_str("-other");
+        sender_mutations.push(("sender identity", changed));
+        let mut changed = sender.clone();
+        changed.tenant_scope.push_str("-other");
+        sender_mutations.push(("sender tenant", changed));
+        let mut changed = sender.clone();
+        changed.request.text.push_str("-other");
+        sender_mutations.push(("sender request", changed));
+        let mut changed = sender.clone();
+        changed.ratification_required = !changed.ratification_required;
+        sender_mutations.push(("sender policy fence", changed));
+        for (label, changed) in sender_mutations {
+            assert_ne!(changed, sender, "{label} mutation must differ");
+            let error =
+                <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+                    &store,
+                    &changed,
+                    &receiver,
+                    authority_now,
+                )
+                .await
+                .expect_err(label);
+            assert_eq!(error.code, -32603, "{label}");
+            assert_eq!(
+                error.message, "durable runtime authority unavailable",
+                "{label}"
+            );
+            assert!(error.details.is_none(), "{label}");
+        }
+
+        let mut receiver_mutations = Vec::new();
+        let mut changed = receiver.clone();
+        changed.lease_token.push_str("-stale");
+        receiver_mutations.push(("receiver token", changed));
+        let mut changed = receiver.clone();
+        changed.lease_epoch += 1;
+        receiver_mutations.push(("receiver epoch", changed));
+        let mut changed = receiver.clone();
+        changed.sender_lease_token.push_str("-stale");
+        receiver_mutations.push(("receiver sender binding", changed));
+        let mut changed = receiver.clone();
+        changed.sender_attempt_no += 1;
+        receiver_mutations.push(("receiver sender attempt", changed));
+        let mut changed = receiver.clone();
+        changed.payload_digest.push_str("-other");
+        receiver_mutations.push(("receiver digest", changed));
+        let mut changed = receiver.clone();
+        changed.tenant_scope.push_str("-other");
+        receiver_mutations.push(("receiver scope", changed));
+        let mut changed = receiver.clone();
+        changed.task_id.push_str("-other");
+        receiver_mutations.push(("receiver task identity", changed));
+        let mut changed = receiver.clone();
+        changed.dispatch_id.push_str("-other");
+        receiver_mutations.push(("receiver dispatch identity", changed));
+
+        for (label, changed) in receiver_mutations {
+            assert_ne!(changed, receiver, "{label} mutation must differ");
+            let error =
+                <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+                    &store,
+                    &sender,
+                    &changed,
+                    authority_now,
+                )
+                .await
+                .expect_err(label);
+            assert_eq!(error.code, -32603, "{label}");
+            assert_eq!(
+                error.message, "durable runtime authority unavailable",
+                "{label}"
+            );
+            assert!(error.details.is_none(), "{label}");
+        }
+
+        let mut paused =
+            <SqliteTaskStore as crate::OutboxAuthority>::task_for_outbox(&store, &sender)
+                .await
+                .unwrap()
+                .unwrap();
+        paused.status.state = a2a::TaskState::InputRequired;
+        paused.status.timestamp = chrono::DateTime::from_timestamp_millis(now + 200);
+        let paused_json = serde_json::to_string(&paused).unwrap();
+        let paused_state = serde_json::to_string(&paused.status.state).unwrap();
+        let mut connection = Connection::open(&path).unwrap();
+        register_disabled_projection_functions(&connection);
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "UPDATE tasks SET state=?1,status_timestamp=?2,revision=2,task_json=?3 WHERE task_id=?4",
+                params![
+                    paused_state,
+                    paused.status.timestamp.map(|value| value.to_rfc3339()),
+                    paused_json,
+                    paused.id
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO task_events(tenant_scope,task_id,event_seq,task_revision,event_kind,
+                     from_state,to_state,event_json,created_at)
+                 VALUES(?1,?2,2,2,'runtime_interrupted',?3,?4,?5,?6)",
+                params![
+                    TRUSTED_SINGLE_TENANT_SCOPE,
+                    paused.id,
+                    serde_json::to_string(&a2a::TaskState::Submitted).unwrap(),
+                    paused_state,
+                    paused_json,
+                    now + 200
+                ],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        let mut continuation_message =
+            a2a::Message::new(a2a::Role::User, vec![a2a::Part::text("continue under p2")]);
+        continuation_message.message_id = "runtime-continuation-message".to_owned();
+        continuation_message.task_id = Some(paused.id.clone());
+        continuation_message.context_id = Some(paused.context_id.clone());
+        let continuation_request = SendMessageRequest {
+            message: continuation_message,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let continuation_scope = OwnedTaskScope::new_with_principal_and_authentication(
+            TRUSTED_SINGLE_TENANT_SCOPE,
+            DEV_ONLY_ACCOUNT_ID,
+            "runtime-principal-p2",
+            VisibilityScope::Own,
+            "mutual-tls",
+        )
+        .unwrap();
+        let continuation_digest = canonical_send_message_digest_v2(
+            TRUSTED_SINGLE_TENANT_SCOPE,
+            DEV_ONLY_ACCOUNT_ID,
+            &continuation_request,
+            true,
+        )
+        .unwrap();
+        store
+            .authorize_and_continue(
+                &continuation_scope,
+                SendMessageAdmission {
+                    request: continuation_request.clone(),
+                    streaming: true,
+                    task: paused.clone(),
+                    original_result: SendMessageResponse::Task(paused),
+                    input_limits: InputLimits::default(),
+                    now: now + 201,
+                    max_attempts: 3,
+                },
+                AuthorizationAuditInput::new(
+                    "runtime-continuation-decision-p2",
+                    TRUSTED_SINGLE_TENANT_SCOPE,
+                    DEV_ONLY_ACCOUNT_ID,
+                    "continuation-policy-p2",
+                    8,
+                    content_digest(b"continuation-policy-p2/v8"),
+                    "TaskContinue",
+                    AuthorizationDecisionEffect::Allow,
+                    "allowed",
+                    "send-message-request",
+                    continuation_digest.clone(),
+                    None,
+                    now + 201,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let continuation_sender = store
+            .claim_outbox("runtime-continuation-sender", now + 202, 60_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let continuation_receiver = match store
+            .begin_receive(
+                DurableDispatchEnvelope {
+                    tenant_scope: continuation_sender.tenant_scope.clone(),
+                    dispatch_id: continuation_sender.dispatch_id.clone(),
+                    payload_digest: content_digest(
+                        &serde_json::to_vec(&continuation_sender.request).unwrap(),
+                    ),
+                    request: continuation_sender.request.clone(),
+                    execution_reservation: None,
+                },
+                "runtime-continuation-receiver",
+                now + 203,
+                60_000,
+            )
+            .await
+            .unwrap()
+        {
+            ReceiverAdmission::Execute(lease) => lease,
+            other => panic!("expected continuation receiver execution, got {other:?}"),
+        };
+        let continuation_context =
+            <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+                &store,
+                &continuation_sender,
+                &continuation_receiver,
+                now + 203,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            continuation_context.scope().principal_scope(),
+            "runtime-principal-p2"
+        );
+        assert_eq!(
+            continuation_context.scope().authentication_method(),
+            "mutual-tls"
+        );
+        assert_eq!(
+            continuation_context.scope().visibility(),
+            VisibilityScope::Own
+        );
+        assert_eq!(
+            continuation_context.scope().authorization_policy_id(),
+            "continuation-policy-p2"
+        );
+        assert_eq!(
+            continuation_context.scope().authorization_policy_revision(),
+            8
+        );
+        assert_eq!(
+            continuation_context.scope().authorization_policy_digest(),
+            content_digest(b"continuation-policy-p2/v8")
+        );
+        assert_eq!(
+            continuation_context.authorized_request_digest(),
+            continuation_digest
+        );
+        let tamper = Connection::open(&path).unwrap();
+        register_disabled_projection_functions(&tamper);
+        let continuation_evidence = tamper
+            .query_row(
+                "SELECT d.decision_id,d.operation,d.resource_kind,d.resource_digest,
+                        d.actor_account_id,d.policy_id,d.policy_revision,d.policy_digest,
+                        i.authorization_principal_scope,i.authorization_authentication_method,
+                        i.authorization_visibility
+                 FROM idempotency_records i
+                 JOIN authorization_decisions d
+                   ON d.tenant_scope=i.tenant_scope
+                  AND d.decision_id=i.authorization_decision_id
+                 WHERE i.tenant_scope=?1 AND i.message_id=?2",
+                params![
+                    TRUSTED_SINGLE_TENANT_SCOPE,
+                    authorized_message_identity(
+                        TRUSTED_SINGLE_TENANT_SCOPE,
+                        DEV_ONLY_ACCOUNT_ID,
+                        "runtime-continuation-message"
+                    )
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(continuation_evidence.0, "runtime-continuation-decision-p2");
+        assert_eq!(continuation_evidence.1, "TaskContinue");
+        assert_eq!(continuation_evidence.2, "send-message-request");
+        assert_eq!(continuation_evidence.3, continuation_digest);
+        assert_eq!(continuation_evidence.4, DEV_ONLY_ACCOUNT_ID);
+        assert_eq!(continuation_evidence.5, "continuation-policy-p2");
+        assert_eq!(continuation_evidence.6, 8);
+        assert_eq!(
+            continuation_evidence.7,
+            content_digest(b"continuation-policy-p2/v8")
+        );
+        assert_eq!(continuation_evidence.8, "runtime-principal-p2");
+        assert_eq!(continuation_evidence.9, "mutual-tls");
+        assert_eq!(continuation_evidence.10, "own");
+        tamper
+            .execute_batch("DROP TRIGGER idempotency_runtime_authority_immutable")
+            .unwrap();
+        let continuation_message_id = authorized_message_identity(
+            TRUSTED_SINGLE_TENANT_SCOPE,
+            DEV_ONLY_ACCOUNT_ID,
+            "runtime-continuation-message",
+        );
+        tamper
+            .execute(
+                "UPDATE idempotency_records SET authorization_decision_id='runtime-decision'
+                 WHERE tenant_scope=?1 AND message_id=?2",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, continuation_message_id],
+            )
+            .unwrap();
+        let error = <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+            &store,
+            &continuation_sender,
+            &continuation_receiver,
+            now + 203,
+        )
+        .await
+        .expect_err("initial P1 decision must not authorize continuation P2 dispatch");
+        assert_eq!(error.code, -32603);
+        assert_eq!(error.message, "durable runtime authority unavailable");
+        assert!(error.details.is_none());
+        let unary_digest = canonical_send_message_digest_v2(
+            TRUSTED_SINGLE_TENANT_SCOPE,
+            DEV_ONLY_ACCOUNT_ID,
+            &continuation_request,
+            false,
+        )
+        .unwrap();
+        assert_ne!(unary_digest, continuation_digest);
+        tamper
+            .execute(
+                "INSERT INTO authorization_decisions(decision_id,tenant_scope,actor_account_id,
+                     policy_id,policy_revision,policy_digest,operation,effect,reason,resource_kind,
+                     resource_digest,task_id,decided_at)
+                 VALUES('runtime-unary-substitute',?1,?2,'continuation-policy-p2',8,?3,
+                        'TaskContinue','allow','allowed','send-message-request',?4,NULL,?5)",
+                params![
+                    TRUSTED_SINGLE_TENANT_SCOPE,
+                    DEV_ONLY_ACCOUNT_ID,
+                    content_digest(b"continuation-policy-p2/v8"),
+                    unary_digest,
+                    now + 201
+                ],
+            )
+            .unwrap();
+        tamper
+            .execute(
+                "UPDATE idempotency_records SET authorization_decision_id='runtime-unary-substitute'
+                 WHERE tenant_scope=?1 AND message_id=?2",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, continuation_message_id],
+            )
+            .unwrap();
+        let error = <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+            &store,
+            &continuation_sender,
+            &continuation_receiver,
+            now + 203,
+        )
+        .await
+        .expect_err("unary authorization digest must not authorize a streaming continuation");
+        assert_eq!(error.code, -32603);
+        assert_eq!(error.message, "durable runtime authority unavailable");
+        assert!(error.details.is_none());
+        tamper
+            .execute(
+                "INSERT INTO authorization_decisions(decision_id,tenant_scope,actor_account_id,
+                     policy_id,policy_revision,policy_digest,operation,effect,reason,resource_kind,
+                     resource_digest,task_id,decided_at)
+                 VALUES('runtime-unrelated-decision',?1,?2,'continuation-policy-p2',8,?3,
+                        'TaskContinue','allow','allowed','send-message-request','sha256:unrelated',
+                        'runtime-task',?4)",
+                params![
+                    TRUSTED_SINGLE_TENANT_SCOPE,
+                    DEV_ONLY_ACCOUNT_ID,
+                    content_digest(b"continuation-policy-p2/v8"),
+                    now + 201
+                ],
+            )
+            .unwrap();
+        tamper
+            .execute(
+                "UPDATE idempotency_records SET authorization_decision_id='runtime-unrelated-decision'
+                 WHERE tenant_scope=?1 AND message_id=?2",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, continuation_message_id],
+            )
+            .unwrap();
+        let error = <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+            &store,
+            &continuation_sender,
+            &continuation_receiver,
+            now + 203,
+        )
+        .await
+        .expect_err("unrelated allow decision must not authorize continuation dispatch");
+        assert_eq!(error.message, "durable runtime authority unavailable");
+        tamper
+            .execute(
+                "UPDATE idempotency_records SET authorization_decision_id='runtime-continuation-decision-p2'
+                 WHERE tenant_scope=?1 AND message_id=?2",
+                params![TRUSTED_SINGLE_TENANT_SCOPE, continuation_message_id],
+            )
+            .unwrap();
+        drop(tamper);
+
+        let large_admitted_text = "x".repeat(70 * 1024);
+        let mut tampered_message =
+            a2a::Message::new(a2a::Role::User, vec![a2a::Part::text(large_admitted_text)]);
+        tampered_message.message_id = "semantic-substitution-message".to_owned();
+        let tampered_request = a2a::SendMessageRequest {
+            message: tampered_message.clone(),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let tampered_task = Task {
+            id: "semantic-substitution-task".to_owned(),
+            context_id: "semantic-substitution-context".to_owned(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: Some(vec![tampered_message]),
+            metadata: None,
+        };
+        store
+            .authorize_and_admit(
+                &scope,
+                SendMessageAdmission {
+                    request: tampered_request.clone(),
+                    streaming: false,
+                    task: tampered_task.clone(),
+                    original_result: SendMessageResponse::Task(tampered_task.clone()),
+                    input_limits: InputLimits {
+                        max_text_bytes: 80 * 1024,
+                    },
+                    now: now + 100,
+                    max_attempts: 3,
+                },
+                AuthorizationAuditInput::new(
+                    "semantic-substitution-decision",
+                    TRUSTED_SINGLE_TENANT_SCOPE,
+                    DEV_ONLY_ACCOUNT_ID,
+                    "admission-policy-b",
+                    7,
+                    &policy_digest,
+                    "TaskCreate",
+                    AuthorizationDecisionEffect::Allow,
+                    "allowed",
+                    "send-message-request",
+                    canonical_send_message_digest_v2(
+                        TRUSTED_SINGLE_TENANT_SCOPE,
+                        DEV_ONLY_ACCOUNT_ID,
+                        &tampered_request,
+                        false,
+                    )
+                    .unwrap(),
+                    Some(tampered_task.id.clone()),
+                    now + 100,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut substituted_request = MeshRequest::from_a2a(
+            tampered_task.id.clone(),
+            tampered_task.context_id.clone(),
+            &tampered_request.message,
+            InputLimits {
+                max_text_bytes: 80 * 1024,
+            },
+        )
+        .unwrap();
+        substituted_request.text = "coherently substituted executable text".to_owned();
+        let substituted_json = serde_json::to_string(&substituted_request).unwrap();
+        let substituted_digest = content_digest(substituted_json.as_bytes());
+        let mut substituted_sender = store
+            .claim_outbox("semantic-substitution-sender", now + 101, 60_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let original_digest =
+            content_digest(&serde_json::to_vec(&substituted_sender.request).unwrap());
+        let mut substituted_receiver = match store
+            .begin_receive(
+                DurableDispatchEnvelope {
+                    tenant_scope: substituted_sender.tenant_scope.clone(),
+                    dispatch_id: substituted_sender.dispatch_id.clone(),
+                    payload_digest: original_digest,
+                    request: substituted_sender.request.clone(),
+                    execution_reservation: None,
+                },
+                "semantic-substitution-receiver",
+                now + 102,
+                60_000,
+            )
+            .await
+            .unwrap()
+        {
+            ReceiverAdmission::Execute(lease) => lease,
+            other => panic!("expected substituted receiver execution, got {other:?}"),
+        };
+        let large_context =
+            <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+                &store,
+                &substituted_sender,
+                &substituted_receiver,
+                now + 103,
+            )
+            .await
+            .expect("request admitted above the default limit must reload");
+        assert_eq!(large_context.request(), &substituted_sender.request);
+        let tamper = Connection::open(&path).unwrap();
+        assert_eq!(
+            tamper
+                .execute(
+                    "UPDATE outbox SET payload_json=?1,payload_digest=?2
+                     WHERE task_id=?3 AND state='leased'",
+                    params![substituted_json, substituted_digest, tampered_task.id],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tamper
+                .execute(
+                    "UPDATE receiver_inbox SET payload_json=?1,payload_digest=?2
+                     WHERE task_id=?3 AND state='processing'",
+                    params![substituted_json, substituted_digest, tampered_task.id],
+                )
+                .unwrap(),
+            1
+        );
+        drop(tamper);
+        substituted_sender.request = substituted_request;
+        substituted_receiver.payload_digest = substituted_digest;
+        let error = <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+            &store,
+            &substituted_sender,
+            &substituted_receiver,
+            now + 102,
+        )
+        .await
+        .expect_err("causative request must bind executable semantics");
+        assert_eq!(error.code, -32603);
+        assert_eq!(error.message, "durable runtime authority unavailable");
+        assert!(error.details.is_none());
+
+        let tamper = Connection::open(&path).unwrap();
+        for mutation in [
+            "UPDATE tasks SET principal_scope='forged-principal' WHERE task_id='runtime-task'",
+            "UPDATE tasks SET authentication_method='forged-authentication' WHERE task_id='runtime-task'",
+            "UPDATE tasks SET visibility='own' WHERE task_id='runtime-task'",
+            "UPDATE tasks SET admission_policy_id='forged-policy' WHERE task_id='runtime-task'",
+            "UPDATE tasks SET admission_policy_revision=8 WHERE task_id='runtime-task'",
+            "UPDATE tasks SET admission_policy_digest='forged-digest' WHERE task_id='runtime-task'",
+            "UPDATE tasks SET admission_decision_id='forged-decision' WHERE task_id='runtime-task'",
+        ] {
+            assert!(tamper.execute(mutation, []).is_err(), "{mutation}");
+        }
+        drop(tamper);
+        let still_authoritative =
+            <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+                &store,
+                &sender,
+                &receiver,
+                authority_now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            still_authoritative.scope().visibility(),
+            VisibilityScope::Tenant
+        );
+        assert_eq!(
+            still_authoritative.scope().authorization_policy_id(),
+            "admission-policy-b"
+        );
+        assert_eq!(
+            still_authoritative.scope().authorization_policy_revision(),
+            7
+        );
+        assert_eq!(
+            still_authoritative.scope().authorization_policy_digest(),
+            policy_digest
+        );
+        let tamper = Connection::open(&path).unwrap();
+        tamper
+            .execute_batch("DROP TRIGGER authorization_decisions_no_update")
+            .unwrap();
+        tamper
+            .execute(
+                "UPDATE authorization_decisions SET operation='TaskGet'
+                 WHERE decision_id='runtime-decision'",
+                [],
+            )
+            .unwrap();
+        let error = <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+            &store,
+            &sender,
+            &receiver,
+            authority_now,
+        )
+        .await
+        .expect_err("allow decision for another operation must not authorize execution");
+        assert_eq!(error.message, "durable runtime authority unavailable");
+        tamper
+            .execute(
+                "UPDATE authorization_decisions SET operation='TaskCreate',resource_digest='sha256:unrelated'
+                 WHERE decision_id='runtime-decision'",
+                [],
+            )
+            .unwrap();
+        let error = <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+            &store,
+            &sender,
+            &receiver,
+            authority_now,
+        )
+        .await
+        .expect_err("allow decision for another resource must not authorize execution");
+        assert_eq!(error.message, "durable runtime authority unavailable");
+        tamper
+            .execute(
+                "UPDATE authorization_decisions SET resource_digest=?1
+                 WHERE decision_id='runtime-decision'",
+                [canonical_send_message_digest_v2(
+                    TRUSTED_SINGLE_TENANT_SCOPE,
+                    DEV_ONLY_ACCOUNT_ID,
+                    &request,
+                    true,
+                )
+                .unwrap()],
+            )
+            .unwrap();
+        drop(tamper);
+        let tamper = Connection::open(&path).unwrap();
+        tamper
+            .execute_batch(
+                "DROP TRIGGER tasks_runtime_authority_immutable;
+                 UPDATE tasks SET admission_policy_id='privileged-contradiction'
+                  WHERE task_id='runtime-task';",
+            )
+            .unwrap();
+        drop(tamper);
+        let still_causative =
+            <SqliteTaskStore as crate::OutboxAuthority>::load_runtime_authority_context(
+                &store,
+                &sender,
+                &receiver,
+                authority_now,
+            )
+            .await
+            .expect("runtime authority must not be sourced from copied task admission provenance");
+        assert_eq!(
+            still_causative.scope().authorization_policy_id(),
+            "admission-policy-b"
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn register_disabled_projection_functions(connection: &Connection) {
         let flags = FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS;
@@ -11922,6 +13841,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Historical DDL and exact byte-accounting witness are one migration fixture.
     fn v8_migration_backfills_exact_authorization_accounting() {
         let mut connection = Connection::open_in_memory().unwrap();
         initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
@@ -11969,7 +13889,24 @@ mod tests {
         }
         connection
             .execute_batch(
-                "DROP TRIGGER outbox_ratification_fence_immutable;
+                "DROP TRIGGER tasks_runtime_authority_immutable;
+                 DROP TRIGGER idempotency_runtime_authority_immutable;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_decided_at;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_decision_id;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_policy_digest;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_policy_revision;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_policy_id;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_visibility;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_authentication_method;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_principal_scope;
+                 ALTER TABLE receiver_inbox DROP COLUMN sender_lease_token;
+                 ALTER TABLE receiver_inbox DROP COLUMN sender_attempt_no;
+                 ALTER TABLE tasks DROP COLUMN admission_decision_id;
+                 ALTER TABLE tasks DROP COLUMN admission_policy_digest;
+                 ALTER TABLE tasks DROP COLUMN admission_policy_revision;
+                 ALTER TABLE tasks DROP COLUMN admission_policy_id;
+                 ALTER TABLE tasks DROP COLUMN visibility;
+                 DROP TRIGGER outbox_ratification_fence_immutable;
                  ALTER TABLE outbox DROP COLUMN ratification_required;
                  DROP TRIGGER authorization_decision_accounting_no_insert;
                  DROP TRIGGER authorization_decision_accounting_no_delete;
@@ -12249,6 +14186,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep historical downgrade, rollback injection, and successful retry explicit.
     fn v10_to_v11_anchor_migration_rolls_back_and_retries() {
         let mut connection = Connection::open_in_memory().unwrap();
         initialize_schema(&mut connection, &LegacyTenantBinding::development()).unwrap();
@@ -12274,7 +14212,24 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TRIGGER outbox_ratification_fence_immutable;
+                "DROP TRIGGER tasks_runtime_authority_immutable;
+                 DROP TRIGGER idempotency_runtime_authority_immutable;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_decided_at;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_decision_id;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_policy_digest;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_policy_revision;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_policy_id;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_visibility;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_authentication_method;
+                 ALTER TABLE idempotency_records DROP COLUMN authorization_principal_scope;
+                 ALTER TABLE receiver_inbox DROP COLUMN sender_lease_token;
+                 ALTER TABLE receiver_inbox DROP COLUMN sender_attempt_no;
+                 ALTER TABLE tasks DROP COLUMN admission_decision_id;
+                 ALTER TABLE tasks DROP COLUMN admission_policy_digest;
+                 ALTER TABLE tasks DROP COLUMN admission_policy_revision;
+                 ALTER TABLE tasks DROP COLUMN admission_policy_id;
+                 ALTER TABLE tasks DROP COLUMN visibility;
+                 DROP TRIGGER outbox_ratification_fence_immutable;
                  ALTER TABLE outbox DROP COLUMN ratification_required;
                  DROP TRIGGER ratification_ledger_anchor_identity;
                  DROP TRIGGER ratification_ledger_anchor_no_delete;
@@ -12313,6 +14268,31 @@ mod tests {
                 .unwrap(),
             1
         );
+        connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_v12_metadata
+                 BEFORE UPDATE ON store_metadata
+                 BEGIN SELECT RAISE(ABORT, 'injected v12 migration failure'); END;",
+            )
+            .unwrap();
+        assert!(migrate_v11_to_v12(&mut connection).is_err());
+        let rollback: (i64, i64) = (
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='visibility'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+        );
+        assert_eq!(rollback, (11, 0));
+        connection
+            .execute_batch("DROP TRIGGER reject_v12_metadata")
+            .unwrap();
+        migrate_v11_to_v12(&mut connection).unwrap();
         validate_schema(&connection).unwrap();
     }
 

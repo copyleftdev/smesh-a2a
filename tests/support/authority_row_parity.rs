@@ -418,24 +418,20 @@ fn normalize(tables: &mut BTreeMap<String, Vec<Value>>) {
             }
             match table.as_str() {
                 "tasks" => {
-                    // PostgreSQL alone persists the policy part of trusted admission provenance
-                    // on the task for later ratification. Normalize only these three enumerated
-                    // columns and retain shared principal/authentication plus every other field.
-                    let postgres_only_provenance = [
-                        "authorization_policy_id",
-                        "authorization_policy_revision",
-                        "authorization_policy_digest",
-                    ];
-                    let present = postgres_only_provenance
-                        .iter()
-                        .filter(|field| object.contains_key(**field))
-                        .count();
-                    assert!(
-                        present == 0 || present == postgres_only_provenance.len(),
-                        "partial PostgreSQL task policy provenance row"
-                    );
-                    for field in postgres_only_provenance {
-                        object.remove(field);
+                    // Both adapters retain the original admission authority, using
+                    // different physical names. Rename, never discard, that evidence.
+                    for (postgres, logical) in [
+                        ("authorization_decision_id", "admission_decision_id"),
+                        ("authorization_policy_id", "admission_policy_id"),
+                        ("authorization_policy_revision", "admission_policy_revision"),
+                        ("authorization_policy_digest", "admission_policy_digest"),
+                    ] {
+                        if let Some(value) = object.remove(postgres) {
+                            assert!(
+                                object.insert(logical.into(), value).is_none(),
+                                "duplicate task authority representation"
+                            );
+                        }
                     }
                 }
                 "store_metadata" => {
@@ -550,5 +546,27 @@ fn normalize(tables: &mut BTreeMap<String, Vec<Value>>) {
             }
         }
         rows.sort_by_key(Value::to_string);
+    }
+}
+
+#[test]
+fn task_authority_normalization_preserves_every_provenance_field() {
+    let sqlite = serde_json::json!({
+        "admission_decision_id":"decision-1", "admission_policy_id":"policy-1",
+        "admission_policy_revision":2, "admission_policy_digest":"digest-1",
+        "principal_scope":"principal-1", "authentication_method":"bearer-jwt", "visibility":"own"
+    });
+    let postgres = serde_json::json!({
+        "authorization_decision_id":"decision-1", "authorization_policy_id":"policy-1",
+        "authorization_policy_revision":2, "authorization_policy_digest":"digest-1",
+        "principal_scope":"principal-1", "authentication_method":"bearer-jwt", "visibility":"own"
+    });
+    let dump = |row| LogicalAuthorityDump::new(BTreeMap::from([("tasks".into(), vec![row])]));
+    let expected = dump(sqlite);
+    assert_eq!(expected, dump(postgres.clone()));
+    for field in postgres.as_object().unwrap().keys() {
+        let mut changed = postgres.clone();
+        changed[field] = Value::Null;
+        assert_ne!(expected, dump(changed), "normalization discarded {field}");
     }
 }

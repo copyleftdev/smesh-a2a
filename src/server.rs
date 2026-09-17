@@ -14,19 +14,22 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
     ArtifactGcHandle, ArtifactOrphanScannerHandle, ArtifactPromoterHandle, BoundedTaskStore,
-    CompletionPolicySpec, DurableAuthority, DurableLoopbackEndpoint, ExecutionLimits,
-    InjectedClock, InputLimits, IntoDurableAuthority, MeshDispatcher, Operation, OwnedTaskScope,
-    PolicyError, RuntimeEventCapture, SmeshExecutor, SqliteTaskStore, VersionedCompletionPolicy,
+    CompletionPolicySpec, DurableAuthority, DurableLoopbackEndpoint, DurableRuntimeAdapter,
+    ExecutionLimits, InjectedClock, InputLimits, IntoDurableAuthority, MeshDispatcher, Operation,
+    OwnedTaskScope, PolicyError, RuntimeEventCapture, SmeshExecutor, SqliteTaskStore,
+    VersionedCompletionPolicy,
     auth::{AuthState, authenticate_request},
     authorization::{AuthorizationMiddlewareState, AuthorizationPolicy, authorize_request},
     build_agent_card, build_secured_agent_card_with_policy,
     card::LiveAgentCard,
     content_digest,
     durable_authority::DurableAuthorityParts,
+    durable_dispatch::DurableCoordinatorMode,
     durable_handler::DurableRequestHandler,
     guard::GuardedRequestHandler,
     outbox_driver::{
-        DurableDriverHandle, spawn_durable_driver, spawn_durable_driver_with_telemetry,
+        DurableDriverHandle, spawn_durable_driver_with_telemetry,
+        spawn_durable_loopback_driver_with_telemetry,
     },
     spawn_artifact_gc, spawn_artifact_orphan_scanner, spawn_artifact_promoter,
     spawn_artifact_promoter_with_telemetry,
@@ -1386,6 +1389,20 @@ impl DurableGateway {
     }
 
     #[doc(hidden)]
+    pub async fn wait_for_coordinator_idle(&self) -> Result<(), A2AError> {
+        let driver = self
+            .driver
+            .as_ref()
+            .ok_or_else(|| A2AError::internal("durable gateway is shut down"))?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            driver.control().wait_for_coordinator_idle(),
+        )
+        .await
+        .map_err(|_| A2AError::internal("durable coordinator idle wait timed out"))?
+    }
+
+    #[doc(hidden)]
     pub async fn durable_effect_count(&self) -> Result<u64, A2AError> {
         self.authority
             .as_ref()
@@ -1502,7 +1519,40 @@ impl Drop for DurableGateway {
     }
 }
 
+/// Build an authorized `PostgreSQL` durable gateway backed by an authority-free runtime adapter.
+///
+/// The concrete `PostgreSQL` store parameter deliberately prevents exposing a production
+/// runtime-plus-SQLite composition. CLI selection remains fail-closed until issue #95.
+///
+/// # Errors
+/// Returns an error if durable gateway policy construction fails.
+pub fn build_authorized_postgres_runtime_gateway(
+    config: GatewayConfig,
+    store: crate::PostgresTaskStore,
+    adapter: Arc<dyn DurableRuntimeAdapter>,
+    clock: InjectedClock,
+    auth: AuthState,
+    policy: Arc<AuthorizationPolicy>,
+) -> Result<DurableGateway, PolicyError> {
+    let authority = store.into_durable_authority();
+    Ok(build_durable_gateway_inner(
+        config,
+        DurableAuthorityParts {
+            authority,
+            local: None,
+        },
+        DurableCoordinatorMode::Runtime(adapter),
+        clock,
+        Some(auth),
+        Some(policy),
+        None,
+    ))
+}
+
 /// Build the repository-owned durable loopback gateway.
+///
+/// This is a development/test compatibility path. Production callers must use
+/// [`build_authorized_postgres_runtime_gateway`].
 ///
 /// Unlike the source-compatible generic builders, this accepts no arbitrary
 /// `MeshDispatcher` and never routes send methods through `DefaultRequestHandler`.
@@ -1524,6 +1574,9 @@ pub fn build_durable_loopback_gateway<A: IntoDurableAuthority>(
 
 /// Build the repository-owned durable gateway with an optional telemetry handle.
 ///
+/// This loopback builder is a development/test compatibility path. Production
+/// callers must use [`build_authorized_postgres_runtime_gateway`].
+///
 /// # Errors
 /// Returns an error if durable gateway policy construction fails.
 pub fn build_durable_loopback_gateway_with_telemetry<A: IntoDurableAuthority>(
@@ -1535,7 +1588,13 @@ pub fn build_durable_loopback_gateway_with_telemetry<A: IntoDurableAuthority>(
 ) -> Result<DurableGateway, PolicyError> {
     let parts = store.into_durable_authority_parts();
     Ok(build_durable_gateway_inner(
-        config, parts, endpoint, clock, None, None, telemetry,
+        config,
+        parts,
+        DurableCoordinatorMode::Loopback(endpoint),
+        clock,
+        None,
+        None,
+        telemetry,
     ))
 }
 
@@ -1543,8 +1602,9 @@ pub fn build_durable_loopback_gateway_with_telemetry<A: IntoDurableAuthority>(
 ///
 /// # Security
 /// This compatibility builder does **not** install tenant authorization and is
-/// therefore development-only and non-multitenant. Production callers must use
-/// [`build_authorized_durable_loopback_gateway`].
+/// therefore development-only and non-multitenant. Loopback-named builders are
+/// compatibility paths only; production callers must use
+/// [`build_authorized_postgres_runtime_gateway`].
 ///
 /// # Errors
 /// Returns an error if durable gateway policy construction fails.
@@ -1559,7 +1619,7 @@ pub fn build_authenticated_durable_loopback_gateway<A: IntoDurableAuthority>(
     Ok(build_durable_gateway_inner(
         config,
         parts,
-        endpoint,
+        DurableCoordinatorMode::Loopback(endpoint),
         clock,
         Some(auth),
         None,
@@ -1567,8 +1627,9 @@ pub fn build_authenticated_durable_loopback_gateway<A: IntoDurableAuthority>(
     ))
 }
 
-/// Build the authenticated durable gateway with server-owned tenant policy.
-/// This is the only authenticated builder intended for production use.
+/// Build a compatibility loopback gateway with server-owned tenant policy.
+/// This remains a development/test path; production callers must use
+/// [`build_authorized_postgres_runtime_gateway`].
 ///
 /// # Errors
 /// Returns an error if durable gateway policy construction fails.
@@ -1581,13 +1642,14 @@ pub fn build_authorized_durable_loopback_gateway<A: IntoDurableAuthority>(
     policy: Arc<AuthorizationPolicy>,
 ) -> Result<DurableGateway, PolicyError> {
     let authority = store.into_durable_authority();
+    let endpoint = endpoint.require_authority_context();
     Ok(build_durable_gateway_inner(
         config,
         DurableAuthorityParts {
             authority,
             local: None,
         },
-        endpoint,
+        DurableCoordinatorMode::Loopback(endpoint),
         clock,
         Some(auth),
         Some(policy),
@@ -1595,10 +1657,12 @@ pub fn build_authorized_durable_loopback_gateway<A: IntoDurableAuthority>(
     ))
 }
 
-/// Build the production authorized durable gateway with the human-ratification API.
+/// Build the compatibility loopback gateway with the human-ratification API.
 ///
 /// Ratification is provided only by the selected durable authority so packet,
 /// decision, task, event, audit, and callback writes share one transaction.
+/// This remains a development/test path; production callers must use
+/// [`build_authorized_postgres_runtime_gateway`].
 ///
 /// # Errors
 /// Returns an error if durable gateway policy construction fails.
@@ -1615,7 +1679,9 @@ pub fn build_authorized_durable_loopback_gateway_with_ratification<A: IntoDurabl
     )
 }
 
-/// Build the authorized ratification gateway without dropping optional telemetry.
+/// Build the compatibility loopback ratification gateway with optional telemetry.
+/// This remains a development/test path; production callers must use
+/// [`build_authorized_postgres_runtime_gateway`].
 ///
 /// # Errors
 /// Returns an error if durable gateway or ratification route construction fails.
@@ -1706,7 +1772,9 @@ pub fn build_authorized_durable_loopback_gateway_with_ratification_and_telemetry
     Ok(gateway)
 }
 
-/// Build the production authorized durable gateway with an optional telemetry handle.
+/// Build the compatibility loopback gateway with an optional telemetry handle.
+/// This remains a development/test path; production callers must use
+/// [`build_authorized_postgres_runtime_gateway`].
 ///
 /// # Errors
 /// Returns an error if durable gateway policy construction fails.
@@ -1720,13 +1788,14 @@ pub fn build_authorized_durable_loopback_gateway_with_telemetry<A: IntoDurableAu
     telemetry: Option<crate::telemetry::TelemetryHandle>,
 ) -> Result<DurableGateway, PolicyError> {
     let authority = store.into_durable_authority();
+    let endpoint = endpoint.require_authority_context();
     Ok(build_durable_gateway_inner(
         config,
         DurableAuthorityParts {
             authority,
             local: None,
         },
-        endpoint,
+        DurableCoordinatorMode::Loopback(endpoint),
         clock,
         Some(auth),
         Some(policy),
@@ -1738,7 +1807,7 @@ pub fn build_authorized_durable_loopback_gateway_with_telemetry<A: IntoDurableAu
 fn build_durable_gateway_inner(
     config: GatewayConfig,
     parts: DurableAuthorityParts,
-    endpoint: DurableLoopbackEndpoint,
+    mode: DurableCoordinatorMode,
     clock: InjectedClock,
     auth: Option<AuthState>,
     authorization: Option<Arc<AuthorizationPolicy>>,
@@ -1751,16 +1820,24 @@ fn build_durable_gateway_inner(
         max_body_bytes,
         ..
     } = config;
-    let endpoint = endpoint.with_telemetry(telemetry.clone());
-    let driver = if telemetry.is_some() {
-        spawn_durable_driver_with_telemetry(
+    let driver = match mode {
+        DurableCoordinatorMode::Loopback(endpoint) => spawn_durable_loopback_driver_with_telemetry(
             Arc::clone(&authority),
             endpoint,
             clock.clone(),
             telemetry.clone(),
-        )
-    } else {
-        spawn_durable_driver(Arc::clone(&authority), endpoint, clock.clone())
+        ),
+        DurableCoordinatorMode::Runtime(adapter) => spawn_durable_driver_with_telemetry(
+            Arc::clone(&authority),
+            adapter,
+            clock.clone(),
+            telemetry.clone(),
+        ),
+        #[cfg(test)]
+        DurableCoordinatorMode::TestLoopbackAdapter(_)
+        | DurableCoordinatorMode::TestRuntimeAdapterWithDevelopmentContext(_) => {
+            unreachable!("test-only coordinator mode is not a server composition")
+        }
     };
     let push_readiness = Arc::new(crate::push::PushReadiness::new());
     let jsonrpc_handler = Arc::new(

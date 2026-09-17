@@ -349,6 +349,49 @@ impl DurableRequestHandler {
         )
     }
 
+    fn invocation_audit(
+        &self,
+        context: &AuthorizationContext,
+        operation: Operation,
+        request: &SendMessageRequest,
+        streaming: bool,
+    ) -> Result<AuthorizationAuditInput, A2AError> {
+        let resource_digest = crate::canonical_send_message_digest_v2(
+            context.tenant_id(),
+            context.account_id(),
+            request,
+            streaming,
+        )?;
+        let entropy: [u8; 32] = rand::random();
+        let operation_name = format!("{operation:?}");
+        let decision_id = content_digest(
+            [
+                context.tenant_id().as_bytes(),
+                context.account_id().as_bytes(),
+                operation_name.as_bytes(),
+                resource_digest.as_bytes(),
+                &entropy,
+            ]
+            .concat()
+            .as_slice(),
+        );
+        AuthorizationAuditInput::new(
+            decision_id,
+            context.tenant_id(),
+            context.account_id(),
+            context.policy_id(),
+            context.policy_revision(),
+            context.policy_digest(),
+            operation_name,
+            AuthorizationDecisionEffect::Allow,
+            "policy_grant",
+            "send-message-request",
+            resource_digest,
+            None,
+            self.clock.now(),
+        )
+    }
+
     async fn acquire_quota_stream_lease(
         &self,
         context: Option<&AuthorizationContext>,
@@ -1151,7 +1194,7 @@ impl RequestHandler for DurableRequestHandler {
                             command,
                             crate::QuotaOperation::TaskContinue,
                         )?,
-                        self.audit(context, Operation::TaskContinue, "task", &task.id)?,
+                        self.invocation_audit(context, Operation::TaskContinue, &request, false)?,
                     )
                     .await?
             } else {
@@ -1181,12 +1224,7 @@ impl RequestHandler for DurableRequestHandler {
                     .authorize_and_admit_mutation(
                         scope,
                         mutation,
-                        self.audit(
-                            context,
-                            Operation::TaskCreate,
-                            "message",
-                            &request.message.message_id,
-                        )?,
+                        self.invocation_audit(context, Operation::TaskCreate, &request, false)?,
                     )
                     .await?
             } else {
@@ -1355,7 +1393,12 @@ impl RequestHandler for DurableRequestHandler {
                                 command,
                                 crate::QuotaOperation::TaskContinue,
                             )?,
-                            self.audit(context, Operation::TaskContinue, "task", &task.id)?,
+                            self.invocation_audit(
+                                context,
+                                Operation::TaskContinue,
+                                &request,
+                                true,
+                            )?,
                         )
                         .await?
                 } else {
@@ -1374,12 +1417,7 @@ impl RequestHandler for DurableRequestHandler {
                     .authorize_and_admit_mutation(
                         scope,
                         mutation,
-                        self.audit(
-                            context,
-                            Operation::TaskCreate,
-                            "message",
-                            &request.message.message_id,
-                        )?,
+                        self.invocation_audit(context, Operation::TaskCreate, &request, true)?,
                     )
                     .await?
             } else {
@@ -1674,13 +1712,15 @@ impl RequestHandler for DurableRequestHandler {
         } else {
             self.local()?.cancel(&request.id, self.clock.now()).await?
         };
+        let legacy_replay = matches!(&outcome, CancellationOutcome::LegacyReplayOnly { .. });
         let immediate_cancel = matches!(&outcome, CancellationOutcome::Canceled(_));
         if let Some(telemetry) = &self.telemetry {
             let (task_id, context_id) = match &outcome {
                 CancellationOutcome::Canceled(task) => {
                     (Some(task.id.as_str()), Some(task.context_id.as_str()))
                 }
-                CancellationOutcome::AwaitReceiver { .. } => (Some(request.id.as_str()), None),
+                CancellationOutcome::AwaitReceiver { .. }
+                | CancellationOutcome::LegacyReplayOnly { .. } => (Some(request.id.as_str()), None),
             };
             telemetry.durable_event(
                 crate::telemetry::EventName::CancellationRequested,
@@ -1697,11 +1737,22 @@ impl RequestHandler for DurableRequestHandler {
                 self.driver.changed();
                 task
             }
+            CancellationOutcome::LegacyReplayOnly { message_id } => {
+                // Migration preserved receiver replay, not a runtime identity.
+                // Do not manufacture a correlation or issue cancellation.
+                let result = self
+                    .wait_for_result(&message_id, authorization.as_ref().map(|(_, scope)| scope))
+                    .await?;
+                let SendMessageResponse::Task(task) = result else {
+                    return Err(A2AError::invalid_agent_response());
+                };
+                task
+            }
             CancellationOutcome::AwaitReceiver {
-                dispatch_id,
+                correlation,
                 message_id,
             } => {
-                self.driver.signal_cancel(&dispatch_id);
+                self.driver.signal_cancel(&correlation);
                 let result = self
                     .wait_for_result(&message_id, authorization.as_ref().map(|(_, scope)| scope))
                     .await?;
@@ -1719,7 +1770,9 @@ impl RequestHandler for DurableRequestHandler {
             1,
         )
         .await?;
-        if let Some(telemetry) = &self.telemetry {
+        if let Some(telemetry) = &self.telemetry
+            && !legacy_replay
+        {
             telemetry.durable_event(
                 crate::telemetry::EventName::CancellationAcknowledged,
                 "canceled",

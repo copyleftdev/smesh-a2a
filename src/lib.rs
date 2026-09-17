@@ -26,6 +26,7 @@ mod durable_dispatch;
 mod durable_handler;
 #[cfg(test)]
 mod durable_handler_tests;
+mod durable_runtime;
 mod executor;
 mod full_matrix_capture;
 mod full_matrix_replay;
@@ -144,6 +145,13 @@ pub use durable_dispatch::{
     DurableDispatchEnvelope, DurableInterruptionKind, DurableLoopbackEndpoint,
     DurableReceiverResult, DurableReceiverTermination, InjectedClock, SystemClockTicker,
 };
+pub use durable_runtime::{
+    DurableAuthorizationDecisionProvenance, DurableDispatchCorrelation, DurableRuntimeAdapter,
+    DurableRuntimeAuthorityContext, DurableRuntimeScope, DurableWorkEnvelope,
+    PreparedDurableRuntimeDispatch, RuntimeAdapterAdmission, RuntimeAdapterExecution,
+    RuntimeAdapterOutcome, RuntimeAdapterPreparation, RuntimeCancellationRequest,
+    RuntimeExecutionFailure, RuntimePreAdmissionFailure,
+};
 pub use executor::{ExecutionLimits, SmeshExecutor};
 pub use full_matrix_capture::{
     A2aCaptureAdapter, ArtifactCaptureAdapter, CanonicalCapture, CaptureError, CaptureEvent,
@@ -237,7 +245,8 @@ pub use server::{
     build_authenticated_router_with_trace, build_authorized_durable_loopback_gateway,
     build_authorized_durable_loopback_gateway_with_ratification,
     build_authorized_durable_loopback_gateway_with_ratification_and_telemetry,
-    build_authorized_durable_loopback_gateway_with_telemetry, build_durable_loopback_gateway,
+    build_authorized_durable_loopback_gateway_with_telemetry,
+    build_authorized_postgres_runtime_gateway, build_durable_loopback_gateway,
     build_durable_loopback_gateway_with_telemetry, build_router, build_router_with_policy,
     build_router_with_policy_and_trace, build_router_with_sqlite,
     build_router_with_sqlite_and_trace, build_router_with_trace,
