@@ -202,8 +202,8 @@ async fn clone_ratification_rows_into_revision_ten(
          ALTER TABLE {target_schema}.retained_authority_usage DISABLE ROW LEVEL SECURITY;
          ALTER TABLE {target_schema}.ratification_packets DISABLE ROW LEVEL SECURITY;
          ALTER TABLE {target_schema}.ratification_events DISABLE ROW LEVEL SECURITY;
-         INSERT INTO {target_schema}.tasks OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.tasks WHERE tenant_scope='tenant-ratification' AND task_id='postgres-ratification-task';
-         INSERT INTO {target_schema}.idempotency_records OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.idempotency_records WHERE tenant_scope='tenant-ratification' AND task_id='postgres-ratification-task';
+         INSERT INTO {target_schema}.tasks(created_order,tenant_scope,task_id,context_id,state,status_timestamp,revision,task_json,owner_account_id,principal_scope,authentication_method,authorization_policy_id,authorization_policy_revision,authorization_policy_digest) OVERRIDING SYSTEM VALUE SELECT created_order,tenant_scope,task_id,context_id,state,status_timestamp,revision,task_json,owner_account_id,principal_scope,authentication_method,authorization_policy_id,authorization_policy_revision,authorization_policy_digest FROM {source_schema}.tasks WHERE tenant_scope='tenant-ratification' AND task_id='postgres-ratification-task';
+         INSERT INTO {target_schema}.idempotency_records(tenant_scope,message_id,request_digest,task_id,state,admission_result_json,final_result_json,created_at,updated_at,digest_version,actor_account_id,causative_request_json,invocation_kind) OVERRIDING SYSTEM VALUE SELECT tenant_scope,message_id,request_digest,task_id,state,admission_result_json,final_result_json,created_at,updated_at,digest_version,actor_account_id,causative_request_json,invocation_kind FROM {source_schema}.idempotency_records WHERE tenant_scope='tenant-ratification' AND task_id='postgres-ratification-task';
          INSERT INTO {target_schema}.outbox(outbox_id,dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,attempt_count,max_attempts,available_at,lease_owner,lease_token,lease_until,last_error,created_at,updated_at,dispatch_identity_version,quota_binding_digest,quota_reservation_id,quota_reservation_version,reserved_output_bytes,reserved_event_count) OVERRIDING SYSTEM VALUE SELECT outbox_id,dispatch_id,tenant_scope,task_id,message_id,causative_revision,payload_json,payload_digest,state,attempt_count,max_attempts,available_at,lease_owner,lease_token,lease_until,last_error,created_at,updated_at,dispatch_identity_version,quota_binding_digest,quota_reservation_id,quota_reservation_version,reserved_output_bytes,reserved_event_count FROM {source_schema}.outbox WHERE tenant_scope='tenant-ratification' AND task_id='postgres-ratification-task';
          INSERT INTO {target_schema}.task_events OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.task_events WHERE tenant_scope='tenant-ratification';
          INSERT INTO {target_schema}.outbox_attempts OVERRIDING SYSTEM VALUE SELECT * FROM {source_schema}.outbox_attempts WHERE tenant_scope='tenant-ratification';
@@ -240,6 +240,56 @@ async fn clone_ratification_rows_into_revision_ten(
     )).await.unwrap();
     drop(client);
     driver.abort();
+}
+
+async fn upgrade_revision_ten_fixture_to_eleven(
+    client: &tokio_postgres::Client,
+    admin: &str,
+    schema: &str,
+) {
+    let migrator = url::Url::parse(admin).unwrap().username().to_owned();
+    let migration = include_str!("../migrations/postgres/0011_ratification_retained_authority.sql");
+    let rendered = smesh_a2a::render_migration_sql_for_test(
+        migration,
+        schema,
+        &format!("{schema}_runtime"),
+        &migrator,
+    );
+    client.batch_execute(&rendered).await.unwrap();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {schema}.schema_migrations VALUES(11,11,$1,$2,{schema}.db_millis())"
+            ),
+            &[
+                &"0011_ratification_retained_authority",
+                &smesh_a2a::content_digest(migration.as_bytes()),
+            ],
+        )
+        .await
+        .unwrap();
+    let catalog = test_catalog_digest(client, schema).await;
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata DISABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .unwrap();
+    client
+        .execute(
+            &format!(
+                "UPDATE {schema}.store_metadata SET schema_version=11,catalog_hash=$1 WHERE singleton=1"
+            ),
+            &[&catalog],
+        )
+        .await
+        .unwrap();
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .unwrap();
 }
 
 fn retained_limit_policy(tenant: u64, account: u64, principal: u64) -> QuotaPolicy {
@@ -287,31 +337,51 @@ async fn write_revision_ten_limits(
     )).await.unwrap();
 }
 
-async fn revision_ten_final_totals(
+async fn revision_eleven_runtime_final_totals(
     client: &tokio_postgres::Client,
     schema: &str,
     owner_principal: &str,
 ) -> (u64, u64, u64) {
     client
-        .batch_execute(&format!(
-            "ALTER TABLE {schema}.ratification_packets DISABLE ROW LEVEL SECURITY;
-         ALTER TABLE {schema}.ratification_events DISABLE ROW LEVEL SECURITY;
-         SET smesh.internal_global='diag-v1'"
-        ))
+        .batch_execute("SET smesh.internal_global='diag-v1'")
         .await
         .unwrap();
-    let row = client.query_one(
-        &format!("SELECT ({schema}.retained_authority_oracle('tenant-ratification',NULL)+(SELECT COALESCE(sum({schema}.row_retained_bytes(p)),0) FROM {schema}.ratification_packets p)+(SELECT COALESCE(sum({schema}.row_retained_bytes(e)),0) FROM {schema}.ratification_events e)+(SELECT COALESCE(sum(octet_length((to_jsonb(o)||jsonb_build_object('ratification_required',false))::text)::bigint-{schema}.row_retained_bytes(o)),0) FROM {schema}.outbox o))::bigint,({schema}.retained_authority_account_oracle('tenant-ratification','owner-ratification')+(SELECT COALESCE(sum({schema}.row_retained_bytes(p)),0) FROM {schema}.ratification_packets p)+(SELECT COALESCE(sum({schema}.row_retained_bytes(e)),0) FROM {schema}.ratification_events e)+(SELECT COALESCE(sum(octet_length((to_jsonb(o)||jsonb_build_object('ratification_required',false))::text)::bigint-{schema}.row_retained_bytes(o)),0) FROM {schema}.outbox o WHERE {schema}.retained_account(to_jsonb(o))='owner-ratification'))::bigint,({schema}.retained_authority_oracle('tenant-ratification',$1)+(SELECT COALESCE(sum({schema}.row_retained_bytes(p)),0) FROM {schema}.ratification_packets p))::bigint"),
-        &[&owner_principal],
-    ).await.unwrap();
-    client.batch_execute(&format!(
-        "ALTER TABLE {schema}.ratification_packets ENABLE ROW LEVEL SECURITY; ALTER TABLE {schema}.ratification_packets FORCE ROW LEVEL SECURITY;
-         ALTER TABLE {schema}.ratification_events ENABLE ROW LEVEL SECURITY; ALTER TABLE {schema}.ratification_events FORCE ROW LEVEL SECURITY"
-    )).await.unwrap();
+    let row = client
+        .query_one(
+            &format!(
+                "WITH task_deltas AS (
+                   SELECT tenant_scope,owner_account_id AS account_id,principal_scope,
+                          octet_length((to_jsonb(t)||jsonb_build_object('visibility',NULL,'authorization_decision_id',NULL))::text)::bigint-{schema}.row_retained_bytes(t) AS delta
+                   FROM {schema}.tasks t
+                 ), idempotency_deltas AS (
+                   SELECT tenant_scope,{schema}.retained_account(to_jsonb(i)) AS account_id,{schema}.retained_principal(to_jsonb(i)) AS principal_scope,
+                          octet_length((to_jsonb(i)||jsonb_build_object('authorization_principal_scope',NULL,'authorization_authentication_method',NULL,'authorization_visibility',NULL,'authorization_policy_id',NULL,'authorization_policy_revision',NULL,'authorization_policy_digest',NULL,'authorization_decision_id',NULL,'authorization_decided_at',NULL))::text)::bigint-{schema}.row_retained_bytes(i) AS delta
+                   FROM {schema}.idempotency_records i
+                 ), deltas AS (
+                   SELECT * FROM task_deltas UNION ALL SELECT * FROM idempotency_deltas
+                 )
+                 SELECT
+                   (({schema}.retained_authority_oracle('tenant-ratification',NULL)+{schema}.artifact_retained_oracle('tenant-ratification',NULL)+{schema}.callback_retained_oracle('tenant-ratification',NULL)+COALESCE((SELECT sum(delta) FROM deltas WHERE tenant_scope='tenant-ratification'),0))::bigint)::text,
+                   (({schema}.retained_authority_account_oracle('tenant-ratification','owner-ratification')+{schema}.artifact_retained_account_oracle('tenant-ratification','owner-ratification')+{schema}.callback_retained_account_oracle('tenant-ratification','owner-ratification')+COALESCE((SELECT sum(delta) FROM deltas WHERE tenant_scope='tenant-ratification' AND account_id='owner-ratification'),0))::bigint)::text,
+                   (({schema}.retained_authority_oracle('tenant-ratification',$1)+{schema}.artifact_retained_oracle('tenant-ratification',$1)+{schema}.callback_retained_oracle('tenant-ratification',$1)+COALESCE((SELECT sum(delta) FROM deltas WHERE tenant_scope='tenant-ratification' AND principal_scope=$1),0))::bigint)::text"
+            ),
+            &[&owner_principal],
+        )
+        .await
+        .unwrap();
     (
-        u64::try_from(row.get::<_, i64>(0)).unwrap(),
-        u64::try_from(row.get::<_, i64>(1)).unwrap(),
-        u64::try_from(row.get::<_, i64>(2)).unwrap(),
+        row.get::<_, Option<String>>(0)
+            .expect("tenant retained counter")
+            .parse()
+            .unwrap(),
+        row.get::<_, Option<String>>(1)
+            .expect("account retained counter")
+            .parse()
+            .unwrap(),
+        row.get::<_, Option<String>>(2)
+            .expect("principal retained counter")
+            .parse()
+            .unwrap(),
     )
 }
 
@@ -699,7 +769,22 @@ async fn populated_revision_ten_upgrade_attributes_packet_and_receipt_principals
             &format!("SELECT (SELECT retained_bytes FROM {target_schema}.retained_authority_usage WHERE tenant_scope='tenant-ratification' AND scope_kind='principal' AND scope_id=$1),(SELECT retained_bytes FROM {target_schema}.retained_authority_usage WHERE tenant_scope='tenant-ratification' AND scope_kind='principal' AND scope_id=$2),{target_schema}.retained_authority_oracle('tenant-ratification',$1)+{target_schema}.artifact_retained_oracle('tenant-ratification',$1)+{target_schema}.callback_retained_oracle('tenant-ratification',$1),{target_schema}.retained_authority_oracle('tenant-ratification',$2)+{target_schema}.artifact_retained_oracle('tenant-ratification',$2)+{target_schema}.callback_retained_oracle('tenant-ratification',$2)"),
             &[&owner_principal, &ratifier_principal],
         ).await.unwrap();
-        assert_eq!(counters.get::<_, i64>(0), before_owner + packet_bytes);
+        let runtime_structural_delta: i64 = client
+            .query_one(
+                &format!(
+                    "SELECT (
+                       COALESCE((SELECT sum({target_schema}.row_retained_bytes(t)-octet_length((to_jsonb(t)-'visibility'-'authorization_decision_id')::text)::bigint) FROM {target_schema}.tasks t WHERE t.tenant_scope='tenant-ratification' AND t.principal_scope=$1),0)
+                       + COALESCE((SELECT sum({target_schema}.row_retained_bytes(i)-octet_length((to_jsonb(i)-'authorization_principal_scope'-'authorization_authentication_method'-'authorization_visibility'-'authorization_policy_id'-'authorization_policy_revision'-'authorization_policy_digest'-'authorization_decision_id'-'authorization_decided_at')::text)::bigint) FROM {target_schema}.idempotency_records i WHERE i.tenant_scope='tenant-ratification' AND {target_schema}.retained_principal(to_jsonb(i))=$1),0))::bigint"
+                ),
+                &[&owner_principal],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            counters.get::<_, i64>(0),
+            before_owner + packet_bytes + runtime_structural_delta
+        );
         assert_eq!(counters.get::<_, i64>(1), event_bytes);
         assert_eq!(counters.get::<_, i64>(0), counters.get::<_, i64>(2));
         assert_eq!(counters.get::<_, i64>(1), counters.get::<_, i64>(3));
@@ -1000,7 +1085,7 @@ async fn post_v11_artifact_and_callback_only_tenants_require_usage_rows_on_resta
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn populated_revision_ten_enforces_each_retained_scope_at_exact_boundary() {
+async fn populated_revision_eleven_enforces_runtime_scope_at_exact_boundary() {
     let Some((admin, runtime)) = postgres_urls() else {
         return;
     };
@@ -1059,11 +1144,13 @@ async fn populated_revision_ten_enforces_each_retained_scope_at_exact_boundary()
                 .await;
                 let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
                 let driver = tokio::spawn(connection);
+                upgrade_revision_ten_fixture_to_eleven(&client, &admin, &schema).await;
                 let mut limits = (67_108_864_u64, 67_108_864_u64, 67_108_864_u64);
                 for _ in 0..8 {
                     write_revision_ten_limits(&client, &schema, limits.0, limits.1, limits.2).await;
                     let totals =
-                        revision_ten_final_totals(&client, &schema, &owner_principal).await;
+                        revision_eleven_runtime_final_totals(&client, &schema, &owner_principal)
+                            .await;
                     let next = (
                         totals.0 - u64::from(over && kind == "tenant"),
                         totals.1 - u64::from(over && kind == "account"),
@@ -1075,7 +1162,8 @@ async fn populated_revision_ten_enforces_each_retained_scope_at_exact_boundary()
                     limits = next;
                 }
                 write_revision_ten_limits(&client, &schema, limits.0, limits.1, limits.2).await;
-                let totals = revision_ten_final_totals(&client, &schema, &owner_principal).await;
+                let totals =
+                    revision_eleven_runtime_final_totals(&client, &schema, &owner_principal).await;
                 assert_eq!(
                     match kind {
                         "tenant" => limits.0,
@@ -1113,7 +1201,7 @@ async fn populated_revision_ten_enforces_each_retained_scope_at_exact_boundary()
             .unwrap();
     })
     .await
-    .expect("revision-10 retained-scope boundary watchdog");
+    .expect("revision-11 runtime-scope boundary watchdog");
 }
 
 #[tokio::test]
@@ -1621,7 +1709,7 @@ async fn external_key_binds_an_empty_postgres_ratification_authority() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One catalog boundary owns grants, two tenants, and reopen.
-async fn fresh_catalog_is_v11_rls_forced_and_runtime_least_privileged() {
+async fn fresh_catalog_is_v12_rls_forced_and_runtime_least_privileged() {
     let Some((admin, runtime)) = postgres_urls() else {
         return;
     };
@@ -1640,7 +1728,7 @@ async fn fresh_catalog_is_v11_rls_forced_and_runtime_least_privileged() {
             )
             .await
             .unwrap();
-        assert_eq!(metadata.get::<_, i64>(0), 11);
+        assert_eq!(metadata.get::<_, i64>(0), 12);
         let migration = client
             .query_one(
                 &format!("SELECT logical_schema_version,name FROM {schema}.schema_migrations WHERE revision=10"),
@@ -1661,6 +1749,18 @@ async fn fresh_catalog_is_v11_rls_forced_and_runtime_least_privileged() {
         assert_eq!(
             retained_migration.get::<_, &str>(1),
             "0011_ratification_retained_authority"
+        );
+        let runtime_migration = client
+            .query_one(
+                &format!("SELECT logical_schema_version,name FROM {schema}.schema_migrations WHERE revision=12"),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime_migration.get::<_, i64>(0), 12);
+        assert_eq!(
+            runtime_migration.get::<_, &str>(1),
+            "0012_runtime_authority_scope"
         );
         let tables = client
             .query(

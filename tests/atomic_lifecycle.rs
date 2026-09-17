@@ -19,12 +19,18 @@ use smesh_a2a::{
 };
 
 const WATCHDOG: Duration = Duration::from_secs(5);
+const FIXTURE_ADMISSION_WATCHDOG: Duration = Duration::from_secs(30);
+static SQLITE_OPEN_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 async fn open_store(
     path: impl AsRef<Path>,
     max_tasks: usize,
 ) -> Result<SqliteTaskStore, smesh_a2a::SqliteStoreError> {
     let path = path.as_ref().to_path_buf();
+    let _permit = tokio::time::timeout(FIXTURE_ADMISSION_WATCHDOG, SQLITE_OPEN_PERMITS.acquire())
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for SQLite fixture admission"))
+        .expect("SQLite fixture semaphore remains open");
     tokio::time::timeout(WATCHDOG, SqliteTaskStore::open(&path, max_tasks))
         .await
         .unwrap_or_else(|_| panic!("timed out opening SQLite task store at {}", path.display()))
@@ -1871,8 +1877,8 @@ fn canonical_digest_binds_semantics_not_caller_tenant_or_transport() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)] // Keep the complete v1-to-v11 migration fixture auditable together.
-async fn exact_v1_schema_migrates_to_v11_with_explicit_binding_preserving_keys_and_task() {
+#[allow(clippy::too_many_lines)] // Keep the complete v1-to-v12 migration fixture auditable together.
+async fn exact_v1_schema_migrates_to_v12_with_explicit_binding_preserving_keys_and_task() {
     const V1: &str = "CREATE TABLE store_metadata (
      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
      schema_version INTEGER NOT NULL,
@@ -1975,8 +1981,17 @@ async fn exact_v1_schema_migrates_to_v11_with_explicit_binding_preserving_keys_a
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     assert_eq!(event_kind, "migration_snapshot");
+    let legacy_authority: (Option<String>, Option<String>, Option<i64>, Option<String>) = connection
+        .query_row(
+            "SELECT visibility,admission_policy_id,admission_policy_revision,admission_policy_digest
+             FROM tasks WHERE task_id='migrated-terminal'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(legacy_authority, (None, None, None, None));
 }
 
 #[tokio::test]
@@ -2743,6 +2758,115 @@ async fn receiver_crash_barriers_preserve_atomic_durable_loopback_effect_marker_
         ReceiverAdmission::Replay(events) if events == receiver_events()
     ));
     assert_eq!(store.durable_effect_count().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn expired_and_completed_receiver_cancellation_match_restart_semantics() {
+    let path = path();
+    let store = open_store(&path, 8).await.unwrap();
+    let base_now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+
+    let mut receiver_leases = Vec::new();
+    for (task_id, lease_duration) in [
+        ("expired-receiver-cancel", 1),
+        ("completed-receiver-cancel", 60_000),
+    ] {
+        let submitted = task(task_id, TaskState::Submitted);
+        store
+            .admit_fixture(
+                submitted.clone(),
+                digest(task_id),
+                SendMessageResponse::Task(submitted),
+                request(task_id),
+                base_now,
+                3,
+            )
+            .await
+            .unwrap();
+        let sender = store
+            .claim_outbox(&format!("sender-{task_id}"), base_now, lease_duration)
+            .await
+            .unwrap()
+            .unwrap();
+        let ReceiverAdmission::Execute(receiver) = store
+            .begin_receive(
+                envelope_for_lease(&sender),
+                &format!("receiver-{task_id}"),
+                base_now,
+                lease_duration,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("new receiver envelope must execute");
+        };
+        receiver_leases.push((task_id, receiver));
+    }
+    store
+        .complete_loopback_receive(&receiver_leases[1].1, &receiver_events(), base_now + 1)
+        .await
+        .unwrap();
+
+    drop(store);
+    let reopened = open_store(&path, 8).await.unwrap();
+    let cancellation_now = base_now + 2;
+
+    let CancellationOutcome::Canceled(expired) = reopened
+        .request_cancellation("expired-receiver-cancel", cancellation_now)
+        .await
+        .unwrap()
+    else {
+        panic!("an expired processing receiver must not defer cancellation after restart");
+    };
+    assert_eq!(expired.status.state, TaskState::Canceled);
+
+    assert!(matches!(
+        reopened
+            .request_cancellation("completed-receiver-cancel", cancellation_now)
+            .await
+            .unwrap(),
+        CancellationOutcome::AwaitReceiver { .. }
+    ));
+    shutdown_store(&reopened).await.unwrap();
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let expired_durable: (String, String, String, i64) = connection
+        .query_row(
+            "SELECT t.state, o.state, i.state,
+                    (SELECT COUNT(*) FROM cancellation_intents c
+                     WHERE c.tenant_scope = t.tenant_scope AND c.task_id = t.task_id)
+             FROM tasks t
+             JOIN outbox o ON o.tenant_scope = t.tenant_scope AND o.task_id = t.task_id
+             JOIN idempotency_records i ON i.tenant_scope = t.tenant_scope
+               AND i.message_id = o.message_id AND i.task_id = t.task_id
+             WHERE t.task_id = 'expired-receiver-cancel'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        expired_durable,
+        (
+            serde_json::to_string(&TaskState::Canceled).unwrap(),
+            "superseded".to_owned(),
+            "completed".to_owned(),
+            0,
+        )
+    );
+    let cancellation_intents: Vec<(String, String)> = connection
+        .prepare("SELECT task_id, state FROM cancellation_intents ORDER BY task_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(cancellation_intents.is_empty());
 }
 
 #[tokio::test]

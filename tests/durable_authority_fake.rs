@@ -7,7 +7,7 @@ use tower::ServiceExt as _;
 
 use smesh_a2a::{
     AuthorizationMiddlewareState, AuthorizationPolicy, DurableLoopbackEndpoint, GatewayConfig,
-    InjectedClock, IntoDurableAuthority, PollInterval, SqliteTaskStore,
+    InjectedClock, IntoDurableAuthority, LegacyTenantBinding, PollInterval, SqliteTaskStore,
     build_durable_loopback_gateway,
 };
 
@@ -181,10 +181,21 @@ async fn sqlite_runs_the_same_backend_neutral_command_conformance() {
     run_durable_authority_fixture_conformance(
         || async {
             let directory = SecureTempDir::new();
-            let store =
-                SqliteTaskStore::open(directory.path().join("command-conformance.sqlite3"), 8)
-                    .await
-                    .expect("open sqlite command authority");
+            let binding = LegacyTenantBinding::new(
+                "tenant-conformance",
+                "owner-conformance",
+                "policy-conformance",
+                9,
+                "sha256:policy-conformance",
+            )
+            .expect("valid conformance authority binding");
+            let store = SqliteTaskStore::open_with_legacy_binding(
+                directory.path().join("command-conformance.sqlite3"),
+                8,
+                binding,
+            )
+            .await
+            .expect("open sqlite command authority");
             let authority: std::sync::Arc<dyn smesh_a2a::DurableAuthority> =
                 std::sync::Arc::new(store);
             (authority, directory)

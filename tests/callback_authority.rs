@@ -35,6 +35,7 @@ fn postgres_urls() -> Option<(String, String)> {
 
 struct SchemaGuard(Option<smesh_a2a::PostgresStoreConfig>);
 const SCHEMA_GUARD_TIMEOUT: Duration = Duration::from_secs(20);
+static POSTGRES_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 impl SchemaGuard {
     async fn cleanup(mut self) {
@@ -75,6 +76,7 @@ async fn postgres_v8_enabled_policy_is_persisted_before_runtime_pool_and_exposed
     let Some((admin, runtime)) = postgres_urls() else {
         return;
     };
+    let _postgres_fixture = POSTGRES_TEST_LOCK.lock().await;
     let schema = format!("smesh_callback_{:016x}", rand::random::<u64>());
     let config = smesh_a2a::PostgresStoreConfig::new(admin, runtime, schema)
         .unwrap()
@@ -97,6 +99,7 @@ async fn postgres_concurrent_same_policy_openers_share_the_durable_fence() {
     let Some((admin, runtime)) = postgres_urls() else {
         return;
     };
+    let _postgres_fixture = POSTGRES_TEST_LOCK.lock().await;
     let schema = format!("smesh_callback_concurrent_{:016x}", rand::random::<u64>());
     let config = smesh_a2a::PostgresStoreConfig::new(&admin, &runtime, &schema)
         .unwrap()
@@ -728,6 +731,7 @@ async fn postgres_active_policy_snapshot_hides_historical_enrollments_from_resol
     let Some((admin, runtime)) = postgres_urls() else {
         return;
     };
+    let _postgres_fixture = POSTGRES_TEST_LOCK.lock().await;
     let schema = format!(
         "smesh_callback_active_policy_{:016x}",
         rand::random::<u64>()
@@ -964,6 +968,7 @@ async fn postgres_terminal_callback_fault_matrix_rolls_back_and_retries_exactly_
     let Some((admin, runtime)) = postgres_urls() else {
         return;
     };
+    let _postgres_fixture = POSTGRES_TEST_LOCK.lock().await;
     let schema = format!("smesh_callback_fault_{:016x}", rand::random::<u64>());
     let config = smesh_a2a::PostgresStoreConfig::new(&admin, &runtime, &schema)
         .unwrap()
@@ -1097,6 +1102,7 @@ async fn postgres_drain_finalization_is_scoped_by_task_for_reused_config_ids() {
     let Some((admin, runtime)) = postgres_urls() else {
         return;
     };
+    let _postgres_fixture = POSTGRES_TEST_LOCK.lock().await;
     let schema = format!("smesh_callback_drain_scope_{:016x}", rand::random::<u64>());
     let config = smesh_a2a::PostgresStoreConfig::new(&admin, &runtime, &schema)
         .unwrap()
@@ -1235,6 +1241,7 @@ async fn postgres_startup_rejects_callback_audit_substitution_and_nonrevoked_cap
     let Some((admin, runtime)) = postgres_urls() else {
         return;
     };
+    let _postgres_fixture = POSTGRES_TEST_LOCK.lock().await;
     let superuser =
         std::env::var("SMESH_TEST_POSTGRES_SUPERUSER_URL").unwrap_or_else(|_| admin.clone());
     let policy = enabled_policy();
@@ -1404,6 +1411,7 @@ async fn postgres_callback_crud_uses_scope_first_rls_paths() {
     let Some((admin, runtime)) = postgres_urls() else {
         return;
     };
+    let _postgres_fixture = POSTGRES_TEST_LOCK.lock().await;
     let schema = format!("smesh_callback_crud_{:016x}", rand::random::<u64>());
     let admin_insert = admin.clone();
     let runtime_plan = runtime.clone();
@@ -2004,9 +2012,11 @@ impl AuthorityIdentity for LegacyAuthority {
             quota_reservations: false,
         }
     }
+
     fn completion_receipt_key(&self) -> Option<[u8; 32]> {
         None
     }
+
     fn authorization_resource_digest(&self, _: &str) -> Result<String, a2a::A2AError> {
         Ok("sha256:0000000000000000000000000000000000000000000000000000000000000000".into())
     }

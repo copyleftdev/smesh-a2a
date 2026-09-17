@@ -29,6 +29,9 @@ cd "$repo"
 ACCEPTANCE_OUTER_TIMEOUT_SECS=140
 
 mkdir -p "$repo/target"
+# Keep build outputs colocated with the binaries invoked below, even when the
+# caller has a global CARGO_TARGET_DIR configured.
+export CARGO_TARGET_DIR="$repo/target"
 # node_modules is replaced by npm ci, so keep its install and every browser
 # consumer in one bounded dependency lifecycle. The descriptor closes on every
 # exit path after report verification and cleanup.

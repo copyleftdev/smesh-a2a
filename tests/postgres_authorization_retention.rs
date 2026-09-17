@@ -3,8 +3,10 @@ mod support;
 use std::{env, str::FromStr as _, time::Duration};
 
 use smesh_a2a::{
-    AuditProjectionAuthority, AuthorityShutdown, PostgresStoreConfig, PostgresStoreError,
-    PostgresTaskStore, content_digest,
+    AttemptDisposition, AuditProjectionAuthority, AuthorityShutdown, AuthorizationAuditInput,
+    AuthorizationDecisionEffect, InputLimits, OutboxAuthority, OwnedTaskScope, PostgresStoreConfig,
+    PostgresStoreError, PostgresTaskStore, SendMessageAdmission, TaskAdmission, VisibilityScope,
+    canonical_send_message_digest_v2, content_digest,
 };
 use tokio_postgres::NoTls;
 
@@ -356,6 +358,166 @@ async fn bounded_cleanup_is_tenant_projection_and_live_window_safe_across_restar
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn unfinished_runtime_authority_survives_retention_then_uses_index_and_releases() {
+    let Some((admin, runtime)) = postgres_urls() else {
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(45), async move {
+        let config = config(&admin, &runtime, "guard");
+        let schema = config.schema_name().to_owned();
+        let store = PostgresTaskStore::open(config.clone()).await.unwrap();
+        let tenant = "tenant-runtime-retention";
+        let account = "account-runtime-retention";
+        let scope = OwnedTaskScope::new(tenant, account, VisibilityScope::Own).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        for index in 0..2 {
+            let message_id = format!("runtime-retention-message-{index}");
+            let mut message = a2a::Message::new(
+                a2a::Role::User,
+                vec![a2a::Part::text(format!("runtime retention {index}"))],
+            );
+            message.message_id = message_id;
+            let request = a2a::SendMessageRequest {
+                message: message.clone(),
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            };
+            let task = a2a::Task {
+                id: format!("runtime-retention-task-{index}"),
+                context_id: format!("runtime-retention-context-{index}"),
+                status: a2a::TaskStatus {
+                    state: a2a::TaskState::Submitted,
+                    message: None,
+                    timestamp: chrono::DateTime::from_timestamp_millis(now + index),
+                },
+                artifacts: None,
+                history: Some(vec![message]),
+                metadata: None,
+            };
+            let decision_id = format!("runtime-retention-decision-{index}");
+            let digest = canonical_send_message_digest_v2(tenant, account, &request, false).unwrap();
+            store
+                .authorize_and_admit(
+                    &scope,
+                    SendMessageAdmission {
+                        request,
+                        streaming: false,
+                        task: task.clone(),
+                        original_result: a2a::SendMessageResponse::Task(task.clone()),
+                        input_limits: InputLimits::default(),
+                        now: now + index,
+                        max_attempts: 3,
+                    },
+                    AuthorizationAuditInput::new(
+                        decision_id,
+                        tenant,
+                        account,
+                        "runtime-retention-policy",
+                        1,
+                        content_digest(b"runtime-retention-policy"),
+                        "TaskCreate",
+                        AuthorizationDecisionEffect::Allow,
+                        "allowed",
+                        "send-message-request",
+                        digest,
+                        Some(task.id),
+                        now + index,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let leased = store
+            .claim_outbox("runtime-retention-worker", now + 10, 60_000)
+            .await
+            .unwrap()
+            .expect("one outbox row becomes leased");
+        let protected = PostgresTaskStore::cleanup_authorization_decisions(
+            &config, tenant, 0, 100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(protected.deleted, 0);
+        assert!(!protected.has_more);
+
+        let (client, connection) = tokio_postgres::connect(&admin, NoTls).await.unwrap();
+        let driver = tokio::spawn(connection);
+        client
+            .execute("SELECT set_config('smesh.tenant_scope',$1,false)", &[&tenant])
+            .await
+            .unwrap();
+        client
+            .batch_execute("SET enable_seqscan=off")
+            .await
+            .unwrap();
+        let plan = client
+            .query(
+                &format!("EXPLAIN (COSTS OFF) SELECT 1 FROM {schema}.idempotency_records WHERE tenant_scope=$1 AND authorization_decision_id=$2"),
+                &[&tenant, &"runtime-retention-decision-0"],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plan.contains("idempotency_runtime_authorization_decision"), "{plan}");
+        store
+            .finish_outbox_attempt(
+                &leased,
+                AttemptDisposition::Permanent {
+                    error: "retention terminalization".to_owned(),
+                },
+                now + 20,
+            )
+            .await
+            .unwrap();
+        let second = store
+            .claim_outbox("runtime-retention-worker", now + 21, 60_000)
+            .await
+            .unwrap()
+            .expect("pending outbox row becomes leased");
+        store
+            .finish_outbox_attempt(
+                &second,
+                AttemptDisposition::Permanent {
+                    error: "retention terminalization".to_owned(),
+                },
+                now + 22,
+            )
+            .await
+            .unwrap();
+        let released = PostgresTaskStore::cleanup_authorization_decisions(
+            &config, tenant, 0, 100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(released.deleted, 2);
+        let remaining: i64 = client
+            .query_one(
+                &format!("SELECT count(*) FROM {schema}.authorization_decisions WHERE tenant_scope=$1 AND decision_id LIKE 'runtime-retention-decision-%'"),
+                &[&tenant],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(remaining, 0);
+
+        store.shutdown().await.unwrap();
+        drop(store);
+        drop(client);
+        driver.abort();
+        PostgresTaskStore::drop_test_schema(&config).await.unwrap();
+    })
+    .await
+    .expect("runtime retention guard watchdog");
+}
+
+#[tokio::test]
 async fn runtime_cannot_bypass_retention_authority_and_catalog_tamper_fails_closed() {
     let Some((admin, runtime)) = postgres_urls() else {
         return;
@@ -565,7 +727,7 @@ async fn populated_revision_eight_upgrades_authorization_projection_evidence_tra
             let ledger = client.query_one(
                     &format!("SELECT m.schema_version,l.logical_schema_version,l.name,l.checksum,r.logical_schema_version,r.name,r.checksum,x.logical_schema_version,x.name,x.checksum FROM {upgrade_schema}.store_metadata m JOIN {upgrade_schema}.schema_migrations l ON l.revision=9 JOIN {upgrade_schema}.schema_migrations r ON r.revision=10 JOIN {upgrade_schema}.schema_migrations x ON x.revision=11 WHERE m.singleton=1"), &[]
                 ).await.unwrap();
-            assert_eq!(ledger.get::<_, i64>(0), 11);
+            assert_eq!(ledger.get::<_, i64>(0), 12);
             assert_eq!(ledger.get::<_, i64>(1), 9);
             assert_eq!(
                 ledger.get::<_, &str>(2),

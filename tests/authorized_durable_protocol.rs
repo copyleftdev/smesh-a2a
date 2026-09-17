@@ -285,6 +285,7 @@ async fn selector_and_role_matrix_fail_closed_with_identical_transport_errors() 
     )
     .await;
     assert!(allowed.json().get("error").is_none(), "{}", allowed.json());
+    let allowed_task = rpc_result_task(&allowed);
 
     let mut denied = Vec::new();
     denied.push(
@@ -375,6 +376,36 @@ async fn selector_and_role_matrix_fail_closed_with_identical_transport_errors() 
     assert!(missing_auth.headers.get("www-authenticate").is_some());
     assert!(!String::from_utf8_lossy(&missing_auth.bytes).contains(TOKEN_CANARY));
 
+    bounded("selector task completion", async {
+        loop {
+            let response = rpc(
+                gateway.router(),
+                "agent-a",
+                &[],
+                a2a::jsonrpc::methods::GET_TASK,
+                serde_json::to_value(GetTaskRequest {
+                    id: allowed_task.id.clone(),
+                    history_length: Some(0),
+                    tenant: None,
+                })
+                .unwrap(),
+            )
+            .await;
+            let body = response.json();
+            let task: Task = serde_json::from_value(body["result"].clone()).unwrap();
+            if task.status.state == TaskState::Completed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    bounded(
+        "selector coordinator idle",
+        gateway.wait_for_coordinator_idle(),
+    )
+    .await
+    .unwrap();
     bounded("selector gateway shutdown", gateway.shutdown())
         .await
         .unwrap();

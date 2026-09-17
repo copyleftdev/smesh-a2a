@@ -149,6 +149,10 @@
       [
         "smesh.reason",
         "committed"
+      ],
+      [
+        "smesh.task.state",
+        "completed"
       ]
     ],
     "name": "smesh.receiver.completed",
@@ -371,6 +375,10 @@
       [
         "smesh.reason",
         "committed"
+      ],
+      [
+        "smesh.task.state",
+        "completed"
       ]
     ],
     "name": "smesh.receiver.execute",

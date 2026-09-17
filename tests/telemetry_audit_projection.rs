@@ -85,9 +85,11 @@ impl AuthorityIdentity for Authority {
             quota_reservations: false,
         }
     }
+
     fn completion_receipt_key(&self) -> Option<[u8; 32]> {
         None
     }
+
     fn authorization_resource_digest(&self, _: &str) -> Result<String, A2AError> {
         Ok("sha256:0000000000000000000000000000000000000000000000000000000000000000".into())
     }

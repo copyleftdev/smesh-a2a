@@ -346,11 +346,19 @@ limitations. Required dependencies fail rather than skip.
 
 Owner: durable gateway/authority integration.
 
-- Replace the production loopback receiver with real runtime dispatch.
-- Commit stable tenant-scoped dispatch identity, authorization, quota reservation, outbox state,
-  receiver deduplication, fences, stored replay, and atomic terminal arbitration.
-- Prove crash windows before and after worker admission, receiver result commit, and gateway terminal
-  commit; reject stale claims and late results.
+- Replace production-capable builders' concrete loopback dependency with an authority-free,
+  in-process runtime adapter; keep explicitly named loopback compatibility compositions.
+- Preserve stable tenant-scoped dispatch identity, persisted authorization provenance, quota
+  reservation, outbox state, receiver deduplication, fences, and stored replay. The adapter cannot
+  authorize terminal arbitration: production runtime proposals remain unresolved in #94, including
+  proposals observed before cancellation or forced reap.
+- Prove admission-loss, cancellation, and cleanup ownership before and after worker admission.
+  Existing receiver-result/gateway-terminal commit and crash-window tests continue to qualify only
+  the sealed loopback compatibility path, not production runtime completion. #95 owns policy-gated
+  completion/evidence; #96 owns separate-process admission ambiguity and restart reconciliation.
+  Reject stale claims and late results without inventing terminal state or retrying uncertain work.
+- Keep the standalone PostgreSQL runtime CLI profile disabled until #95; runtime plus SQLite
+  remains unavailable. These boundaries narrow qualification claims, not the final profile contract.
 
 ### #95 — semantic processor and evidence path
 

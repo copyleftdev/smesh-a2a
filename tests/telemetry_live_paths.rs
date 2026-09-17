@@ -85,7 +85,8 @@ async fn ordinary_streaming_admission_uses_the_authoritative_task_context_and_me
     assert!(admitted.attributes().iter().any(|attribute| {
         attribute.key() == "a2a.message.id" && attribute.value() == "stream-message"
     }));
-    drop(response);
+    let _stream = response.into_body().collect().await.unwrap();
+    gateway.wait_for_coordinator_idle().await.unwrap();
     gateway.shutdown().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -369,9 +370,13 @@ async fn interrupted_receivers_emit_nonterminal_transition_without_task_terminal
                 .filter(|record| record.name() == expected.as_str())
                 .collect();
             assert_eq!(matching.len(), 1, "{expected_state} {expected:?}");
-            assert!(matching[0].attributes().iter().any(|attribute| {
-                attribute.key() == "smesh.task.state" && attribute.value() == expected_state
-            }));
+            assert!(
+                matching[0].attributes().iter().any(|attribute| {
+                    attribute.key() == "smesh.task.state" && attribute.value() == expected_state
+                }),
+                "{expected_state} {expected:?} attributes: {:?}",
+                matching[0].attributes()
+            );
         }
         let commit_metrics = records
             .iter()

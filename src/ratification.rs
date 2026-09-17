@@ -600,10 +600,23 @@ pub enum HumanRatificationAction {
     Decision(HumanDecision),
 }
 
+/// Server-authored causative authorization for executable amendments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AmendmentAuthorization {
+    pub resource_digest: String,
+    pub decision_id: String,
+    pub decided_at_millis: i64,
+    pub visibility: String,
+    pub task_owner_account_id: String,
+}
+
 /// Domain-separated, chained HMAC receipt over the exact reviewed candidate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HumanRatificationReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amendment_authorization: Option<AmendmentAuthorization>,
     pub tenant_id: String,
     pub task_id: String,
     pub account_id: String,
@@ -640,6 +653,8 @@ pub struct HumanRatificationReceipt {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReceiptStatement<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amendment_authorization: Option<&'a AmendmentAuthorization>,
     tenant_id: &'a str,
     task_id: &'a str,
     account_id: &'a str,
@@ -1816,6 +1831,7 @@ impl RatificationLedger {
             return Err(RatificationError::PreconditionFailed);
         }
         let mut receipt = HumanRatificationReceipt {
+            amendment_authorization: None,
             tenant_id: packet.tenant_id.clone(),
             task_id: packet.task_id.clone(),
             account_id: account_id.to_owned(),
@@ -1944,6 +1960,7 @@ pub(crate) fn receipt_statement_hash(
     receipt: &HumanRatificationReceipt,
 ) -> Result<String, RatificationError> {
     let statement = ReceiptStatement {
+        amendment_authorization: receipt.amendment_authorization.as_ref(),
         tenant_id: &receipt.tenant_id,
         task_id: &receipt.task_id,
         account_id: &receipt.account_id,

@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Once;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -19,10 +19,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AttemptDisposition, DurableAuthority, DurableDispatchEnvelope, DurableLoopbackEndpoint,
-    DurableReceiverTermination, InjectedClock, LeaseRenewalOutcome, MeshEvent, TransitionOutcome,
-    content_digest,
-    durable_dispatch::{DURABLE_CANCELED_SUMMARY, DurableDispatchError, DurableDispatchOutcome},
+    DurableReceiverTermination, DurableRuntimeAdapter, InjectedClock, LeaseRenewalOutcome,
+    MeshEvent, TransitionOutcome, content_digest,
+    durable_dispatch::{
+        DURABLE_CANCELED_SUMMARY, DurableCoordinator, DurableCoordinatorMode, DurableDispatchError,
+        DurableDispatchOutcome,
+    },
 };
+
+#[cfg(test)]
+const ACTIVE_RUNTIME_JOIN_TIMEOUT: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+const ACTIVE_RUNTIME_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn driver_lease_millis() -> i64 {
     if cfg!(debug_assertions)
@@ -107,6 +115,12 @@ impl<T> AbortOnDropJoin<T> {
             join.abort();
         }
     }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
 }
 
 impl<T> Drop for AbortOnDropJoin<T> {
@@ -134,8 +148,10 @@ impl Drop for WaiterGuard {
 
 pub(crate) struct DurableDriverControl {
     pub wake: Arc<Notify>,
+    #[cfg(test)]
+    pub cancel_signals: std::sync::atomic::AtomicUsize,
     state: watch::Sender<DriverState>,
-    endpoint: DurableLoopbackEndpoint,
+    coordinator: Arc<DurableCoordinator>,
 }
 
 #[cfg(test)]
@@ -177,12 +193,22 @@ pub(crate) struct DriverTestHooks {
 }
 
 impl DurableDriverControl {
-    pub(crate) fn signal_cancel(&self, dispatch_id: &str) {
-        self.endpoint.signal_cancel(dispatch_id);
+    pub(crate) fn signal_cancel(&self, correlation: &crate::DurableDispatchCorrelation) {
+        #[cfg(test)]
+        self.cancel_signals
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.coordinator.signal_cancel(correlation);
         self.wake.notify_one();
     }
     pub(crate) fn subscribe(&self) -> watch::Receiver<DriverState> {
         self.state.subscribe()
+    }
+
+    pub(crate) async fn wait_for_coordinator_idle(&self) -> Result<(), a2a::A2AError> {
+        self.coordinator
+            .wait_for_idle()
+            .await
+            .map_err(|()| a2a::A2AError::internal("durable coordinator registry is unavailable"))
     }
 
     pub(crate) fn waiter(self: &Arc<Self>) -> WaiterGuard {
@@ -223,7 +249,7 @@ impl DurableDriverHandle {
             }
         });
         self.shutdown_requested.cancel();
-        self.control.endpoint.cancel_all();
+        self.control.coordinator.cancel_all();
         self.control.wake.notify_waiters();
     }
 
@@ -232,8 +258,10 @@ impl DurableDriverHandle {
         let Some(join) = self.join.take() else {
             return;
         };
+        let coordinator = Arc::clone(&self.control.coordinator);
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             join.abort();
+            coordinator.abort_active();
             return;
         };
         runtime.spawn(async move {
@@ -245,23 +273,44 @@ impl DurableDriverHandle {
                 join.abort();
                 let _ = join.handle_mut().await;
             }
+            let _ = coordinator
+                .shutdown_active(ACTIVE_RUNTIME_JOIN_TIMEOUT)
+                .await;
         });
     }
 
     pub(crate) async fn shutdown(mut self) -> Result<(), a2a::A2AError> {
         self.request_shutdown("durable gateway is shutting down");
-        let Some(mut join) = self.join.take() else {
-            return Ok(());
-        };
-        if let Ok(joined) = tokio::time::timeout(Duration::from_secs(5), join.handle_mut()).await {
-            joined.map_err(|_| a2a::A2AError::internal("durable outbox driver panicked"))?
-        } else {
-            join.abort();
-            let _ = join.handle_mut().await;
-            Err(a2a::A2AError::internal(
-                "durable outbox driver shutdown timed out",
-            ))
-        }
+        let coordinator = Arc::clone(&self.control.coordinator);
+        let join = self.join.take();
+        // The detached cleanup task owns both the root driver and coordinator
+        // joins. If the caller cancels this shutdown future, cleanup continues.
+        let cleanup = tokio::spawn(async move {
+            let driver_result = if let Some(mut join) = join {
+                if let Ok(joined) =
+                    tokio::time::timeout(Duration::from_secs(5), join.handle_mut()).await
+                {
+                    joined.map_err(|_| a2a::A2AError::internal("durable outbox driver panicked"))?
+                } else {
+                    join.abort();
+                    let _ = join.handle_mut().await;
+                    Err(a2a::A2AError::internal(
+                        "durable outbox driver shutdown timed out",
+                    ))
+                }
+            } else {
+                Ok(())
+            };
+            let coordinator_result = coordinator
+                .shutdown_active(ACTIVE_RUNTIME_JOIN_TIMEOUT)
+                .await
+                .map_err(|()| a2a::A2AError::internal("durable coordinator shutdown incomplete"));
+            driver_result?;
+            coordinator_result
+        });
+        cleanup
+            .await
+            .map_err(|_| a2a::A2AError::internal("durable shutdown cleanup panicked"))?
     }
 }
 
@@ -271,16 +320,16 @@ impl Drop for DurableDriverHandle {
     }
 }
 
-#[allow(clippy::too_many_lines)] // The loop is one cohesive fenced-lease state machine.
+#[cfg(test)]
 pub(crate) fn spawn_durable_driver(
     authority: Arc<dyn DurableAuthority>,
-    endpoint: DurableLoopbackEndpoint,
+    adapter: impl DurableRuntimeAdapter,
     clock: InjectedClock,
 ) -> DurableDriverHandle {
-    spawn_durable_driver_with_telemetry(authority, endpoint, clock, None)
+    spawn_durable_driver_with_telemetry(authority, Arc::new(adapter), clock, None)
 }
 
-pub(crate) fn spawn_durable_driver_with_telemetry(
+pub(crate) fn spawn_durable_loopback_driver_with_telemetry(
     authority: Arc<dyn DurableAuthority>,
     endpoint: DurableLoopbackEndpoint,
     clock: InjectedClock,
@@ -288,7 +337,23 @@ pub(crate) fn spawn_durable_driver_with_telemetry(
 ) -> DurableDriverHandle {
     spawn_durable_driver_inner(
         authority,
-        endpoint,
+        DurableCoordinatorMode::Loopback(endpoint),
+        clock,
+        telemetry,
+        #[cfg(test)]
+        DriverTestHooks::default(),
+    )
+}
+
+pub(crate) fn spawn_durable_driver_with_telemetry(
+    authority: Arc<dyn DurableAuthority>,
+    adapter: Arc<dyn DurableRuntimeAdapter>,
+    clock: InjectedClock,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
+) -> DurableDriverHandle {
+    spawn_durable_driver_inner(
+        authority,
+        DurableCoordinatorMode::Runtime(adapter),
         clock,
         telemetry,
         #[cfg(test)]
@@ -299,13 +364,44 @@ pub(crate) fn spawn_durable_driver_with_telemetry(
 #[cfg(test)]
 pub(crate) fn spawn_durable_driver_with_test_hooks<A: crate::IntoDurableAuthority>(
     authority: A,
-    endpoint: DurableLoopbackEndpoint,
+    adapter: impl DurableRuntimeAdapter,
     clock: InjectedClock,
     hooks: DriverTestHooks,
 ) -> DurableDriverHandle {
     spawn_durable_driver_inner(
         authority.into_durable_authority(),
-        endpoint,
+        DurableCoordinatorMode::TestLoopbackAdapter(Arc::new(adapter)),
+        clock,
+        None,
+        hooks,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_durable_runtime_driver_with_test_context<A: crate::IntoDurableAuthority>(
+    authority: A,
+    adapter: impl DurableRuntimeAdapter,
+    clock: InjectedClock,
+) -> DurableDriverHandle {
+    spawn_durable_driver_inner(
+        authority.into_durable_authority(),
+        DurableCoordinatorMode::TestRuntimeAdapterWithDevelopmentContext(Arc::new(adapter)),
+        clock,
+        None,
+        DriverTestHooks::default(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_durable_runtime_driver_with_test_hooks<A: crate::IntoDurableAuthority>(
+    authority: A,
+    adapter: impl DurableRuntimeAdapter,
+    clock: InjectedClock,
+    hooks: DriverTestHooks,
+) -> DurableDriverHandle {
+    spawn_durable_driver_inner(
+        authority.into_durable_authority(),
+        DurableCoordinatorMode::Runtime(Arc::new(adapter)),
         clock,
         None,
         hooks,
@@ -315,17 +411,25 @@ pub(crate) fn spawn_durable_driver_with_test_hooks<A: crate::IntoDurableAuthorit
 #[allow(clippy::too_many_lines)] // The loop is one cohesive fenced-lease state machine.
 fn spawn_durable_driver_inner(
     authority: Arc<dyn DurableAuthority>,
-    endpoint: DurableLoopbackEndpoint,
+    mode: DurableCoordinatorMode,
     clock: InjectedClock,
     telemetry: Option<crate::telemetry::TelemetryHandle>,
     #[cfg(test)] hooks: DriverTestHooks,
 ) -> DurableDriverHandle {
     install_driver_panic_hook();
     let (state, _) = watch::channel(DriverState::default());
+    let coordinator = Arc::new(DurableCoordinator::new(
+        Arc::clone(&authority),
+        mode,
+        clock.clone(),
+        telemetry.clone(),
+    ));
     let control = Arc::new(DurableDriverControl {
         wake: Arc::new(Notify::new()),
+        #[cfg(test)]
+        cancel_signals: std::sync::atomic::AtomicUsize::new(0),
         state,
-        endpoint: endpoint.clone(),
+        coordinator: Arc::clone(&coordinator),
     });
     let shutdown_requested = CancellationToken::new();
     let worker_shutdown = shutdown_requested.clone();
@@ -441,11 +545,13 @@ fn spawn_durable_driver_inner(
                         None
                     };
                 let renewal_cancel = CancellationToken::new();
+                let authority_load_fence = Arc::new(tokio::sync::Mutex::new(()));
                 let (mut renewed_lease, renewal_join) = if authority.capabilities().lease_renewal {
                     let (tx, rx) = watch::channel(lease.clone());
                     let renewal_authority = Arc::clone(&authority);
                     let renewal_cancel_task = renewal_cancel.clone();
                     let renewal_telemetry = telemetry.clone();
+                    let renewal_fence = Arc::clone(&authority_load_fence);
                     let mut current = lease.clone();
                     let join = tokio::spawn(RedactedDriverPoll::new(async move {
                         loop {
@@ -453,6 +559,10 @@ fn spawn_durable_driver_inner(
                                 () = renewal_cancel_task.cancelled() => return Ok(()),
                                 () = tokio::time::sleep(renewal_period) => {}
                             }
+                            let _authority_load_guard = tokio::select! {
+                                () = renewal_cancel_task.cancelled() => return Ok(()),
+                                guard = renewal_fence.lock() => guard,
+                            };
                             let renewal = tokio::select! {
                                 () = renewal_cancel_task.cancelled() => return Ok(()),
                                 renewal = tokio::time::timeout(
@@ -547,13 +657,14 @@ fn spawn_durable_driver_inner(
                     );
                 }
                 let dispatch_cancel = CancellationToken::new();
-                let dispatch_future = endpoint.dispatch_once(
-                    Arc::clone(&authority),
+                let dispatch_future = coordinator.dispatch_once_with_sender_renewal(
+                    &lease,
                     envelope,
                     &lease.lease_token,
-                    &clock,
                     &replica_id,
                     &dispatch_cancel,
+                    renewed_lease.clone(),
+                    Arc::clone(&authority_load_fence),
                 );
                 tokio::pin!(dispatch_future);
                 let mut shutdown_requested = false;
@@ -579,11 +690,7 @@ fn spawn_durable_driver_inner(
                         }
                     }
                 };
-                let dispatch = if shutdown_requested || sender_renewal_failed {
-                    None
-                } else {
-                    Some(dispatch_result)
-                };
+                let dispatch = dispatch_result;
                 renewal_cancel.cancel();
                 if let Some(mut join) = renewal_join {
                     match tokio::time::timeout(Duration::from_secs(5), join.handle_mut()).await {
@@ -602,7 +709,7 @@ fn spawn_durable_driver_inner(
                 let lease = renewed_lease
                     .as_ref()
                     .map_or_else(|| lease.clone(), |rx| rx.borrow().clone());
-                if shutdown_requested {
+                if shutdown_requested && matches!(dispatch, Err(DurableDispatchError::OwnerCancelledBeforeReceive)) {
                     let outcome = authority.finish_outbox_attempt(
                         &lease,
                         AttemptDisposition::Retry {
@@ -616,7 +723,7 @@ fn spawn_durable_driver_inner(
                     }
                     return Ok(());
                 }
-                let Some(dispatch) = dispatch else {
+                if sender_renewal_failed {
                     if let Some(telemetry) = &telemetry {
                         telemetry.dispatch_event(
                             crate::telemetry::EventName::LeaseRenewed,
@@ -631,7 +738,7 @@ fn spawn_durable_driver_inner(
                         );
                     }
                     return Err(a2a::A2AError::internal("durable lease renewal failed"));
-                };
+                }
                 let (events, termination) = match dispatch {
                     Ok(DurableDispatchOutcome::Delivered(events)) => {
                         (events, DurableReceiverTermination::Success)
@@ -684,8 +791,14 @@ fn spawn_durable_driver_inner(
                         }
                         continue;
                     }
-                    Err(DurableDispatchError::FatalRenewal | DurableDispatchError::OwnerCancelled) => {
-                        return Err(a2a::A2AError::internal("durable lease renewal failed"));
+                    Err(DurableDispatchError::FatalRenewal | DurableDispatchError::PostReceiveUnresolved) => {
+                        return Err(a2a::A2AError::internal("durable post-receive outcome is unresolved"));
+                    }
+                    Err(DurableDispatchError::RuntimeProposalUnresolved) => {
+                        return Err(a2a::A2AError::internal("durable runtime terminal proposal is unresolved"));
+                    }
+                    Err(DurableDispatchError::OwnerCancelledBeforeReceive) => {
+                        return Err(a2a::A2AError::internal("durable dispatch canceled before receiver admission"));
                     }
                     Err(DurableDispatchError::Permanent(error)) => {
                         // Receiver validation/corruption errors are permanent. Busy is
@@ -1086,8 +1199,8 @@ mod tests {
         AdmissionOutcome, AtomicRecordCounts, AuthorityCapabilities, AuthorityDiagnostics,
         AuthorityIdentity, AuthorityShutdown, AuthorizationAuditInput, AuthorizationAuditSink,
         AuthorizedTaskRead, CancellationAuthority, CancellationOutcome, ChangeObservation,
-        ChangeObserver, LeaseRenewalOutcome, OutboxAuthority, OutboxLease, OwnedTaskScope,
-        ReceiverAdmission, ReceiverAuthority, ReceiverLease, SendMessageAdmission,
+        ChangeObserver, DurableLoopbackEndpoint, LeaseRenewalOutcome, OutboxAuthority, OutboxLease,
+        OwnedTaskScope, ReceiverAdmission, ReceiverAuthority, ReceiverLease, SendMessageAdmission,
         StreamTranscriptBatch, SubscriptionCursor, TaskAdmission, TaskEventBatch, TaskLifecycle,
         TranscriptAuthority,
     };
@@ -1115,6 +1228,7 @@ mod tests {
         fn completion_receipt_key(&self) -> Option<[u8; 32]> {
             None
         }
+
         fn authorization_resource_digest(&self, _: &str) -> Result<String, a2a::A2AError> {
             Err(unused())
         }
@@ -1219,6 +1333,15 @@ mod tests {
 
     #[async_trait]
     impl OutboxAuthority for PanickingAuthority {
+        async fn load_runtime_authority_context(
+            &self,
+            _: &OutboxLease,
+            _: &ReceiverLease,
+            _: i64,
+        ) -> Result<crate::DurableRuntimeAuthorityContext, a2a::A2AError> {
+            Err(unused())
+        }
+
         async fn claim_outbox(
             &self,
             owner: &str,
@@ -1451,8 +1574,18 @@ mod tests {
         let task_cancel = cancel.clone();
         let control = Arc::new(DurableDriverControl {
             wake: Arc::new(Notify::new()),
+            #[cfg(test)]
+            cancel_signals: std::sync::atomic::AtomicUsize::new(0),
             state,
-            endpoint: DurableLoopbackEndpoint::new(),
+            coordinator: Arc::new(DurableCoordinator::new(
+                Arc::new(PanickingAuthority {
+                    release: Arc::new(Notify::new()),
+                    claims: std::sync::Mutex::new(Vec::new()),
+                }),
+                DurableCoordinatorMode::Loopback(DurableLoopbackEndpoint::new()),
+                InjectedClock::new(10),
+                None,
+            )),
         });
         let started = Arc::new(Notify::new());
         let task_started = Arc::clone(&started);
@@ -1483,6 +1616,148 @@ mod tests {
             observed_cancel.load(Ordering::SeqCst),
             "drop must request cooperative cancellation before any fallback abort"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_reaps_retained_coordinator_tasks_before_returning() {
+        struct ResourceGuard(Arc<Notify>);
+        impl Drop for ResourceGuard {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let authority: Arc<dyn DurableAuthority> = Arc::new(PanickingAuthority {
+            release: Arc::new(Notify::new()),
+            claims: std::sync::Mutex::new(Vec::new()),
+        });
+        let coordinator = Arc::new(DurableCoordinator::new(
+            authority,
+            DurableCoordinatorMode::Loopback(DurableLoopbackEndpoint::new()),
+            InjectedClock::new(10),
+            None,
+        ));
+        let released = Arc::new(Notify::new());
+        let task_released = Arc::clone(&released);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = Arc::clone(&calls);
+        let active = tokio::spawn(async move {
+            let _resource = ResourceGuard(task_released);
+            loop {
+                task_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        coordinator.retain_test_runtime(
+            crate::DurableDispatchCorrelation::from_authority_parts(
+                "shutdown-tenant",
+                "shutdown-dispatch",
+                1,
+                1,
+            )
+            .expect("test correlation"),
+            CancellationToken::new(),
+            active,
+        );
+        let (state, _) = watch::channel(DriverState::default());
+        let control = Arc::new(DurableDriverControl {
+            wake: Arc::new(Notify::new()),
+            #[cfg(test)]
+            cancel_signals: std::sync::atomic::AtomicUsize::new(0),
+            state,
+            coordinator: Arc::clone(&coordinator),
+        });
+        let handle = DurableDriverHandle {
+            control,
+            shutdown_requested: CancellationToken::new(),
+            join: Some(AbortOnDropJoin::new(tokio::spawn(async { Ok(()) }))),
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+            .await
+            .expect("driver shutdown watchdog")
+            .expect("driver shutdown");
+        tokio::time::timeout(Duration::from_secs(1), released.notified())
+            .await
+            .expect("retained task was destroyed before shutdown returned");
+        coordinator
+            .wait_for_idle()
+            .await
+            .expect("correlation registry is empty");
+        let calls_after_shutdown = calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), calls_after_shutdown);
+    }
+
+    #[tokio::test]
+    async fn canceling_explicit_shutdown_keeps_coordinator_cleanup_owned() {
+        struct ResourceGuard(Arc<Notify>);
+        impl Drop for ResourceGuard {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let authority: Arc<dyn DurableAuthority> = Arc::new(PanickingAuthority {
+            release: Arc::new(Notify::new()),
+            claims: std::sync::Mutex::new(Vec::new()),
+        });
+        let coordinator = Arc::new(DurableCoordinator::new(
+            authority,
+            DurableCoordinatorMode::Loopback(DurableLoopbackEndpoint::new()),
+            InjectedClock::new(10),
+            None,
+        ));
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let released = Arc::new(Notify::new());
+        let task_released = Arc::clone(&released);
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let active = tokio::spawn(async move {
+            let _resource = ResourceGuard(task_released);
+            task_cancellation.cancelled().await;
+            let _ = cancelled_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        coordinator.retain_test_runtime(
+            crate::DurableDispatchCorrelation::from_authority_parts(
+                "shutdown-tenant",
+                "canceled-explicit-shutdown",
+                1,
+                1,
+            )
+            .unwrap(),
+            cancellation,
+            active,
+        );
+        let (state, _) = watch::channel(DriverState::default());
+        let control = Arc::new(DurableDriverControl {
+            wake: Arc::new(Notify::new()),
+            #[cfg(test)]
+            cancel_signals: std::sync::atomic::AtomicUsize::new(0),
+            state,
+            coordinator: Arc::clone(&coordinator),
+        });
+        let handle = DurableDriverHandle {
+            control,
+            shutdown_requested: CancellationToken::new(),
+            join: Some(AbortOnDropJoin::new(tokio::spawn(async { Ok(()) }))),
+        };
+
+        let shutdown = tokio::spawn(handle.shutdown());
+        tokio::time::timeout(Duration::from_secs(1), cancelled_rx)
+            .await
+            .expect("coordinator cleanup did not begin")
+            .unwrap();
+        shutdown.abort();
+        let _ = shutdown.await;
+        tokio::time::timeout(Duration::from_secs(1), released.notified())
+            .await
+            .expect("canceling explicit shutdown detached coordinator work");
+        coordinator
+            .wait_for_idle()
+            .await
+            .expect("detached cleanup emptied the coordinator registry");
     }
 
     #[tokio::test]

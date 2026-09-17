@@ -15,12 +15,13 @@ use smesh_a2a::{
     AuthorizationAuditInput, AuthorizationAuditSink, AuthorizationDecisionEffect,
     AuthorizedMutation, AuthorizedTaskRead, CancellationAuthority, CancellationOutcome,
     ChangeObservation, ChangeObserver, DurableAuthority, DurableDispatchEnvelope,
-    DurableReceiverResult, DurableReceiverTermination, InputLimits, LeaseRenewalOutcome, MeshEvent,
-    MeshRequest, OutboxAuthority, OutboxLease, OwnedTaskScope, QuotaReservationInput,
-    ReceiverAdmission, ReceiverAuthority, ReceiverLease, SendMessageAdmission,
-    StreamTranscriptBatch, SubscriptionCursor, TaskAdmission, TaskEventBatch, TaskLifecycle,
-    TranscriptAuthority, TransitionOutcome, VisibilityScope, authorized_message_identity,
-    content_digest,
+    DurableReceiverResult, DurableReceiverTermination, ExecutionBudget, ExecutionReservation,
+    InputLimits, LeaseRenewalOutcome, MeshEvent, MeshRequest, OutboxAuthority, OutboxLease,
+    OwnedTaskScope, QuotaPolicy, QuotaReservationInput, QuotaSubject, ReceiverAdmission,
+    ReceiverAuthority, ReceiverLease, SendMessageAdmission, StreamTranscriptBatch,
+    SubscriptionCursor, TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority,
+    TransitionOutcome, VisibilityScope, authorized_message_identity,
+    canonical_send_message_digest_v2, content_digest,
 };
 
 const NOW: i64 = 1_700_000_000_000;
@@ -67,6 +68,26 @@ fn request(text: &str) -> SendMessageRequest {
         metadata: None,
         tenant: None,
     }
+}
+
+fn invocation_audit(command: &SendMessageAdmission) -> AuthorizationAuditInput {
+    AuthorizationAuditInput::new(
+        "audit-admit",
+        TENANT,
+        OWNER,
+        "policy-conformance",
+        9,
+        "sha256:policy-conformance",
+        "TaskCreate",
+        AuthorizationDecisionEffect::Allow,
+        "grant",
+        "send-message-request",
+        canonical_send_message_digest_v2(TENANT, OWNER, &command.request, command.streaming)
+            .unwrap(),
+        Some(TASK_ID.to_owned()),
+        NOW,
+    )
+    .expect("valid invocation audit")
 }
 
 fn audit(
@@ -163,6 +184,18 @@ fn command(text: &str) -> SendMessageAdmission {
     }
 }
 
+fn execution_reservation() -> ExecutionReservation {
+    ExecutionReservation {
+        reservation_id: "reservation-conformance".to_owned(),
+        reservation_version: 1,
+        binding_digest: "binding-conformance".to_owned(),
+        policy_id: "quota-policy-conformance".to_owned(),
+        policy_revision: 4,
+        policy_digest: "quota-policy-digest-conformance".to_owned(),
+        budget: ExecutionBudget::new(4096, 16).unwrap(),
+    }
+}
+
 fn outbox_lease() -> OutboxLease {
     OutboxLease {
         tenant_scope: TENANT.to_owned(),
@@ -181,7 +214,7 @@ fn outbox_lease() -> OutboxLease {
             text: "work-conformance".to_owned(),
         },
         ratification_required: false,
-        execution_reservation: None,
+        execution_reservation: Some(execution_reservation()),
     }
 }
 
@@ -190,31 +223,42 @@ fn receiver_lease() -> ReceiverLease {
         tenant_scope: TENANT.to_owned(),
         task_id: TASK_ID.to_owned(),
         dispatch_id: DISPATCH_ID.to_owned(),
-        payload_digest: "sha256:payload-conformance".to_owned(),
-        sender_attempt_no: 2,
+        payload_digest: content_digest(&serde_json::to_vec(&outbox_lease().request).unwrap()),
+        sender_attempt_no: 1,
         sender_lease_token: "sender-fence-conformance".to_owned(),
         lease_owner: "receiver-conformance".to_owned(),
         lease_token: "receiver-fence-conformance".to_owned(),
         lease_epoch: 3,
         lease_until: NOW + 700,
-        execution_reservation: None,
+        execution_reservation: Some(execution_reservation()),
     }
 }
 
 /// Runs the backend-neutral command contract directly against an authority.
 /// Every await is watchdog-bounded; the function owns and verifies shutdown.
 pub async fn run_durable_authority_command_conformance(authority: Arc<dyn DurableAuthority>) {
-    run_durable_authority_command_conformance_inner(authority, true).await;
+    run_durable_authority_command_conformance_inner(authority, true, true, None).await;
+}
+
+/// Runs the command contract with a production execution reservation.
+pub async fn run_durable_authority_command_conformance_with_quota(
+    authority: Arc<dyn DurableAuthority>,
+    quota_policy: Arc<QuotaPolicy>,
+) {
+    run_durable_authority_command_conformance_inner(authority, true, true, Some(quota_policy))
+        .await;
 }
 
 /// Runs the command contract while leaving the authority open for parity extensions.
 pub async fn run_durable_authority_command_conformance_open(authority: Arc<dyn DurableAuthority>) {
-    run_durable_authority_command_conformance_inner(authority, false).await;
+    run_durable_authority_command_conformance_inner(authority, false, false, None).await;
 }
 
 async fn run_durable_authority_command_conformance_inner(
     authority: Arc<dyn DurableAuthority>,
     shutdown: bool,
+    exercise_runtime_context: bool,
+    quota_policy: Option<Arc<QuotaPolicy>>,
 ) {
     tokio::time::timeout(Duration::from_secs(5), async move {
         assert!(authority.completion_receipt_key().is_some());
@@ -257,7 +301,14 @@ async fn run_durable_authority_command_conformance_inner(
                 .is_err()
         );
 
-        let scope = OwnedTaskScope::new(TENANT, OWNER, VisibilityScope::Own).unwrap();
+        let scope = OwnedTaskScope::new_with_principal_and_authentication(
+            TENANT,
+            OWNER,
+            "principal-conformance",
+            VisibilityScope::Own,
+            "bearer-jwt",
+        )
+        .unwrap();
         assert!(
             authority
                 .replay_authorized(
@@ -275,18 +326,33 @@ async fn run_durable_authority_command_conformance_inner(
                 .unwrap()
                 .is_none()
         );
-        let admitted = authority
-            .authorize_and_admit(
-                &scope,
-                command("work-conformance"),
-                audit(
-                    "audit-admit",
-                    "TaskCreate",
-                    AuthorizationDecisionEffect::Allow,
-                ),
-            )
-            .await
-            .unwrap();
+        let admission = command("work-conformance");
+        let admission_audit = invocation_audit(&admission);
+        let admitted = if let Some(policy) = quota_policy.as_ref() {
+            let subject = QuotaSubject::new(TENANT, OWNER, "principal-conformance").unwrap();
+            let input_bytes = serde_json::to_vec(&admission.request).unwrap().len() as u64;
+            let intent = policy
+                .admission_intent(
+                    &subject,
+                    "durable-authority-conformance",
+                    input_bytes,
+                    admission.streaming,
+                )
+                .unwrap();
+            authority
+                .authorize_and_admit_mutation(
+                    &scope,
+                    AuthorizedMutation::with_quota_intent(admission, intent),
+                    admission_audit.clone(),
+                )
+                .await
+                .unwrap()
+        } else {
+            authority
+                .authorize_and_admit(&scope, admission, admission_audit)
+                .await
+                .unwrap()
+        };
         let AdmissionOutcome::Admitted(record) = admitted else {
             panic!("first admission must be new")
         };
@@ -393,6 +459,48 @@ async fn run_durable_authority_command_conformance_inner(
         assert_eq!(receiver.lease_owner, "receiver-conformance");
         assert_eq!(receiver.lease_until, NOW + 700);
         assert!(!receiver.lease_token.is_empty());
+        if exercise_runtime_context {
+            let runtime_context = authority
+                .load_runtime_authority_context(&lease, &receiver, NOW)
+                .await
+                .unwrap();
+            assert_eq!(runtime_context.request(), &lease.request);
+            assert_eq!(
+                runtime_context.correlation().dispatch_id(),
+                lease.dispatch_id
+            );
+            assert_eq!(runtime_context.correlation().attempt(), lease.attempt_no);
+            assert_eq!(runtime_context.correlation().fence(), receiver.lease_epoch);
+            assert_eq!(runtime_context.scope().tenant_scope(), TENANT);
+            assert_eq!(runtime_context.scope().account_id(), OWNER);
+            assert_eq!(
+                runtime_context.scope().principal_scope(),
+                "principal-conformance"
+            );
+            assert_eq!(
+                runtime_context.scope().authentication_method(),
+                "bearer-jwt"
+            );
+            assert_eq!(
+                runtime_context.scope().authorization_policy_id(),
+                "policy-conformance"
+            );
+            assert_eq!(runtime_context.scope().authorization_policy_revision(), 9);
+            assert_eq!(
+                runtime_context.scope().authorization_policy_digest(),
+                "sha256:policy-conformance"
+            );
+            if let Some(reservation) = lease.execution_reservation.as_ref() {
+                assert!(!runtime_context.is_loopback_development());
+                assert_eq!(runtime_context.production_reservation(), Some(reservation));
+                assert_eq!(runtime_context.budget(), reservation.budget);
+            } else {
+                assert!(runtime_context.is_loopback_development());
+                assert!(runtime_context.production_reservation().is_none());
+                assert!(runtime_context.budget().max_output_bytes() > 0);
+                assert!(runtime_context.budget().max_event_count() > 0);
+            }
+        }
         assert!(
             !authority
                 .cancellation_requested(&lease.dispatch_id)
@@ -824,6 +932,7 @@ impl RecordingAuthority {
             "task_for_outbox:sender-fence-conformance",
             "progress:tenant-conformance:dispatch-conformance:1700000000001",
             "receive:receiver-conformance:1700000000000:700",
+            "runtime:context",
             "receiver:cancel_requested",
             "receiver:complete",
             "receiver:outcome",
@@ -1031,6 +1140,37 @@ impl TaskLifecycle for RecordingAuthority {
 
 #[async_trait]
 impl OutboxAuthority for RecordingAuthority {
+    async fn load_runtime_authority_context(
+        &self,
+        outbox: &OutboxLease,
+        receiver: &ReceiverLease,
+        now: i64,
+    ) -> Result<smesh_a2a::DurableRuntimeAuthorityContext, A2AError> {
+        assert_eq!(outbox, &outbox_lease());
+        assert_eq!(receiver, &receiver_lease());
+        assert_eq!(now, NOW);
+        self.record("runtime:context");
+        smesh_a2a::DurableRuntimeAuthorityContext::from_persisted_authority(
+            OwnedTaskScope::new_with_principal_and_authentication(
+                TENANT,
+                OWNER,
+                "principal-conformance",
+                VisibilityScope::Own,
+                "bearer-jwt",
+            )?,
+            "policy-conformance",
+            9,
+            "sha256:policy-conformance",
+            DISPATCH_ID,
+            outbox.attempt_no,
+            receiver.lease_epoch,
+            outbox.request.clone(),
+            receiver.payload_digest.clone(),
+            "authorized-request-conformance",
+            execution_reservation(),
+        )
+    }
+
     async fn claim_outbox(
         &self,
         owner: &str,

@@ -1,6 +1,6 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use a2a_server::TaskStore as _;
 use async_trait::async_trait;
@@ -1555,10 +1555,15 @@ async fn browser_dto_etag_review_decision_stale_and_replay_contract() {
         .unwrap();
     let task_id = lease.task_id.clone();
     let store_probe = store.clone();
+    let amendment_receiver_started = Arc::new(tokio::sync::Notify::new());
+    let amendment_receiver_release = Arc::new(tokio::sync::Notify::new());
     let gateway = build_authorized_durable_loopback_gateway_with_ratification_and_telemetry(
         GatewayConfig::new("http://127.0.0.1:1", "ratification-test"),
         store,
-        DurableLoopbackEndpoint::new(),
+        DurableLoopbackEndpoint::with_completion_barrier(
+            Arc::clone(&amendment_receiver_started),
+            amendment_receiver_release,
+        ),
         InjectedClock::new(1_700_000_020_100),
         AuthState::new(Arc::new(RouteVerifier), [31; 32]),
         Arc::clone(&authorization),
@@ -1942,7 +1947,20 @@ async fn browser_dto_etag_review_decision_stale_and_replay_contract() {
         serde_json::from_slice(&terminal.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(terminal_json["reviewedByCurrentActor"], true);
     assert_eq!(terminal_json["terminalDecision"], "amend");
-    gateway.shutdown().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        amendment_receiver_started.notified(),
+    )
+    .await
+    .expect("amendment receiver admission did not reach the barrier");
+    let shutdown_error = gateway
+        .shutdown()
+        .await
+        .expect_err("shutdown after receiver admission must fail closed");
+    assert_eq!(
+        shutdown_error.message,
+        "durable post-receive outcome is unresolved"
+    );
     drop(store_probe);
     let store_probe = SqliteTaskStore::open_with_ratification_key_and_legacy_binding(
         &fixture.0,
@@ -3866,7 +3884,9 @@ fn disable_integrated_ratification_immutability(connection: &rusqlite::Connectio
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
              DROP TRIGGER tasks_ownership_immutable;
+             DROP TRIGGER tasks_runtime_authority_immutable;
              DROP TRIGGER idempotency_identity_update;
+             DROP TRIGGER idempotency_runtime_authority_immutable;
              DROP TRIGGER outbox_identity_update;
              DROP TRIGGER outbox_message_immutable;
              DROP TRIGGER ratification_packets_identity_immutable;

@@ -1,7 +1,8 @@
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use a2a::{
@@ -15,16 +16,151 @@ use crate::durable_handler::DurableRequestHandler;
 use crate::durable_handler::project_send_response;
 use crate::outbox_driver::{
     DriverTestGate, DriverTestHooks, DurableDriverControl, spawn_durable_driver_with_test_hooks,
+    spawn_durable_runtime_driver_with_test_context, spawn_durable_runtime_driver_with_test_hooks,
 };
 use crate::{
     AdmissionOutcome, AdmissionRecord, AttemptDisposition, AuthorizationAuditInput,
     AuthorizationDecisionEffect, CompletionEvidence, DurableDispatchEnvelope,
     DurableInterruptionKind, DurableLoopbackEndpoint, GatewayConfig, HumanDecision, InjectedClock,
-    InputLimits, MeshEvent, OwnedTaskScope, PolicyCheckpoint, RatificationAuthority,
-    RatificationCommand, ReceiverAdmission, ReviewAcknowledgement, SendMessageAdmission,
-    SqliteTaskStore, TRUSTED_SINGLE_TENANT_SCOPE, TransitionOutcome, VisibilityScope,
-    build_durable_loopback_gateway, content_digest,
+    InputLimits, MeshEvent, OwnedTaskScope, PolicyCheckpoint, PreparedDurableRuntimeDispatch,
+    RatificationAuthority, RatificationCommand, ReceiverAdmission, ReviewAcknowledgement,
+    RuntimeAdapterAdmission, RuntimeAdapterExecution, RuntimeAdapterOutcome,
+    RuntimeAdapterPreparation, RuntimeCancellationRequest, RuntimePreAdmissionFailure,
+    SendMessageAdmission, SqliteTaskStore, TRUSTED_SINGLE_TENANT_SCOPE, TransitionOutcome,
+    VisibilityScope, build_durable_loopback_gateway, content_digest,
 };
+
+#[derive(Clone, Copy)]
+enum CoordinatorProbeMode {
+    Full,
+    Closed,
+    RejectAfterReceive,
+    ExecutionFailed,
+    AdmittedUnknown,
+    ForgedTerminal,
+}
+
+#[derive(Clone)]
+struct CoordinatorProbeAdapter {
+    mode: CoordinatorProbeMode,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+}
+
+struct CoordinatorProbePrepared(CoordinatorProbeAdapter);
+
+#[async_trait::async_trait]
+impl PreparedDurableRuntimeDispatch for CoordinatorProbePrepared {
+    async fn admit(
+        self: Box<Self>,
+        envelope: crate::DurableWorkEnvelope,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> RuntimeAdapterAdmission {
+        assert!(!envelope.correlation().dispatch_id().is_empty());
+        assert!(!envelope.request().task_id.is_empty());
+        self.0.calls.lock().unwrap().push("admit");
+        if matches!(self.0.mode, CoordinatorProbeMode::RejectAfterReceive) {
+            return RuntimeAdapterAdmission::Rejected(RuntimePreAdmissionFailure::Unavailable);
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let outcome = match self.0.mode {
+            CoordinatorProbeMode::ExecutionFailed => {
+                RuntimeAdapterOutcome::ExecutionFailed(crate::RuntimeExecutionFailure::Processor)
+            }
+            CoordinatorProbeMode::AdmittedUnknown => RuntimeAdapterOutcome::AdmittedUnknown,
+            CoordinatorProbeMode::ForgedTerminal => {
+                RuntimeAdapterOutcome::Terminal(crate::DurableReceiverResult {
+                    events: vec![
+                        MeshEvent::Artifact {
+                            name: "forged.txt".to_owned(),
+                            media_type: "text/plain".to_owned(),
+                            content: "forged public artifact".to_owned(),
+                        },
+                        MeshEvent::Completed {
+                            summary: "forged completion".to_owned(),
+                        },
+                    ],
+                    termination: crate::DurableReceiverTermination::Success,
+                })
+            }
+            _ => unreachable!("only post-receive probe modes admit"),
+        };
+        tx.send(outcome).expect("probe outcome receiver");
+        RuntimeAdapterAdmission::Admitted(RuntimeAdapterExecution::new(rx))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::DurableRuntimeAdapter for CoordinatorProbeAdapter {
+    async fn prepare(&self) -> RuntimeAdapterPreparation {
+        self.calls.lock().unwrap().push("prepare");
+        match self.mode {
+            CoordinatorProbeMode::Full => {
+                RuntimeAdapterPreparation::Retryable(RuntimePreAdmissionFailure::Capacity)
+            }
+            CoordinatorProbeMode::Closed => {
+                RuntimeAdapterPreparation::Rejected(RuntimePreAdmissionFailure::Unavailable)
+            }
+            _ => RuntimeAdapterPreparation::Ready(Box::new(CoordinatorProbePrepared(self.clone()))),
+        }
+    }
+
+    async fn cancel_durable(
+        &self,
+        _correlation: &crate::DurableDispatchCorrelation,
+    ) -> RuntimeCancellationRequest {
+        RuntimeCancellationRequest::NotActive
+    }
+}
+
+#[derive(Clone)]
+struct RenewalRaceAdapter {
+    started: Arc<Notify>,
+    active: Arc<AtomicUsize>,
+    admissions: Arc<AtomicUsize>,
+    cancellation_calls: Arc<AtomicUsize>,
+}
+
+struct RenewalRacePrepared(RenewalRaceAdapter);
+
+#[async_trait::async_trait]
+impl PreparedDurableRuntimeDispatch for RenewalRacePrepared {
+    async fn admit(
+        self: Box<Self>,
+        _envelope: crate::DurableWorkEnvelope,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> RuntimeAdapterAdmission {
+        self.0.admissions.fetch_add(1, Ordering::SeqCst);
+        self.0.active.fetch_add(1, Ordering::SeqCst);
+        self.0.started.notify_one();
+        let adapter = self.0.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let admission_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            cancellation.cancelled().await;
+            adapter.active.fetch_sub(1, Ordering::SeqCst);
+            let _ = tx.send(RuntimeAdapterOutcome::ConfirmedStopped);
+        });
+        // Work exists, but its acknowledgement is still in flight. Supervision
+        // must cancel it without dropping the admission future or its receiver.
+        admission_cancellation.cancelled().await;
+        RuntimeAdapterAdmission::Admitted(RuntimeAdapterExecution::new(rx))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::DurableRuntimeAdapter for RenewalRaceAdapter {
+    async fn prepare(&self) -> RuntimeAdapterPreparation {
+        RuntimeAdapterPreparation::Ready(Box::new(RenewalRacePrepared(self.clone())))
+    }
+
+    async fn cancel_durable(
+        &self,
+        _correlation: &crate::DurableDispatchCorrelation,
+    ) -> RuntimeCancellationRequest {
+        self.cancellation_calls.fetch_add(1, Ordering::SeqCst);
+        RuntimeCancellationRequest::Requested
+    }
+}
 
 const WATCHDOG: Duration = Duration::from_secs(5);
 
@@ -491,6 +627,371 @@ async fn receiver_ratification_termination_freezes_packet_in_live_driver() {
     }
     drop(connection);
     shutdown_store(&store).await.expect("store shutdown");
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn coordinator_prepares_full_or_closed_capacity_before_receiver_mutation() {
+    for (label, mode) in [
+        ("coordinator-full", CoordinatorProbeMode::Full),
+        ("coordinator-closed", CoordinatorProbeMode::Closed),
+    ] {
+        let path = database_path(label);
+        let now = 1_700_000_550_000;
+        let store = open_store(&path, 8).await.expect("open probe store");
+        admit(&store, label, now).await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let idle = Arc::new(Notify::new());
+        let driver = spawn_durable_driver_with_test_hooks(
+            store.clone(),
+            CoordinatorProbeAdapter {
+                mode,
+                calls: Arc::clone(&calls),
+            },
+            InjectedClock::new(now),
+            DriverTestHooks {
+                idle: Some(Arc::clone(&idle)),
+                ..DriverTestHooks::default()
+            },
+        );
+        bounded("preparation result reached driver idle", idle.notified()).await;
+        bounded("preparation probe driver shutdown", driver.shutdown())
+            .await
+            .expect("pre-receive preparation is safely recoverable");
+        shutdown_store(&store).await.expect("shutdown probe store");
+        assert_eq!(*calls.lock().unwrap(), vec!["prepare"]);
+        let connection = Connection::open(&path).expect("inspect preparation state");
+        let receiver_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM receiver_inbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(receiver_rows, 0, "{label} mutated receiver authority");
+        drop(connection);
+        cleanup(&path);
+    }
+}
+
+#[tokio::test]
+async fn coordinator_post_receive_nonadmission_failure_and_unknown_fail_stop() {
+    for (label, mode) in [
+        (
+            "coordinator-rejected",
+            CoordinatorProbeMode::RejectAfterReceive,
+        ),
+        (
+            "coordinator-execution-failed",
+            CoordinatorProbeMode::ExecutionFailed,
+        ),
+        (
+            "coordinator-admitted-unknown",
+            CoordinatorProbeMode::AdmittedUnknown,
+        ),
+    ] {
+        let path = database_path(label);
+        let now = 1_700_000_575_000;
+        let store = open_store(&path, 8).await.expect("open fail-stop store");
+        admit(&store, label, now).await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let driver = spawn_durable_driver_with_test_hooks(
+            store.clone(),
+            CoordinatorProbeAdapter {
+                mode,
+                calls: Arc::clone(&calls),
+            },
+            InjectedClock::new(now),
+            DriverTestHooks::default(),
+        );
+        let mut state = driver.control().subscribe();
+        bounded("post-receive fail-stop publication", async {
+            while state.borrow().failure.is_none() {
+                state
+                    .changed()
+                    .await
+                    .expect("driver state remains observable");
+            }
+        })
+        .await;
+        let error = bounded("post-receive fail-stop join", driver.shutdown())
+            .await
+            .expect_err("post-receive uncertainty must terminate ownership");
+        assert!(
+            error
+                .to_string()
+                .contains("post-receive outcome is unresolved")
+        );
+        shutdown_store(&store)
+            .await
+            .expect("shutdown fail-stop store");
+        assert_eq!(*calls.lock().unwrap(), vec!["prepare", "admit"]);
+        let connection = Connection::open(&path).expect("inspect fail-stop state");
+        let state: (String, i64, String, String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT o.state,o.attempt_count,t.state,r.state,
+                        (SELECT COUNT(*) FROM outbox_attempts WHERE finished_at IS NOT NULL),
+                        (SELECT COUNT(*) FROM receiver_frames),
+                        (SELECT COUNT(*) FROM loopback_effects)
+                 FROM outbox o JOIN tasks t USING(task_id)
+                 JOIN receiver_inbox r USING(dispatch_id)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("fail-stop durable state");
+        assert_eq!(
+            state,
+            (
+                "leased".to_owned(),
+                1,
+                "\"TASK_STATE_SUBMITTED\"".to_owned(),
+                "processing".to_owned(),
+                0,
+                0,
+                0,
+            ),
+            "{label} settled authority after receiver admission"
+        );
+        drop(connection);
+        cleanup(&path);
+    }
+}
+
+#[tokio::test]
+async fn runtime_context_load_failure_never_reaches_hostile_adapter_admission() {
+    let path = database_path("runtime-context-fail-closed");
+    let now = 1_700_000_580_000;
+    let store = open_store(&path, 8).await.expect("open fail-closed store");
+    admit(&store, "runtime-context-fail-closed", now).await;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let driver = spawn_durable_runtime_driver_with_test_hooks(
+        store.clone(),
+        CoordinatorProbeAdapter {
+            mode: CoordinatorProbeMode::ExecutionFailed,
+            calls: Arc::clone(&calls),
+        },
+        InjectedClock::new(now),
+        DriverTestHooks::default(),
+    );
+    let mut state = driver.control().subscribe();
+    bounded("context-load fail-stop publication", async {
+        while state.borrow().failure.is_none() {
+            state
+                .changed()
+                .await
+                .expect("driver state remains observable");
+        }
+    })
+    .await;
+    bounded("context-load fail-stop join", driver.shutdown())
+        .await
+        .expect_err("failed authority context must fail-stop");
+    shutdown_store(&store)
+        .await
+        .expect("shutdown fail-closed store");
+    assert_eq!(*calls.lock().unwrap(), vec!["prepare"]);
+    let connection = Connection::open(&path).expect("inspect fail-closed state");
+    let state: (String, String, String, i64, i64) = connection
+        .query_row(
+            "SELECT o.state,t.state,r.state,
+                    (SELECT COUNT(*) FROM outbox_attempts WHERE finished_at IS NOT NULL),
+                    (SELECT COUNT(*) FROM receiver_frames)
+             FROM outbox o JOIN tasks t USING(task_id) JOIN receiver_inbox r USING(dispatch_id)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("fail-closed durable state");
+    assert_eq!(
+        state,
+        (
+            "leased".to_owned(),
+            "\"TASK_STATE_SUBMITTED\"".to_owned(),
+            "processing".to_owned(),
+            0,
+            0
+        )
+    );
+    drop(connection);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn runtime_terminal_proposal_cannot_publish_completion_or_artifacts() {
+    let path = database_path("runtime-forged-terminal");
+    let now = 1_700_000_585_000;
+    let store = open_store(&path, 8)
+        .await
+        .expect("open forged-terminal store");
+    admit(&store, "runtime-forged-terminal", now).await;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let driver = spawn_durable_runtime_driver_with_test_context(
+        store.clone(),
+        CoordinatorProbeAdapter {
+            mode: CoordinatorProbeMode::ForgedTerminal,
+            calls: Arc::clone(&calls),
+        },
+        InjectedClock::new(now),
+    );
+    let mut driver_state = driver.control().subscribe();
+    bounded("forged terminal fail-stop publication", async {
+        while driver_state.borrow().failure.is_none() {
+            driver_state
+                .changed()
+                .await
+                .expect("driver state remains observable");
+        }
+    })
+    .await;
+    assert!(
+        driver_state
+            .borrow()
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("runtime terminal proposal is unresolved"))
+    );
+    bounded("forged terminal fail-stop join", driver.shutdown())
+        .await
+        .expect_err("untrusted terminal proposal must fail-stop");
+    shutdown_store(&store)
+        .await
+        .expect("shutdown forged-terminal store");
+    assert_eq!(*calls.lock().unwrap(), vec!["prepare", "admit"]);
+    let connection = Connection::open(&path).expect("inspect forged-terminal state");
+    let state: (String, String, String, String, i64, i64, i64) = connection
+        .query_row(
+            "SELECT o.state,t.state,r.state,t.task_json,
+                    (SELECT COUNT(*) FROM outbox_attempts WHERE finished_at IS NOT NULL),
+                    (SELECT COUNT(*) FROM receiver_frames),
+                    (SELECT COUNT(*) FROM loopback_effects)
+             FROM outbox o JOIN tasks t USING(task_id) JOIN receiver_inbox r USING(dispatch_id)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .expect("forged-terminal durable state");
+    let task: Task = serde_json::from_str(&state.3).expect("stored task JSON");
+    assert!(task.artifacts.is_none(), "forged artifacts became public");
+    assert_eq!(
+        (state.0, state.1, state.2, state.4, state.5, state.6),
+        (
+            "leased".to_owned(),
+            "\"TASK_STATE_SUBMITTED\"".to_owned(),
+            "processing".to_owned(),
+            0,
+            0,
+            0
+        )
+    );
+    drop(connection);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn receiver_renewal_loss_cancels_and_reaps_before_authority_can_advance() {
+    let path = database_path("receiver-renewal-loss");
+    let now = 1_700_000_590_000;
+    let store = open_store(&path, 8).await.expect("open renewal-loss store");
+    let (_, admission) = admit(&store, "receiver-renewal-loss", now).await;
+    let renewal =
+        crate::durable_dispatch::install_receiver_renewal_test_hook(&admission.dispatch_id);
+    let started = Arc::new(Notify::new());
+    let active = Arc::new(AtomicUsize::new(0));
+    let admissions = Arc::new(AtomicUsize::new(0));
+    let cancellation_calls = Arc::new(AtomicUsize::new(0));
+    let adapter = RenewalRaceAdapter {
+        started: Arc::clone(&started),
+        active: Arc::clone(&active),
+        admissions: Arc::clone(&admissions),
+        cancellation_calls: Arc::clone(&cancellation_calls),
+    };
+    let clock = InjectedClock::new(now);
+    let driver =
+        spawn_durable_runtime_driver_with_test_context(store.clone(), adapter, clock.clone());
+    let mut driver_state = driver.control().subscribe();
+    bounded("runtime admission", started.notified()).await;
+    bounded("receiver renewal attempt", renewal.reached.notified()).await;
+    assert_eq!(active.load(Ordering::SeqCst), 1);
+    renewal.release_stale.notify_one();
+    bounded("renewal-loss fail-stop publication", async {
+        while driver_state.borrow().failure.is_none() {
+            driver_state
+                .changed()
+                .await
+                .expect("driver state remains observable");
+        }
+    })
+    .await;
+    assert_eq!(
+        active.load(Ordering::SeqCst),
+        0,
+        "runtime remained active after lease loss"
+    );
+    assert_eq!(cancellation_calls.load(Ordering::SeqCst), 1);
+    clock.advance_to(now + 120_000);
+    assert_eq!(
+        admissions.load(Ordering::SeqCst),
+        1,
+        "renewal loss allowed duplicate execution"
+    );
+    bounded("renewal-loss driver join", driver.shutdown())
+        .await
+        .expect_err("receiver renewal loss must fail-stop");
+    shutdown_store(&store)
+        .await
+        .expect("shutdown renewal-loss store");
+    let connection = Connection::open(&path).expect("inspect renewal-loss state");
+    let state: (String, String, String, i64, i64) = connection
+        .query_row(
+            "SELECT o.state,t.state,r.state,
+                    (SELECT COUNT(*) FROM outbox_attempts WHERE finished_at IS NOT NULL),
+                    (SELECT COUNT(*) FROM receiver_frames)
+             FROM outbox o JOIN tasks t USING(task_id) JOIN receiver_inbox r USING(dispatch_id)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("renewal-loss durable state");
+    assert_eq!(
+        state,
+        (
+            "leased".to_owned(),
+            "\"TASK_STATE_SUBMITTED\"".to_owned(),
+            "processing".to_owned(),
+            0,
+            0
+        )
+    );
+    drop(connection);
     cleanup(&path);
 }
 
