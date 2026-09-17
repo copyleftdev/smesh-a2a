@@ -400,6 +400,12 @@ async fn selector_and_role_matrix_fail_closed_with_identical_transport_errors() 
         }
     })
     .await;
+    bounded(
+        "selector coordinator idle",
+        gateway.wait_for_coordinator_idle(),
+    )
+    .await
+    .unwrap();
     bounded("selector gateway shutdown", gateway.shutdown())
         .await
         .unwrap();
