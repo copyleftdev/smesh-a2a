@@ -2049,7 +2049,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error when a persistent SQLite store and policy use different receipt keys.
+/// Returns an error when a persistent `SQLite` store and policy use different receipt keys.
 pub fn build_router_with_policy<D, S>(
     config: GatewayConfig,
     dispatcher: D,
@@ -2067,7 +2067,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error when a persistent SQLite store and policy use different receipt keys.
+/// Returns an error when a persistent `SQLite` store and policy use different receipt keys.
 pub fn build_router_with_policy_and_trace<D, S>(
     config: GatewayConfig,
     dispatcher: D,

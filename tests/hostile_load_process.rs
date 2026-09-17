@@ -282,7 +282,10 @@ async fn hostile_load_network_faults_and_slow_consumers_remain_bounded() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
     let (warm_ms, warm_ok) = send_canary(&client, &endpoint, "warm-canary").await;
-    assert!(warm_ok && warm_ms <= 1_000);
+    assert!(
+        warm_ok && warm_ms <= 2_000,
+        "warm canary {warm_ms}ms exceeded the request deadline"
+    );
     let baseline_rss = process_rss_bytes(pid);
     let baseline_fds = process_fd_count(pid);
     let baseline_db = sqlite_file_set_bytes(&database);

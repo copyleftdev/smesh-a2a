@@ -74,7 +74,7 @@ pub async fn authorize_request(
 }
 
 /// Server-owned middleware dependencies. Production installs the durable sink;
-/// isolated policy tests may omit it because they have no SQLite boundary.
+/// isolated policy tests may omit it because they have no `SQLite` boundary.
 #[derive(Clone)]
 pub struct AuthorizationMiddlewareState {
     policy: Arc<AuthorizationPolicy>,

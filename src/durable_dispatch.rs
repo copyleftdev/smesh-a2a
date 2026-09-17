@@ -305,7 +305,7 @@ impl DurableLoopbackEndpoint {
     #[must_use]
     /// Attach a post-commit diagnostic counter.
     ///
-    /// This observable is not durable: a process crash after the SQLite commit
+    /// This observable is not durable: a process crash after the `SQLite` commit
     /// and before the increment can undercount. Use `durable_effect_count` as
     /// the enforceable local transaction proof.
     pub fn from_diagnostic_counter(effects: Arc<AtomicUsize>) -> Self {

@@ -887,7 +887,7 @@ impl SqliteTaskStore {
         Ok(())
     }
 
-    /// Open or create a versioned SQLite task store with callbacks disabled.
+    /// Open or create a versioned `SQLite` task store with callbacks disabled.
     pub async fn open(path: impl AsRef<Path>, max_tasks: usize) -> Result<Self, SqliteStoreError> {
         Self::open_inner(path, max_tasks, None, true, false, None, None).await
     }
@@ -4531,11 +4531,11 @@ impl SqliteTaskStore {
         .await
     }
 
-    /// Synchronously close shared admission, SQLite, and ownership state.
+    /// Synchronously close shared admission, `SQLite`, and ownership state.
     ///
     /// Used only by fail-safe owner drop after its worker has been aborted. Closing
     /// the semaphore rejects router-clone work; taking the mutexes waits for any
-    /// already-running bounded SQLite operation before releasing the process lock.
+    /// already-running bounded `SQLite` operation before releasing the process lock.
     pub(crate) fn close_shared_sync(&self) {
         self.admission.close();
         if let Ok(mut connection) = self.connection.lock() {
@@ -4546,7 +4546,7 @@ impl SqliteTaskStore {
         }
     }
 
-    /// Relinquish the shared SQLite connection and process ownership lock for all clones.
+    /// Relinquish the shared `SQLite` connection and process ownership lock for all clones.
     ///
     /// # Errors
     ///

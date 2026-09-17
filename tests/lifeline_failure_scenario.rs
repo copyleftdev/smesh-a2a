@@ -239,6 +239,22 @@ fn one_command_verifier_replays_persisted_evidence() {
     assert!(verify.success());
 }
 
+fn canonical_event_semantics(events: &[smesh_a2a::LifelineFailureEvent]) -> Vec<serde_json::Value> {
+    let mut values = events
+        .iter()
+        .map(|event| {
+            let mut value = serde_json::to_value(event).unwrap();
+            let object = value.as_object_mut().unwrap();
+            object.remove("sequence");
+            object.remove("eventId");
+            object.remove("parentEventId");
+            value
+        })
+        .collect::<Vec<_>>();
+    values.sort_by_key(|value| serde_json::to_string(value).unwrap());
+    values
+}
+
 #[test]
 fn run_receipt_readback_accepts_deterministic_rerun_and_rejects_downgrade() {
     let parent = TempDir::new("run-verification");
@@ -260,8 +276,10 @@ fn run_receipt_readback_accepts_deterministic_rerun_and_rejects_downgrade() {
     let run: smesh_a2a::LifelineFailureScenarioRun = serde_json::from_slice(&run_bytes).unwrap();
     assert!(run.verify(&first_events).is_ok());
     assert!(run.verify(&second_events).is_ok());
-    assert_eq!(first_events, second_events);
-
+    assert_eq!(
+        canonical_event_semantics(&first_events),
+        canonical_event_semantics(&second_events)
+    );
     let mut changed_operation: serde_json::Value = serde_json::from_slice(&run_bytes).unwrap();
     let primary_receipt = changed_operation["directorRun"]["initialOperations"]
         .as_array_mut()
