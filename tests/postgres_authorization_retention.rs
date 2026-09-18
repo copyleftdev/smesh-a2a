@@ -727,7 +727,7 @@ async fn populated_revision_eight_upgrades_authorization_projection_evidence_tra
             let ledger = client.query_one(
                     &format!("SELECT m.schema_version,l.logical_schema_version,l.name,l.checksum,r.logical_schema_version,r.name,r.checksum,x.logical_schema_version,x.name,x.checksum FROM {upgrade_schema}.store_metadata m JOIN {upgrade_schema}.schema_migrations l ON l.revision=9 JOIN {upgrade_schema}.schema_migrations r ON r.revision=10 JOIN {upgrade_schema}.schema_migrations x ON x.revision=11 WHERE m.singleton=1"), &[]
                 ).await.unwrap();
-            assert_eq!(ledger.get::<_, i64>(0), 12);
+            assert_eq!(ledger.get::<_, i64>(0), 13);
             assert_eq!(ledger.get::<_, i64>(1), 9);
             assert_eq!(
                 ledger.get::<_, &str>(2),

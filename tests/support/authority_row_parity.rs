@@ -134,6 +134,14 @@ pub async fn assert_postgres_tables_match(client: &Client, schema: &str) {
         "quota_receipts",
         "quota_request_receipts",
         "retained_authority_usage",
+        // PostgreSQL-only semantic completion authority. SQLite remains the
+        // loopback development backend and cannot publish runtime evidence.
+        "candidate_artifacts",
+        "candidate_generations",
+        "completion_policy_versions",
+        "evidence_conflicts",
+        "issuer_enrollments",
+        "issuer_evidence",
         // PostgreSQL authenticates ratification in bounded tenant/task shards for
         // multi-replica lookups. SQLite serializes one global ledger anchor; that
         // shared authority object remains in AUTHORITY_TABLES and is row-compared.

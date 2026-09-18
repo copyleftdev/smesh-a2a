@@ -724,7 +724,7 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
     let source = include_str!("../src/postgres_store.rs");
     assert_eq!(
         source.matches(".transaction()").count() + source.matches(".build_transaction()").count(),
-        19,
+        24,
         "new direct transaction site must be routed through the bounded runner or explicitly reviewed"
     );
     assert_eq!(
@@ -753,6 +753,11 @@ fn direct_postgres_transactions_are_only_runner_migration_or_read_only_allowlist
         "read-only tenant/key-generation snapshot before atomic reload",
         "operator-only bounded authorization retention transaction",
         "ratification key reconciliation and anchor qualification are one startup transaction",
+        "semantic authority initialization is startup-only and atomically rejects configuration drift",
+        "semantic candidate freeze atomically binds one live execution fence and immutable artifact",
+        "read-only semantic candidate snapshot uses one forced-RLS transaction",
+        "semantic approval atomically verifies the closed evidence set and records one idempotent receipt",
+        "semantic evidence ingestion atomically verifies live authority and retains one immutable decision",
     ] {
         assert!(
             source.contains(reason),

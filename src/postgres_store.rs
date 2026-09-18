@@ -41,14 +41,18 @@ use crate::{
     AuthorityCapabilities, AuthorityDiagnostics, AuthorityIdentity, AuthorityShutdown,
     AuthorizationAuditInput, AuthorizationAuditParts, AuthorizationAuditSink,
     AuthorizationDecisionEffect, AuthorizedMutation, AuthorizedTaskRead, CancellationAuthority,
-    CancellationOutcome, ChangeObservation, ChangeObserver, DurableDispatchEnvelope,
-    DurableReceiverResult, DurableReceiverTermination, ExecutionReservation, LeaseRenewalOutcome,
-    MeshEvent, MeshRequest, OutboxAuthority, OutboxLease, OwnedTaskScope, PosixArtifactBlobStore,
-    QuotaLease, QuotaLeaseAuthority, QuotaReservationInput, ReceiverAdmission, ReceiverAuthority,
-    ReceiverLease, ReloadingArtifactKeyring, SendMessageAdmission, StreamTranscriptBatch,
-    SubscriptionCursor, TaskAdmission, TaskEventBatch, TaskLifecycle, TranscriptAuthority,
+    CancellationOutcome, CandidateGenerationV1, ChangeObservation, ChangeObserver,
+    DurableDispatchEnvelope, DurableReceiverResult, DurableReceiverTermination,
+    ExecutionReservation, IssuerEnrollmentV1, IssuerRoleV1, LeaseRenewalOutcome, MeshEvent,
+    MeshRequest, OutboxAuthority, OutboxLease, OwnedTaskScope, PosixArtifactBlobStore, QuotaLease,
+    QuotaLeaseAuthority, QuotaReservationInput, ReceiverAdmission, ReceiverAuthority,
+    ReceiverLease, ReloadingArtifactKeyring, SemanticEvidenceIngestOutcome, SendMessageAdmission,
+    SignedIssuerEvidenceV1, StreamTranscriptBatch, SubscriptionCursor,
+    TEXT_CONCORDANCE_ARTIFACT_NAME_V1, TEXT_CONCORDANCE_COMPLETION_POLICY_REVISION_V1,
+    TEXT_CONCORDANCE_COMPLETION_POLICY_V1, TEXT_CONCORDANCE_MEDIA_TYPE, TaskAdmission,
+    TaskEventBatch, TaskLifecycle, TextConcordanceCandidatePacketV1, TranscriptAuthority,
     TransitionOutcome, VisibilityScope, authorized_message_identity,
-    canonical_send_message_digest_v2, content_digest,
+    canonical_send_message_digest_v2, content_digest, validate_text_concordance_candidate,
 };
 
 const MIGRATION_SQL: &str = include_str!("../migrations/postgres/0001_authority_schema_v6.sql");
@@ -86,6 +90,9 @@ const RATIFICATION_RETAINED_MIGRATION_NAME: &str = "0011_ratification_retained_a
 const RUNTIME_AUTHORITY_MIGRATION_SQL: &str =
     include_str!("../migrations/postgres/0012_runtime_authority_scope.sql");
 const RUNTIME_AUTHORITY_MIGRATION_NAME: &str = "0012_runtime_authority_scope";
+const SEMANTIC_EVIDENCE_MIGRATION_SQL: &str =
+    include_str!("../migrations/postgres/0013_semantic_evidence.sql");
+const SEMANTIC_EVIDENCE_MIGRATION_NAME: &str = "0013_semantic_evidence";
 
 #[doc(hidden)]
 #[must_use]
@@ -143,9 +150,10 @@ fn render_migration_sql_with_quotes(
     rendered
 }
 const LEGACY_LOGICAL_SCHEMA_VERSION: i64 = 6;
-const PREVIOUS_LOGICAL_SCHEMA_VERSION: i64 = 11;
-const LOGICAL_SCHEMA_VERSION: i64 = 12;
-const CURRENT_SCHEMA_VERSION: i64 = 12;
+const RATIFICATION_RETAINED_SCHEMA_VERSION: i64 = 11;
+const RUNTIME_AUTHORITY_SCHEMA_VERSION: i64 = 12;
+const LOGICAL_SCHEMA_VERSION: i64 = 13;
+const CURRENT_SCHEMA_VERSION: i64 = 13;
 const MAX_CONFIG_BYTES: usize = 4096;
 const ACTIVE_CALLBACK_ENROLLMENT_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM __S__.callback_enrollments WHERE tenant_scope=$1 AND enrollment_id=$2 AND enrollment_generation=$3 AND canonical_url=$4 AND url_digest=$5 AND policy_id=$6 AND policy_revision=$7 AND policy_revision=(SELECT max(policy_revision) FROM __S__.callback_policy_snapshots))";
 const CALLBACK_POLICY_FENCE_LOCK: i64 = 6_001_136_200_065;
@@ -232,8 +240,14 @@ pub(crate) const EXPECTED_TABLES: &[&str] = &[
     "callback_worker_session_secret",
     "callback_worker_sessions",
     "cancellation_intents",
+    "candidate_artifacts",
+    "candidate_generations",
+    "completion_policy_versions",
     "content_objects",
+    "evidence_conflicts",
     "idempotency_records",
+    "issuer_enrollments",
+    "issuer_evidence",
     "list_page_tokens",
     "list_snapshot_entries",
     "list_snapshots",
@@ -302,8 +316,14 @@ const TENANT_TABLES: &[&str] = &[
     "callback_events",
     "callback_tenant_scheduler",
     "cancellation_intents",
+    "candidate_artifacts",
+    "candidate_generations",
+    "completion_policy_versions",
     "content_objects",
+    "evidence_conflicts",
     "idempotency_records",
+    "issuer_enrollments",
+    "issuer_evidence",
     "list_page_tokens",
     "list_snapshot_entries",
     "list_snapshots",
@@ -1648,6 +1668,1152 @@ impl PostgresTaskStore {
     #[must_use]
     pub fn completion_receipt_key(&self) -> Option<[u8; 32]> {
         Some(*self.receipt_key)
+    }
+
+    /// Atomically install the closed text-concordance policy and its three issuer authorities.
+    ///
+    /// Repeating the operation is accepted only when every durable field matches exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-request error for incomplete, duplicate, inactive, or cross-tenant
+    /// enrollments and fails closed on durable configuration drift.
+    pub async fn initialize_text_concordance_authority(
+        &self,
+        tenant: &str,
+        owner_account_id: &str,
+        principal_scope: &str,
+        enrollments: &[IssuerEnrollmentV1; 3],
+        now: i64,
+    ) -> Result<(), A2AError> {
+        let now_u64 = u64::try_from(now)
+            .map_err(|_| A2AError::invalid_request("semantic authority time is invalid"))?;
+        if tenant.is_empty()
+            || owner_account_id.is_empty()
+            || principal_scope.is_empty()
+            || enrollments
+                .iter()
+                .any(|enrollment| enrollment.tenant_scope != tenant)
+        {
+            return Err(A2AError::invalid_request(
+                "semantic authority scope is invalid",
+            ));
+        }
+        let mut roles = BTreeSet::new();
+        let mut identities = BTreeSet::new();
+        let mut public_keys = BTreeSet::new();
+        for enrollment in enrollments {
+            enrollment
+                .validate_at(now_u64)
+                .map_err(|_| A2AError::invalid_request("semantic issuer enrollment is invalid"))?;
+            let role = match enrollment.issuer_role {
+                IssuerRoleV1::Review => "text-concordance-review/v1",
+                IssuerRoleV1::Test => "text-concordance-test/v1",
+                IssuerRoleV1::Contradiction => "text-concordance-contradiction/v1",
+            };
+            if !roles.insert(role)
+                || !identities.insert(enrollment.issuer_identity.as_str())
+                || !public_keys.insert(enrollment.public_key.as_str())
+            {
+                return Err(A2AError::invalid_request(
+                    "semantic issuer authorities must be distinct",
+                ));
+            }
+        }
+        if roles.len() != 3 {
+            return Err(A2AError::invalid_request(
+                "semantic issuer role set is incomplete",
+            ));
+        }
+
+        let policy = serde_json::json!({
+            "schema": "semantic-completion-policy/v1",
+            "policy_id": TEXT_CONCORDANCE_COMPLETION_POLICY_V1,
+            "revision": TEXT_CONCORDANCE_COMPLETION_POLICY_REVISION_V1,
+            "required_roles": [
+                "text-concordance-review/v1",
+                "text-concordance-test/v1",
+                "text-concordance-contradiction/v1"
+            ]
+        });
+        let policy_bytes = serde_json::to_vec(&policy)
+            .map_err(|_| A2AError::internal("semantic policy encoding failed"))?;
+        let policy_digest = content_digest(&policy_bytes);
+        let required_roles = policy
+            .get("required_roles")
+            .cloned()
+            .ok_or_else(|| A2AError::internal("semantic policy roles are missing"))?;
+        let policy_json = String::from_utf8(policy_bytes)
+            .map_err(|_| A2AError::internal("semantic policy encoding failed"))?;
+        let required_roles_json = serde_json::to_string(&required_roles)
+            .map_err(|_| A2AError::internal("semantic policy role encoding failed"))?;
+        let policy_revision = i64::try_from(TEXT_CONCORDANCE_COMPLETION_POLICY_REVISION_V1)
+            .map_err(|_| A2AError::internal("semantic policy revision is invalid"))?;
+
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| A2AError::internal("semantic authority database unavailable"))?;
+        // semantic authority initialization is startup-only and atomically rejects configuration drift
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| A2AError::internal("semantic authority transaction failed"))?;
+        self.set_tenant(&tx, tenant, Some(owner_account_id)).await?;
+        let insert_policy = self.q("INSERT INTO __S__.completion_policy_versions(tenant_scope,policy_id,policy_revision,canonical_json,policy_digest,required_roles,owner_account_id,principal_scope,created_at) VALUES($1,$2,$3,$4::text::jsonb,$5,$6::text::jsonb,$7,$8,$9) ON CONFLICT(tenant_scope,policy_id,policy_revision) DO NOTHING");
+        tx.execute(
+            &insert_policy,
+            &[
+                &tenant,
+                &TEXT_CONCORDANCE_COMPLETION_POLICY_V1,
+                &policy_revision,
+                &policy_json,
+                &policy_digest,
+                &required_roles_json,
+                &owner_account_id,
+                &principal_scope,
+                &now,
+            ],
+        )
+        .await
+        .map_err(|_| A2AError::internal("semantic policy persistence failed"))?;
+
+        let policy_row = tx
+            .query_opt(
+                &self.q("SELECT policy_digest,owner_account_id,principal_scope FROM __S__.completion_policy_versions WHERE tenant_scope=$1 AND policy_id=$2 AND policy_revision=$3"),
+                &[&tenant, &TEXT_CONCORDANCE_COMPLETION_POLICY_V1, &policy_revision],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic policy verification failed"))?
+            .ok_or_else(|| A2AError::internal("semantic policy is missing"))?;
+        if policy_row.get::<_, &str>(0) != policy_digest
+            || policy_row.get::<_, &str>(1) != owner_account_id
+            || policy_row.get::<_, &str>(2) != principal_scope
+        {
+            return Err(A2AError::invalid_request(
+                "semantic policy configuration conflicts with durable authority",
+            ));
+        }
+
+        let insert_enrollment = self.q("INSERT INTO __S__.issuer_enrollments(tenant_scope,issuer_identity,issuer_role,public_key,valid_from,expires_at,revoked_at,owner_account_id,principal_scope,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING");
+        for enrollment in enrollments {
+            let role = match enrollment.issuer_role {
+                IssuerRoleV1::Review => "text-concordance-review/v1",
+                IssuerRoleV1::Test => "text-concordance-test/v1",
+                IssuerRoleV1::Contradiction => "text-concordance-contradiction/v1",
+            };
+            let valid_from = i64::try_from(enrollment.valid_from)
+                .map_err(|_| A2AError::invalid_request("issuer validity is invalid"))?;
+            let expires_at = i64::try_from(enrollment.expires_at)
+                .map_err(|_| A2AError::invalid_request("issuer validity is invalid"))?;
+            let revoked_at = enrollment
+                .revoked_at
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| A2AError::invalid_request("issuer revocation is invalid"))?;
+            tx.execute(
+                &insert_enrollment,
+                &[
+                    &tenant,
+                    &enrollment.issuer_identity,
+                    &role,
+                    &enrollment.public_key,
+                    &valid_from,
+                    &expires_at,
+                    &revoked_at,
+                    &owner_account_id,
+                    &principal_scope,
+                    &now,
+                ],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic issuer persistence failed"))?;
+            let row = tx
+                .query_opt(
+                    &self.q("SELECT issuer_role,public_key,valid_from,expires_at,revoked_at,owner_account_id,principal_scope FROM __S__.issuer_enrollments WHERE tenant_scope=$1 AND issuer_identity=$2"),
+                    &[&tenant, &enrollment.issuer_identity],
+                )
+                .await
+                .map_err(|_| A2AError::internal("semantic issuer verification failed"))?
+                .ok_or_else(|| A2AError::internal("semantic issuer is missing"))?;
+            if row.get::<_, &str>(0) != role
+                || row.get::<_, &str>(1) != enrollment.public_key
+                || row.get::<_, i64>(2) != valid_from
+                || row.get::<_, i64>(3) != expires_at
+                || row.get::<_, Option<i64>>(4) != revoked_at
+                || row.get::<_, &str>(5) != owner_account_id
+                || row.get::<_, &str>(6) != principal_scope
+            {
+                return Err(A2AError::invalid_request(
+                    "semantic issuer configuration conflicts with durable authority",
+                ));
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|_| A2AError::internal("semantic authority commit failed"))
+    }
+
+    /// Freeze one runtime proposal as private candidate material under the live execution fence.
+    ///
+    /// The call independently recomputes the closed workload, verifies the task/outbox/receiver
+    /// authority tuple, and atomically retains the generation and its private artifact.
+    pub async fn freeze_text_concordance_candidate(
+        &self,
+        packet: &TextConcordanceCandidatePacketV1,
+        runtime_proposal_json: &str,
+        owner_account_id: &str,
+        principal_scope: &str,
+        now: i64,
+    ) -> Result<String, A2AError> {
+        if owner_account_id.is_empty()
+            || owner_account_id.len() > 64
+            || principal_scope.is_empty()
+            || principal_scope.len() > 256
+            || now <= 0
+            || runtime_proposal_json.len() > 1_048_576
+        {
+            return Err(A2AError::invalid_params(
+                "invalid semantic candidate freeze",
+            ));
+        }
+        let artifact = validate_text_concordance_candidate(packet)
+            .map_err(|_| A2AError::invalid_request("semantic candidate validation failed"))?;
+        let runtime_proposal: serde_json::Value = serde_json::from_str(runtime_proposal_json)
+            .map_err(|_| A2AError::invalid_params("invalid semantic runtime proposal"))?;
+        let proposal = serde_json::json!({
+            "candidatePacket": packet,
+            "runtimeProposal": runtime_proposal,
+        });
+        let proposal_json = serde_json::to_string(&proposal)
+            .map_err(|_| A2AError::internal("semantic proposal encoding failed"))?;
+        if proposal_json.len() > 1_048_576 {
+            return Err(A2AError::invalid_params(
+                "semantic proposal exceeds durable bound",
+            ));
+        }
+        let candidate = &packet.candidate;
+        let candidate_id = candidate
+            .id()
+            .map_err(|_| A2AError::invalid_request("semantic candidate identifier is invalid"))?;
+        let attempt = i64::try_from(candidate.attempt)
+            .map_err(|_| A2AError::invalid_params("semantic candidate attempt is invalid"))?;
+        let fence = i64::try_from(candidate.fence)
+            .map_err(|_| A2AError::invalid_params("semantic candidate fence is invalid"))?;
+        let policy_revision =
+            i64::try_from(candidate.completion_policy_revision).map_err(|_| {
+                A2AError::invalid_params("semantic candidate policy revision is invalid")
+            })?;
+        let artifact_digest = content_digest(&artifact);
+
+        let mut client = self.connection().await?;
+        // semantic candidate freeze atomically binds one live execution fence and immutable artifact
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate transaction failed"))?;
+        self.set_tenant(&tx, &candidate.tenant_scope, None).await?;
+        let execution_sql = self.q(
+            "SELECT t.context_id,t.owner_account_id,t.principal_scope,t.state,
+                    o.attempt_count,o.state,r.lease_epoch,r.state,r.lease_until,
+                    EXISTS(SELECT 1 FROM __S__.cancellation_intents c
+                      WHERE c.tenant_scope=t.tenant_scope AND c.dispatch_id=o.dispatch_id
+                        AND c.task_id=t.task_id AND c.state IN ('requested','receiver_canceled'))
+               FROM __S__.tasks t
+               JOIN __S__.outbox o ON o.tenant_scope=t.tenant_scope
+                 AND o.task_id=t.task_id AND o.dispatch_id=$3
+               JOIN __S__.receiver_inbox r ON r.tenant_scope=o.tenant_scope
+                 AND r.dispatch_id=o.dispatch_id AND r.task_id=o.task_id
+              WHERE t.tenant_scope=$1 AND t.task_id=$2
+              FOR UPDATE OF t,o,r",
+        );
+        let execution = tx
+            .query_opt(
+                &execution_sql,
+                &[
+                    &candidate.tenant_scope,
+                    &candidate.task_id,
+                    &candidate.dispatch_id,
+                ],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic execution authority lookup failed"))?
+            .ok_or_else(|| A2AError::invalid_request("semantic execution authority is absent"))?;
+        let context_id: String = execution.get(0);
+        let stored_owner: String = execution.get(1);
+        let stored_principal: String = execution.get(2);
+        let task_state: String = execution.get(3);
+        let stored_attempt: i64 = execution.get(4);
+        let outbox_state: String = execution.get(5);
+        let stored_fence: i64 = execution.get(6);
+        let receiver_state: String = execution.get(7);
+        let receiver_lease_until: i64 = execution.get(8);
+        let canceled: bool = execution.get(9);
+        if context_id != candidate.context_id
+            || stored_owner != owner_account_id
+            || stored_principal != principal_scope
+            || stored_attempt != attempt
+            || stored_fence != fence
+            || task_state == "completed"
+            || outbox_state != "leased"
+            || receiver_state != "processing"
+            || receiver_lease_until <= now
+            || canceled
+        {
+            return Err(A2AError::invalid_request(
+                "semantic candidate execution authority is stale or mismatched",
+            ));
+        }
+        let policy_sql = self.q("SELECT 1 FROM __S__.completion_policy_versions
+              WHERE tenant_scope=$1 AND policy_id=$2 AND policy_revision=$3
+                AND required_roles='[\"text-concordance-review/v1\",\"text-concordance-test/v1\",\"text-concordance-contradiction/v1\"]'::jsonb",
+        );
+        if tx
+            .query_opt(
+                &policy_sql,
+                &[
+                    &candidate.tenant_scope,
+                    &candidate.completion_policy,
+                    &policy_revision,
+                ],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic completion policy lookup failed"))?
+            .is_none()
+        {
+            return Err(A2AError::invalid_request(
+                "semantic completion policy authority is absent",
+            ));
+        }
+
+        let insert_candidate = self.q("INSERT INTO __S__.candidate_generations(
+                tenant_scope,candidate_generation_id,task_id,context_id,request_digest,artifact_set_digest,
+                dispatch_id,attempt,fence,completion_policy,completion_policy_revision,
+                owner_account_id,principal_scope,proposal_json,state,created_at)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::text::jsonb,'open',$15)
+             ON CONFLICT DO NOTHING");
+        tx.execute(
+            &insert_candidate,
+            &[
+                &candidate.tenant_scope,
+                &candidate_id,
+                &candidate.task_id,
+                &candidate.context_id,
+                &candidate.request_digest,
+                &candidate.artifact_set_digest,
+                &candidate.dispatch_id,
+                &attempt,
+                &fence,
+                &candidate.completion_policy,
+                &policy_revision,
+                &owner_account_id,
+                &principal_scope,
+                &proposal_json,
+                &now,
+            ],
+        )
+        .await
+        .map_err(|_| A2AError::internal("semantic candidate persistence failed"))?;
+        let verify_candidate = self.q(
+            "SELECT candidate_generation_id,request_digest,artifact_set_digest,owner_account_id,
+                    principal_scope,proposal_json::text,state
+               FROM __S__.candidate_generations
+              WHERE tenant_scope=$1 AND dispatch_id=$2 AND attempt=$3 AND fence=$4
+                AND completion_policy=$5 AND completion_policy_revision=$6",
+        );
+        let stored = tx
+            .query_one(
+                &verify_candidate,
+                &[
+                    &candidate.tenant_scope,
+                    &candidate.dispatch_id,
+                    &attempt,
+                    &fence,
+                    &candidate.completion_policy,
+                    &policy_revision,
+                ],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate verification failed"))?;
+        let stored_proposal: serde_json::Value = serde_json::from_str(&stored.get::<_, String>(5))
+            .map_err(|_| A2AError::internal("stored semantic proposal is malformed"))?;
+        if stored.get::<_, String>(0) != candidate_id
+            || stored.get::<_, String>(1) != candidate.request_digest
+            || stored.get::<_, String>(2) != candidate.artifact_set_digest
+            || stored.get::<_, String>(3) != owner_account_id
+            || stored.get::<_, String>(4) != principal_scope
+            || stored_proposal != proposal
+            || stored.get::<_, String>(6) != "open"
+        {
+            let stored_candidate_id: String = stored.get(0);
+            let conflict_id = content_digest(
+                format!("semantic-candidate-conflict/v1\0{stored_candidate_id}\0{candidate_id}")
+                    .as_bytes(),
+            );
+            let conflict = self.q("INSERT INTO __S__.evidence_conflicts(tenant_scope,conflict_id,candidate_generation_id,task_id,observed_digest,conflict_kind,owner_account_id,principal_scope,observed_at) VALUES($1,$2,$3,$4,$5,'candidate',$6,$7,$8) ON CONFLICT DO NOTHING");
+            tx.execute(
+                &conflict,
+                &[
+                    &candidate.tenant_scope,
+                    &conflict_id,
+                    &stored_candidate_id,
+                    &candidate.task_id,
+                    &candidate_id,
+                    &owner_account_id,
+                    &principal_scope,
+                    &now,
+                ],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate conflict retention failed"))?;
+            let poison = self.q("UPDATE __S__.candidate_generations SET state='conflicted' WHERE tenant_scope=$1 AND candidate_generation_id=$2 AND state='open'");
+            tx.execute(&poison, &[&candidate.tenant_scope, &stored_candidate_id])
+                .await
+                .map_err(|_| A2AError::internal("semantic candidate conflict transition failed"))?;
+            tx.commit()
+                .await
+                .map_err(|_| A2AError::internal("semantic candidate conflict commit failed"))?;
+            return Err(A2AError::invalid_request(
+                "semantic candidate conflicts with immutable authority",
+            ));
+        }
+        let insert_artifact = self.q("INSERT INTO __S__.candidate_artifacts(
+                tenant_scope,candidate_generation_id,ordinal,task_id,name,media_type,
+                artifact_digest,artifact_bytes,owner_account_id,principal_scope,created_at)
+             VALUES($1,$2,0,$3,$4,$5,$6,$7,$8,$9,$10)
+             ON CONFLICT DO NOTHING");
+        tx.execute(
+            &insert_artifact,
+            &[
+                &candidate.tenant_scope,
+                &candidate_id,
+                &candidate.task_id,
+                &TEXT_CONCORDANCE_ARTIFACT_NAME_V1,
+                &TEXT_CONCORDANCE_MEDIA_TYPE,
+                &artifact_digest,
+                &artifact,
+                &owner_account_id,
+                &principal_scope,
+                &now,
+            ],
+        )
+        .await
+        .map_err(|_| A2AError::internal("semantic candidate artifact persistence failed"))?;
+        let verify_artifact = self.q(
+            "SELECT artifact_digest,artifact_bytes,task_id,owner_account_id,principal_scope
+               FROM __S__.candidate_artifacts
+              WHERE tenant_scope=$1 AND candidate_generation_id=$2 AND ordinal=0",
+        );
+        let stored_artifact = tx
+            .query_one(&verify_artifact, &[&candidate.tenant_scope, &candidate_id])
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate artifact verification failed"))?;
+        if stored_artifact.get::<_, String>(0) != artifact_digest
+            || stored_artifact.get::<_, Vec<u8>>(1) != artifact
+            || stored_artifact.get::<_, String>(2) != candidate.task_id
+            || stored_artifact.get::<_, String>(3) != owner_account_id
+            || stored_artifact.get::<_, String>(4) != principal_scope
+        {
+            return Err(A2AError::invalid_request(
+                "semantic candidate artifact conflicts with immutable authority",
+            ));
+        }
+        tx.commit()
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate commit failed"))?;
+        Ok(candidate_id)
+    }
+
+    /// Load and independently verify one private candidate packet.
+    pub async fn load_text_concordance_candidate(
+        &self,
+        tenant: &str,
+        candidate_generation_id: &str,
+    ) -> Result<TextConcordanceCandidatePacketV1, A2AError> {
+        if tenant.is_empty()
+            || candidate_generation_id.len() != 71
+            || !candidate_generation_id.starts_with("sha256:")
+        {
+            return Err(A2AError::invalid_params(
+                "invalid semantic candidate lookup",
+            ));
+        }
+        let mut client = self.connection().await?;
+        // read-only semantic candidate snapshot uses one forced-RLS transaction
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate lookup transaction failed"))?;
+        self.set_tenant(&tx, tenant, None).await?;
+        let sql = self.q(
+            "SELECT g.proposal_json::text,a.name,a.media_type,a.artifact_digest,a.artifact_bytes,g.state
+               FROM __S__.candidate_generations g
+               JOIN __S__.candidate_artifacts a
+                 ON a.tenant_scope=g.tenant_scope
+                AND a.candidate_generation_id=g.candidate_generation_id
+                AND a.ordinal=0
+              WHERE g.tenant_scope=$1 AND g.candidate_generation_id=$2",
+        );
+        let row = tx
+            .query_opt(&sql, &[&tenant, &candidate_generation_id])
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate lookup failed"))?
+            .ok_or_else(|| A2AError::invalid_request("semantic candidate is absent"))?;
+        let proposal: serde_json::Value = serde_json::from_str(&row.get::<_, String>(0))
+            .map_err(|_| A2AError::internal("stored semantic candidate is malformed"))?;
+        let mut packet: TextConcordanceCandidatePacketV1 =
+            serde_json::from_value(proposal.get("candidatePacket").cloned().ok_or_else(|| {
+                A2AError::internal("stored semantic candidate packet is missing")
+            })?)
+            .map_err(|_| A2AError::internal("stored semantic candidate packet is malformed"))?;
+        let artifact = validate_text_concordance_candidate(&packet)
+            .map_err(|_| A2AError::internal("stored semantic candidate validation failed"))?;
+        if packet.candidate.tenant_scope != tenant
+            || packet.candidate.id().map_err(|_| {
+                A2AError::internal("stored semantic candidate identifier is invalid")
+            })? != candidate_generation_id
+            || row.get::<_, String>(1) != TEXT_CONCORDANCE_ARTIFACT_NAME_V1
+            || row.get::<_, String>(2) != TEXT_CONCORDANCE_MEDIA_TYPE
+            || row.get::<_, String>(3) != content_digest(&artifact)
+            || row.get::<_, Vec<u8>>(4) != artifact
+            || row.get::<_, String>(5) != "open"
+        {
+            return Err(A2AError::internal(
+                "stored semantic candidate artifact is inconsistent",
+            ));
+        }
+        let conflicts = self.q("SELECT observed_digest FROM __S__.evidence_conflicts WHERE tenant_scope=$1 AND candidate_generation_id=$2 ORDER BY observed_digest");
+        packet.observed_conflict_digests = tx
+            .query(&conflicts, &[&tenant, &candidate_generation_id])
+            .await
+            .map_err(|_| A2AError::internal("semantic conflict snapshot failed"))?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        tx.commit()
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate lookup commit failed"))?;
+        Ok(packet)
+    }
+
+    fn verify_text_concordance_approval_receipt(
+        &self,
+        candidate_generation_id: &str,
+        receipt_json: &str,
+    ) -> Result<(String, Vec<String>), A2AError> {
+        let receipt: serde_json::Value = serde_json::from_str(receipt_json)
+            .map_err(|_| A2AError::internal("semantic approval receipt is malformed"))?;
+        let object = receipt
+            .as_object()
+            .ok_or_else(|| A2AError::internal("semantic approval receipt is malformed"))?;
+        if object.len() != 5
+            || object.get("schema").and_then(serde_json::Value::as_str)
+                != Some("semantic-approval-receipt/v1")
+            || object
+                .get("candidate_generation_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(candidate_generation_id)
+        {
+            return Err(A2AError::invalid_request(
+                "semantic approval receipt is unauthenticated",
+            ));
+        }
+        let approved_at = object
+            .get("approved_at")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                A2AError::invalid_request("semantic approval receipt is unauthenticated")
+            })?;
+        let evidence_digests = object
+            .get("evidence_digests")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                A2AError::invalid_request("semantic approval receipt is unauthenticated")
+            })?;
+        if evidence_digests.len() != 3
+            || evidence_digests.iter().any(|digest| {
+                digest.as_str().is_none_or(|digest| {
+                    digest.len() != 71
+                        || !digest.starts_with("sha256:")
+                        || !digest[7..]
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                })
+            })
+        {
+            return Err(A2AError::invalid_request(
+                "semantic approval receipt is unauthenticated",
+            ));
+        }
+        let mut sorted = evidence_digests.clone();
+        sorted.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+        sorted.dedup();
+        if sorted.len() != 3 || sorted != *evidence_digests {
+            return Err(A2AError::invalid_request(
+                "semantic approval receipt is unauthenticated",
+            ));
+        }
+        let claims = serde_json::json!({
+            "schema": "semantic-approval-receipt/v1",
+            "candidate_generation_id": candidate_generation_id,
+            "evidence_digests": evidence_digests,
+            "approved_at": approved_at,
+        });
+        let claims_bytes = serde_json::to_vec(&claims)
+            .map_err(|_| A2AError::internal("semantic approval receipt encoding failed"))?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.receipt_key.as_ref())
+            .map_err(|_| A2AError::internal("semantic approval receipt key is invalid"))?;
+        mac.update(b"SMESH-A2A\0semantic-approval-receipt\0v1\0");
+        mac.update(&(claims_bytes.len() as u64).to_be_bytes());
+        mac.update(&claims_bytes);
+        let expected = format!("sha256:{:x}", mac.finalize().into_bytes());
+        let seal = object
+            .get("seal")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                A2AError::invalid_request("semantic approval receipt is unauthenticated")
+            })?;
+        if seal != expected {
+            return Err(A2AError::invalid_request(
+                "semantic approval receipt is unauthenticated",
+            ));
+        }
+        Ok((
+            seal.to_owned(),
+            evidence_digests
+                .iter()
+                .filter_map(|digest| digest.as_str().map(str::to_owned))
+                .collect(),
+        ))
+    }
+
+    async fn verify_live_text_concordance_evidence(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        candidate_generation_id: &str,
+        candidate: &CandidateGenerationV1,
+        owner_account_id: &str,
+        principal_scope: &str,
+        now: u64,
+    ) -> Result<Vec<String>, A2AError> {
+        let tenant = &candidate.tenant_scope;
+        let conflict_sql = self.q("SELECT EXISTS(SELECT 1 FROM __S__.evidence_conflicts
+              WHERE tenant_scope=$1 AND candidate_generation_id=$2)");
+        if tx
+            .query_one(&conflict_sql, &[&tenant, &candidate_generation_id])
+            .await
+            .map_err(|_| A2AError::internal("semantic conflict lookup failed"))?
+            .get::<_, bool>(0)
+        {
+            return Err(A2AError::invalid_request(
+                "semantic candidate has durable conflicts",
+            ));
+        }
+        let evidence_sql = self.q(
+            "SELECT e.evidence_json::text,e.signature,e.evidence_digest,e.issuer_role,
+                    e.issuer_identity,e.public_key,i.public_key,i.valid_from,i.expires_at,
+                    i.revoked_at,i.owner_account_id,i.principal_scope
+               FROM __S__.issuer_evidence e
+               JOIN __S__.issuer_enrollments i
+                 ON i.tenant_scope=e.tenant_scope
+                AND i.issuer_role=e.issuer_role
+                AND i.issuer_identity=e.issuer_identity
+              WHERE e.tenant_scope=$1 AND e.candidate_generation_id=$2
+              ORDER BY e.issuer_role
+              FOR UPDATE OF e,i",
+        );
+        let rows = tx
+            .query(&evidence_sql, &[&tenant, &candidate_generation_id])
+            .await
+            .map_err(|_| A2AError::internal("semantic evidence-set lookup failed"))?;
+        if rows.len() != 3 {
+            return Err(A2AError::invalid_request(
+                "semantic evidence set is incomplete",
+            ));
+        }
+        let mut roles = BTreeSet::new();
+        let mut evidence_digests = Vec::with_capacity(3);
+        for row in rows {
+            let evidence: crate::IssuerEvidenceV1 = serde_json::from_str(&row.get::<_, String>(0))
+                .map_err(|_| A2AError::internal("stored semantic evidence is malformed"))?;
+            let signed = SignedIssuerEvidenceV1 {
+                evidence,
+                signature: row.get(1),
+            };
+            let expected_role = match signed.evidence.issuer_role {
+                IssuerRoleV1::Review => "text-concordance-review/v1",
+                IssuerRoleV1::Test => "text-concordance-test/v1",
+                IssuerRoleV1::Contradiction => "text-concordance-contradiction/v1",
+            };
+            let role_name: String = row.get(3);
+            let issuer_identity: String = row.get(4);
+            let evidence_key: String = row.get(5);
+            let enrollment_key: String = row.get(6);
+            if !roles.insert(role_name.clone())
+                || role_name != expected_role
+                || issuer_identity != signed.evidence.issuer_identity
+                || evidence_key != enrollment_key
+                || row.get::<_, String>(10) != owner_account_id
+                || row.get::<_, String>(11) != principal_scope
+            {
+                return Err(A2AError::invalid_request(
+                    "semantic evidence authorities are not distinct",
+                ));
+            }
+            let enrollment = IssuerEnrollmentV1 {
+                tenant_scope: tenant.to_owned(),
+                issuer_role: signed.evidence.issuer_role,
+                issuer_identity,
+                public_key: enrollment_key,
+                valid_from: u64::try_from(row.get::<_, i64>(7)).map_err(|_| {
+                    A2AError::internal("stored semantic issuer validity is invalid")
+                })?,
+                expires_at: u64::try_from(row.get::<_, i64>(8)).map_err(|_| {
+                    A2AError::internal("stored semantic issuer validity is invalid")
+                })?,
+                revoked_at: row
+                    .get::<_, Option<i64>>(9)
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        A2AError::internal("stored semantic issuer revocation is invalid")
+                    })?,
+            };
+            signed
+                .verify(candidate, &enrollment, now)
+                .map_err(|_| A2AError::invalid_request("semantic evidence set is invalid"))?;
+            let digest = signed
+                .evidence
+                .digest()
+                .map_err(|_| A2AError::internal("semantic evidence digest failed"))?;
+            if row.get::<_, String>(2) != digest {
+                return Err(A2AError::invalid_request(
+                    "semantic evidence digest is inconsistent",
+                ));
+            }
+            evidence_digests.push(digest);
+        }
+        if roles
+            != BTreeSet::from([
+                "text-concordance-contradiction/v1".to_owned(),
+                "text-concordance-review/v1".to_owned(),
+                "text-concordance-test/v1".to_owned(),
+            ])
+        {
+            return Err(A2AError::invalid_request(
+                "semantic evidence role set is incomplete",
+            ));
+        }
+        evidence_digests.sort();
+        Ok(evidence_digests)
+    }
+
+    /// Revalidate the closed evidence set and durably approve one candidate generation.
+    pub async fn approve_text_concordance_candidate(
+        &self,
+        tenant: &str,
+        candidate_generation_id: &str,
+        now: i64,
+    ) -> Result<String, A2AError> {
+        if tenant.is_empty()
+            || candidate_generation_id.len() != 71
+            || !candidate_generation_id.starts_with("sha256:")
+        {
+            return Err(A2AError::invalid_params(
+                "invalid semantic candidate approval",
+            ));
+        }
+        let mut client = self.connection().await?;
+        // semantic approval atomically verifies the closed evidence set and records one idempotent receipt
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| A2AError::internal("semantic approval transaction failed"))?;
+        self.set_tenant(&tx, tenant, None).await?;
+        let now = self.effective_now(&tx, now).await?;
+        let now_u64 = u64::try_from(now)
+            .map_err(|_| A2AError::internal("semantic approval time is invalid"))?;
+        let candidate_sql = self.q("SELECT proposal_json::text,state,completion_receipt::text,
+                    owner_account_id,principal_scope
+               FROM __S__.candidate_generations
+              WHERE tenant_scope=$1 AND candidate_generation_id=$2
+              FOR UPDATE");
+        let row = tx
+            .query_opt(&candidate_sql, &[&tenant, &candidate_generation_id])
+            .await
+            .map_err(|_| A2AError::internal("semantic approval candidate lookup failed"))?
+            .ok_or_else(|| A2AError::invalid_request("semantic candidate is absent"))?;
+        let state: String = row.get(1);
+        if state == "sealed" {
+            let receipt_json = row
+                .get::<_, Option<String>>(2)
+                .ok_or_else(|| A2AError::internal("sealed semantic receipt is missing"))?;
+            return self
+                .verify_text_concordance_approval_receipt(candidate_generation_id, &receipt_json)
+                .map(|(seal, _)| seal);
+        }
+        if state != "open" {
+            return Err(A2AError::invalid_request(
+                "semantic candidate cannot be approved",
+            ));
+        }
+        if let Some(receipt_json) = row.get::<_, Option<String>>(2) {
+            return self
+                .verify_text_concordance_approval_receipt(candidate_generation_id, &receipt_json)
+                .map(|(seal, _)| seal);
+        }
+        let owner_account_id: String = row.get(3);
+        let principal_scope: String = row.get(4);
+        let proposal: serde_json::Value = serde_json::from_str(&row.get::<_, String>(0))
+            .map_err(|_| A2AError::internal("semantic candidate proposal is malformed"))?;
+        let packet: TextConcordanceCandidatePacketV1 = serde_json::from_value(
+            proposal
+                .get("candidatePacket")
+                .cloned()
+                .ok_or_else(|| A2AError::internal("semantic candidate packet is missing"))?,
+        )
+        .map_err(|_| A2AError::internal("semantic candidate packet is malformed"))?;
+        let artifact = validate_text_concordance_candidate(&packet)
+            .map_err(|_| A2AError::internal("semantic candidate packet is invalid"))?;
+        if packet.candidate.tenant_scope != tenant
+            || packet
+                .candidate
+                .id()
+                .map_err(|_| A2AError::internal("semantic candidate identifier is invalid"))?
+                != candidate_generation_id
+        {
+            return Err(A2AError::invalid_request(
+                "semantic candidate authority binding is mismatched",
+            ));
+        }
+        let artifact_sql = self.q(
+            "SELECT a.name,a.media_type,a.artifact_digest,a.artifact_bytes,a.owner_account_id,a.principal_scope,
+                    (SELECT count(*) FROM __S__.candidate_artifacts all_artifacts
+                      WHERE all_artifacts.tenant_scope=a.tenant_scope
+                        AND all_artifacts.candidate_generation_id=a.candidate_generation_id)
+               FROM __S__.candidate_artifacts a
+              WHERE a.tenant_scope=$1 AND a.candidate_generation_id=$2 AND a.ordinal=0",
+        );
+        let artifact_row = tx
+            .query_one(&artifact_sql, &[&tenant, &candidate_generation_id])
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate artifact lookup failed"))?;
+        if artifact_row.get::<_, String>(0) != TEXT_CONCORDANCE_ARTIFACT_NAME_V1
+            || artifact_row.get::<_, String>(1) != TEXT_CONCORDANCE_MEDIA_TYPE
+            || artifact_row.get::<_, String>(2) != content_digest(&artifact)
+            || artifact_row.get::<_, Vec<u8>>(3) != artifact
+            || artifact_row.get::<_, String>(4) != owner_account_id
+            || artifact_row.get::<_, String>(5) != principal_scope
+            || artifact_row.get::<_, i64>(6) != 1
+        {
+            return Err(A2AError::invalid_request(
+                "semantic candidate artifact authority is mismatched",
+            ));
+        }
+        let evidence_digests = self
+            .verify_live_text_concordance_evidence(
+                &tx,
+                candidate_generation_id,
+                &packet.candidate,
+                &owner_account_id,
+                &principal_scope,
+                now_u64,
+            )
+            .await?;
+        let claims = serde_json::json!({
+            "schema": "semantic-approval-receipt/v1",
+            "candidate_generation_id": candidate_generation_id,
+            "evidence_digests": evidence_digests,
+            "approved_at": now,
+        });
+        let claims_bytes = serde_json::to_vec(&claims)
+            .map_err(|_| A2AError::internal("semantic approval receipt encoding failed"))?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.receipt_key.as_ref())
+            .map_err(|_| A2AError::internal("semantic approval receipt key is invalid"))?;
+        mac.update(b"SMESH-A2A\0semantic-approval-receipt\0v1\0");
+        mac.update(&(claims_bytes.len() as u64).to_be_bytes());
+        mac.update(&claims_bytes);
+        let seal = format!("sha256:{:x}", mac.finalize().into_bytes());
+        let receipt = serde_json::json!({
+            "schema": "semantic-approval-receipt/v1",
+            "candidate_generation_id": candidate_generation_id,
+            "evidence_digests": claims["evidence_digests"],
+            "approved_at": now,
+            "seal": seal,
+        });
+        let receipt_json = serde_json::to_string(&receipt)
+            .map_err(|_| A2AError::internal("semantic approval receipt encoding failed"))?;
+        let update_sql = self.q("UPDATE __S__.candidate_generations
+                SET completion_receipt=$1::text::jsonb
+              WHERE tenant_scope=$2 AND candidate_generation_id=$3 AND state='open' AND completion_receipt IS NULL");
+        if tx
+            .execute(
+                &update_sql,
+                &[&receipt_json, &tenant, &candidate_generation_id],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate approval failed"))?
+            != 1
+        {
+            return Err(A2AError::invalid_request(
+                "semantic candidate approval lost its authority fence",
+            ));
+        }
+        tx.commit()
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate approval commit failed"))?;
+        Ok(seal)
+    }
+
+    /// Verify and durably retain one independently signed issuer decision.
+    pub async fn submit_text_concordance_evidence(
+        &self,
+        signed: &SignedIssuerEvidenceV1,
+        now: i64,
+    ) -> Result<SemanticEvidenceIngestOutcome, A2AError> {
+        let now_u64 = u64::try_from(now)
+            .map_err(|_| A2AError::invalid_params("semantic evidence time is invalid"))?;
+        let evidence = &signed.evidence;
+        let role = match evidence.issuer_role {
+            IssuerRoleV1::Review => "text-concordance-review/v1",
+            IssuerRoleV1::Test => "text-concordance-test/v1",
+            IssuerRoleV1::Contradiction => "text-concordance-contradiction/v1",
+        };
+        let decision = match evidence.decision {
+            crate::IssuerDecisionV1::Approve => "approve",
+            crate::IssuerDecisionV1::Clear => "clear",
+        };
+        let evidence_digest = evidence
+            .digest()
+            .map_err(|_| A2AError::invalid_request("semantic evidence is malformed"))?;
+        let evidence_json = serde_json::to_string(evidence)
+            .map_err(|_| A2AError::internal("semantic evidence encoding failed"))?;
+
+        let mut client = self.connection().await?;
+        // semantic evidence ingestion atomically verifies live authority and retains one immutable decision
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| A2AError::internal("semantic evidence transaction failed"))?;
+        self.set_tenant(&tx, &evidence.tenant_scope, None).await?;
+        let candidate_sql = self.q(
+            "SELECT task_id,context_id,request_digest,artifact_set_digest,dispatch_id,
+                    attempt,fence,completion_policy,completion_policy_revision,state,
+                    owner_account_id,principal_scope
+               FROM __S__.candidate_generations
+              WHERE tenant_scope=$1 AND candidate_generation_id=$2
+              FOR UPDATE",
+        );
+        let row = tx
+            .query_opt(
+                &candidate_sql,
+                &[&evidence.tenant_scope, &evidence.candidate_generation_id],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic candidate lookup failed"))?
+            .ok_or_else(|| A2AError::invalid_request("semantic candidate is absent"))?;
+        let attempt = u64::try_from(row.get::<_, i64>(5))
+            .map_err(|_| A2AError::internal("stored semantic candidate attempt is invalid"))?;
+        let fence = u64::try_from(row.get::<_, i64>(6))
+            .map_err(|_| A2AError::internal("stored semantic candidate fence is invalid"))?;
+        let policy_revision = u64::try_from(row.get::<_, i64>(8)).map_err(|_| {
+            A2AError::internal("stored semantic candidate policy revision is invalid")
+        })?;
+        let candidate = CandidateGenerationV1 {
+            tenant_scope: evidence.tenant_scope.clone(),
+            task_id: row.get(0),
+            context_id: row.get(1),
+            request_digest: row.get(2),
+            artifact_set_digest: row.get(3),
+            dispatch_id: row.get(4),
+            attempt,
+            fence,
+            completion_policy: row.get(7),
+            completion_policy_revision: policy_revision,
+        };
+        if row.get::<_, String>(9) != "open" {
+            return Err(A2AError::invalid_request(
+                "semantic candidate is not open for evidence",
+            ));
+        }
+        let owner_account_id: String = row.get(10);
+        let principal_scope: String = row.get(11);
+
+        let live_sql = self.q("SELECT o.state,r.state,r.lease_epoch,r.lease_until,
+                    EXISTS(SELECT 1 FROM __S__.cancellation_intents c
+                      WHERE c.tenant_scope=o.tenant_scope AND c.dispatch_id=o.dispatch_id
+                        AND c.task_id=o.task_id AND c.state IN ('requested','receiver_canceled'))
+               FROM __S__.outbox o
+               JOIN __S__.receiver_inbox r ON r.tenant_scope=o.tenant_scope
+                 AND r.dispatch_id=o.dispatch_id AND r.task_id=o.task_id
+              WHERE o.tenant_scope=$1 AND o.dispatch_id=$2 AND o.task_id=$3
+              FOR UPDATE OF o,r");
+        let live = tx
+            .query_opt(
+                &live_sql,
+                &[
+                    &candidate.tenant_scope,
+                    &candidate.dispatch_id,
+                    &candidate.task_id,
+                ],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic execution fence lookup failed"))?
+            .ok_or_else(|| A2AError::invalid_request("semantic execution fence is absent"))?;
+        if live.get::<_, String>(0) != "leased"
+            || live.get::<_, String>(1) != "processing"
+            || live.get::<_, i64>(2) != i64::try_from(candidate.fence).unwrap_or(i64::MAX)
+            || live.get::<_, i64>(3) <= now
+            || live.get::<_, bool>(4)
+        {
+            return Err(A2AError::invalid_request(
+                "semantic execution fence is stale or canceled",
+            ));
+        }
+
+        let enrollment_sql = self.q(
+            "SELECT public_key,valid_from,expires_at,revoked_at,owner_account_id,principal_scope
+               FROM __S__.issuer_enrollments
+              WHERE tenant_scope=$1 AND issuer_role=$2 AND issuer_identity=$3
+              FOR UPDATE",
+        );
+        let enrollment_row = tx
+            .query_opt(
+                &enrollment_sql,
+                &[&evidence.tenant_scope, &role, &evidence.issuer_identity],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic issuer enrollment lookup failed"))?
+            .ok_or_else(|| A2AError::invalid_request("semantic issuer is not enrolled"))?;
+        if enrollment_row.get::<_, String>(4) != owner_account_id
+            || enrollment_row.get::<_, String>(5) != principal_scope
+        {
+            return Err(A2AError::invalid_request(
+                "semantic issuer authority scope is mismatched",
+            ));
+        }
+        let enrollment = IssuerEnrollmentV1 {
+            tenant_scope: evidence.tenant_scope.clone(),
+            issuer_role: evidence.issuer_role,
+            issuer_identity: evidence.issuer_identity.clone(),
+            public_key: enrollment_row.get(0),
+            valid_from: u64::try_from(enrollment_row.get::<_, i64>(1))
+                .map_err(|_| A2AError::internal("stored semantic issuer validity is invalid"))?,
+            expires_at: u64::try_from(enrollment_row.get::<_, i64>(2))
+                .map_err(|_| A2AError::internal("stored semantic issuer validity is invalid"))?,
+            revoked_at: enrollment_row
+                .get::<_, Option<i64>>(3)
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| A2AError::internal("stored semantic issuer revocation is invalid"))?,
+        };
+        signed
+            .verify(&candidate, &enrollment, now_u64)
+            .map_err(|_| A2AError::invalid_request("semantic evidence verification failed"))?;
+
+        let insert_sql = self.q("INSERT INTO __S__.issuer_evidence(
+                tenant_scope,candidate_generation_id,issuer_role,issuer_identity,decision,
+                task_id,evidence_json,evidence_digest,signature,public_key,
+                owner_account_id,principal_scope,accepted_at)
+             VALUES($1,$2,$3,$4,$5,$6,$7::text::jsonb,$8,$9,$10,$11,$12,$13)
+             ON CONFLICT DO NOTHING");
+        let inserted = tx
+            .execute(
+                &insert_sql,
+                &[
+                    &evidence.tenant_scope,
+                    &evidence.candidate_generation_id,
+                    &role,
+                    &evidence.issuer_identity,
+                    &decision,
+                    &evidence.task_id,
+                    &evidence_json,
+                    &evidence_digest,
+                    &signed.signature,
+                    &enrollment.public_key,
+                    &owner_account_id,
+                    &principal_scope,
+                    &now,
+                ],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic evidence persistence failed"))?
+            == 1;
+        let stored_sql = self.q(
+            "SELECT issuer_identity,decision,evidence_digest,signature,public_key,evidence_json::text
+               FROM __S__.issuer_evidence
+              WHERE tenant_scope=$1 AND candidate_generation_id=$2 AND issuer_role=$3",
+        );
+        let stored = tx
+            .query_one(
+                &stored_sql,
+                &[
+                    &evidence.tenant_scope,
+                    &evidence.candidate_generation_id,
+                    &role,
+                ],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic evidence verification lookup failed"))?;
+        let stored_evidence: serde_json::Value = serde_json::from_str(&stored.get::<_, String>(5))
+            .map_err(|_| A2AError::internal("stored semantic evidence is malformed"))?;
+        let expected_evidence = serde_json::to_value(evidence)
+            .map_err(|_| A2AError::internal("semantic evidence encoding failed"))?;
+        if stored.get::<_, String>(0) != evidence.issuer_identity
+            || stored.get::<_, String>(1) != decision
+            || stored.get::<_, String>(2) != evidence_digest
+            || stored.get::<_, String>(3) != signed.signature
+            || stored.get::<_, String>(4) != enrollment.public_key
+            || stored_evidence != expected_evidence
+        {
+            let stored_digest: String = stored.get(2);
+            let conflict_id = content_digest(
+                format!(
+                    "semantic-evidence-conflict/v1\0{}\0{role}\0{stored_digest}\0{evidence_digest}",
+                    evidence.candidate_generation_id
+                )
+                .as_bytes(),
+            );
+            let conflict = self.q("INSERT INTO __S__.evidence_conflicts(tenant_scope,conflict_id,candidate_generation_id,task_id,issuer_role,observed_digest,conflict_kind,owner_account_id,principal_scope,observed_at) VALUES($1,$2,$3,$4,$5,$6,'evidence',$7,$8,$9) ON CONFLICT DO NOTHING");
+            tx.execute(
+                &conflict,
+                &[
+                    &evidence.tenant_scope,
+                    &conflict_id,
+                    &evidence.candidate_generation_id,
+                    &evidence.task_id,
+                    &role,
+                    &evidence_digest,
+                    &owner_account_id,
+                    &principal_scope,
+                    &now,
+                ],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic evidence conflict retention failed"))?;
+            let poison = self.q("UPDATE __S__.candidate_generations SET state='conflicted' WHERE tenant_scope=$1 AND candidate_generation_id=$2 AND state='open'");
+            tx.execute(
+                &poison,
+                &[&evidence.tenant_scope, &evidence.candidate_generation_id],
+            )
+            .await
+            .map_err(|_| A2AError::internal("semantic evidence conflict transition failed"))?;
+            tx.commit()
+                .await
+                .map_err(|_| A2AError::internal("semantic evidence conflict commit failed"))?;
+            return Err(A2AError::invalid_request(
+                "semantic evidence conflicts with immutable authority",
+            ));
+        }
+        tx.commit()
+            .await
+            .map_err(|_| A2AError::internal("semantic evidence commit failed"))?;
+        Ok(if inserted {
+            SemanticEvidenceIngestOutcome::Accepted
+        } else {
+            SemanticEvidenceIngestOutcome::Duplicate
+        })
     }
 
     /// Arms one named terminal-enqueue fault; consumed only at the exact checkpoint.
@@ -5824,7 +6990,7 @@ async fn migrate(
         .await
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
     if let Some(row) = ratification_retained_row {
-        if row.get::<_, i64>(0) != PREVIOUS_LOGICAL_SCHEMA_VERSION
+        if row.get::<_, i64>(0) != RATIFICATION_RETAINED_SCHEMA_VERSION
             || row.get::<_, String>(1) != ratification_retained_checksum
         {
             return Err(PostgresStoreError::InvalidSchema);
@@ -5894,7 +7060,7 @@ async fn migrate(
         .await
         .map_err(|_| PostgresStoreError::InvalidSchema)?;
     if let Some(row) = runtime_authority_row {
-        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+        if row.get::<_, i64>(0) != RUNTIME_AUTHORITY_SCHEMA_VERSION
             || row.get::<_, String>(1) != runtime_authority_checksum
         {
             return Err(PostgresStoreError::InvalidSchema);
@@ -5908,7 +7074,7 @@ async fn migrate(
             .await
             .map_err(|_| PostgresStoreError::InvalidSchema)?;
         let sealed_catalog = metadata.get::<_, String>(1);
-        if metadata.get::<_, i64>(0) != PREVIOUS_LOGICAL_SCHEMA_VERSION
+        if metadata.get::<_, i64>(0) != RATIFICATION_RETAINED_SCHEMA_VERSION
             || (sealed_catalog != legacy_catalog_digest(&tx, schema).await?
                 && sealed_catalog != catalog_digest(&tx, schema).await?)
         {
@@ -5945,6 +7111,71 @@ async fn migrate(
         .map_err(|_| PostgresStoreError::Initialization)?;
         tx.execute(
             &format!("UPDATE {schema}.store_metadata SET schema_version=12,catalog_hash=$1 WHERE singleton=1"),
+            &[&catalog],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata ENABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+    }
+    let semantic_evidence_checksum = content_digest(SEMANTIC_EVIDENCE_MIGRATION_SQL.as_bytes());
+    let semantic_evidence_row = tx
+        .query_opt(
+            &format!("SELECT logical_schema_version,checksum FROM {schema}.schema_migrations WHERE revision=13"),
+            &[],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::InvalidSchema)?;
+    if let Some(row) = semantic_evidence_row {
+        if row.get::<_, i64>(0) != LOGICAL_SCHEMA_VERSION
+            || row.get::<_, String>(1) != semantic_evidence_checksum
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+    } else {
+        let metadata = tx
+            .query_one(
+                &format!("SELECT schema_version,catalog_hash FROM {schema}.store_metadata WHERE singleton=1"),
+                &[],
+            )
+            .await
+            .map_err(|_| PostgresStoreError::InvalidSchema)?;
+        if metadata.get::<_, i64>(0) != RUNTIME_AUTHORITY_SCHEMA_VERSION
+            || metadata.get::<_, String>(1) != catalog_digest(&tx, schema).await?
+        {
+            return Err(PostgresStoreError::InvalidSchema);
+        }
+        let sql = SEMANTIC_EVIDENCE_MIGRATION_SQL
+            .replace("__SCHEMA__", schema)
+            .replace("__ROLE__", &format!("{schema}_runtime"));
+        tx.batch_execute(&sql)
+            .await
+            .inspect_err(|error| {
+                eprintln!("smesh.postgres.migration_failed revision=13 error={error:?}");
+            })
+            .map_err(|error| map_retained_authority_migration_error(&error))?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {schema}.schema_migrations VALUES(13,13,$1,$2,{schema}.db_millis())"
+            ),
+            &[
+                &SEMANTIC_EVIDENCE_MIGRATION_NAME,
+                &semantic_evidence_checksum,
+            ],
+        )
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        let catalog = catalog_digest(&tx, schema).await?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {schema}.store_metadata DISABLE TRIGGER store_metadata_immutable"
+        ))
+        .await
+        .map_err(|_| PostgresStoreError::Initialization)?;
+        tx.execute(
+            &format!("UPDATE {schema}.store_metadata SET schema_version=13,catalog_hash=$1 WHERE singleton=1"),
             &[&catalog],
         )
         .await
@@ -7332,6 +8563,11 @@ async fn validate_catalog(
             RUNTIME_AUTHORITY_MIGRATION_NAME,
             content_digest(RUNTIME_AUTHORITY_MIGRATION_SQL.as_bytes()),
         ),
+        (
+            13_i64,
+            SEMANTIC_EVIDENCE_MIGRATION_NAME,
+            content_digest(SEMANTIC_EVIDENCE_MIGRATION_SQL.as_bytes()),
+        ),
     ];
     if migration_rows.len() != expected_migrations.len()
         || migration_rows
@@ -7345,8 +8581,9 @@ async fn validate_catalog(
                             8 => 8,
                             9 => 9,
                             10 => 10,
-                            11 => PREVIOUS_LOGICAL_SCHEMA_VERSION,
-                            12 => LOGICAL_SCHEMA_VERSION,
+                            11 => RATIFICATION_RETAINED_SCHEMA_VERSION,
+                            12 => RUNTIME_AUTHORITY_SCHEMA_VERSION,
+                            13 => LOGICAL_SCHEMA_VERSION,
                             _ => LEGACY_LOGICAL_SCHEMA_VERSION,
                         }
                     || row.get::<_, &str>(2) != expected.1
@@ -12011,8 +13248,7 @@ impl ReceiverAuthority for PostgresTaskStore {
             events,
             DurableReceiverTermination::Success,
             now,
-            true,
-            false,
+            ReceiverCompletionKind::Loopback,
         )
         .await
     }
@@ -12027,8 +13263,7 @@ impl ReceiverAuthority for PostgresTaskStore {
             &outcome.events,
             outcome.termination.clone(),
             now,
-            true,
-            false,
+            ReceiverCompletionKind::Loopback,
         )
         .await
     }
@@ -12043,11 +13278,11 @@ impl ReceiverAuthority for PostgresTaskStore {
             events,
             DurableReceiverTermination::Success,
             now,
-            false,
-            true,
+            ReceiverCompletionKind::Canceled,
         )
         .await
     }
+
     async fn cancellation_requested(&self, dispatch: &str) -> Result<bool, A2AError> {
         let dispatch = dispatch.to_owned();
         self.run_retryable_transaction("", None, |store, tx| {
@@ -12069,7 +13304,85 @@ impl ReceiverAuthority for PostgresTaskStore {
     }
 }
 
+#[derive(Clone)]
+enum ReceiverCompletionKind {
+    Loopback,
+    Canceled,
+    SemanticCanceled {
+        candidate_generation_id: String,
+    },
+    Semantic {
+        candidate_generation_id: String,
+        artifact_digest: String,
+    },
+}
+
 impl PostgresTaskStore {
+    pub(crate) async fn complete_text_concordance_receive(
+        &self,
+        lease: &ReceiverLease,
+        candidate_generation_id: &str,
+        events: &[MeshEvent],
+        now: i64,
+    ) -> Result<(), A2AError> {
+        let artifact_digest = events
+            .iter()
+            .find_map(|event| match event {
+                MeshEvent::Artifact {
+                    name,
+                    media_type,
+                    content,
+                } if name == TEXT_CONCORDANCE_ARTIFACT_NAME_V1
+                    && media_type == TEXT_CONCORDANCE_MEDIA_TYPE =>
+                {
+                    match crate::bridge::internal_artifact_payload(content) {
+                        Some(crate::bridge::InternalArtifactPayload::Binary { bytes }) => {
+                            use base64::Engine as _;
+                            base64::engine::general_purpose::STANDARD
+                                .decode(bytes)
+                                .ok()
+                                .map(|bytes| content_digest(&bytes))
+                        }
+                        Some(crate::bridge::InternalArtifactPayload::Published { .. }) | None => {
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            })
+            .ok_or_else(|| A2AError::invalid_params("semantic artifact is missing"))?;
+        self.complete_receiver(
+            lease,
+            events,
+            DurableReceiverTermination::Success,
+            now,
+            ReceiverCompletionKind::Semantic {
+                candidate_generation_id: candidate_generation_id.to_owned(),
+                artifact_digest,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_text_concordance_canceled_receive(
+        &self,
+        lease: &ReceiverLease,
+        candidate_generation_id: &str,
+        events: &[MeshEvent],
+        now: i64,
+    ) -> Result<(), A2AError> {
+        self.complete_receiver(
+            lease,
+            events,
+            DurableReceiverTermination::Success,
+            now,
+            ReceiverCompletionKind::SemanticCanceled {
+                candidate_generation_id: candidate_generation_id.to_owned(),
+            },
+        )
+        .await
+    }
+
     #[allow(clippy::single_match_else)]
     async fn prepare_receiver_artifacts(
         &self,
@@ -12260,9 +13573,13 @@ impl PostgresTaskStore {
         events: &[MeshEvent],
         termination: DurableReceiverTermination,
         now: i64,
-        loopback_effect: bool,
-        completion_canceled: bool,
+        completion_kind: ReceiverCompletionKind,
     ) -> Result<(), A2AError> {
+        let loopback_effect = matches!(completion_kind, ReceiverCompletionKind::Loopback);
+        let completion_canceled = matches!(
+            completion_kind,
+            ReceiverCompletionKind::Canceled | ReceiverCompletionKind::SemanticCanceled { .. }
+        );
         if events.len() > 1024 {
             return Err(A2AError::invalid_params(
                 "receiver transcript exceeds limit",
@@ -12342,6 +13659,7 @@ impl PostgresTaskStore {
             let transcript = transcript.clone();
             let termination_json = termination_json.clone();
             let staged_artifacts = staged_artifacts.clone();
+            let completion_kind = completion_kind.clone();
             Box::pin(async move {
         let now = store.effective_now(tx, now).await?;
         let reservation_id = lease.execution_reservation.as_ref().map(|value| value.reservation_id.as_str());
@@ -12390,6 +13708,123 @@ impl PostgresTaskStore {
             .get::<_, bool>(0);
         if cancellation_requested != completion_canceled {
             return Err(A2AError::invalid_request("receiver lease is stale"));
+        }
+        if let ReceiverCompletionKind::SemanticCanceled {
+            candidate_generation_id,
+        } = &completion_kind
+        {
+            let cancel_candidate = store.q("UPDATE __S__.candidate_generations SET state='canceled' WHERE tenant_scope=$1 AND candidate_generation_id=$2 AND task_id=$3 AND dispatch_id=$4 AND attempt=$5 AND fence=$6 AND state='open'");
+            if tx
+                .execute(
+                    &cancel_candidate,
+                    &[
+                        &lease.tenant_scope,
+                        candidate_generation_id,
+                        &lease.task_id,
+                        &lease.dispatch_id,
+                        &i64::from(lease.sender_attempt_no),
+                        &i64::try_from(lease.lease_epoch).unwrap_or(i64::MAX),
+                    ],
+                )
+                .await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("semantic cancellation transition failed")))?
+                != 1
+            {
+                return Err(A2AError::invalid_request(
+                    "semantic cancellation authority is stale",
+                ));
+            }
+        }
+        if let ReceiverCompletionKind::Semantic {
+            candidate_generation_id,
+            artifact_digest,
+        } = &completion_kind
+        {
+            let semantic = store.q("SELECT task_id,dispatch_id,attempt,fence,state,completion_receipt::text,proposal_json::text,owner_account_id,principal_scope FROM __S__.candidate_generations WHERE tenant_scope=$1 AND candidate_generation_id=$2 FOR UPDATE");
+            let row = tx
+                .query_opt(&semantic, &[&lease.tenant_scope, candidate_generation_id])
+                .await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("semantic receiver authority lookup failed")))?
+                .ok_or_else(|| A2AError::invalid_request("semantic receiver authority is absent"))?;
+            if row.get::<_, String>(0) != lease.task_id
+                || row.get::<_, String>(1) != lease.dispatch_id
+                || row.get::<_, i64>(2) != i64::from(lease.sender_attempt_no)
+                || row.get::<_, i64>(3) != i64::try_from(lease.lease_epoch).unwrap_or(i64::MAX)
+                || row.get::<_, String>(4) != "open"
+                || row.get::<_, Option<String>>(5).is_none()
+            {
+                return Err(A2AError::invalid_request("semantic receiver authority is stale"));
+            }
+            let (_, receipt_digests) = store.verify_text_concordance_approval_receipt(
+                candidate_generation_id,
+                &row.get::<_, String>(5),
+            )?;
+            let proposal: serde_json::Value = serde_json::from_str(&row.get::<_, String>(6))
+                .map_err(|_| A2AError::internal("semantic candidate proposal is malformed"))?;
+            let packet: TextConcordanceCandidatePacketV1 = serde_json::from_value(
+                proposal
+                    .get("candidatePacket")
+                    .cloned()
+                    .ok_or_else(|| A2AError::internal("semantic candidate packet is missing"))?,
+            )
+            .map_err(|_| A2AError::internal("semantic candidate packet is malformed"))?;
+            let candidate_artifact = validate_text_concordance_candidate(&packet)
+                .map_err(|_| A2AError::internal("semantic candidate packet is invalid"))?;
+            if packet.candidate.tenant_scope != lease.tenant_scope
+                || packet.candidate.task_id != lease.task_id
+                || packet.candidate.dispatch_id != lease.dispatch_id
+                || packet.candidate.attempt != u64::from(lease.sender_attempt_no)
+                || packet.candidate.fence != lease.lease_epoch
+                || packet
+                    .candidate
+                    .id()
+                    .map_err(|_| A2AError::internal("semantic candidate identifier is invalid"))?
+                    != *candidate_generation_id
+            {
+                return Err(A2AError::invalid_request("semantic receiver authority is stale"));
+            }
+            let artifact = store.q("SELECT artifact_digest,count(*) OVER() FROM __S__.candidate_artifacts WHERE tenant_scope=$1 AND candidate_generation_id=$2");
+            let artifacts = tx
+                .query(&artifact, &[&lease.tenant_scope, candidate_generation_id])
+                .await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("semantic artifact authority lookup failed")))?;
+            if artifacts.len() != 1
+                || artifacts[0].get::<_, String>(0) != *artifact_digest
+                || artifacts[0].get::<_, String>(0) != content_digest(&candidate_artifact)
+                || artifacts[0].get::<_, i64>(1) != 1
+            {
+                return Err(A2AError::invalid_request("semantic artifact authority is stale"));
+            }
+            let semantic_now: i64 = tx
+                .query_one(&store.q("SELECT __S__.db_millis()"), &[])
+                .await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("semantic database clock failed")))?
+                .get(0);
+            let live_digests = store
+                .verify_live_text_concordance_evidence(
+                    tx,
+                    candidate_generation_id,
+                    &packet.candidate,
+                    &row.get::<_, String>(7),
+                    &row.get::<_, String>(8),
+                    u64::try_from(semantic_now)
+                        .map_err(|_| A2AError::internal("semantic database clock is invalid"))?,
+                )
+                .await?;
+            if live_digests != receipt_digests {
+                return Err(A2AError::invalid_request("semantic approval receipt is stale"));
+            }
+            let seal = store.q("UPDATE __S__.candidate_generations SET state='sealed',sealed_at=$1 WHERE tenant_scope=$2 AND candidate_generation_id=$3 AND state='open' AND completion_receipt IS NOT NULL");
+            if tx
+                .execute(&seal, &[&now, &lease.tenant_scope, candidate_generation_id])
+                .await
+                .map_err(|error| Self::transaction_body_error(&error, A2AError::internal("semantic candidate sealing failed")))?
+                != 1
+            {
+                return Err(A2AError::invalid_request(
+                    "semantic candidate sealing lost its fence",
+                ));
+            }
         }
         // Artifact metadata becomes authoritative only inside the fenced receiver
         // completion transaction. Staging is the sole pre-transaction side effect.

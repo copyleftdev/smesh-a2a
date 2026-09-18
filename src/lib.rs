@@ -48,6 +48,7 @@ mod outbox_driver;
 pub mod owned_temp;
 mod policy;
 mod postgres_store;
+mod private_file;
 #[doc(hidden)]
 pub use postgres_store::render_migration_sql_for_test;
 /// Secure operator-enrolled callback policy, SSRF validation, and signing.
@@ -57,12 +58,15 @@ mod ratification;
 mod runtime_config;
 mod runtime_trace;
 mod runtime_worker;
+mod semantic_evidence;
+mod semantic_issuer;
 mod server;
 mod sqlite_store;
 mod store;
 mod task_state;
 /// Closed, bounded optional OpenTelemetry projection schema and exporter owner.
 pub mod telemetry;
+mod text_concordance;
 /// Bounded pre-persistence trace classification, redaction, and privacy verification.
 pub mod trace_privacy;
 /// Production exposure policy, TLS material loading, reload, and bounded acceptor.
@@ -239,6 +243,17 @@ pub use runtime_worker::{
     RuntimeAdmissionProcessor, RuntimeEventSink, RuntimeTask, RuntimeTaskProcessor, RuntimeWorker,
     RuntimeWorkerConfig, RuntimeWorkerHandle,
 };
+pub use semantic_evidence::{
+    CandidateGenerationV1, ISSUER_EVIDENCE_SCHEMA_V1, IssuerDecisionV1, IssuerEnrollmentV1,
+    IssuerEvidenceV1, IssuerRoleV1, SemanticEvidenceError, SemanticEvidenceIngestOutcome,
+    SignedIssuerEvidenceV1, TEXT_CONCORDANCE_COMPLETION_POLICY_REVISION_V1,
+    TEXT_CONCORDANCE_COMPLETION_POLICY_V1, TextConcordanceCandidatePacketV1,
+    sign_text_concordance_evidence, sign_text_concordance_evidence_from_private_file,
+    validate_text_concordance_candidate,
+};
+pub use semantic_issuer::{
+    TextConcordanceIssuerError, TextConcordanceIssuerProcess, TextConcordanceIssuerSet,
+};
 pub use server::{
     CompletionPolicyStore, DurableGateway, GatewayConfig,
     build_authenticated_durable_loopback_gateway, build_authenticated_router,
@@ -246,7 +261,8 @@ pub use server::{
     build_authorized_durable_loopback_gateway_with_ratification,
     build_authorized_durable_loopback_gateway_with_ratification_and_telemetry,
     build_authorized_durable_loopback_gateway_with_telemetry,
-    build_authorized_postgres_runtime_gateway, build_durable_loopback_gateway,
+    build_authorized_postgres_runtime_gateway,
+    build_authorized_postgres_text_concordance_runtime_gateway, build_durable_loopback_gateway,
     build_durable_loopback_gateway_with_telemetry, build_router, build_router_with_policy,
     build_router_with_policy_and_trace, build_router_with_sqlite,
     build_router_with_sqlite_and_trace, build_router_with_trace,
@@ -255,6 +271,13 @@ pub use sqlite_store::{LegacyTenantBinding, SqliteStoreError, SqliteTaskStore};
 pub use store::BoundedTaskStore;
 #[doc(hidden)]
 pub use task_state::task_state_transition_allowed;
+pub use text_concordance::{
+    STANDALONE_TEXT_CONCORDANCE_PROFILE_V1, TEXT_CONCORDANCE_ARTIFACT_NAME_V1,
+    TEXT_CONCORDANCE_MEDIA_TYPE, TEXT_CONCORDANCE_WORKLOAD_V1, TextConcordanceError,
+    TextConcordanceInputError, TextConcordanceLimits, TextConcordanceOutput,
+    TextConcordanceProcessor, extract_text_concordance_input, process_text_concordance,
+    text_concordance_request_digest, validate_text_concordance_runtime_proposal,
+};
 pub use trace_privacy::{
     DataClass, PrivacyError, PrivacyPolicy, PublicProjectionReceipt, PublicTraceManifest,
     RedactionAction, RedactionLogEntry, RedactionRule, RestrictedStoragePolicy,

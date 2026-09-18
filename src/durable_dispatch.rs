@@ -672,10 +672,88 @@ struct ActiveRuntime {
 pub(crate) enum DurableCoordinatorMode {
     Loopback(DurableLoopbackEndpoint),
     Runtime(Arc<dyn crate::DurableRuntimeAdapter>),
+    TextConcordance(TextConcordanceCompletionProfile),
     #[cfg(test)]
     TestLoopbackAdapter(Arc<dyn crate::DurableRuntimeAdapter>),
     #[cfg(test)]
     TestRuntimeAdapterWithDevelopmentContext(Arc<dyn crate::DurableRuntimeAdapter>),
+}
+
+#[derive(Clone)]
+pub(crate) struct TextConcordanceCompletionProfile {
+    pub(crate) adapter: Arc<dyn crate::DurableRuntimeAdapter>,
+    pub(crate) store: crate::PostgresTaskStore,
+    pub(crate) issuers: crate::TextConcordanceIssuerSet,
+    pub(crate) issuer_timeout: Duration,
+}
+
+impl TextConcordanceCompletionProfile {
+    async fn authorize(
+        &self,
+        context: &crate::DurableRuntimeAuthorityContext,
+        proposal: &DurableReceiverResult,
+        now: i64,
+    ) -> Result<String, DurableDispatchError> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let artifact =
+            crate::validate_text_concordance_runtime_proposal(&context.request().text, proposal)
+                .map_err(|_| DurableDispatchError::PostReceiveUnresolved)?;
+        let output = crate::process_text_concordance(
+            &context.request().text,
+            crate::TextConcordanceLimits::default(),
+        )
+        .map_err(|_| DurableDispatchError::PostReceiveUnresolved)?;
+        let packet = crate::TextConcordanceCandidatePacketV1 {
+            candidate: crate::CandidateGenerationV1 {
+                tenant_scope: context.scope().tenant_scope().to_owned(),
+                task_id: context.request().task_id.clone(),
+                context_id: context.request().context_id.clone(),
+                request_digest: output.request_digest,
+                artifact_set_digest: output.artifact_set_digest,
+                dispatch_id: context.correlation().dispatch_id().to_owned(),
+                attempt: u64::from(context.correlation().attempt()),
+                fence: context.correlation().fence(),
+                completion_policy: crate::TEXT_CONCORDANCE_COMPLETION_POLICY_V1.to_owned(),
+                completion_policy_revision: crate::TEXT_CONCORDANCE_COMPLETION_POLICY_REVISION_V1,
+            },
+            input: context.request().text.clone(),
+            artifact: URL_SAFE_NO_PAD.encode(artifact),
+            observed_conflict_digests: Vec::new(),
+        };
+        let candidate_id = self
+            .store
+            .freeze_text_concordance_candidate(
+                &packet,
+                r#"{"termination":"success"}"#,
+                context.scope().account_id(),
+                context.scope().principal_scope(),
+                now,
+            )
+            .await
+            .map_err(|_| DurableDispatchError::PostReceiveUnresolved)?;
+        let frozen = self
+            .store
+            .load_text_concordance_candidate(&packet.candidate.tenant_scope, &candidate_id)
+            .await
+            .map_err(|_| DurableDispatchError::PostReceiveUnresolved)?;
+        let evidence = self
+            .issuers
+            .issue_all(&frozen, self.issuer_timeout)
+            .await
+            .map_err(|_| DurableDispatchError::PostReceiveUnresolved)?;
+        for signed in evidence {
+            self.store
+                .submit_text_concordance_evidence(&signed, now)
+                .await
+                .map_err(|_| DurableDispatchError::PostReceiveUnresolved)?;
+        }
+        self.store
+            .approve_text_concordance_candidate(&packet.candidate.tenant_scope, &candidate_id, now)
+            .await
+            .map_err(|_| DurableDispatchError::PostReceiveUnresolved)?;
+        Ok(candidate_id)
+    }
 }
 
 impl DurableCoordinatorMode {
@@ -683,6 +761,7 @@ impl DurableCoordinatorMode {
         match self {
             Self::Loopback(endpoint) => endpoint,
             Self::Runtime(adapter) => adapter.as_ref(),
+            Self::TextConcordance(profile) => profile.adapter.as_ref(),
             #[cfg(test)]
             Self::TestLoopbackAdapter(adapter)
             | Self::TestRuntimeAdapterWithDevelopmentContext(adapter) => adapter.as_ref(),
@@ -693,6 +772,7 @@ impl DurableCoordinatorMode {
         match self {
             Self::Loopback(endpoint) => endpoint.permits_development_context(),
             Self::Runtime(_) => false,
+            Self::TextConcordance(_) => false,
             #[cfg(test)]
             Self::TestLoopbackAdapter(_) | Self::TestRuntimeAdapterWithDevelopmentContext(_) => {
                 true
@@ -704,6 +784,7 @@ impl DurableCoordinatorMode {
         match self {
             Self::Loopback(_) => true,
             Self::Runtime(_) => false,
+            Self::TextConcordance(_) => true,
             #[cfg(test)]
             Self::TestLoopbackAdapter(_) => true,
             #[cfg(test)]
@@ -1026,6 +1107,7 @@ impl DurableCoordinator {
             if registration.await.is_err() {
                 return;
             }
+
             let _active_cleanup = ActiveRuntimeCleanup {
                 coordinator: Arc::clone(&coordinator),
                 correlation: active_correlation,
@@ -1071,6 +1153,7 @@ impl DurableCoordinator {
                     &receiver_load_fence,
                 )
                 .await;
+
             cancellation.cancel();
             let _ = monitor.handle_mut().await;
             let _ = stop_receiver_renewal(&mut renewal, &lease).await;
@@ -1137,14 +1220,17 @@ impl DurableCoordinator {
         let loaded = tokio::select! {
             biased;
             () = receiver_loss(renewal.as_ref().map(|r| r.latest.clone())) => {
+
                 cancellation.cancel();
                 return Err(DurableDispatchError::FatalRenewal);
             }
             () = cancellation.cancelled() => {
+
                 let _ = stop_receiver_renewal(renewal, lease).await;
                 return Err(DurableDispatchError::PostReceiveUnresolved);
             }
             () = tokio::time::sleep(runtime_phase_bound()) => {
+
                 cancellation.cancel();
                 return Err(DurableDispatchError::PostReceiveUnresolved);
             }
@@ -1238,6 +1324,7 @@ impl DurableCoordinator {
             }
         };
         tokio::pin!(durable_cancellation);
+        let semantic_context = context.clone();
         let admission = prepared.admit(
             crate::DurableWorkEnvelope::new(context),
             cancellation.clone(),
@@ -1256,10 +1343,12 @@ impl DurableCoordinator {
             tokio::select! {
                 biased;
                 () = receiver_loss(renewal.as_ref().map(|r| r.latest.clone())) => {
+
                     cancellation.cancel();
                     Err(DurableDispatchError::FatalRenewal)
                 }
                 () = owner_cancel.cancelled() => {
+
                     cancellation.cancel();
                     Err(DurableDispatchError::PostReceiveUnresolved)
                 }
@@ -1270,6 +1359,7 @@ impl DurableCoordinator {
                     Err(DurableDispatchError::PostReceiveUnresolved)
                 }
                 () = &mut admission_deadline => {
+
                     cancellation.cancel();
                     Err(DurableDispatchError::PostReceiveUnresolved)
                 }
@@ -1326,6 +1416,7 @@ impl DurableCoordinator {
         let outcome = tokio::select! {
             biased;
             () = &mut receiver_renewal_failed => {
+
                 cancellation.cancel();
                 let _ = tokio::time::timeout(runtime_supervision_bound(), async {
                     if !adapter_cancel_requested {
@@ -1338,6 +1429,7 @@ impl DurableCoordinator {
             }
             outcome = &mut execution => outcome,
             requested = &mut durable_cancellation => {
+
                 if requested.is_err() {
                     cancellation.cancel();
                     return Err(DurableDispatchError::PostReceiveUnresolved);
@@ -1354,6 +1446,7 @@ impl DurableCoordinator {
                 }
             }
             () = &mut execution_deadline => {
+
                 cancellation.cancel();
                 let _ = tokio::time::timeout(runtime_supervision_bound(), async {
                     if !adapter_cancel_requested {
@@ -1365,6 +1458,7 @@ impl DurableCoordinator {
                 return Err(DurableDispatchError::PostReceiveUnresolved);
             }
             () = owner_cancel.cancelled() => {
+
                 cancellation.cancel();
                 match tokio::time::timeout(runtime_supervision_bound(), async {
                     if !adapter_cancel_requested {
@@ -1377,6 +1471,7 @@ impl DurableCoordinator {
                 }
             }
             () = &mut runtime_cancel => {
+
                 match tokio::time::timeout(runtime_supervision_bound(), async {
                     if !adapter_cancel_requested {
                         let _ = self.mode.adapter().cancel_durable(&correlation).await;
@@ -1388,12 +1483,40 @@ impl DurableCoordinator {
                 }
             }
         };
-        let fenced = stop_receiver_renewal(renewal, lease).await?;
         match outcome {
             crate::RuntimeAdapterOutcome::Terminal(proposal) => {
                 if !self.mode.terminal_is_authoritative() {
+                    let _ = stop_receiver_renewal(renewal, lease).await;
                     return Err(DurableDispatchError::RuntimeProposalUnresolved);
                 }
+                let semantic_candidate = if let DurableCoordinatorMode::TextConcordance(profile) =
+                    &self.mode
+                {
+                    Some(tokio::select! {
+                        biased;
+                        () = receiver_loss(renewal.as_ref().map(|r| r.latest.clone())) => {
+                            cancellation.cancel();
+                            let _ = stop_receiver_renewal(renewal, lease).await;
+                            return Err(DurableDispatchError::FatalRenewal);
+                        }
+                        () = owner_cancel.cancelled() => {
+                            cancellation.cancel();
+                            let _ = stop_receiver_renewal(renewal, lease).await;
+                            return Err(DurableDispatchError::PostReceiveUnresolved);
+                        }
+                        () = cancellation.cancelled() => {
+                            let _ = stop_receiver_renewal(renewal, lease).await;
+                            return Err(DurableDispatchError::PostReceiveUnresolved);
+                        }
+                        result = profile.authorize(&semantic_context, &proposal, self.clock.now()) => {
+                            result?
+                        }
+                    })
+                } else {
+                    None
+                };
+                let fenced = stop_receiver_renewal(renewal, lease).await?;
+
                 let cancellation_won = tokio::select! {
                     biased;
                     () = tokio::time::sleep(runtime_phase_bound()) => {
@@ -1402,14 +1525,31 @@ impl DurableCoordinator {
                     result = self.authority.cancellation_requested(&envelope.dispatch_id) =>
                         result.map_err(|_| DurableDispatchError::PostReceiveUnresolved)?,
                 };
+
                 if cancellation_won {
                     let events = canceled_events();
-                    await_receiver_settlement(self.authority.complete_canceled_receive(
-                        &fenced,
-                        &events,
-                        self.clock.now(),
-                    ))
-                    .await?;
+                    if let (
+                        Some(candidate_generation_id),
+                        DurableCoordinatorMode::TextConcordance(profile),
+                    ) = (&semantic_candidate, &self.mode)
+                    {
+                        await_receiver_settlement(
+                            profile.store.complete_text_concordance_canceled_receive(
+                                &fenced,
+                                candidate_generation_id,
+                                &events,
+                                self.clock.now(),
+                            ),
+                        )
+                        .await?;
+                    } else {
+                        await_receiver_settlement(self.authority.complete_canceled_receive(
+                            &fenced,
+                            &events,
+                            self.clock.now(),
+                        ))
+                        .await?;
+                    }
                     return self
                         .authoritative_replay(envelope, replica_id, owner_cancel)
                         .await;
@@ -1421,12 +1561,28 @@ impl DurableCoordinator {
                 };
                 let settlement = match proposal.termination {
                     DurableReceiverTermination::Success => {
-                        await_receiver_settlement(self.authority.complete_loopback_receive(
-                            &fenced,
-                            &proposal.events,
-                            self.clock.now(),
-                        ))
-                        .await
+                        if let (
+                            Some(candidate_generation_id),
+                            DurableCoordinatorMode::TextConcordance(profile),
+                        ) = (&semantic_candidate, &self.mode)
+                        {
+                            await_receiver_settlement(
+                                profile.store.complete_text_concordance_receive(
+                                    &fenced,
+                                    candidate_generation_id,
+                                    &proposal.events,
+                                    self.clock.now(),
+                                ),
+                            )
+                            .await
+                        } else {
+                            await_receiver_settlement(self.authority.complete_loopback_receive(
+                                &fenced,
+                                &proposal.events,
+                                self.clock.now(),
+                            ))
+                            .await
+                        }
                     }
                     DurableReceiverTermination::InputRequired { .. }
                     | DurableReceiverTermination::AuthRequired { .. } => {
@@ -1451,16 +1607,33 @@ impl DurableCoordinator {
                         return Err(DurableDispatchError::PostReceiveUnresolved);
                     }
                     let events = canceled_events();
-                    await_receiver_settlement(self.authority.complete_canceled_receive(
-                        &fenced,
-                        &events,
-                        self.clock.now(),
-                    ))
-                    .await?;
+                    if let (
+                        Some(candidate_generation_id),
+                        DurableCoordinatorMode::TextConcordance(profile),
+                    ) = (&semantic_candidate, &self.mode)
+                    {
+                        await_receiver_settlement(
+                            profile.store.complete_text_concordance_canceled_receive(
+                                &fenced,
+                                candidate_generation_id,
+                                &events,
+                                self.clock.now(),
+                            ),
+                        )
+                        .await?;
+                    } else {
+                        await_receiver_settlement(self.authority.complete_canceled_receive(
+                            &fenced,
+                            &events,
+                            self.clock.now(),
+                        ))
+                        .await?;
+                    }
                     return self
                         .authoritative_replay(envelope, replica_id, owner_cancel)
                         .await;
                 }
+
                 if let Some(telemetry) = &self.telemetry {
                     telemetry.dispatch_event_with_task_state(
                         crate::telemetry::EventName::ReceiverCompleted,
@@ -1480,6 +1653,7 @@ impl DurableCoordinator {
                     .await
             }
             crate::RuntimeAdapterOutcome::ConfirmedStopped => {
+                let fenced = stop_receiver_renewal(renewal, lease).await?;
                 let cancellation_won = tokio::select! {
                     biased;
                     () = tokio::time::sleep(runtime_phase_bound()) => {
@@ -1503,6 +1677,7 @@ impl DurableCoordinator {
             }
             crate::RuntimeAdapterOutcome::ExecutionFailed(_)
             | crate::RuntimeAdapterOutcome::AdmittedUnknown => {
+                let _ = stop_receiver_renewal(renewal, lease).await;
                 Err(DurableDispatchError::PostReceiveUnresolved)
             }
         }

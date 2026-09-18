@@ -268,6 +268,7 @@ pub(crate) struct DurableRequestHandler {
     driver: Arc<DurableDriverControl>,
     clock: InjectedClock,
     input_limits: InputLimits,
+    text_concordance_only: bool,
     errors_before_stream: bool,
     telemetry: Option<crate::telemetry::TelemetryHandle>,
     push_readiness: Option<Arc<crate::push::PushReadiness>>,
@@ -546,6 +547,7 @@ impl DurableRequestHandler {
             driver,
             clock,
             input_limits,
+            text_concordance_only: false,
             errors_before_stream: false,
             telemetry: None,
             push_readiness: None,
@@ -563,6 +565,33 @@ impl DurableRequestHandler {
     pub(crate) fn with_errors_before_stream(mut self) -> Self {
         self.errors_before_stream = true;
         self
+    }
+
+    pub(crate) fn with_text_concordance_only(mut self, enabled: bool) -> Self {
+        self.text_concordance_only = enabled;
+        self
+    }
+
+    fn validate_closed_workload(&self, request: &SendMessageRequest) -> Result<(), A2AError> {
+        if !self.text_concordance_only {
+            return Ok(());
+        }
+        if request.message.task_id.is_some()
+            || request.metadata.is_some()
+            || request.configuration.is_some()
+        {
+            return Err(A2AError::invalid_params(
+                "invalid text-concordance request shape",
+            ));
+        }
+        let input = crate::extract_text_concordance_input(
+            &request.message,
+            self.input_limits.max_text_bytes,
+        )
+        .map_err(|_| A2AError::invalid_params("invalid text-concordance input"))?;
+        crate::process_text_concordance(&input, crate::TextConcordanceLimits::default())
+            .map(|_| ())
+            .map_err(|_| A2AError::invalid_params("invalid text-concordance workload"))
     }
 
     pub(crate) fn with_telemetry(
@@ -1084,6 +1113,7 @@ impl RequestHandler for DurableRequestHandler {
         _params: &ServiceParams,
         mut request: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
+        self.validate_closed_workload(&request)?;
         let operation = if request.message.task_id.is_some() {
             Operation::TaskContinue
         } else {
@@ -1306,6 +1336,7 @@ impl RequestHandler for DurableRequestHandler {
         _params: &ServiceParams,
         mut request: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        self.validate_closed_workload(&request)?;
         let operation = if request.message.task_id.is_some() {
             Operation::TaskContinue
         } else {

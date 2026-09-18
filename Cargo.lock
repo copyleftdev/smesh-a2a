@@ -2968,6 +2968,7 @@ dependencies = [
  "base64",
  "chrono",
  "deadpool-postgres",
+ "ed25519-dalek",
  "fs2",
  "futures",
  "hmac 0.12.1",
