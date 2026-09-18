@@ -1709,7 +1709,7 @@ async fn external_key_binds_an_empty_postgres_ratification_authority() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One catalog boundary owns grants, two tenants, and reopen.
-async fn fresh_catalog_is_v12_rls_forced_and_runtime_least_privileged() {
+async fn fresh_catalog_is_v13_rls_forced_and_runtime_least_privileged() {
     let Some((admin, runtime)) = postgres_urls() else {
         return;
     };
@@ -1728,7 +1728,7 @@ async fn fresh_catalog_is_v12_rls_forced_and_runtime_least_privileged() {
             )
             .await
             .unwrap();
-        assert_eq!(metadata.get::<_, i64>(0), 12);
+        assert_eq!(metadata.get::<_, i64>(0), 13);
         let migration = client
             .query_one(
                 &format!("SELECT logical_schema_version,name FROM {schema}.schema_migrations WHERE revision=10"),
@@ -1761,6 +1761,18 @@ async fn fresh_catalog_is_v12_rls_forced_and_runtime_least_privileged() {
         assert_eq!(
             runtime_migration.get::<_, &str>(1),
             "0012_runtime_authority_scope"
+        );
+        let semantic_migration = client
+            .query_one(
+                &format!("SELECT logical_schema_version,name FROM {schema}.schema_migrations WHERE revision=13"),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(semantic_migration.get::<_, i64>(0), 13);
+        assert_eq!(
+            semantic_migration.get::<_, &str>(1),
+            "0013_semantic_evidence"
         );
         let tables = client
             .query(
