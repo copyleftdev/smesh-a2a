@@ -24,12 +24,13 @@ use crate::{
     card::LiveAgentCard,
     content_digest,
     durable_authority::DurableAuthorityParts,
-    durable_dispatch::DurableCoordinatorMode,
+    durable_dispatch::{DurableCoordinatorMode, TextConcordanceCompletionProfile},
     durable_handler::DurableRequestHandler,
     guard::GuardedRequestHandler,
     outbox_driver::{
         DurableDriverHandle, spawn_durable_driver_with_telemetry,
         spawn_durable_loopback_driver_with_telemetry,
+        spawn_durable_text_concordance_driver_with_telemetry,
     },
     spawn_artifact_gc, spawn_artifact_orphan_scanner, spawn_artifact_promoter,
     spawn_artifact_promoter_with_telemetry,
@@ -1549,6 +1550,50 @@ pub fn build_authorized_postgres_runtime_gateway(
     ))
 }
 
+/// Build the closed `PostgreSQL` text-concordance production profile.
+///
+/// Runtime output remains candidate material; this composition alone runs the three
+/// independently keyed issuers before permitting durable receiver completion.
+///
+/// # Errors
+/// Returns an error when the issuer lifetime is zero or unreasonably large, or when durable
+/// gateway policy construction fails.
+#[allow(clippy::too_many_arguments)]
+pub fn build_authorized_postgres_text_concordance_runtime_gateway(
+    config: GatewayConfig,
+    store: crate::PostgresTaskStore,
+    adapter: Arc<dyn DurableRuntimeAdapter>,
+    issuers: crate::TextConcordanceIssuerSet,
+    issuer_timeout: Duration,
+    clock: InjectedClock,
+    auth: AuthState,
+    policy: Arc<AuthorizationPolicy>,
+) -> Result<DurableGateway, PolicyError> {
+    if issuer_timeout.is_zero() || issuer_timeout > Duration::from_secs(300) {
+        return Err(PolicyError::InvalidPolicy(
+            "invalid text-concordance issuer timeout".to_owned(),
+        ));
+    }
+    let authority = store.clone().into_durable_authority();
+    Ok(build_durable_gateway_inner(
+        config,
+        DurableAuthorityParts {
+            authority,
+            local: None,
+        },
+        DurableCoordinatorMode::TextConcordance(TextConcordanceCompletionProfile {
+            adapter,
+            store,
+            issuers,
+            issuer_timeout,
+        }),
+        clock,
+        Some(auth),
+        Some(policy),
+        None,
+    ))
+}
+
 /// Build the repository-owned durable loopback gateway.
 ///
 /// This is a development/test compatibility path. Production callers must use
@@ -1820,6 +1865,7 @@ fn build_durable_gateway_inner(
         max_body_bytes,
         ..
     } = config;
+    let text_concordance_only = matches!(&mode, DurableCoordinatorMode::TextConcordance(_));
     let driver = match mode {
         DurableCoordinatorMode::Loopback(endpoint) => spawn_durable_loopback_driver_with_telemetry(
             Arc::clone(&authority),
@@ -1833,6 +1879,14 @@ fn build_durable_gateway_inner(
             clock.clone(),
             telemetry.clone(),
         ),
+        DurableCoordinatorMode::TextConcordance(profile) => {
+            spawn_durable_text_concordance_driver_with_telemetry(
+                Arc::clone(&authority),
+                profile,
+                clock.clone(),
+                telemetry.clone(),
+            )
+        }
         #[cfg(test)]
         DurableCoordinatorMode::TestLoopbackAdapter(_)
         | DurableCoordinatorMode::TestRuntimeAdapterWithDevelopmentContext(_) => {
@@ -1848,6 +1902,7 @@ fn build_durable_gateway_inner(
             clock.clone(),
             input_limits,
         )
+        .with_text_concordance_only(text_concordance_only)
         .with_telemetry(telemetry.clone())
         .with_push_readiness(Arc::clone(&push_readiness)),
     );
@@ -1859,6 +1914,7 @@ fn build_durable_gateway_inner(
             clock.clone(),
             input_limits,
         )
+        .with_text_concordance_only(text_concordance_only)
         .with_errors_before_stream()
         .with_telemetry(telemetry.clone())
         .with_push_readiness(Arc::clone(&push_readiness)),

@@ -345,6 +345,22 @@ pub(crate) fn spawn_durable_loopback_driver_with_telemetry(
     )
 }
 
+pub(crate) fn spawn_durable_text_concordance_driver_with_telemetry(
+    authority: Arc<dyn DurableAuthority>,
+    profile: crate::durable_dispatch::TextConcordanceCompletionProfile,
+    clock: InjectedClock,
+    telemetry: Option<crate::telemetry::TelemetryHandle>,
+) -> DurableDriverHandle {
+    spawn_durable_driver_inner(
+        authority,
+        DurableCoordinatorMode::TextConcordance(profile),
+        clock,
+        telemetry,
+        #[cfg(test)]
+        DriverTestHooks::default(),
+    )
+}
+
 pub(crate) fn spawn_durable_driver_with_telemetry(
     authority: Arc<dyn DurableAuthority>,
     adapter: Arc<dyn DurableRuntimeAdapter>,

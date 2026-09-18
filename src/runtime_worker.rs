@@ -987,6 +987,109 @@ mod ownership_tests {
     }
 
     #[tokio::test]
+    async fn text_concordance_processor_emits_one_exact_private_candidate() {
+        use base64::Engine as _;
+
+        let mut network = smesh_core::Network::new();
+        network.add_node(smesh_core::Node::named("text-concordance-runtime"));
+        let runtime = Arc::new(SmeshRuntime::with_network(
+            network,
+            smesh_runtime::RuntimeConfig::default(),
+        ));
+        let scope = crate::DurableRuntimeScope::new(
+            "tenant-text",
+            "account-text",
+            "principal-text",
+            "trusted-local",
+            crate::VisibilityScope::Own,
+        )
+        .unwrap();
+        let correlation = crate::DurableDispatchCorrelation::new(
+            scope.clone(),
+            "dispatch-text-concordance",
+            1,
+            1,
+        )
+        .unwrap();
+        let request = MeshRequest {
+            protocol: "a2a-v1".to_owned(),
+            task_id: "task-text-concordance".to_owned(),
+            context_id: "context-text-concordance".to_owned(),
+            text: "Hello hello\nworld".to_owned(),
+        };
+        let expected =
+            crate::process_text_concordance(&request.text, crate::TextConcordanceLimits::default())
+                .unwrap();
+        let envelope = production_envelope_with_budget(
+            scope,
+            correlation,
+            request,
+            ExecutionBudget::new(1_048_576, 4).unwrap(),
+        );
+        let signal = envelope.request().to_signal("text-concordance-runtime");
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+
+        run_durable_task(
+            runtime,
+            "text-concordance-runtime".to_owned(),
+            Arc::new(crate::TextConcordanceProcessor::default()),
+            envelope,
+            signal,
+            CancellationToken::new(),
+            durable_task_outcome_state(outcome_tx),
+            None,
+        )
+        .await;
+
+        let crate::RuntimeAdapterOutcome::Terminal(result) = outcome_rx.await.unwrap() else {
+            panic!("text-concordance processor did not return a terminal proposal");
+        };
+        assert_eq!(
+            result
+                .events
+                .iter()
+                .filter(|event| matches!(event, MeshEvent::Artifact { .. }))
+                .count(),
+            1
+        );
+        let MeshEvent::Artifact {
+            name,
+            media_type,
+            content,
+        } = result
+            .events
+            .iter()
+            .find(|event| matches!(event, MeshEvent::Artifact { .. }))
+            .unwrap()
+        else {
+            unreachable!("artifact predicate admitted a non-artifact event");
+        };
+        assert_eq!(name, crate::TEXT_CONCORDANCE_ARTIFACT_NAME_V1);
+        assert_eq!(media_type, crate::TEXT_CONCORDANCE_MEDIA_TYPE);
+        let crate::bridge::InternalArtifactPayload::Binary { bytes } =
+            crate::bridge::internal_artifact_payload(content).unwrap()
+        else {
+            panic!("candidate did not use the binary artifact envelope");
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(bytes)
+                .unwrap(),
+            expected.artifact_bytes
+        );
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            MeshEvent::Completed { summary } if summary == "text-concordance/v1 candidate proposed"
+        )));
+        assert!(
+            result
+                .events
+                .iter()
+                .all(|event| !matches!(event, MeshEvent::Evidence(_)))
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_proposal_observed_before_cancellation_remains_visible() {
         struct CompletesThenCancels;
 
